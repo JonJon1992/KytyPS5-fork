@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -36,7 +37,76 @@ bool CanCoalesceAfter(const QueuedSubmission& previous, const QueuedSubmission& 
 	       next.tick == previous.tick + 1;
 }
 
+uint64_t SteadyNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// Host dependency waits since the last log line, which follows a wait at most once a minute.
+std::atomic<uint64_t> g_host_waits {0};
+std::atomic<uint64_t> g_host_wait_ns {0};
+std::atomic<uint64_t> g_host_wait_max_ns {0};
+std::atomic<uint64_t> g_host_wait_report_ns {0};
+
+void NoteHostWait(uint64_t start_ns) {
+	const auto now  = SteadyNs();
+	const auto wait = now - start_ns;
+	g_host_waits.fetch_add(1, std::memory_order_relaxed);
+	g_host_wait_ns.fetch_add(wait, std::memory_order_relaxed);
+	auto max = g_host_wait_max_ns.load(std::memory_order_relaxed);
+	while (wait > max && !g_host_wait_max_ns.compare_exchange_weak(max, wait,
+	                                                               std::memory_order_relaxed)) {
+	}
+	auto last = g_host_wait_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_host_wait_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	constexpr uint64_t Interval = 60'000'000'000ull;
+	if (now - last < Interval ||
+	    !g_host_wait_report_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto waits = g_host_waits.exchange(0, std::memory_order_relaxed);
+	const auto total = g_host_wait_ns.exchange(0, std::memory_order_relaxed);
+	const auto worst = g_host_wait_max_ns.exchange(0, std::memory_order_relaxed);
+	std::printf("Kyty submit waits: last %.0f s, %" PRIu64
+	            " batches waited on the host for texture staging copies or upload DMA submits, "
+	            "%.2f ms in total, longest %.2f ms\n",
+	            static_cast<double>(now - last) / 1e9, waits, static_cast<double>(total) / 1e6,
+	            static_cast<double>(worst) / 1e6);
+	std::fflush(stdout);
+}
+
 } // namespace
+
+bool SubmitWaitBeforeSignal() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SUBMIT_WAIT_BEFORE_SIGNAL");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+void SubmitInfo::WaitHostDependencies() const {
+	uint64_t start_ns = 0;
+	for (uint32_t i = 0; i < num_host_dependencies; ++i) {
+		auto* const dependency = host_dependencies[i];
+		const auto  value      = host_dependency_values[i];
+		if (dependency->Submittable(value)) {
+			continue;
+		}
+		if (start_ns == 0) {
+			start_ns = SteadyNs();
+		}
+		Profiler::ScopedFrameWait wait(Profiler::FrameWait::SubmitDependencyWait);
+		dependency->WaitSubmittable(value);
+	}
+	if (start_ns != 0) {
+		NoteHostWait(start_ns);
+	}
+}
 
 QueueSubmissionBroker::~QueueSubmissionBroker() {
 	Shutdown();
@@ -91,15 +161,65 @@ void QueueSubmissionBroker::Worker() {
 				return;
 			}
 		}
-		// Never pop before this lock. A direct queue operation can acquire it and
-		// drain older records itself without waiting for this worker.
-		KYTY_PROFILER_DETAIL_BLOCK("SubmissionQueue::WorkerDrain");
-		Common::LockGuard queue_lock(m_graphics->queue_mutex);
-		DrainPendingLocked();
-		if ((++placement_count & 15u) == 0u) {
-			Common::SamplePlacement(Common::ThreadRole::Host);
+		SubmitInfo blocked;
+		bool       waiting = false;
+		{
+			// Never pop before this lock. A direct queue operation can acquire it and
+			// drain older records itself without waiting for this worker.
+			KYTY_PROFILER_DETAIL_BLOCK("SubmissionQueue::WorkerDrain");
+			Common::LockGuard queue_lock(m_graphics->queue_mutex);
+			waiting = DrainReadyLocked(&blocked);
+			if ((++placement_count & 15u) == 0u) {
+				Common::SamplePlacement(Common::ThreadRole::Host);
+			}
+		}
+		if (waiting) {
+			// Work the oldest record reads is still running or not submitted yet. Wait for it
+			// without queue_mutex: presentation and direct queue users go on meanwhile, and wait
+			// for it themselves only if they must submit that record first. It stays queued.
+			blocked.WaitHostDependencies();
 		}
 	}
+}
+
+bool QueueSubmissionBroker::DrainReadyLocked(SubmitInfo* blocked) {
+	size_t remaining;
+	{
+		std::lock_guard lock(m_mutex);
+		remaining = m_pending.size();
+	}
+	while (remaining != 0) {
+		std::array<QueuedSubmission, MaxBatch> records;
+		size_t                                 count   = 0;
+		bool                                   stopped = false;
+		{
+			std::lock_guard lock(m_mutex);
+			EXIT_IF(m_pending.size() < remaining);
+			const auto limit = std::min(remaining, MaxBatch);
+			while (count < limit) {
+				auto& next = m_pending.front();
+				if (!next.submit.HostDependenciesReady()) {
+					*blocked = next.submit;
+					stopped  = true;
+					break;
+				}
+				records[count++] = std::move(next);
+				m_pending.pop_front();
+			}
+			if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+				TracyPlot("SubmissionQueue.Pending", static_cast<double>(m_pending.size()));
+			}
+		}
+		if (count != 0) {
+			m_space_available.notify_all();
+			SubmitBatch(records.data(), count);
+			remaining -= count;
+		}
+		if (stopped) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void QueueSubmissionBroker::DrainPendingLocked() {
@@ -128,8 +248,139 @@ void QueueSubmissionBroker::DrainPendingLocked() {
 			}
 		}
 		m_space_available.notify_all();
-		SubmitBatch(records.data(), count);
+		SubmitInOrder(records.data(), count);
 		remaining -= count;
+	}
+}
+
+void QueueSubmissionBroker::DrainThroughLocked(const SubmissionProgress* progress, uint64_t tick) {
+	if (!m_enabled || progress == nullptr) {
+		return;
+	}
+	while (progress->dispatched_tick.load(std::memory_order_acquire) < tick) {
+		std::array<QueuedSubmission, MaxBatch> records;
+		size_t                                 count = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			bool            last = false;
+			while (!last && count < MaxBatch && !m_pending.empty()) {
+				auto& next = m_pending.front();
+				last       = next.progress.get() == progress && next.tick >= tick;
+				records[count++] = std::move(next);
+				m_pending.pop_front();
+			}
+			if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+				TracyPlot("SubmissionQueue.Pending", static_cast<double>(m_pending.size()));
+			}
+		}
+		if (count == 0) {
+			return; // not pending: the caller made sure the tick reached the broker
+		}
+		m_space_available.notify_all();
+		SubmitInOrder(records.data(), count);
+	}
+}
+
+void QueueSubmissionBroker::DrainReadyForPresentLocked() {
+	if (!m_enabled) {
+		return;
+	}
+	std::vector<QueuedSubmission> ready;
+	{
+		std::lock_guard lock(m_mutex);
+		// Schedulers with a held record; their later records stay behind it, in order.
+		std::array<const SubmissionProgress*, 4> held {};
+		size_t                                   held_count = 0;
+		bool                                     hold_all   = false;
+		std::deque<QueuedSubmission>             kept;
+		ready.reserve(m_pending.size());
+		for (auto& record: m_pending) {
+			const auto* progress = record.progress.get();
+			bool        hold     = hold_all || std::find(held.begin(), held.begin() + held_count,
+			                                             progress) != held.begin() + held_count;
+			if (!hold && !record.submit.HostDependenciesReady()) {
+				hold = true;
+				if (held_count < held.size()) {
+					held[held_count++] = progress;
+				} else {
+					hold_all = true;
+				}
+			}
+			if (hold) {
+				kept.push_back(std::move(record));
+			} else {
+				ready.push_back(std::move(record));
+			}
+		}
+		m_pending = std::move(kept);
+		if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+			TracyPlot("SubmissionQueue.Pending", static_cast<double>(m_pending.size()));
+		}
+	}
+	if (ready.empty()) {
+		return;
+	}
+	m_space_available.notify_all();
+	for (size_t first = 0; first < ready.size(); first += MaxBatch) {
+		SubmitBatch(ready.data() + first, std::min(MaxBatch, ready.size() - first));
+	}
+}
+
+void QueueSubmissionBroker::WaitPendingDependencies(const SubmissionProgress* progress,
+                                                    uint64_t                  tick) {
+	if (!m_enabled) {
+		return;
+	}
+	// Per dependency, the newest value a pending record names: values only grow along the queue.
+	SubmitInfo needs;
+	bool       found = progress == nullptr;
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& record: m_pending) {
+			const auto& submit = record.submit;
+			for (uint32_t i = 0; i < submit.num_host_dependencies; ++i) {
+				auto* const dependency = submit.host_dependencies[i];
+				const auto  value      = submit.host_dependency_values[i];
+				uint32_t    slot       = 0;
+				while (slot < needs.num_host_dependencies &&
+				       needs.host_dependencies[slot] != dependency) {
+					++slot;
+				}
+				if (slot < needs.num_host_dependencies) {
+					needs.host_dependency_values[slot] =
+					    std::max(needs.host_dependency_values[slot], value);
+				} else if (slot < SubmitInfo::MaxHostDependencies) {
+					needs.AddHostDependency(dependency, value);
+				}
+			}
+			if (progress != nullptr && record.progress.get() == progress && record.tick >= tick) {
+				found = record.tick == tick;
+				break;
+			}
+		}
+	}
+	if (!found) {
+		return; // the worker has taken that tick meanwhile
+	}
+	// The dependencies outlive the records (SubmitInfo), which the worker may submit meanwhile.
+	needs.WaitHostDependencies();
+}
+
+void QueueSubmissionBroker::SubmitInOrder(const QueuedSubmission* records, size_t count) {
+	size_t first = 0;
+	for (size_t i = 0; i < count; ++i) {
+		if (records[i].submit.HostDependenciesReady()) {
+			continue;
+		}
+		// The records before it reach the GPU first; then this thread waits for its work.
+		if (i > first) {
+			SubmitBatch(records + first, i - first);
+			first = i;
+		}
+		records[i].submit.WaitHostDependencies();
+	}
+	if (first < count) {
+		SubmitBatch(records + first, count - first);
 	}
 }
 

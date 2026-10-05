@@ -199,7 +199,10 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		if (bits.FirstRangeFrom(start).first >= end) {
+		// A clean range has nothing to visit or clear (upstream 0bb2bdad1), except that a GPU clear
+		// still retires pending side readbacks below.
+		if (!bits.AnyInRange(start, end) &&
+		    (!clear || source != DirtySource::Gpu || !m_readback_pending.AnyInRange(start, end))) {
 			return;
 		}
 		RegionBits mask(bits, start, end);

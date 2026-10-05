@@ -733,6 +733,11 @@ add_executable(bda_hot_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaHotRa
 target_link_libraries(bda_hot_ranges_tests common)
 target_include_directories(bda_hot_ranges_tests PRIVATE ${inc_headers})
 
+# Device-capability choices for AMD, Intel and older NVIDIA GPUs (graphics/host_gpu/deviceCompat.h).
+add_executable(device_compat_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceCompatTests.cpp")
+target_link_libraries(device_compat_tests Vulkan::Headers)
+target_include_directories(device_compat_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -762,6 +767,8 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	# The IR it includes (Program.cpp, Value.cpp) reads KYTY_IR_LINEAR_USES from the codegen options.
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 )
 target_link_libraries(resource_materialization_tests common fmt::fmt xxhash)
 if(LINUX)
@@ -1079,6 +1086,17 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME upsync2_shader_ir COMMAND $<TARGET_FILE:shader_cfg_tests> --upsync2-only)
+	# KYTY_IR_LINEAR_USES (Senaxx 5145dc1f9): every test compilation with the switch off and on gives
+	# the same SPIR-V word for word (KYTY_TEST_COMPARE_LINEAR_USES compiles each one both ways).
+	add_test(NAME upsync2_shader_ir_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --upsync2-only)
+	set_tests_properties(upsync2_shader_ir_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
+	add_test(NAME wave_reductions_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
+	set_tests_properties(wave_reductions_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
+	add_test(NAME isa_accuracy_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --isa-accuracy-only)
+	set_tests_properties(isa_accuracy_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
@@ -1159,6 +1177,7 @@ if(BUILD_TESTING)
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
+	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1554,6 +1573,15 @@ if(BUILD_TESTING)
 	# launched lane below (BryanKAdams/KytyPS5 8f02ad19, 067e8826); VulkanHarness(false).
 	add_test(NAME wave_halves
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-halves-only)
+	# KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): the row reductions with the fold off and on (the
+	# S_ORN2_SAVEEXEC work-list shape among them), and wave64 mask logic folded without growing.
+	add_test(NAME fold_lane_masks_codegen
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --fold-lane-masks-only)
+	# The GPU wave-reduction checks with the fold on.
+	add_test(NAME wave_reductions_fold_lane_masks
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	set_tests_properties(wave_reductions_fold_lane_masks PROPERTIES
+		ENVIRONMENT "KYTY_FOLD_LANE_MASKS=1")
 	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
 	add_test(NAME sampler_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)
@@ -2233,6 +2261,7 @@ if(BUILD_TESTING)
 		spirv_local_arrays_tests
 		vram_budget_tests
 		bda_hot_ranges_tests
+		device_compat_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

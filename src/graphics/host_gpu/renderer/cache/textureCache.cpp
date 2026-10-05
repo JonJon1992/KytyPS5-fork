@@ -39,6 +39,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -991,11 +992,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
-	if (accounted > m_total_used_memory) {
+	// With VK_EXT_memory_budget the collector sets m_total_used_memory to the device-local usage,
+	// which can be below the images' own bytes (allocations outside the device-local heaps when
+	// VRAM runs short), so it saturates. m_registered_image_memory is the exact owned count.
+	m_total_used_memory -= std::min(m_total_used_memory, accounted);
+	if (accounted > m_registered_image_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
-	m_total_used_memory -= accounted;
-	EXIT_IF(accounted > m_registered_image_memory);
 	m_registered_image_memory -= accounted;
 	image.registered = false;
 }
@@ -1881,13 +1884,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
-		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
-			return {ExpandImage(requested, cached_id)};
-		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
@@ -1897,6 +1893,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapLayout);
 			}
 			return {merged_id};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		// Volume depth is not an array-layer count. A larger depth can retain the
+		// same block-slice layout while requiring a larger native image.
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.height == cached.info.extent.height &&
+		      requested.extent.depth > cached.info.extent.depth))) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
 		if (requested.data.size == cached.info.data.size &&
@@ -1985,7 +1994,12 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
-	expanded.usage         = source.usage;
+	// A block-compressed image keeps its own guest layout and texture transfers: it does not
+	// inherit render-target or storage usage from the non-block image it replaces (upstream
+	// 0d4f99335, reused BC5 textures).
+	if (!info.IsBlock() || source.info.IsBlock()) {
+		expanded.usage = source.usage;
+	}
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
@@ -2948,8 +2962,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		EraseSurfaceMeta(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
-			// Decided by the description and the image's level count (fixed for its lifetime).
+		// A single-mip target reused from a cached mip chain clears its view's mip (upstream
+		// 0ec3655f1); the image's own level count does not matter.
+		if (range.size == 0 || desc.info.resources.levels != 1) {
+			// Decided by the description alone.
 			if (noop != nullptr) {
 				noop->provable = true;
 			}
@@ -3217,11 +3233,16 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
-		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
-		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			KYTY_PROFILER_DETAIL_BLOCK("DCC::ConsumeClearKey");
-			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			// Not a guest write (no write fault): images over the metadata bytes keep their
+			// contents (upstream 190608ae2). Like FillBuffer, retire a metadata clear recorded here.
+			(void)ClearMeta(address);
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, slice_size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 		if (diagnostic_readback != 0) {
 			TraceDccDiagnostic(
@@ -5007,23 +5028,39 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	// Map refuses a reservation larger than the download buffer instead of waiting for space, so
+	// a whole-image readback can exceed it. Such a readback is staged in a private buffer of
+	// exactly the needed size instead of exiting; the deferred write-back retires it once the copy
+	// has been read, as the shared-buffer path releases its reservation.
+	std::unique_ptr<Buffer> oversized;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("TextureCache: image readback of %" PRIu64
+			     " bytes exceeds the download buffer; staging it in a private buffer\n",
+			     range.size);
+		}
+		oversized = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped    = oversized->Mapped().data();
+		offset    = 0;
+	} else {
+		download.Commit();
 	}
-	download.Commit();
+	auto& destination = oversized != nullptr ? *oversized : static_cast<Buffer&>(download);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	destination.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, destination, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = destination.Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
@@ -5032,6 +5069,16 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	const auto publication = m_buffer_cache.BeginBackingPublication(
 	    std::span<const GuestRange>(&range, 1), m_scheduler.CurrentTick());
+	if (oversized != nullptr) {
+		m_scheduler.DeferPriorityOperation(
+		    [this, owner = std::move(oversized), range, mapped, publication]() mutable {
+			    owner->Invalidate(0, range.size);
+			    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+			    m_buffer_cache.EndBackingPublication(publication);
+			    owner.reset();
+		    });
+		return true;
+	}
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);

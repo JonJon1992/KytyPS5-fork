@@ -18,6 +18,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
@@ -130,11 +131,74 @@ struct TestCompileResult {
   ShaderRecompiler::IR::ResourceSnapshot resources;
 };
 
+TestCompileResult RecompileOnceForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options,
+    ShaderRecompiler::IR::SrtMemoryReader read_memory,
+    void *read_memory_data, uint32_t push_data_start_dword);
+
+// KYTY_TEST_COMPARE_LINEAR_USES=1: every test compilation runs with KYTY_IR_LINEAR_USES off and on
+// and the SPIR-V must be the same word for word (Senaxx 5145dc1f9 changes only the IR passes'
+// bookkeeping, not their result). The second result is returned.
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
     ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
     void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0) {
+  static const bool compare = std::getenv("KYTY_TEST_COMPARE_LINEAR_USES") != nullptr;
+  if (!compare) {
+    return RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                push_data_start_dword);
+  }
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  auto variant = saved;
+  variant.ir_linear_uses = false;
+  ShaderRecompiler::SetCodegenOptions(variant);
+  const auto quadratic = RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                              push_data_start_dword);
+  variant.ir_linear_uses = true;
+  ShaderRecompiler::SetCodegenOptions(variant);
+  auto linear = RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                     push_data_start_dword);
+  ShaderRecompiler::SetCodegenOptions(saved);
+  static uint64_t compared = 0;
+  static uint64_t differing = 0;
+  compared++;
+  if (quadratic.spirv != linear.spirv) {
+    differing++;
+    std::fprintf(stderr,
+                 "ShaderCfgTests: KYTY_IR_LINEAR_USES changed the SPIR-V of compilation %llu "
+                 "(hash 0x%016llx: %zu -> %zu words)\n",
+                 static_cast<unsigned long long>(compared),
+                 static_cast<unsigned long long>(options.shader_hash), quadratic.spirv.size(),
+                 linear.spirv.size());
+    // KYTY_TEST_COMPARE_LINEAR_USES_DUMP=<prefix>: both modules as <prefix><n>-off.spv / -on.spv.
+    if (const char *prefix = std::getenv("KYTY_TEST_COMPARE_LINEAR_USES_DUMP"); prefix != nullptr) {
+      using Dump = std::pair<const char *, const std::vector<uint32_t> *>;
+      for (const auto &[suffix, words] :
+           {Dump{"-off.spv", &quadratic.spirv}, Dump{"-on.spv", &linear.spirv}}) {
+        const auto path = std::string(prefix) + std::to_string(compared) + suffix;
+        if (auto *file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+          std::fwrite(words->data(), sizeof(uint32_t), words->size(), file);
+          std::fclose(file);
+        }
+      }
+    }
+  }
+  Check(quadratic.spirv == linear.spirv, "KYTY_IR_LINEAR_USES changed a program's SPIR-V");
+  if ((compared & 63u) == 0) {
+    std::printf("ShaderCfgTests: KYTY_IR_LINEAR_USES compared %llu compilations, %llu differ\n",
+                static_cast<unsigned long long>(compared),
+                static_cast<unsigned long long>(differing));
+  }
+  return linear;
+}
+
+TestCompileResult RecompileOnceForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options,
+    ShaderRecompiler::IR::SrtMemoryReader read_memory,
+    void *read_memory_data, uint32_t push_data_start_dword) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1311,7 +1375,8 @@ void TestSpirvRequirementsAnalysis() {
   block->AppendNewInst(ValueOpcode::ImageQueryLod,
                        {Value(0u), Value(0u), Value(0u)});
   block->AppendNewInst(ValueOpcode::ImageGatherRaw,
-                       {Value(0u), Value(0u), Value(0u)});
+                       {Value(0u), Value(0u), Value(0u), Value(0u),
+                        Value(0u), Value(0u), Value(0u)});
   auto &shared = block->AppendNewInst(ValueOpcode::LoadSharedU32,
                                       {Value(0u), Value(true)});
   shared.SetFlags(MemoryFlags{.index = 0});
@@ -4220,6 +4285,38 @@ void TestScalarAshrI64Decoder() {
         "S_ASHR_I64 is missing from the decoded dump");
 }
 
+void TestImageAtomicWidthDecoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // Captured PPSA29343 pixel shader: image_atomic_umax v[2:3], v[0:1], s[0:7].
+  const uint32_t captured[] = {0xf05c0308u, 0x00000200u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_ATOMIC_UMAX &&
+            decoded.data_bits == 64u && decoded.data_dwords == 2u &&
+            decoded.dst.reg == 2u && decoded.dmask == 3u && !decoded.glc,
+        "captured image atomic lost its 64-bit data width");
+
+  for (const auto opcode : {0x10u, 0x17u}) {
+    for (uint32_t mask = 0; mask < 16u; ++mask) {
+      const uint32_t words[] = {EncodeMimg0(opcode, mask), captured[1]};
+      DecodeInstruction(words, 0, decoded);
+      const bool compare_swap = opcode == 0x10u;
+      const bool supported = mask == (compare_swap ? 3u : 1u) ||
+                             (!compare_swap && mask == 3u);
+      Check((decoded.opcode != Opcode::UNSUPPORTED) == supported,
+            "image atomic accepted an invalid or unsupported width mask");
+      if (supported) {
+        Check(decoded.data_bits == (!compare_swap && mask == 3u ? 64u : 32u),
+              "image atomic DMASK selected the wrong data width");
+      }
+    }
+  }
+  const uint32_t unsupported[] = {EncodeMimg0(0x11u, 3u), captured[1]};
+  DecodeInstruction(unsupported, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.data_bits == 64u,
+        "unsupported 64-bit image atomic silently decoded as 32-bit");
+}
+
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
 
@@ -5011,6 +5108,61 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// The compute-derivatives declaration follows the device (SetHostImageFeatures): the KHR SPIR-V
+// extension by default and with VK_KHR_compute_shader_derivatives, the NV one with only
+// VK_NV_compute_shader_derivatives (the same capability and execution mode), and still KHR on a
+// device with neither (the emitter names the shader instead).
+void TestComputeDerivativesHostExtension() {
+  namespace Spirv = ShaderRecompiler::Spirv;
+  // The LOD goes to LDS so that the query stays live; an 8x8 group has the even X and Y sizes
+  // DerivativeGroupQuads needs.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x60, 0x3),
+      EncodeMimg1(6, 0, 0, 1), // image_get_lod v[6:7], v[1:2]
+      EncodeDs0(0x0d),
+      EncodeDs1(0, 6, 0), // ds_write_b32 v0, v6
+      0xbf810000u,
+  };
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 8;
+  compute.threads_num[1] = 8;
+  compute.threads_num[2] = 1;
+  compute.thread_ids_num = 2;
+  compute.lds_size_dwords = 256;
+  compute.wave_size = 64;
+  compute.host_subgroup_size = 64;
+  const auto contains_text = [](const std::vector<uint32_t> &binary, const char *text) {
+    const std::string bytes(reinterpret_cast<const char *>(binary.data()),
+                            binary.size() * sizeof(uint32_t));
+    return bytes.find(text) != std::string::npos;
+  };
+  const auto saved = Spirv::GetHostImageFeatures();
+  for (const auto mode : {Spirv::HostComputeDerivatives::Khr, Spirv::HostComputeDerivatives::Nv,
+                          Spirv::HostComputeDerivatives::None}) {
+    auto features = saved;
+    features.compute_derivatives = mode;
+    Spirv::SetHostImageFeatures(features);
+    auto user_data = ImageTestUserData();
+    // Clear the fixture T#'s reserved bits: otherwise it is not a descriptor and binds a null image.
+    user_data[2] = 0x003f003fu;
+    user_data[6] = 0u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.wave_size = 64;
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options);
+    const bool nv = mode == Spirv::HostComputeDerivatives::Nv;
+    Check(contains_text(result.spirv, "SPV_NV_compute_shader_derivatives") == nv &&
+              contains_text(result.spirv, "SPV_KHR_compute_shader_derivatives") == !nv,
+          "compute derivatives declare the wrong SPIR-V extension for the host device");
+    Check(std::find(result.spirv.begin(), result.spirv.end(), 5288u) != result.spirv.end() &&
+              std::find(result.spirv.begin(), result.spirv.end(), 5289u) != result.spirv.end(),
+          "compute derivatives lost the derivative group capability or execution mode");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  Spirv::SetHostImageFeatures(saved);
+}
+
 void TestNewShaderRecompilerCubeSampleCoordinates() {
   constexpr uint32_t MimgDimCube = 3;
   const uint32_t shader[] = {
@@ -5384,12 +5536,25 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   {
     const auto result = compile(0x20, 0xf); // image_sample
     const auto metrics = MeasureSpirv(result.spirv);
-    Check(metrics.type_images == 1u && metrics.type_samplers == 1u &&
-              metrics.type_sampled_images == 1u &&
-              metrics.sampled_1d_capabilities == 0u &&
-              metrics.image_1d_capabilities == 0u &&
-              metrics.image_query_capabilities == 0u,
-          "plain 2D sample emitted unrelated image declarations");
+    // GET_LOD_STATS feedback (KYTY_LOD_STATS_MODE=gpu, the default) records the LOD of every
+    // implicit pixel sample with OpImageQueryLod, which needs the ImageQuery capability.
+    const uint32_t lod_queries =
+        ShaderRecompiler::IR::UsesMipStats(result.program) ? 1u : 0u;
+    const bool plain = metrics.type_images == 1u && metrics.type_samplers == 1u &&
+                       metrics.type_sampled_images == 1u &&
+                       metrics.sampled_1d_capabilities == 0u &&
+                       metrics.image_1d_capabilities == 0u &&
+                       metrics.image_query_capabilities == lod_queries;
+    if (!plain) {
+      std::fprintf(stderr,
+                   "plain 2D sample: images=%u samplers=%u sampled images=%u "
+                   "Sampled1D=%u Image1D=%u ImageQuery=%u (expected %u)\n",
+                   metrics.type_images, metrics.type_samplers,
+                   metrics.type_sampled_images, metrics.sampled_1d_capabilities,
+                   metrics.image_1d_capabilities, metrics.image_query_capabilities,
+                   lod_queries);
+    }
+    Check(plain, "plain 2D sample emitted unrelated image declarations");
     Check((result.decoded_dump.find("image_sample") != std::string::npos),
           "plain pixel IMAGE_SAMPLE did not decode");
     Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleImplicitLod) ==
@@ -9603,9 +9768,10 @@ void TestCapturedBufferAtomicsX2() {
 // KYTY_LANE_REDUCTIONS=0, stays a scan. Every lane is enabled either by s_mov exec, -1 or as the
 // complement form EXEC = m | ~m (s_orn2_saveexec of a copy of EXEC), which reaches the emitter as
 // a mask test or, after upstream's wave32 lane-mask projection, as p || !p.
-void TestWaveRowReduction() {
-  const auto native_reductions = [](uint32_t last_control, bool row_pairs,
-                                    bool lane_reductions = true, bool complement = false) {
+void TestWaveRowReduction(bool fold_lane_masks = false) {
+  const auto native_reductions = [fold_lane_masks](uint32_t last_control, bool row_pairs,
+                                                   bool lane_reductions = true,
+                                                   bool complement = false) {
     std::vector<uint32_t> shader;
     if (!complement) {
       shader.push_back(row_pairs ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
@@ -9643,6 +9809,7 @@ void TestWaveRowReduction() {
     const auto saved = ShaderRecompiler::GetCodegenOptions();
     auto codegen = saved;
     codegen.lane_reductions = lane_reductions;
+    codegen.fold_lane_masks = fold_lane_masks;
     ShaderRecompiler::SetCodegenOptions(codegen);
     const auto result = RecompileForTest(shader, options);
     ShaderRecompiler::SetCodegenOptions(saved);
@@ -9666,6 +9833,95 @@ void TestWaveRowReduction() {
   Check(native_reductions(0x118, false, true, true) == 2 &&
             native_reductions(0x118, true, true, true) == 2,
         "a DPP row scan under EXEC = m | ~m did not become two lane reductions");
+
+  // Senaxx 5189ea360: the same scan as a pixel shader's work-list loop writes it (PS
+  // 0x00e3d8e3fcdfd5a7): EXEC saved, WQM, the lanes with work through S_AND_SAVEEXEC, every lane
+  // through S_ORN2_SAVEEXEC of that mask, the scan over the lanes with work, EXEC restored. With the
+  // mask reads folded (KYTY_FOLD_LANE_MASKS), EXEC of the scan is x || !x; the scan must still
+  // become native reductions, or the emulated one hangs the GPU. Checked with the fold off and on.
+  {
+    const std::vector<uint32_t> shader = {
+        EncodeVop3Word0(0x365, 3), EncodeVop3Word1(193, 128, 0),    // v_mbcnt_lo_u32_b32 v3, -1, 0
+        EncodeSMovB32(80, 126),                                     // s_mov_b32 s80, exec_lo
+        EncodeSop1(0x09, 126, 126),                                 // s_wqm_b32 exec_lo, exec_lo
+        EncodeVopc(0xd1, 130, 3),                                   // v_cmpx_lt_u32 exec_lo, 2, v3
+        EncodeVopc(0xc1, 132, 3),                                   // v_cmp_lt_u32 vcc_lo, 4, v3
+        EncodeSop1(0x3c, 69, 106),                                  // s_and_saveexec_b32 s69, vcc_lo
+        EncodeSMovB32(126, 69),                                     // s_mov_b32 exec_lo, s69
+        EncodeSop2(0x0e, 0, 69, 80),                                // s_and_b32 s0, s69, s80
+        EncodeSop1(0x40, 106, 69),                                  // s_orn2_saveexec_b32 vcc_lo, s69
+        EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 3, 0), // v_cndmask_b32 v1, 0, v3, s0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x111),       // v_max_u32 v1, v1 row_shr:1, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x118),
+        EncodeSMovB32(126, 106),                                    // s_mov_b32 exec_lo, vcc_lo
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + 15, 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + 31, 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                                  // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                                     // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2),              // exp mrt0
+        0xbf810000u,
+    };
+    auto options      = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = 32;
+    const auto saved  = ShaderRecompiler::GetCodegenOptions();
+    auto codegen      = saved;
+    codegen.fold_lane_masks = fold_lane_masks;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    const auto result = RecompileForTest(shader, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t     found  = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    Check(found == 2, "a work-list scan after S_ORN2_SAVEEXEC did not become two row reductions");
+  }
+}
+
+// KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): wave64 mask logic that the wave32 projection does not
+// cover. Two compares written to VCC and an SGPR pair, combined with S_AND_B64 / S_XOR_B64 /
+// S_ANDN2_B64 and read as a V_CNDMASK mask: with the fold the read is the compares' predicates
+// (smaller SPIR-V); both forms validate and the fold never grows the module.
+void TestFoldLaneMasks() {
+  struct Case {
+    uint32_t    opcode;
+    const char *name;
+  };
+  const Case cases[] = {{0x0f, "s_and_b64"}, {0x13, "s_xor_b64"}, {0x15, "s_andn2_b64"}};
+  for (const auto stage : {ShaderType::Pixel}) {
+    for (const auto &c : cases) {
+      const std::vector<uint32_t> shader = {
+          EncodeVopc(0xc1, 132, 0),                                // v_cmp_lt_u32 vcc, 4, v0
+          EncodeSop1(0x04, 10, 106),                               // s_mov_b64 s[10:11], vcc
+          EncodeVopc(0xc4, 136, 0),                                // v_cmp_gt_u32 vcc, 8, v0
+          EncodeSop2(c.opcode, 0, 10, 106),                        // s_<op>_b64 s[0:1], s[10:11], vcc
+          EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 0, 0), // v_cndmask_b32 v1, 0, v0, s[0:1]
+          EncodeExp0(0x00, 0xf), EncodeExp1(1, 1, 1, 1),           // exp mrt0
+          0xbf810000u,
+      };
+      auto options      = MakeCompileOptions(stage);
+      options.wave_size = 64;
+      const auto saved  = ShaderRecompiler::GetCodegenOptions();
+      auto codegen      = saved;
+      codegen.fold_lane_masks = false;
+      ShaderRecompiler::SetCodegenOptions(codegen);
+      const auto off = RecompileForTest(shader, options);
+      codegen.fold_lane_masks = true;
+      ShaderRecompiler::SetCodegenOptions(codegen);
+      const auto on = RecompileForTest(shader, options);
+      ShaderRecompiler::SetCodegenOptions(saved);
+      CheckSpirvBinaryValidates(off.spirv);
+      CheckSpirvBinaryValidates(on.spirv);
+      std::printf("TestFoldLaneMasks: %s %s wave64: %zu -> %zu SPIR-V words\n",
+                  stage == ShaderType::Pixel ? "PS" : "CS", c.name, off.spirv.size(),
+                  on.spirv.size());
+      Check(on.spirv.size() <= off.spirv.size(), "KYTY_FOLD_LANE_MASKS grew a module");
+    }
+  }
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -10391,6 +10647,7 @@ void TestMeshInputAssembly() {
        0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
   for (const auto &test : cases) {
+   for (const uint32_t split : {0u, 1u}) {
     ShaderVertexInputInfo input{};
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
@@ -10399,6 +10656,7 @@ void TestMeshInputAssembly() {
     mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
     mesh.threads_num[0] = 256;
     mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.split_groups = split;
     Decoder::Program decoded;
     CFG::Graph graph;
     CFG::BasicBlock block;
@@ -10412,23 +10670,32 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+    // split_groups: a part of a split draw starts at draw dword 6's group and WorkgroupId.x
+    // counts from there, so the same group is reached with WorkgroupId.x 0. A program without
+    // split_groups (NVIDIA) must not read dword 6.
+    const uint32_t first_group = split != 0 ? test.group : 0u;
+    const uint32_t draw[] = {test.count,       test.base_vertex, 7, test.width,
+                             test.address_low, 0x12,             first_group};
+    static_assert(std::size(draw) == PushData::MeshDrawDwords(true));
+    uint32_t first_group_reads = 0;
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+        first_group_reads += inst.Arg(0).U32() == PushData::MeshFirstGroupDword ? 1u : 0u;
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
         const uint32_t value = kind == StageInputKind::LocalInvocationIndex
                                    ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
+                                   : inst.Arg(1).U32() == 0 ? test.group - first_group : 2;
         inst.ReplaceUsesWith(Value(value));
       } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
         Check(load == nullptr, "mesh index fetch emitted duplicate loads");
         load = &inst;
       }
     }
+    Check(first_group_reads == split,
+          "mesh prolog read the first-group draw dword without split_groups, or not with it");
     ConstantPropagationPass(program.blocks);
     Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
               load->Arg(3).Resolve().U1() == test.fetch,
@@ -10452,6 +10719,7 @@ void TestMeshInputAssembly() {
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+   }
   }
 }
 
@@ -14297,10 +14565,15 @@ void TestRdna2IsaAccuracyDecode() {
       {0x1b, O::IMAGE_ATOMIC_INC},     {0x1c, O::IMAGE_ATOMIC_DEC},
   };
   for (const auto &item : image_atomic_cases) {
-    const uint32_t words[] = {EncodeMimg0(item.encoding, 0x1, true),
+    // A 32-bit compare-and-swap carries the data and the compare value: DMASK 0x3.
+    const uint32_t dmask = item.opcode == O::IMAGE_ATOMIC_CMPSWAP ? 0x3u : 0x1u;
+    const uint32_t words[] = {EncodeMimg0(item.encoding, dmask, true),
                               EncodeMimg1(0, 0, 0, 8)};
     Check(decode(words).opcode == item.opcode, "MIMG atomic opcode did not decode");
   }
+  const uint32_t cmpswap_one_dword[] = {EncodeMimg0(0x10, 0x1, true), EncodeMimg1(0, 0, 0, 8)};
+  Check(decode(cmpswap_one_dword).opcode == O::UNSUPPORTED,
+        "MIMG compare-and-swap with one data dword must stay unsupported");
 
   const uint32_t perm[] = {EncodeVop3Word0(0x344, 3), EncodeVop3Word1(256, 257, 258)};
   const auto perm_inst = decode(perm);
@@ -14456,6 +14729,18 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --wave-reduction-only: ok\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-derivatives-only") == 0) {
+    TestComputeDerivativesHostExtension();
+    std::printf("shader_cfg --compute-derivatives-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fold-lane-masks-only") == 0) {
+    TestWaveRowReduction(false);
+    TestWaveRowReduction(true);
+    TestFoldLaneMasks();
+    std::printf("shader_cfg --fold-lane-masks-only: ok\n");
+    return 0;
+  }
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -14489,8 +14774,10 @@ int main(int argc, char **argv) {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestScalarAshrI64Decoder();
+  TestImageAtomicWidthDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
+  TestComputeDerivativesHostExtension();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();

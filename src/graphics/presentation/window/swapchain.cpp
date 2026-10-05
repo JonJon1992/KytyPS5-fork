@@ -493,6 +493,9 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+	// Freeze reports depend on it (RTX 50 PCs froze in Mailbox, not in Fifo).
+	LOGF("Swapchain: %ux%u, %zu images, present mode %s\n", m_extent.width, m_extent.height,
+	     m_images.size(), vk::to_string(create_info.presentMode).c_str());
 
 	m_image_views.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
@@ -1156,8 +1159,10 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
+		// The blit this present waits for goes ahead of game batches still waiting for their
+		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		m_window.graphic_ctx.submission_queue.DrainPendingLocked();
+		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {

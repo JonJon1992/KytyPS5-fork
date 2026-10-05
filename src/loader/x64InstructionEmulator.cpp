@@ -828,6 +828,14 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 
 #endif
 
+void ConfigureReciprocalSqrtStats() {
+#if !defined(__APPLE__)
+	if (const char* timing = std::getenv("KYTY_AMD_CPU_TIMING"); timing != nullptr) {
+		g_rsqrt_timing.store(std::strcmp(timing, "1") == 0, std::memory_order_relaxed);
+	}
+#endif
+}
+
 ReciprocalSqrtStats GetReciprocalSqrtStats() {
 	ReciprocalSqrtStats stats;
 #if !defined(__APPLE__)

@@ -367,18 +367,19 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 }
 
 /// Resizes the drawable surface to the given pixel dimensions.
-/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on zero.
-void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	if (new_width == 0 || new_height == 0) {
-		LOGF("WindowContext::Resize(): ignoring 0-sized resize request (%" PRIu32 "x%" PRIu32
-		     "); window is likely minimized/hidden\n",
+/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on a
+/// nonpositive one.
+void WindowContext::Resize(int new_width, int new_height) {
+	if (new_width <= 0 || new_height <= 0) {
+		LOGF("WindowContext::Resize(): ignoring nonpositive resize request (%dx%d); window is "
+		     "likely minimized/hidden\n",
 		     new_width, new_height);
 		minimized.store(true, std::memory_order_release);
 		return;
 	}
 	Common::LockGuard lock(mutex);
-	graphic_ctx.screen_width  = new_width;
-	graphic_ctx.screen_height = new_height;
+	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
+	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
 	minimized.store(false, std::memory_order_release);
 }
 
@@ -391,7 +392,7 @@ void WindowContext::RefreshSizeFromWindow() {
 	int width  = 0;
 	int height = 0;
 	if (SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0) {
-		Resize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+		Resize(width, height);
 	}
 }
 
@@ -439,8 +440,7 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			     window_event.windowID, window_event.data1, window_event.data2);
 
 			if (window_event.data1 > 0 && window_event.data2 > 0) {
-				Resize(static_cast<uint32_t>(window_event.data1),
-				       static_cast<uint32_t>(window_event.data2));
+				Resize(window_event.data1, window_event.data2);
 			} else {
 				LOGF("Window %" PRIu32 " ignoring non-positive size change %" PRId32 "x%" PRId32
 				     "\n",

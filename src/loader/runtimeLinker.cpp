@@ -772,8 +772,9 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 }
 
 // The live log's line for the AMD CPU patch (FaultCost::SetPeriodicReporter): VRSQRTPS traps per
-// frame; each costs about one guest fault round trip of the startup benchmark (the exception
-// dispatch; the emulation itself ~0.07 us, timed with KYTY_AMD_CPU_TIMING=1).
+// frame, from the sites the instruction patcher could not give a native trampoline; each costs
+// about one guest fault round trip of the startup benchmark (the exception dispatch; the
+// emulation itself ~0.07 us, timed with KYTY_AMD_CPU_TIMING=1).
 static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
 	static Loader::X64InstructionEmulator::ReciprocalSqrtStats previous {};
 	const auto current = Loader::X64InstructionEmulator::GetReciprocalSqrtStats();
@@ -2111,6 +2112,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
 			                module_name));
 		}
+		if (emulate_amd) {
+			X64InstructionEmulator::ConfigureReciprocalSqrtStats();
+		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
@@ -2154,10 +2158,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                                         : "patched";
 			Log::WriteToConsoleAndLog(
 			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
-		}
-		if (totals.reciprocal_sqrt.trapped != 0) {
-			// Trapped VRSQRTPS executions cost a fault round trip each: report them live.
-			Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);
+			if (totals.reciprocal_sqrt.found != 0) {
+				// The live log's VRSQRTPS trap rate: sites without a native trampoline still trap.
+				Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);
+			}
 		}
 	}
 

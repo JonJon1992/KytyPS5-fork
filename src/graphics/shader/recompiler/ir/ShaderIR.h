@@ -113,7 +113,7 @@ struct BufferResource {
 	bool operator==(const BufferResource& other) const = default;
 };
 
-enum class ImageMipMode { None, DynamicStorage };
+enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
@@ -132,6 +132,7 @@ struct ImageResource {
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
+	bool                          atomic64          = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
@@ -146,9 +147,12 @@ struct ImageResource {
 struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
+	// Native filtering/border variants share the original sampler's runtime descriptor.
+	uint32_t snapshot_index        = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
+	bool     gather_lod            = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -294,7 +298,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -308,12 +312,19 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draw dword 6, only for programs with ShaderMeshInputInfo::split_groups: the first
+	// workgroup of this part of a draw split past the host's X group limit (0 when unsplit; a
+	// native indirect draw's parameter block holds 0 there).
+	static constexpr uint32_t MeshFirstGroupDword = MeshDrawDwordCount;
+	[[nodiscard]] static constexpr uint32_t MeshDrawDwords(bool split_groups) {
+		return MeshDrawDwordCount + (split_groups ? 1u : 0u);
+	}
 	// Mesh draw dword 3 (the index size: 0, 1, 2 or 4 when pushed by the CPU) marking a native
 	// indirect mesh draw: dwords 0-1 then hold the device address of the dispatch's parameter
 	// block, whose first MeshDrawDwordCount dwords replace the pushed ones (CodegenOptions::
@@ -391,7 +402,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
 				return std::nullopt;
 			}
-			base = AtomicUintBinding;
+			base = AtomicUintBinding + (image.atomic64 ? 5u : 0u);
 		} else {
 			switch (image.numeric_class) {
 				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;

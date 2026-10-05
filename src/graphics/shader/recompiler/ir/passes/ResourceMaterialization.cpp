@@ -11,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,8 +21,10 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -94,6 +98,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    format > Prospero::BufferFormat::kBc7Srgb) {
 		return false;
 	}
+	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead
+	// of being treated as what it is: eight dwords that are not a descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		return false;
+	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
@@ -114,6 +124,26 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		       (r128 || max_mip == fragments);
 	}
 	return true;
+}
+
+// A null image keeps the draw alive, but the walk read something that is not a descriptor (all-zero
+// dwords are an unbound slot, not reported), so say so once per shader and slot instead of hiding it.
+void ReportInvalidImageDescriptor(uint64_t shader_hash, uint32_t slot,
+                                  const DescriptorValue& descriptor) {
+	static std::mutex                                   mutex;
+	static std::set<std::pair<uint64_t, uint32_t>>    reported;
+	{
+		const std::lock_guard lock(mutex);
+		if (reported.size() >= 64 || !reported.emplace(shader_hash, slot).second) {
+			return;
+		}
+	}
+	const auto& words = descriptor.dwords;
+	std::fprintf(stderr,
+	             "image descriptor %u of shader 0x%016" PRIx64
+	             " is not a descriptor, binding null: %08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	             slot, shader_hash, words[0], words[1], words[2], words[3], words[4], words[5],
+	             words[6], words[7]);
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
@@ -142,8 +172,8 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
-uint32_t StorageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
-	if (image.mip_mode != ImageMipMode::DynamicStorage || NullImageDescriptor(descriptor)) {
+uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descriptor) {
+	if (image.mip_mode != ImageMipMode::Dynamic || NullImageDescriptor(descriptor)) {
 		return 1;
 	}
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
@@ -590,10 +620,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
-		image.mip_count = StorageMipCount(base, descriptor);
+		image.mip_count = ImageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
-			    fmt::format("storage image descriptor {} has an invalid mip range", i));
+			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
@@ -615,8 +645,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt &&
-		    format != Prospero::BufferFormat::k32Float) {
+		if (base.atomic &&
+		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		                   : format != Prospero::BufferFormat::k32UInt &&
+		                         format != Prospero::BufferFormat::k32Float)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -736,13 +768,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	// Native filtering/border variants read their source sampler's snapshot entry
+	// (SamplerResource::snapshot_index); the snapshot holds the program's samplers only.
 	SamplerPlan sampler_plan;
 	if (!BuildSamplerPlan(program.info, specialization.images, sampler_plan)) {
 		return SpecializationFail("specialized sampler layout exceeds its resource limit");
-	}
-	for (uint32_t index = static_cast<uint32_t>(program.info.samplers.size());
-	     index < sampler_plan.sampler_count; index++) {
-		snapshot.samplers.push_back(snapshot.samplers[sampler_plan.bindings[index].source]);
 	}
 	ImageRemap(specialization).Apply(snapshot.images);
 	return true;
@@ -1264,6 +1294,9 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 					return false;
 				}
 				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+					if (!NullImageDescriptor(snapshot.images[i])) {
+						ReportInvalidImageDescriptor(program.shader_hash, i, snapshot.images[i]);
+					}
 					snapshot.images[i].dwords.fill(0);
 				}
 			}
@@ -1275,6 +1308,21 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
 				return false;
+			}
+			if (program.info.samplers[i].gather_lod) {
+				const auto control = snapshot.samplers[i].dwords[2];
+				const auto filter  = (control >> 26u) & 3u;
+				// MipNone always selects the base level and Point the nearest mip. Linear mip
+				// selection and nonzero LOD biases also use the nearest mip: upstream rejects the
+				// stage here, which drops draws that earlier builds rendered from mip 0.
+				if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
+					static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+					if (!warned.test_and_set(std::memory_order_relaxed)) {
+						std::fputs("Warning: explicit-LOD gather with linear mip filtering or a LOD bias "
+						           "reads the nearest mip.\n",
+						           stderr);
+					}
+				}
 			}
 		}
 		if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
@@ -1353,6 +1401,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		if (index >= program.info.samplers.size()) {
 			samplers.push_back(program.info.samplers[binding.source]);
 		}
+		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}

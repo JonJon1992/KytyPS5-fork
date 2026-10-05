@@ -320,6 +320,22 @@ int KernelEqueuePrivate::GetTriggeredEventsLegacy(KernelEvent* ev, int num) {
 }
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
+	// A periodic timer counts every expired period in its data and moves its deadline past now.
+	const auto count_periods = [now_ns](KernelEqueueEvent& event) {
+		if (event.event.filter != KERNEL_EVFILT_TIMER) {
+			return;
+		}
+		const auto count = event.interval_ns == 0 ? (event.triggered ? 0 : 1)
+		                                          : 1 + (now_ns - event.deadline_ns) / event.interval_ns;
+		event.event.data += static_cast<intptr_t>(count);
+		event.deadline_ns += count * event.interval_ns;
+	};
+	// A pending periodic timer keeps its place in the active list.
+	for (auto& event: m_events) {
+		if (event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
+			count_periods(event);
+		}
+	}
 	// Expired timers become pending in deadline order, the order their callouts would have fired.
 	// A periodic timer (interval_ns != 0) counts every period that expired in its data and moves
 	// its deadline past now; it stays pending (and keeps its place) until it is consumed.
@@ -337,17 +353,9 @@ void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 		if (earliest == nullptr) {
 			return;
 		}
-		if (earliest->event.filter == KERNEL_EVFILT_TIMER) {
-			const auto count = earliest->interval_ns == 0
-			                       ? uint64_t {earliest->triggered ? 0u : 1u}
-			                       : 1 + (now_ns - earliest->deadline_ns) / earliest->interval_ns;
-			earliest->event.data += static_cast<intptr_t>(count);
-			earliest->deadline_ns += count * earliest->interval_ns;
-		}
-		if (!earliest->triggered) {
-			earliest->triggered  = true;
-			earliest->active_seq = m_next_active_seq++;
-		}
+		count_periods(*earliest);
+		earliest->triggered  = true;
+		earliest->active_seq = m_next_active_seq++;
 		NoteWatchdogEvent(*earliest);
 	}
 }
