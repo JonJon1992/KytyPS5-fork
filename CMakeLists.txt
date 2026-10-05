@@ -1113,6 +1113,8 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_frontend_optimization
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --frontend-optimization-only)
 	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
 	add_test(NAME shader_cfg_post_dominators
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --post-dominators-only)

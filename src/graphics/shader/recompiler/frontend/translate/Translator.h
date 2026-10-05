@@ -96,7 +96,7 @@ private:
 	IR::Value     ConstructU32x4(const Decoder::Operand& base, uint32_t count);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
-	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);
+	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst);
 	IR::U32       WidenSubdword(IR::Value value, uint32_t bits, bool sign);
 	IR::Value     NarrowSubdword(IR::U32 value, uint32_t bits);
 	void          S_LOAD(const Decoder::Instruction& inst, bool raw);

@@ -15,7 +15,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -14598,6 +14600,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 }
 
 #include "ShaderRayTracingTests.inc"
+#include "ShaderFrontendOptimizationTests.inc"
 
 void TestRdna2IsaAccuracyDecode() {
   namespace Decoder = ShaderRecompiler::Decoder;
@@ -14822,6 +14825,21 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--frontend-optimization-only") == 0) {
+    TestFrontendInstructionPrefixes();
+    TestFrontendBufferAddresses();
+    TestFrontendImageAddresses();
+    TestNewShaderDecoderArchitecture();
+    TestImageAddressOperands();
+    TestNewShaderRecompilerNativeWideBufferIr();
+    TestNewShaderRecompilerMubufFormatTranslation();
+    TestNewShaderRecompilerMubufD16Translation();
+    TestNewShaderRecompilerTypedBufferTranslation();
+    TestNewShaderRecompilerBufferLoadsGuardedByExec();
+    TestCapturedBufferAtomicsX2();
+    std::puts("ShaderCfgTests: frontend optimization cases passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--post-dominators-only") == 0) {
     TestNewShaderRecompilerCfgPostDominatorsMatchPaths();
     std::puts("ShaderCfgTests: post-dominator cases passed");
@@ -14874,6 +14892,9 @@ int main(int argc, char **argv) {
     return 0;
   }
   TestRayTracingDispatchDetection();
+  TestFrontendInstructionPrefixes();
+  TestFrontendBufferAddresses();
+  TestFrontendImageAddresses();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

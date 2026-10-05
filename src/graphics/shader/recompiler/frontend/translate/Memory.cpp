@@ -385,6 +385,9 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
 		if (index != 0u && index - 1u < nsa_components) {
 			components[index] =
 			    ir.GetVectorReg(static_cast<IR::VectorReg>(inst.image_nsa_addr[index - 1u]));
+		} else if (base.kind == Decoder::OperandKind::Vgpr) {
+			// Image addresses read raw registers, without source modifiers.
+			components[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(base.reg + index));
 		} else {
 			components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
 		}
@@ -399,7 +402,9 @@ IR::Value Translator::ConstructU32x4(const Decoder::Operand& base, uint32_t coun
 	std::array<IR::Value, 4> components {IR::Value(0u), IR::Value(0u), IR::Value(0u),
 	                                     IR::Value(0u)};
 	for (uint32_t index = 0; index < std::min(count, 4u); index++) {
-		components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
+		components[index] = base.kind == Decoder::OperandKind::Vgpr
+		                        ? ir.GetVectorReg(static_cast<IR::VectorReg>(base.reg + index))
+		                        : ReadRawU32(OffsetOperand(PlainOperand(base), index));
 	}
 	return ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	               {components[0], components[1], components[2], components[3]});
@@ -426,13 +431,13 @@ void Translator::WriteImageComponents(const Decoder::Operand& dst, IR::Value val
 	}
 }
 
-Translator::BufferAddress Translator::ReadBufferAddress(const Decoder::Instruction& inst,
-                                                        uint32_t                    first_source) {
-	uint32_t   cursor  = first_source;
-	const auto next    = [&]() { return ReadU32(MemorySourceAt(inst, cursor++)); };
-	const auto index   = inst.idxen ? next() : IR::U32(IR::Value(0u));
-	const auto offset  = inst.offen ? next() : IR::U32(IR::Value(0u));
-	const auto soffset = next();
+Translator::BufferAddress Translator::ReadBufferAddress(const Decoder::Instruction& inst) {
+	// MUBUF/MTBUF keep their address in src0 and scalar offset in src2 for every operation.
+	const auto index = inst.idxen ? ReadU32(inst.src0) : IR::U32(IR::Value(0u));
+	const auto offset = inst.offen
+	                        ? ReadU32(inst.idxen ? OffsetDecodedRegister(inst.src0, 1u) : inst.src0)
+	                        : IR::U32(IR::Value(0u));
+	const auto soffset = ReadU32(inst.src2);
 	return {index, offset, soffset};
 }
 
@@ -502,7 +507,7 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 		    IR::ValueOpcode::LoadBufferU32x3, IR::ValueOpcode::LoadBufferU32x4};
 		const auto count    = memory.component_count;
 		const auto resource = GetBufferResource(memory);
-		const auto address  = ReadBufferAddress(inst, 0);
+		const auto address  = ReadBufferAddress(inst);
 		const auto loaded   = ir.Emit(
             opcodes.at(count - 1u),
             {resource, address.index, address.offset, address.soffset, ir.GetExec()},
@@ -541,7 +546,7 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 			     Decoder::InstructionToString(inst).c_str(), inst.pc, bits);
 	}
 	const auto resource = GetBufferResource(memory);
-	const auto address  = ReadBufferAddress(inst, 0);
+	const auto address  = ReadBufferAddress(inst);
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(memory, inst.pc));
@@ -561,8 +566,8 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      memory   = MemoryInfoFromDecoded(inst);
 	const auto      resource = GetBufferResource(memory);
-	const auto      address  = ReadBufferAddress(inst, 1);
-	const auto      data_src = MemorySourceAt(inst, 0);
+	const auto      address  = ReadBufferAddress(inst);
+	const auto&     data_src = inst.dst;
 	const auto      data     = ReadU32(data_src);
 	if (memory.formatted && memory.data_bits == 16u) {
 		// Formatted D16: unpack the 16-bit components, low half first (D16_HI_X reads the high
@@ -646,8 +651,8 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 void Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetBufferResource(memory);
-	const auto address  = ReadBufferAddress(inst, 1);
-	const auto data_src = MemorySourceAt(inst, 0);
+	const auto address  = ReadBufferAddress(inst);
+	const auto& data_src = inst.dst;
 	const auto flags    = AddMemoryInfo(memory, inst.pc);
 	IR::Value  result;
 	if (opcode == IR::ValueOpcode::BufferAtomicCmpSwap32) {
