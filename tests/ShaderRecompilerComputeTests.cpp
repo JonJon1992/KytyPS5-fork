@@ -44166,9 +44166,16 @@ TestCase CacheInvalidateAndClauseAreNoOps() {
   return test;
 }
 
+#include "ShaderRayTracingGpuTests.inc"
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
+  cases.push_back(FlatStackApertures(32));
+  cases.push_back(FlatStackApertures(64));
+  for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+    cases.push_back(BvhIntersections(barycentrics, sorted));
+  cases.push_back(BvhIntersections(false, true, 1));
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
@@ -50903,6 +50910,27 @@ int main(int argc, char **argv) {
   }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
   // checks that precede them in the default run.
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-codegen-only") == 0) {
+    for (u32 subgroup : {32u, 64u}) {
+      (void)CompileCase(FlatStackApertures(32), subgroup);
+      (void)CompileCase(FlatStackApertures(64), subgroup);
+      for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+        (void)CompileCase(BvhIntersections(barycentrics, sorted), subgroup);
+      (void)CompileCase(BvhIntersections(false, true, 1), subgroup);
+    }
+    std::puts("ShaderRecompilerComputeTests: Wolverine fixture CPU/SPIR-V cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FlatStackApertures(32));
+    RunCase(&vulkan, FlatStackApertures(64));
+    for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+      RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
+    RunCase(&vulkan, BvhIntersections(false, true, 1));
+    std::puts("ShaderRecompilerComputeTests: Wolverine instruction GPU cases passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : MakeCases()) {

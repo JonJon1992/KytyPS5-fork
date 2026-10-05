@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -263,7 +264,14 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
 		case O::S_CLAUSE:
-		case O::S_TRAP: EmitControlNop(); return;
+			EmitControlNop(); return;
+		case O::S_TRAP:
+			if (inst.src0.value == Decoder::ShaderCallMissTrapCode) {
+				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value)});
+			} else {
+				EmitControlNop();
+			}
+			return;
 		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;

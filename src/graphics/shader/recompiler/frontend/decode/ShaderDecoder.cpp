@@ -263,6 +263,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
+		case 235u: operand.kind = OperandKind::SharedBase; return;
+		case 236u: operand.kind = OperandKind::SharedLimit; return;
+		case 237u: operand.kind = OperandKind::PrivateBase; return;
+		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
@@ -413,7 +417,6 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
-	program.has_bvh = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -422,10 +425,6 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
-		if (inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u)) {
-			program.has_bvh = true;
-			return;
-		}
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
@@ -464,6 +463,10 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::Scc: text = "scc"; break;
 		case OperandKind::M0: text = "m0"; break;
 		case OperandKind::PopsExitingWaveId: text = "pops_exiting_wave_id"; break;
+		case OperandKind::SharedBase: text = "shared_base"; break;
+		case OperandKind::SharedLimit: text = "shared_limit"; break;
+		case OperandKind::PrivateBase: text = "private_base"; break;
+		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;
 	}
@@ -620,6 +623,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
 		case Opcode::IMAGE_GATHER4_L:

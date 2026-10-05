@@ -33,6 +33,7 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -1119,6 +1120,8 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		std::vector<uint32_t> static_state;
+		// Exact translation input after calls are resolved; validated before every lookup.
+		std::vector<uint32_t> function_code;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -1350,6 +1353,32 @@ struct PipelineCache::ProgramCache {
 		ProgramKey           key;
 		// The parallel path keeps both stages' keys alive at once.
 		ProgramKey           second_key;
+		ShaderRecompiler::Decoder::ShaderFunctionExpander function_expander;
+		std::vector<uint32_t> function_caller; // clean caller snapshot, reused by compute preparation
+		// Whether function_caller holds the code BuildKey last keyed (a call-free hit skips it).
+		bool                  function_caller_current = false;
+		// Compute code BuildKey found free of calls, by the identity a translation is already
+		// looked up by without rereading its code. A hit skips copying and scanning the whole
+		// program on every dispatch.
+		struct CallFreeKey {
+			uint64_t base      = 0;
+			uint64_t hash      = 0;
+			uint32_t code_size = 0;
+			uint32_t wave_size = 0;
+
+			bool operator==(const CallFreeKey&) const = default;
+		};
+		struct CallFreeKeyHash {
+			std::size_t operator()(const CallFreeKey& key) const {
+				auto hash = static_cast<std::size_t>(key.hash);
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.base));
+				PipelineKeyHash::Mix(hash, key.code_size);
+				PipelineKeyHash::Mix(hash, key.wave_size);
+				return hash;
+			}
+		};
+		static constexpr size_t MaxCallFree = 4096;
+		std::unordered_set<CallFreeKey, CallFreeKeyHash> call_free;
 		std::vector<uint8_t> validation;
 		std::array<LookupMemo, LookupMemoStages> memos;
 	};
@@ -1378,6 +1407,7 @@ struct PipelineCache::ProgramCache {
 				memo->key.user_data_count = key.user_data_count;
 				memo->key.code_size       = key.code_size;
 				memo->key.static_state.assign(key.static_state.begin(), key.static_state.end());
+				memo->key.function_code = key.function_code;
 				memo->source      = source;
 				memo->permutation = nullptr;
 			} else {
@@ -1440,6 +1470,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
+			PipelineKeyHash::Mix(hash, key.function_code.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing up to 429 words first.
 			return hash;
@@ -1586,13 +1617,89 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// Guest code for call analysis: the clean backing, else (serial path only) the mapped guest
+	// bytes after the usual tracked-page refresh.
+	static bool ReadShaderWords(uint64_t address, std::span<uint32_t> words,
+	                            ShaderReadAttempt* attempt, bool speculative) {
+		if (LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), words.size_bytes())) {
+			return true;
+		}
+		if (speculative || DrawPrep::Speculative()) return false;
+		if (NativeDccEnabled()) {
+			if (attempt != nullptr) attempt->Missing(address, words.size_bytes());
+			return false;
+		}
+		if (!LibKernel::Memory::TryReadBacking(address, words.data(), words.size_bytes())) return false;
+		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
+		return true;
+	}
+
+	// Snapshots the compute caller code into scratch.function_caller.
+	static bool ReadFunctionCaller(const ShaderParams& params, ProgramScratch& scratch,
+	                               ShaderReadAttempt* attempt, bool speculative) {
+		scratch.function_caller.resize(params.code.size());
+		// params.hash can be a declared AGC identity, not XXH3 of these bytes. Preserve it;
+		// use the current snapshot for analysis without reading the protected mapping.
+		if (params.code.empty() ||
+		    ReadShaderWords(params.Base(), scratch.function_caller, attempt, speculative)) {
+			scratch.function_caller_current = true;
+			return true;
+		}
+		if (attempt != nullptr && attempt->count != 0) attempt->materialization_failed = true;
+		if (!speculative && !DrawPrep::Speculative() && !NativeDccEnabled()) {
+			EXIT("shader function caller code is not mapped at 0x%016" PRIx64 "\n", params.Base());
+		}
+		return false;
+	}
+
 	template <typename InputInfo>
-	static void BuildKey(const ShaderParams& params, const InputInfo& input_info, ProgramKey& key) {
+	static bool BuildKey(const ShaderParams& params, const InputInfo& input_info, ProgramKey& key,
+	                     ProgramScratch& scratch, ShaderReadAttempt* attempt = nullptr,
+	                     bool speculative = false) {
 		key.stage           = StageOf(input_info);
 		key.hash            = params.hash;
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
+		key.function_code.clear();
+		// Match upstream's compute-only scope: graphics has embedded fetch and fused stages.
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			scratch.function_caller_current = false;
+			// Expanding call-free code is the identity, so once this code was found free of calls
+			// it is trusted by the same identity the translation it keys is found by.
+			const ProgramScratch::CallFreeKey call_free {params.Base(), params.hash, key.code_size,
+			                                             input_info.wave_size};
+			if (params.hash != 0 && scratch.call_free.contains(call_free)) return true;
+			if (!ReadFunctionCaller(params, scratch, attempt, speculative)) return false;
+			std::string reason;
+			const auto read = [&](uint64_t address, std::span<uint32_t> words) {
+				return ReadShaderWords(address, words, attempt, speculative);
+			};
+			if (!scratch.function_expander.Expand(
+			        scratch.function_caller, params.Base(), std::span(params.user_data).first(params.user_data_count),
+			        read, key.function_code, reason, input_info.wave_size)) {
+				key.function_code.clear();
+				if (attempt != nullptr && attempt->count != 0) {
+					attempt->materialization_failed = true;
+					return false;
+				}
+				if (speculative || DrawPrep::Speculative()) return false;
+				static std::atomic_uint64_t failures {0};
+				if (failures.fetch_add(1, std::memory_order_relaxed) < 8) {
+					std::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
+					            reason.c_str());
+				}
+				// Keep every original instruction so the strict translator reports unsupported calls.
+			} else if (key.function_code.empty() && params.hash != 0) {
+				if (scratch.call_free.size() >= ProgramScratch::MaxCallFree) scratch.call_free.clear();
+				scratch.call_free.insert(call_free);
+			}
+		}
+		return true;
+	}
+
+	static std::span<const uint32_t> TranslationCode(const ShaderParams& params, const ProgramKey& key) {
+		return key.function_code.empty() ? params.code : std::span<const uint32_t>(key.function_code);
 	}
 
 	static ShaderRecompiler::IR::SrtRuntime MakeRuntime(const ShaderParams& params,
@@ -1923,7 +2030,8 @@ struct PipelineCache::ProgramCache {
 				std::memcpy(words.data(), guest.data(), guest.size_bytes());
 			}
 		};
-		copy(params.code, code_words);
+		if (key.function_code.empty()) copy(params.code, code_words);
+		else code_words = key.function_code;
 		copy(params.back_code, back_code_words);
 		ProgramDiskCache::BuildSourceKey(
 		    {.stage                   = static_cast<uint32_t>(key.stage),
@@ -2177,6 +2285,7 @@ struct PipelineCache::ProgramCache {
 		if (!copy(params.code, job->code) || !copy(params.back_code, job->back_code)) {
 			return;
 		}
+		if (!key.function_code.empty()) job->code = key.function_code;
 		job->key  = key;
 		job->hash = params.hash;
 		job->user_data.assign(key.user_data_count, 0u);
@@ -2470,7 +2579,7 @@ struct PipelineCache::ProgramCache {
 
 	// KYTY_TRANSLATION_CACHE_VERIFY: compiles the permutation from a copy of `kept` and from a
 	// fresh translation and compares the outputs that reach the GPU and the renderer.
-	bool VerifyKeptTranslation(const ShaderParams& params,
+	bool VerifyKeptTranslation(std::span<const uint32_t> code,
 	                           const ShaderRecompiler::CompileOptions& options,
 	                           const KeptTranslation& kept,
 	                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
@@ -2479,7 +2588,7 @@ struct PipelineCache::ProgramCache {
 		if (!CopyTranslation(kept.translated, copy)) return false;
 		auto reused = ShaderRecompiler::CompileProgram(std::move(copy), options, specialization,
 		                                               push_data_cursor);
-		auto fresh_translation = ShaderRecompiler::TranslateProgram(params.code, options);
+		auto fresh_translation = ShaderRecompiler::TranslateProgram(code, options);
 		auto fresh = ShaderRecompiler::CompileProgram(std::move(fresh_translation), options,
 		                                              specialization, push_data_cursor);
 		const auto a    = std::move(reused.program).TakeCompiledInfo();
@@ -2601,7 +2710,15 @@ struct PipelineCache::ProgramCache {
 			~StallScope() { if (account) AddCompileStall(CompileClockNs() - begin); }
 		} stall {.account = !speculative};
 		std::vector<uint32_t> owned_code;
-		auto translation_code = params.code;
+		// A call-free hit in BuildKey skipped the caller snapshot; take it for this miss.
+		if (key.stage == ShaderType::Compute && key.function_code.empty() &&
+		    !scratch.function_caller_current &&
+		    !ReadFunctionCaller(params, scratch, &read_attempt, speculative)) {
+			return nullptr;
+		}
+		auto translation_code = key.stage == ShaderType::Compute && key.function_code.empty()
+		                            ? std::span<const uint32_t>(scratch.function_caller)
+		                            : TranslationCode(params, key);
 		if (speculative) {
 			// A certificate checked at draw consumption cannot repair a cache entry published
 			// from changed code. Keep an immutable copy and verify its identity before publication.
@@ -2613,7 +2730,8 @@ struct PipelineCache::ProgramCache {
 				    return LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(guest.data()),
 				        copy.data(), guest.size_bytes());
 			    })) return nullptr;
-			translation_code = owned_code;
+			translation_code = key.function_code.empty() ? std::span<const uint32_t>(owned_code)
+			                                              : std::span<const uint32_t>(key.function_code);
 		}
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
 			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
@@ -2663,6 +2781,7 @@ struct PipelineCache::ProgramCache {
 		record.key.user_data_count = key.user_data_count;
 		record.key.code_size       = key.code_size;
 		record.key.static_state    = key.static_state;
+		record.key.function_code   = key.function_code;
 		record.source              = source;
 		record.push_data_cursor    = push_data_cursor;
 		if (source != nullptr) {
@@ -2756,7 +2875,7 @@ struct PipelineCache::ProgramCache {
 					times.reused = CopyTranslation(kept->translated, translated);
 				}
 				if (times.reused && TranslationVerifyMode() != 0 &&
-				    !VerifyKeptTranslation(params, options, *kept, prep.specialization,
+				    !VerifyKeptTranslation(translation_code, options, *kept, prep.specialization,
 				                           push_data_cursor)) {
 					times.reused = false;
 					lock.lock();
@@ -2784,7 +2903,8 @@ struct PipelineCache::ProgramCache {
 			const auto load_begin = CompileClockNs();
 			auto disk_params = params;
 			disk_params.code = translation_code;
-			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words, speculative);
+			BuildDiskKey(disk_params, options, key, disk_key, code_words, back_code_words,
+			             speculative || stage == ShaderType::Compute);
 			if (source == nullptr) {
 				disk_source = disk->FindSource(disk_key);
 			}
@@ -3110,7 +3230,7 @@ struct PipelineCache::ProgramCache {
 		if (ResourceReuseEnabled()) reuse_lock = std::unique_lock(m_reuse_mutex);
 
 		auto& key = scratch.key;
-		BuildKey(params, input_info, key);
+		if (!BuildKey(params, input_info, key, scratch, &read_attempt, speculative)) return {};
 		const auto* source = FindSourceMemo(key, scratch);
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			return {};
@@ -3201,8 +3321,8 @@ struct PipelineCache::ProgramCache {
 		if (worker == nullptr) return false;
 		auto& ps_key = scratch.key;
 		auto& vs_key = scratch.second_key;
-		BuildKey(ps_params, ps_info, ps_key);
-		BuildKey(vs_params, vs_info, vs_key);
+		BuildKey(ps_params, ps_info, ps_key, scratch);
+		BuildKey(vs_params, vs_info, vs_key, scratch);
 		const auto* ps_source = FindSourceMemo(ps_key, scratch);
 		const auto* vs_source = FindSourceMemo(vs_key, scratch);
 		if (ps_source == nullptr || vs_source == nullptr ||
@@ -3278,7 +3398,7 @@ struct PipelineCache::ProgramCache {
 		const SourceEntry* ps_source = nullptr;
 		bool missing = false;
 		if (pixel_active) {
-			BuildKey(ps_params, ps_info, ps_key);
+			BuildKey(ps_params, ps_info, ps_key, scratch);
 			ps_source = FindSourceMemo(ps_key, scratch);
 			if (ps_source == nullptr) {
 				if (compile_ns != nullptr) return compile_missing();
@@ -3289,7 +3409,7 @@ struct PipelineCache::ProgramCache {
 				return compile_missing();
 			}
 		}
-		BuildKey(vs_params, vs_info, vs_key);
+		BuildKey(vs_params, vs_info, vs_key, scratch);
 		const auto* vs_source = FindSourceMemo(vs_key, scratch);
 		if (vs_source == nullptr) {
 			if (compile_ns != nullptr) return compile_missing();

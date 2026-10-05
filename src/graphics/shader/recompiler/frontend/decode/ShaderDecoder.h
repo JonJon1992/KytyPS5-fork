@@ -10,6 +10,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -620,6 +623,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -694,6 +698,10 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	SharedLimit,
+	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 };
@@ -809,7 +817,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

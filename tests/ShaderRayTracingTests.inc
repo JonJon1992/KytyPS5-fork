@@ -1,87 +1,215 @@
-void TestRayTracingDispatchDetection() {
-  namespace D = ShaderRecompiler::Decoder;
-  const auto check_decoded = [](std::span<const uint32_t> code, bool expected,
-                                const char *message) {
-    D::Program decoded;
-    D::DecodeProgram(code, decoded);
-    Check(decoded.has_bvh == expected, message);
-    if (expected) {
-      const auto &last = decoded.instructions.back();
-      Check(last.family == D::Family::MIMG &&
-                (last.opcode_id == 0xe6u || last.opcode_id == 0xe7u),
-            "decoder continued past the first BVH instruction");
-      const auto result = ShaderRecompiler::TranslateProgram(
-          code, MakeCompileOptions(ShaderType::Compute));
-      Check(result.skip_dispatch && result.program.blocks.empty() && result.cfg_dump.empty(),
-            "BVH compute shader reached IR translation");
+// CPU translation/validation checks: no Vulkan device is created.
+void TestLocalAddressStoreProof() {
+  using namespace ShaderRecompiler::IR;
+  for (uint32_t scenario = 0; scenario < 15; ++scenario) {
+    Program program;
+    program.wave_size = 32;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto* block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.memory_info.push_back({.kind = ResourceKind::Global});
+    IREmitter ir(block);
+    const auto zero = U32(Value(0u));
+    const auto lane = U32(ir.Emit(ValueOpcode::LaneId));
+    const auto predicate = ir.INotEqual(lane, zero);
+    auto high = ir.Select(predicate, U32(Value(SharedApertureHigh)),
+                          U32(Value(PrivateApertureHigh)));
+    auto active = ir.GetExec();
+    if (scenario == 1 || scenario == 9 || scenario == 13 || scenario == 14)
+      high = lane; // Unknown addresses must retain the access.
+    if (scenario == 2 || scenario == 3) {
+      high = ir.Select(predicate, U32(Value(scenario == 2 ? SharedApertureHigh : 1u)), lane);
+      active = ir.LogicalAnd(active, predicate);
     }
-  };
-  const auto check = [&](std::initializer_list<uint32_t> code, bool expected,
-                         const char *message) {
-    check_decoded(std::span<const uint32_t>{code.begin(), code.size()}, expected, message);
-  };
-
-  check({0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "captured contiguous BVH instruction did not skip dispatch");
-  check({0xf1989f07u, 0x00071001u, 0x3d3e3c15u, 0x38095851u, 0x00003a39u,
-         EncodeSopp(0x01)}, true,
-        "captured NSA BVH instruction did not skip dispatch");
-  check({0xf19c9f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "RDNA2 BVH64 instruction did not skip dispatch");
-  check({0xbe8e210eu, 0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "unsupported SWAPPC before BVH prevented dispatch detection");
-  check({0xf1989f01u, 0x00081014u, 0xc0000000u, EncodeSopp(0x01)}, true,
-        "unknown instruction after BVH prevented dispatch skipping");
-
-  for (uint32_t opcode : {0xe6u, 0xe7u}) {
-    for (uint32_t nsa = 0; nsa < 4; ++nsa) {
-      for (uint32_t slc = 0; slc < 2; ++slc) {
-        std::array<uint32_t, 6> code{
-            EncodeMimg0(opcode, 0xf, true) | (nsa << 1u) | (slc << 25u),
-            EncodeMimg1(0, 0, 0, 0)};
-        code[2 + nsa] = EncodeSopp(0x01);
-        check_decoded(std::span(code).first(3 + nsa), true,
-                      "BVH cache flags or NSA length prevented dispatch detection");
-      }
+    if (scenario == 4) {
+      const auto bit = ir.BitwiseAnd(lane, U32(Value(1u)));
+      const auto choice = ir.ShiftLeftLogical(bit, U32(Value(31u)));
+      high = U32(ir.Emit(ValueOpcode::UMedTri32,
+          {Value(SharedApertureHigh), Value(PrivateApertureHigh), choice}));
     }
-  }
-  for (uint32_t opcode : {0x66u, 0x67u, 0xe4u, 0xe5u, 0xe8u, 0xe9u}) {
-    check({EncodeMimg0(opcode, 0xf), EncodeMimg1(0, 0, 0, 0), EncodeSopp(0x01)},
-          false, "non-BVH image opcode was incorrectly skipped");
-  }
-
-  check({EncodeSMovB32(0, 255), 0xf1989f01u, EncodeSopp(0x01)}, false,
-        "scalar literal was mistaken for a BVH instruction");
-  check({EncodeMimg0(0x20, 0xf) | 6u, EncodeMimg1(0, 0, 0, 0),
-         0xf1989f01u, 0xf19c9f01u, 0u, EncodeSopp(0x01)}, false,
-        "NSA address words were mistaken for BVH instructions");
-  check({EncodeMimg0(0x20, 0xf), 0xf1989f01u, EncodeSopp(0x01)}, false,
-        "MIMG operand word was mistaken for a BVH instruction");
-  check({EncodeSopp(0x01), 0xf1989f01u, 0x00081014u}, false,
-        "data after the shader end was mistaken for a BVH instruction");
-  check({EncodeMimg0(0x20, 0xf), EncodeMimg1(0, 0, 0, 0), EncodeSopp(0x01)},
-        false, "ordinary image shader was incorrectly skipped");
-
-  // An end instruction on one branch does not end another branch's code.
-  check({EncodeSopp(0x04, 1), EncodeSopp(0x01), 0xf1989f01u, 0x00081014u,
-         EncodeSopp(0x01)}, true,
-        "BVH at a branch target after an early end was not detected");
-
-  const std::array bvh_code{0xf1989f01u, 0x00081014u, 0xf19c9f01u, 0x00081014u,
-                            EncodeSopp(0x01)};
-  const std::array ordinary_code{EncodeSMovB32(0, 255), 0xf1989f01u, EncodeSopp(0x01)};
-  D::Program reused;
-  D::DecodeProgram(bvh_code, reused);
-  Check(reused.has_bvh && reused.instructions.size() == 1,
-        "decoder did not stop at the first BVH instruction");
-  D::DecodeProgram(ordinary_code, reused);
-  Check(!reused.has_bvh, "decoder retained stale BVH metadata");
-  for (const auto stage : {ShaderType::Compute, ShaderType::Vertex, ShaderType::Pixel}) {
-    const auto options = MakeCompileOptions(stage);
-    Check(!ShaderRecompiler::TranslateProgram(ordinary_code, options).skip_dispatch,
-          "BVH-shaped literal marked an ordinary shader for skipping");
-    const auto compiled = RecompileForTest(ordinary_code, options);
-    Check(!compiled.spirv.empty(), "ordinary shader did not compile");
-    CheckSpirvBinaryValidates(compiled.spirv);
+    if (scenario == 5 || scenario == 6) {
+      auto& phi = block->AppendNewInst(ValueOpcode::Phi);
+      phi.SetFlags(Type::U32);
+      phi.AddPhiOperand(block, Value(SharedApertureHigh));
+      phi.AddPhiOperand(block, Value(PrivateApertureHigh));
+      high = U32(Value(&phi));
+      if (scenario == 6) block->AddBranch(block); // Loop phis require a fixpoint proof.
+    }
+    const auto local = ir.LogicalOr(ir.IEqual(high, U32(Value(SharedApertureHigh))),
+                                    ir.IEqual(high, U32(Value(PrivateApertureHigh))));
+    const auto mask = scenario == 7 || scenario == 10 ? U1(Value(false)) : ir.LogicalAnd(active, ir.LogicalNot(local));
+    if (scenario >= 8)
+      ir.Emit(scenario == 11 || scenario == 13 ? ValueOpcode::LoadAddressU8 :
+              scenario == 12 || scenario == 14 ? ValueOpcode::LoadAddressU16 :
+                                               ValueOpcode::LoadAddressU32,
+            {ir.Emit(ValueOpcode::GetAddressResource, {zero, high}), zero, high, mask},
+            MemoryFlags{.index = 0});
+    else ir.Emit(ValueOpcode::StoreAddressU32,
+            {ir.Emit(ValueOpcode::GetAddressResource, {zero, high}), zero, high, zero, mask},
+            MemoryFlags{.index = 0});
+    const bool removable = scenario == 0 || scenario == 2 || scenario == 4 || scenario == 5 || scenario == 7 || scenario == 8 || scenario == 10 || scenario == 11 || scenario == 12;
+    const auto removed = SimplifyLocalAddressStores(program);
+    if (removed != removable) std::fprintf(stderr, "local proof scenario %u: removed=%u\n", scenario, removed);
+    Check(removed == removable,
+          "local store proof discarded a possible global write or missed a local aperture");
   }
 }
+
+void TestWolverineInstructions() {
+  using namespace ShaderRecompiler;
+  TestLocalAddressStoreProof();
+  const auto count = [](const IR::Program& program, IR::ValueOpcode opcode) {
+    size_t result = 0;
+    for (const auto* block : program.blocks)
+      result += std::ranges::count(*block, opcode, &IR::Inst::GetOpcode);
+    return result;
+  };
+  const auto compile = [](std::span<const uint32_t> code, uint32_t wave) {
+    auto compute = RegressionComputeInputInfo();
+    compute.wave_size = wave;
+    compute.threads_num[0] = wave;
+    compute.scratch_size_dwords = 64;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.shader_hash = 0x123456789abcdef0;
+    auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result;
+  };
+  const auto mov = [](std::vector<uint32_t>& code, uint32_t reg, uint32_t value) {
+    code.insert(code.end(), {EncodeVop1(0x01, reg, 255), value});
+  };
+  for (uint32_t trap : {1u, 0x7fu}) {
+    const std::array code{EncodeSopp(0x12, trap), EncodeSopp(0x01)};
+    auto result = compile(code, 32);
+    Check(count(result.program, IR::ValueOpcode::ShaderTrap) == (trap == 0x7fu),
+          "reserved trap removed or ordinary guest trap became fatal");
+    Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpAtomicCompareExchange) ==
+              (trap == 0x7fu), "shader trap did not elect one payload writer");
+    Check(result.program.info.uses_dma == (trap == 0x7fu), "trap missing DMA binding");
+    if (trap == 0x7fu) {
+      Check(IR::FindBinding(result.program.bindings, IR::DescriptorBindingKind::FaultBuffer),
+            "reserved trap has no fault buffer");
+      std::vector<uint8_t> encoded, reencoded;
+      const auto metadata = std::move(result.program).TakeCompiledInfo();
+      IR::EncodeCompiledShaderInfo(metadata, encoded);
+      IR::CompiledShaderInfo restored;
+      Check(IR::DecodeCompiledShaderInfo(encoded, restored), "trap metadata codec failed");
+      IR::EncodeCompiledShaderInfo(restored, reencoded);
+      Check(encoded == reencoded && restored.info.uses_dma, "trap metadata codec lost bindings");
+    }
+  }
+  for (uint32_t wave : {32u, 64u}) for (uint32_t base : {235u, 237u}) {
+    for (const auto widths : {std::pair{0x08u, 0x18u}, std::pair{0x0au, 0x1au},
+                              std::pair{0x0cu, 0x1cu}}) {
+      std::vector<uint32_t> code{EncodeSop1(0x04, 8, base),
+                                EncodeVop1(0x01, 20, 8), EncodeVop1(0x01, 21, 9)};
+      mov(code, 30, 42);
+      code.insert(code.end(), {EncodeFlat0(widths.second, 0), EncodeFlat1(0, 0x7d, 30, 20),
+                               EncodeFlat0(widths.first, 0), EncodeFlat1(24, 0x7d, 0, 20),
+                               EncodeDs0(0x0d, 32), EncodeDs1(0, 24, 20), EncodeSopp(0x01)});
+      auto result = compile(code, wave);
+      Check(!result.program.has_address_writes && !result.program.info.uses_dma,
+            "local FLAT access retained global ownership/DMA dependency");
+      Check(DisassembleSpirvBinary(result.spirv).find("get_bda_pointer") == std::string::npos,
+            "local FLAT access reached BDA mapper");
+    }
+  }
+  for (const auto operand : {235u, 236u, 237u, 238u}) {
+    const std::array code{EncodeSop1(0x04, 8, operand), EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    Check(decoded.instructions.front().opcode == Decoder::Opcode::S_MOV_B64,
+          "local aperture register did not decode");
+    auto compute = RegressionComputeInputInfo();
+    Frontend::TranslateOptions options{.stage = ShaderType::Compute};
+    options.input_info.compute = &compute;
+    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    bool found = false;
+    for (const auto* block : program.blocks) for (const auto& inst : *block) {
+      if (inst.GetOpcode() == IR::ValueOpcode::SetScalarRegister &&
+          inst.Arg(0).ScalarRegister() == static_cast<IR::ScalarReg>(9)) {
+        const auto high = inst.Arg(1).Resolve();
+        found = high.IsImmediate() && high.U32() ==
+            (operand < 237u ? Decoder::SharedApertureHigh : Decoder::PrivateApertureHigh);
+      }
+    }
+    Check(found, "64-bit aperture source lost high tag");
+  }
+  for (const auto address : {std::pair{0u, 0x78000000u},
+                              std::pair{0xfffffffcu, Decoder::SharedApertureHigh},
+                              std::pair{0u, 0u}}) {
+    std::vector<uint32_t> code;
+    mov(code, 20, address.first); mov(code, 21, address.second);
+    if (address.second != 0)
+      code.insert(code.end(), {EncodeFlat0(0x1c, 0, 4), EncodeFlat1(0, 0x7d, 30, 20)});
+    code.insert(code.end(), {EncodeFlat0(0x0c, 0, 4), EncodeFlat1(24, 0x7d, 0, 20),
+                             EncodeDs0(0x0d), EncodeDs1(0, 24, 30), EncodeSopp(0x01)});
+    const auto result = compile(code, 32);
+    const auto text = DisassembleSpirvBinary(result.spirv);
+    if (address.second == 0) {
+      Check(text.find("1099511627776") != std::string::npos && text.find("OpULessThan") != std::string::npos,
+            "global FLAT access lost 40-bit page-table guard");
+    } else {
+      Check(!result.program.has_address_writes && !result.program.info.uses_dma,
+            "noncanonical/offset-carry FLAT access escaped its aperture guard");
+    }
+  }
+  for (uint32_t wave : {32u, 64u}) for (uint32_t nsa : {0u, 3u}) {
+    for (const auto location : {std::pair{0x100u, 0u}, std::pair{0x100u, 4u},
+                                std::pair{0x100u, 5u}, std::pair{0x100u, (255u << 3u) | 5u},
+                                std::pair{0xffffff00u, (1022u << 3u) | 5u},
+                                std::pair{0xffffff00u, (1023u << 3u) | 4u},
+                                std::pair{0xffffff00u, (1023u << 3u) | 5u},
+                                std::pair{0xffffff00u, (1024u << 3u) | 5u},
+                                std::pair{0u, 5u}}) {
+      std::vector<uint32_t> code;
+      // BVH descriptors encode base >> 8. 0xffffff00 therefore addresses the
+      // last 64 KiB of the 40-bit aperture: node 1023 fits a half node, but its
+      // full node crosses the page-table limit. High word 1 encodes 1 << 40.
+      const std::array descriptor{location.first, location.first == 0 ? 1u : 0u,
+                                  location.first == 0xffffff00u ? 1024u : 256u, 0x81000000u};
+      for (uint32_t word = 0; word < 4; ++word)
+        code.insert(code.end(), {EncodeSMovB32(word, 255), descriptor[word]});
+      for (uint32_t word = 0; word < 11; ++word)
+        mov(code, 40 + word, word == 0 ? location.second : word == 1 ? 0x40c00000u :
+            word == 7 ? 0x3f800000u : word >= 8 ? 0x7f800000u : 0u);
+      code.insert(code.end(), {EncodeMimg0(0xe6, 0xf) | (1u << 15u) | (nsa << 1u),
+                               EncodeMimg1(20, 0, 0, 40)});
+      if (nsa) code.insert(code.end(), {0x2c2b2a29u, 0x302f2e2du, 0x00003231u});
+      code.insert(code.end(), {EncodeDs0(0xdf), EncodeDs1(0, 20, 30), EncodeSopp(0x01)});
+      Decoder::Program decoded;
+      Decoder::DecodeProgram(code, decoded);
+      Check(decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+            "BVH decoder stopped before shader end");
+      const auto result = compile(code, wave);
+      Check(count(result.program, IR::ValueOpcode::BvhIntersect) == 1, "BVH did not reach emission");
+      const auto text = DisassembleSpirvBinary(result.spirv);
+      Check(text.find("bvh_intersect") != std::string::npos &&
+                text.find("1099511627776") != std::string::npos &&
+                text.find("NoContraction") != std::string::npos,
+            "BVH lost checked mapping or watertight arithmetic");
+      Check(SpirvInstructionOpcodeCount(result.spirv, spv::OpFunctionCall) >= 3,
+            "FP32 BVH did not independently translate both page blocks");
+    }
+  }
+  for (uint32_t modifiers : {0u, 2u, 4u}) {
+    const std::array code{EncodeMimg0(0xe6, 0xf) | modifiers, EncodeMimg1(20, 0, 0, 40), 0u, 0u};
+    Decoder::Instruction instruction;
+    Decoder::DecodeInstruction(code, 0, instruction);
+    Check(instruction.opcode == Decoder::Opcode::UNSUPPORTED, "malformed BVH accepted");
+  }
+  const std::array bvh64{EncodeMimg0(0xe7, 0xf) | (1u << 15u), EncodeMimg1(20, 0, 0, 40)};
+  Decoder::Instruction unsupported;
+  Decoder::DecodeInstruction(bvh64, 0, unsupported);
+  Check(unsupported.opcode == Decoder::Opcode::UNSUPPORTED, "unimplemented BVH64 silently accepted");
+  const std::array ds64{EncodeDs0(0x40), EncodeDs1(0, 10, 20), EncodeSopp(0x01)};
+  const auto atomic = compile(ds64, 32);
+  const auto atomic_text = DisassembleSpirvBinary(atomic.spirv);
+  Check(count(atomic.program, IR::ValueOpcode::SharedAtomicIAdd64) == 1 &&
+            SpirvInstructionOpcodeCount(atomic.spirv, spv::OpAtomicIAdd) == 1 &&
+            atomic_text.find("Int64Atomics") != std::string::npos,
+        "DS_ADD_U64 lost its genuine 64-bit shared atomic path");
+}
+
+void TestRayTracingDispatchDetection() { TestWolverineInstructions(); }

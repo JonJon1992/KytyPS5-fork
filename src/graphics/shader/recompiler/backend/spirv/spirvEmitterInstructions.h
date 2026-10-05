@@ -368,4 +368,8 @@ inline constexpr auto EmitSetVccHi                   = EmitUnreachable;
 inline constexpr auto EmitGetM0                      = EmitUnreachable;
 inline constexpr auto EmitSetM0                      = EmitUnreachable;
 
+void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

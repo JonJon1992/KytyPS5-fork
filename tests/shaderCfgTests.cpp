@@ -17,6 +17,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -14402,6 +14403,46 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
         "LDS waitcnt barrier did not emit OpMemoryBarrier");
   CheckSpirvBinaryValidates(exchange.spirv);
 
+  // The only producer before the wait is FLAT. Keep the cross-lane consumer
+  // live by storing its result after both waits; that later DS write cannot
+  // make the first wait look ordered. Exercise split wave64 and both consumers.
+  for (uint32_t subgroup : {32u, 64u}) {
+    compute.host_subgroup_size = subgroup;
+    for (const auto width : {std::array{0x18u, 0x08u, 0x3au},
+                             std::array{0x1au, 0x0au, 0x3cu},
+                             std::array{0x1cu, 0x0cu, 0x36u}}) {
+      for (bool flat_consumer : {false, true}) for (bool split_wait : {false, true}) {
+        const auto wait = split_wait ? EncodeSopk(0x1a, 125, 0)
+                                     : EncodeSopp(0x0c, WaitLgkm0);
+        std::vector<uint32_t> code{
+            EncodeSop1(0x04, 8, 235), // shared base
+            EncodeVop2(0x1a, 1, 130, 0), // v1 = lane * 4
+            EncodeVop1(0x01, 2, 9), // v2 = shared high tag
+            EncodeFlat0(width[0], 0), EncodeFlat1(0, 0x7d, 0, 1),
+            wait, wait, // The second zero-count wait must not duplicate publication.
+            EncodeVop2(0x1d, 3, 132, 1), // v3 = adjacent lane's address
+            EncodeVop1(0x01, 4, 9),
+        };
+        if (flat_consumer)
+          code.insert(code.end(), {EncodeFlat0(width[1], 0), EncodeFlat1(5, 0x7d, 0, 3)});
+        else
+          code.insert(code.end(), {EncodeDs0(width[2]), EncodeDs1(5, 0, 3)});
+        code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 5, 1), EncodeSopp(0x01)});
+        const auto flat_exchange = RecompileForTest(code, options);
+        Check(barriers(flat_exchange) == 1u,
+              "FLAT-only LDS producer did not publish at zero-count wait exactly once");
+        // Subword stores publish their CAS update once per host invocation;
+        // the wait adds one wave-wide LDS barrier, also for split wave64.
+        const auto subword_barriers = width[0] == 0x1cu ? 0u : 64u / subgroup;
+        Check(SpirvInstructionOpcodeCount(flat_exchange.spirv, spv::OpMemoryBarrier) ==
+                  1u + subword_barriers,
+              "FLAT LDS wait did not add one OpMemoryBarrier beyond the subword CAS barriers");
+        CheckSpirvBinaryValidates(flat_exchange.spirv);
+      }
+    }
+  }
+  compute.host_subgroup_size = 64;
+
   const auto nonzero_wait = compile({
       EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
       EncodeSopp(0x0c, WaitLgkm1),
@@ -14417,6 +14458,22 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
   });
   Check(barriers(read_only) == 0u,
         "S_WAITCNT without a preceding LDS write inserted an LDS barrier");
+  const auto flat_nonzero_wait = compile({
+      EncodeSop1(0x04, 8, 235), EncodeVop1(0x01, 2, 9),
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 0, 1),
+      EncodeSopp(0x0c, WaitLgkm1), EncodeSopp(0x01),
+  });
+  Check(barriers(flat_nonzero_wait) == 0u,
+        "nonzero-count wait after a FLAT LDS write inserted a barrier");
+  CheckSpirvBinaryValidates(flat_nonzero_wait.spirv);
+  const auto flat_read_only = compile({
+      EncodeSop1(0x04, 8, 235), EncodeVop1(0x01, 2, 9),
+      EncodeFlat0(0x0c, 0), EncodeFlat1(5, 0x7d, 0, 1),
+      EncodeSopp(0x0c, WaitLgkm0), EncodeSopp(0x01),
+  });
+  Check(barriers(flat_read_only) == 0u,
+        "FLAT read without a prior write inserted an LDS barrier");
+  CheckSpirvBinaryValidates(flat_read_only.spirv);
   const auto split_wait = compile({
       EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
       EncodeSopk(0x1a, 125, 0), // s_waitcnt_lgkmcnt null, 0
@@ -14559,6 +14616,17 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-only") == 0) {
+    TestWolverineInstructions();
+    TestRdna2LdsWaitcntBarrierAndFloatControls();
+    std::puts("ShaderCfgTests: Wolverine instruction CPU/SPIR-V cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-waitcnt-only") == 0) {
+    TestRdna2LdsWaitcntBarrierAndFloatControls();
+    std::puts("ShaderCfgTests: LDS waitcnt cases passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--exec-select-analysis-only") == 0) {
     TestExecSelectAnalysisFixpoint();
     std::puts("ShaderCfgTests: EXEC-select analysis cases passed");
