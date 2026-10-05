@@ -2582,11 +2582,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
-	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
-	// GPU-written images; the BDA hot-pass verification scans in full.
-	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
+	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads still download
+	// GPU-written images, exactly as after an empty collection below; the BDA hot-pass
+	// verification scans in full.
+	if (!is_written && (stats == nullptr || stats->verify_fault_epoch == 0) &&
 	    RelaxedNothingToUpload(vaddr, size)) {
-		return false;
+		return is_texel_buffer ? SynchronizeBufferFromImage(buffer, vaddr, size) : false;
 	}
 	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
 	// READS do more than the tracker work below.)
@@ -2663,8 +2664,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint8_t* reserved = nullptr;
 	uint64_t reserved_offset = 0;
 	uint64_t reserved_size = 0;
-	if (Common::RendererBatchEnabled() && is_written && size <= MiB &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// Only decides whether to reserve: a page this misses is still collected under the tracker
+	// locks below and copied by UploadCopies. On the GPU thread the lock-free mirrors give the
+	// locked answer (memoryTracker.h, QueryDirtyRelaxed); a missing region asks with the locks.
+	const auto may_have_cpu_dirty = [&] {
+		bool dirty = false;
+		if (m_relaxed_queries && GuestGpu::IsGpuThread() &&
+		    m_memory_tracker.QueryCpuDirtyRelaxed(vaddr, size, dirty)) {
+			return dirty;
+		}
+		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	};
+	if (Common::RendererBatchEnabled() && is_written && size <= MiB && may_have_cpu_dirty()) {
 		// Reserve before entering writable tracker locks. The dirty set is collected
 		// again under those locks, so a concurrent CPU write cannot be missed.
 		const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -3084,13 +3095,30 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies the guest runs from their backing alias.
+		// When one mapping holds the whole span of the runs, one lookup (a lock and a tree search)
+		// serves them all: within a mapping the alias is linear in the address. Otherwise each run
+		// is looked up on its own, as it may lie in another mapping.
+		const uint8_t* span_alias = nullptr;
+		uint64_t       span_begin = 0;
+		if (deferred != nullptr && guest_copies > 1) {
+			span_begin        = UINT64_MAX;
+			uint64_t span_end = 0;
+			for (size_t index = 0; index < guest_copies; index++) {
+				span_begin = std::min(span_begin, copies[index].dstOffset);
+				span_end   = std::max(span_end, copies[index].dstOffset + copies[index].size);
+			}
+			span_alias = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(
+			    buffer.CpuAddress() + span_begin, span_end - span_begin));
+		}
 		for (size_t index = 0; index < copies.size(); index++) {
 			auto& copy = copies[index];
 			const void* alias = nullptr;
 			if (deferred != nullptr && index < guest_copies) {
-				// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies from the backing alias.
-				alias = LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
-				                                             copy.size);
+				alias = span_alias != nullptr
+				            ? span_alias + (copy.dstOffset - span_begin)
+				            : LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
+				                                                   copy.size);
 			}
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),

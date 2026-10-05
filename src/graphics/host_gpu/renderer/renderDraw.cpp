@@ -2341,7 +2341,12 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
                                            bool log_change) const {
 	auto&            cache = m_context.GetTextureCache();
 	std::scoped_lock lock {cache.m_lock};
-	const auto&      images = cache.m_slot_images;
+	return DrawRunImagesChangeLocked(compare_serials, attachments_only, log_change);
+}
+
+uint32_t RenderExecutor::DrawRunImagesChangeLocked(bool compare_serials, bool attachments_only,
+                                                 bool log_change) const {
+	const auto& images = m_context.GetTextureCache().m_slot_images;
 	for (uint32_t index = 0; index < m_run.images.size(); index++) {
 		const auto& mark = m_run.images[index];
 		if (attachments_only && mark.texture) {
@@ -2501,29 +2506,28 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 		return false;
 	}
 	// No texture of the draw is an attachment or lies over one (AcquireRenderTargets would detect a
-	// feedback loop or choose other layouts; an alias is synchronized from the attachment).
-	{
-		auto&            cache = m_context.GetTextureCache();
-		std::scoped_lock lock {cache.m_lock};
-		for (const auto* stage: stages) {
-			for (const auto& binding: stage->images) {
-				const auto* image = cache.m_slot_images.try_get(binding.image_id);
-				if (image == nullptr) {
-					return false;
-				}
-				for (const auto& mark: run.images) {
-					if (!mark.texture && mark.id == binding.image_id) {
-						return false;
-					}
-				}
-				if (DrawRunOverAttachment(run.images, image->info.data.address,
-				                          image->info.data.size)) {
+	// feedback loop or choose other layouts; an alias is synchronized from the attachment). The
+	// attachments' state is then checked under the same lock hold.
+	auto&            cache = m_context.GetTextureCache();
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			const auto* image = cache.m_slot_images.try_get(binding.image_id);
+			if (image == nullptr) {
+				return false;
+			}
+			for (const auto& mark: run.images) {
+				if (!mark.texture && mark.id == binding.image_id) {
 					return false;
 				}
 			}
+			if (DrawRunOverAttachment(run.images, image->info.data.address,
+			                          image->info.data.size)) {
+				return false;
+			}
 		}
 	}
-	return DrawRunImagesUnchanged(true, true);
+	return DrawRunImagesChangeLocked(true, true, false) == 0;
 }
 
 bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,

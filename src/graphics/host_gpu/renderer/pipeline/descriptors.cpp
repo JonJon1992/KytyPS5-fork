@@ -1146,7 +1146,10 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
 				                          data.size_bytes());
-				return last.allocation;
+				// An earlier command's allocation: not fresh, so the push-descriptor shadow and the
+				// descriptor-set reuse lookup may match it (KYTY_PUSH_SHADOW_FRESH_SKIP,
+				// KYTY_SET_REUSE_FRESH).
+				return reused(last.allocation);
 			}
 			const auto allocation = NativeUpload(m_context, data);
 			last.words.assign(data.begin(), data.end());

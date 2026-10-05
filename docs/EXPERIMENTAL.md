@@ -112,7 +112,9 @@ From int5 (`u59-windows-20261003-int5`):
   package).
 - Flags that are off by default and left off by the preset: `KYTY_CP_CPU_ONLY_QUERY`,
   `KYTY_CP_BINDING_MEMO_PREFETCH`, `KYTY_CP_BINDING_HOT_MEMO`, `KYTY_BUFFER_REFRESH_FUSION`,
-  `KYTY_CPU_COPY_PAGE_SKIP` and `KYTY_REGISTERED_SHADER_CODE`.
+  `KYTY_CPU_COPY_PAGE_SKIP`, `KYTY_REGISTERED_SHADER_CODE` and `KYTY_IDLE_FLUSH_REFRESH_US` (a time
+  bound on the idle flush's GPU progress queries, meant for Linux with AMD GPUs, where each query
+  is a kernel call).
 - Command-processor work, behind flags that the bundled `u59-preset.json` turns on:
   - a fix for draw-preparation workers that stopped waking (`KYTY_DRAW_PREP_COLD_TOKEN`);
   - cheaper per-draw commits (`KYTY_CP_COMMIT=all`);

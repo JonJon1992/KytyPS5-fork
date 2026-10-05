@@ -109,9 +109,20 @@ std::filesystem::path  GetShaderLogFolder();
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
-bool GraphicsDebugDumpEnabled();
+// Copies of graphics_debug_dump_enabled and printf_direction that Initialize and Load keep current:
+// the renderer asks for both several times per draw, so they are read inline.
+namespace Detail {
+inline bool         g_graphics_debug_dump_enabled = false;
+inline LogDirection g_printf_direction            = LogDirection::Silent;
+} // namespace Detail
 
-LogDirection          GetPrintfDirection();
+inline bool GraphicsDebugDumpEnabled() {
+	return Detail::g_graphics_debug_dump_enabled;
+}
+
+inline LogDirection GetPrintfDirection() {
+	return Detail::g_printf_direction;
+}
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
