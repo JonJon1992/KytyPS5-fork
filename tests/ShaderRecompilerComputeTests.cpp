@@ -51395,6 +51395,11 @@ int main(int argc, char **argv) {
     SrtVariantTests::RunAll(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--spirv-optimization-only") == 0) {
+    VulkanHarness vulkan(false);
+    CodegenTests::CheckSpirvOptimization(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {
     VulkanHarness vulkan;
     CodegenTests::RunAll(&vulkan);

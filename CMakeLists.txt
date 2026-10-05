@@ -718,6 +718,14 @@ add_executable(spirv_cache_salt_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SpirvC
 target_link_libraries(spirv_cache_salt_tests spirv-tools)
 target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 
+add_executable(spirv_optimizer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvOptimizerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvOptimizer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
+)
+target_link_libraries(spirv_optimizer_tests spirv-tools-opt spirv-tools)
+target_include_directories(spirv_optimizer_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
@@ -1160,6 +1168,15 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
+	add_test(NAME spirv_optimizer COMMAND $<TARGET_FILE:spirv_optimizer_tests>)
+	add_test(NAME spirv_optimizer_default COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-enabled)
+	set_tests_properties(spirv_optimizer_default PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=")
+	add_test(NAME spirv_optimizer_off COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-disabled)
+	set_tests_properties(spirv_optimizer_off PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=0")
+	add_test(NAME spirv_optimizer_on COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-enabled)
+	set_tests_properties(spirv_optimizer_on PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=1")
+	add_test(NAME spirv_optimizer_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --spirv-optimization-only)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
@@ -2259,6 +2276,7 @@ if(BUILD_TESTING)
 		game_patch_filter_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
+		spirv_optimizer_tests
 		vram_budget_tests
 		bda_hot_ranges_tests
 		device_compat_tests

@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
@@ -735,8 +736,31 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	const auto optimize = [&](std::vector<uint32_t>& module, const char* variant) {
+		if (!GetCodegenOptions().spirv_optimize) {
+			return;
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		const auto words_before = module.size();
+		std::string diagnostic;
+		const bool success = Spirv::OptimizeProgram(module, diagnostic);
+		const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                            std::chrono::steady_clock::now() - begin).count();
+		LOGF("%s SPIR-V optimize: stage=%s hash=0x%016" PRIx64
+		     " variant=%s words=%" PRIu64 "->%" PRIu64 " elapsed_us=%" PRIu64 " success=%u\n",
+		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash, variant,
+		     static_cast<uint64_t>(words_before), static_cast<uint64_t>(module.size()),
+		     static_cast<uint64_t>(elapsed_us), success ? 1u : 0u);
+		if (!success) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: SPIR-V optimization failed (shader=0x{:016x}, variant={}); "
+			    "using the original module: {}\n", ir.shader_hash, variant, diagnostic));
+		}
+	};
+	optimize(spirv, "main");
 	if (options.plain_mip_stats_variant && IR::UsesMipStats(ir)) {
 		result.spirv_plain = Spirv::EmitProgram(ir, options.input_info, false);
+		optimize(result.spirv_plain, "plain");
 	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

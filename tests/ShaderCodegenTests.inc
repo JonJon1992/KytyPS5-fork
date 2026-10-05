@@ -2160,7 +2160,46 @@ void CheckRealtimeClock(VulkanHarness *vulkan) {
               host.shift, clock_words[2], clock_words[1]);
 }
 
+// Exercise the production CompileProgram path with optimization on/off, then dispatch both
+// modules on the same device. Includes atomics, loops and cross-lane/LDS operations; comparing
+// readbacks catches changes that spirv-val alone cannot detect.
+void CheckSpirvOptimization(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenSpirvOptimization";
+  auto enabled = GetCodegenOptions();
+  enabled.spirv_optimize = true;
+  auto disabled = enabled;
+  disabled.spirv_optimize = false;
+  size_t original_words = 0;
+  size_t optimized_words = 0;
+  size_t cases = 0;
+  for (const auto &test : {IntegerAddSubMul(), BitwiseOps(), Shifts(),
+                           VectorFloatArithmeticOps(), VectorFloatControlContractPreservesInfNan(),
+                           VectorMinMaxF32NanAndSignedZeroEdges(), VectorSpecialF32FlushesDenormalInputs(),
+                           BufferAtomicVariants(), BufferAtomicCmpSwapExactRaw(),
+                           LdsWaitcntOrdersIntraWaveExchange(), ScalarSubvectorLoops(32),
+                           Wave64CrossHalfLaneAndLds()}) {
+    std::vector<u32> original_spirv, optimized_spirv, original_values, optimized_values;
+    {
+      ScopedCodegenOptions scope(disabled);
+      original_values = RunCollect(vulkan, test, test.expected.size(), &original_spirv);
+    }
+    {
+      ScopedCodegenOptions scope(enabled);
+      optimized_values = RunCollect(vulkan, test, test.expected.size(), &optimized_spirv);
+    }
+    RequireEqualWords(test.name, "SPIR-V optimization readback", original_values, optimized_values);
+    original_words += original_spirv.size();
+    optimized_words += optimized_spirv.size();
+    ++cases;
+  }
+  Require(name, "production path", optimized_words < original_words,
+          "CompileProgram did not reduce the emitted SPIR-V");
+  std::printf("[codegen] %-32s ok (%zu GPU readbacks, SPIR-V %zu -> %zu words)\n",
+              name, cases, original_words, optimized_words);
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckSpirvOptimization(vulkan);
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
   CheckExecSelects(vulkan);

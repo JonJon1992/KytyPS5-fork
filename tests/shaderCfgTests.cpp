@@ -213,8 +213,15 @@ TestCompileResult RecompileOnceForTest(
   Check(ShaderRecompiler::IR::MaterializeResources(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
+  // These emitter/CFG tests inspect exact instruction shapes, including dead branches. Test
+  // the raw emitter here; optimizer behavior and optimized readbacks have their own tests.
+  const auto saved_codegen = ShaderRecompiler::GetCodegenOptions();
+  auto raw_codegen = saved_codegen;
+  raw_codegen.spirv_optimize = false;
+  ShaderRecompiler::SetCodegenOptions(raw_codegen);
   auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization, push_data_start_dword);
+  ShaderRecompiler::SetCodegenOptions(saved_codegen);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};

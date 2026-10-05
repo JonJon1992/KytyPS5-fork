@@ -31,9 +31,9 @@ enum class PsLiveExec : uint8_t {
 };
 
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
-// from its environment variable once (first use); tests may replace the whole set. Programs are
-// cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
-// switch between runs needs no cache invalidation.
+// from its environment variable once (first use); tests may replace the whole set. Each field is
+// part of CodegenFingerprint, so the persistent program cache rejects incompatible options.
+// The driver pipeline cache is keyed by the SPIR-V code.
 struct CodegenOptions {
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
@@ -170,6 +170,10 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_SPIRV_OPT=0: bypass conservative SPIRV-Tools cleanup after emission. Enabled by default;
+	// interfaces, memory effects and precise float arithmetic are preserved, and a failed or
+	// invalid optimization keeps the original module. The persistent cache fingerprints this flag.
+	bool spirv_optimize = true;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
