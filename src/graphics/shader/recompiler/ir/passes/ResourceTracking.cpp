@@ -1258,16 +1258,16 @@ private:
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
-			if (expected == ValueOpcode::GetBufferResource &&
-			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
-			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
-				return false;
-			}
 			ReportRuntimeDescriptor(m_program, expected == ValueOpcode::GetImageResource ? "image"
 			                                    : expected == ValueOpcode::GetSamplerResource
 			                                        ? "sampler"
 			                                        : "buffer",
 			                        pc, bad_dword, descriptor.dwords[bad_dword]);
+			if (expected == ValueOpcode::GetBufferResource &&
+			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
+			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
+				return false;
+			}
 			if (m_indirect_scalar_buffers) {
 				MarkUnresolved(pc);
 				return false;
