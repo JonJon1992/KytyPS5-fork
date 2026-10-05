@@ -599,6 +599,11 @@ bool Contains(const std::vector<uint32_t>& values, uint32_t value) {
 	return std::find(values.begin(), values.end(), value) != values.end();
 }
 
+// For vectors kept sorted (SortUnique), such as loop bodies.
+bool SortedContains(const std::vector<uint32_t>& values, uint32_t value) {
+	return std::binary_search(values.begin(), values.end(), value);
+}
+
 bool ReplaceValue(std::vector<uint32_t>& values, uint32_t old_value, uint32_t new_value) {
 	bool changed = false;
 	for (auto& value: values) {
@@ -814,8 +819,20 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 	std::vector<uint32_t> stack;
 	body.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
-	AddUnique(body, header);
-	AddUnique(body, latch);
+	// Membership of `body`: a bitmap instead of a search of the growing vector.
+	std::vector<uint8_t> in_body(graph.blocks.size(), 0u);
+	const auto           add_to_body = [&](uint32_t block_id) {
+		if (block_id < in_body.size() ? in_body[block_id] != 0u : Contains(body, block_id)) {
+			return false;
+		}
+		if (block_id < in_body.size()) {
+			in_body[block_id] = 1u;
+		}
+		body.push_back(block_id);
+		return true;
+	};
+	add_to_body(header);
+	add_to_body(latch);
 	if (latch != header) {
 		stack.push_back(latch);
 	}
@@ -834,8 +851,7 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 			if (!graph.Dominates(header, pred) && natural != nullptr) {
 				*natural = false;
 			}
-			if (!Contains(body, pred)) {
-				body.push_back(pred);
+			if (add_to_body(pred)) {
 				if (pred != header) {
 					stack.push_back(pred);
 				}
@@ -865,7 +881,7 @@ void ComputeNaturalLoops(Graph& graph) {
 				continue;
 			}
 			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
+				if (!SortedContains(loop.body_blocks, succ)) {
 					AddUnique(loop.exit_blocks, succ);
 				}
 			}
@@ -994,10 +1010,12 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 	graph.entry_block = RemapId(graph.entry_block, id_map);
 	for (auto& block: graph.blocks) {
 		block.id = RemapId(block.id, id_map);
-		RemapIds(block.predecessors, id_map);
+		// Every caller rebuilds predecessors and recomputes the analyses next (RebuildPredecessors,
+		// RecomputeAnalyses), which overwrite these without reading them.
+		block.predecessors.clear();
+		block.dominators.clear();
+		block.post_dominators.clear();
 		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -1039,12 +1057,15 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 	std::vector<uint32_t> stack = {header};
 	blocks.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
+	// Visited blocks: a bitmap instead of a search of the growing result.
+	std::vector<uint8_t> visited(graph.blocks.size(), 0u);
 
 	while (!stack.empty()) {
 		const auto block_id = stack.back();
 		stack.pop_back();
-		if (block_id == stop_block || Contains(blocks, block_id) ||
-		    !graph.Dominates(header, block_id)) {
+		const bool seen =
+		    block_id < visited.size() ? visited[block_id] != 0u : Contains(blocks, block_id);
+		if (block_id == stop_block || seen || !graph.Dominates(header, block_id)) {
 			continue;
 		}
 
@@ -1053,7 +1074,10 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 			continue;
 		}
 
-		AddUnique(blocks, block_id);
+		if (block_id < visited.size()) {
+			visited[block_id] = 1u;
+		}
+		blocks.push_back(block_id);
 		for (auto succ: block->successors) {
 			if (succ != stop_block && graph.Dominates(header, succ)) {
 				stack.push_back(succ);
@@ -1109,7 +1133,7 @@ bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
 const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
 	const NaturalLoop* innermost = nullptr;
 	for (const auto& loop: graph.natural_loops) {
-		if (Contains(loop.body_blocks, block_id) &&
+		if (SortedContains(loop.body_blocks, block_id) &&
 		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
 			innermost = &loop;
 		}
@@ -1265,8 +1289,8 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 		};
 		return is_repeat_target(true_target) && is_repeat_target(false_target);
 	}
-	const bool true_in_body  = Contains(loop->body_blocks, true_target);
-	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	const bool true_in_body  = SortedContains(loop->body_blocks, true_target);
+	const bool false_in_body = SortedContains(loop->body_blocks, false_target);
 	if (true_in_body != false_in_body) {
 		return true;
 	}
@@ -1329,8 +1353,8 @@ bool CanonicalizeNaturalLoops(Graph& graph) {
 			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
 			    is_loop_control_target(header->terminator.true_block) ||
 			    is_loop_control_target(header->terminator.false_block) ||
-			    !Contains(loop.body_blocks, header->terminator.true_block) ||
-			    !Contains(loop.body_blocks, header->terminator.false_block)) {
+			    !SortedContains(loop.body_blocks, header->terminator.true_block) ||
+			    !SortedContains(loop.body_blocks, header->terminator.false_block)) {
 				continue;
 			}
 

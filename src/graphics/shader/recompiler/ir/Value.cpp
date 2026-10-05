@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -228,9 +229,15 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Every use moves to the replacement in order, as SetArg on each would leave it, without
+	// searching this use list once per use.
+	auto* const target   = replacement.TryInstruction();
+	const auto  old_uses = std::exchange(uses, {});
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		use.user->args[use.operand] = replacement;
+		if (target != nullptr) {
+			target->uses.push_back(use);
+		}
 	}
 	Invalidate();
 	if (preserve) {
@@ -255,9 +262,8 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	// Each argument slot adds one use and removes it before it changes, so no duplicate check
+	// here: it searched the whole list on every add. ValidateProgram reports duplicated uses.
 	used->uses.push_back({this, operand});
 }
 

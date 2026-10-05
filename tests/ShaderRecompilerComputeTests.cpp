@@ -2585,6 +2585,127 @@ int CorpusSpirvStats(const char *path, const char *disassembly_path = nullptr) {
   return 0;
 }
 
+// A compute shader shaped like the large game shaders that dominate compile time: uniform loops
+// around EXEC-masked if-blocks, each with a constant-buffer load, a buffer load and VALU work.
+std::vector<u32> MakeCompileBenchmarkShader(u32 loops, u32 sections_per_loop, u32 alu) {
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v_lshlrev_b32 v1, 2, v0
+  code.push_back(EncodeVop1(0x01, 5, InlineU32(0)));    // v_mov_b32 v5, 0
+  code.push_back(EncodeVop1(0x01, 7, InlineU32(0)));    // v_mov_b32 v7, 0
+  for (u32 loop = 0; loop < loops; loop++) {
+    code.push_back(EncodeSMovB32(20, InlineU32(3))); // s_mov_b32 s20, 3
+    const auto header = code.size();
+    for (u32 section = 0; section < sections_per_loop; section++) {
+      const u32 sgpr = 40u + section % 16u;
+      AppendSmemLoadOpcode(&code, 0x08, sgpr, (section % 32u) * 4u); // s_buffer_load_dword
+      code.push_back(EncodeVopc(0xc2, InlineU32(section % 8u), 0));   // v_cmp_eq_u32 vcc
+      code.push_back(EncodeSop1(0x24, 10, 106)); // s_and_saveexec_b64 s[10:11], vcc
+      const auto branch = code.size();
+      code.push_back(0);
+      AppendBufferLoadDword(&code, 4, 1);
+      for (u32 i = 0; i < alu; i++) {
+        switch (i % 4u) {
+        case 0: code.push_back(EncodeVop2(0x03, 5, Vgpr(4), 5)); break; // v_add_f32
+        case 1: code.push_back(EncodeVop2(0x08, 6, Vgpr(5), 4)); break; // v_mul_f32
+        case 2: code.push_back(EncodeVop2(0x25, 7, sgpr, 7)); break;    // v_add_nc_u32
+        default: code.push_back(EncodeVop2(0x1d, 7, Vgpr(6), 7)); break; // v_xor_b32
+        }
+      }
+      code[branch] = EncodeSopp(0x08, static_cast<u32>(code.size() - branch - 1u)); // execz
+      code.push_back(EncodeSop1(0x04, 126, 10)); // s_mov_b64 exec, s[10:11]
+    }
+    code.push_back(EncodeSop2(0x01, 20, 20, InlineU32(1))); // s_sub_u32 s20, s20, 1
+    code.push_back(EncodeSopc(0x07, 20, InlineU32(0)));     // s_cmp_lg_u32 s20, 0
+    const auto back = static_cast<int32_t>(header) - static_cast<int32_t>(code.size()) - 1;
+    code.push_back(EncodeSopp(0x05, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 64);
+  AppendEnd(&code);
+  return code;
+}
+
+// --compile-benchmark [rounds]: times TranslateProgram and CompileProgram on generated shaders
+// and prints an FNV-1a digest of each SPIR-V module; equal digests across two builds mean the
+// change left the output byte-identical.
+int CompileBenchmark(u32 rounds) {
+  using Clock = std::chrono::steady_clock;
+  struct Shape {
+    u32 loops, sections, alu;
+  };
+  const Shape shapes[] = {{2, 8, 8}, {4, 16, 12}, {8, 24, 16}, {12, 32, 16}};
+  std::vector<u32> initial(4096, 0x3f800000u);
+  double total_translate = 0;
+  double total_compile = 0;
+  for (const auto &shape : shapes) {
+    const auto code = MakeCompileBenchmarkShader(shape.loops, shape.sections, shape.alu);
+    auto user_data = MakeNativeUserData(nullptr);
+    user_data[2] = static_cast<u32>(initial.size() * sizeof(u32));
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 1;
+    compute.wave_size = 64;
+    compute.host_subgroup_size = 64;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.input_info.compute = &compute;
+    options.user_data = user_data;
+    std::vector<double> translate_ms;
+    std::vector<double> compile_ms;
+    uint64_t digest = 0;
+    std::vector<u32> spirv;
+    for (u32 round = 0; round < rounds; round++) {
+      const auto t0 = Clock::now();
+      auto translated = ShaderRecompiler::TranslateProgram(code, options);
+      const auto t1 = Clock::now();
+      const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      ShaderRecompiler::IR::ResourceSnapshot resources;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      const ShaderRecompiler::IR::SrtRuntime runtime{
+          .user_data = options.user_data,
+          .shader_base = reinterpret_cast<uint64_t>(code.data()),
+          .read_memory = ReadTestMemory,
+          .userdata = &initial,
+      };
+      if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                      specialization)) {
+        std::printf("compile-benchmark: resources could not be materialized\n");
+        return 1;
+      }
+      const auto t2 = Clock::now();
+      const auto result =
+          ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+      const auto t3 = Clock::now();
+      translate_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+      compile_ms.push_back(std::chrono::duration<double, std::milli>(t3 - t2).count());
+      uint64_t hash = 0xcbf29ce484222325ull;
+      for (const auto word : result.spirv) {
+        hash = (hash ^ word) * 0x100000001b3ull;
+      }
+      digest = hash;
+      spirv = result.spirv;
+    }
+    ValidateSpirv("compile-benchmark", spirv);
+    const auto words = spirv.size();
+    std::sort(translate_ms.begin(), translate_ms.end());
+    std::sort(compile_ms.begin(), compile_ms.end());
+    const auto translate = translate_ms[translate_ms.size() / 2];
+    const auto compile = compile_ms[compile_ms.size() / 2];
+    total_translate += translate;
+    total_compile += compile;
+    std::printf("shape loops=%u sections=%u alu=%u guest_words=%zu spirv_words=%zu "
+                "digest=%016llx translate_ms=%.3f compile_ms=%.3f\n",
+                shape.loops, shape.sections, shape.alu, code.size(), words,
+                static_cast<unsigned long long>(digest), translate, compile);
+  }
+  std::printf("total (medians) translate_ms=%.3f compile_ms=%.3f\n", total_translate,
+              total_compile);
+  return 0;
+}
+
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
                                                     u32 num_records,
                                                     bool add_tid = false,
@@ -49633,6 +49754,16 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // The tests also validate the IR as translated (off in production); the compile benchmark
+  // measures the production configuration.
+  if (std::getenv("KYTY_VALIDATE_IR") == nullptr &&
+      (argc < 2 || std::strcmp(argv[1], "--compile-benchmark") != 0)) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_VALIDATE_IR", "1");
+#else
+    setenv("KYTY_VALIDATE_IR", "1", 1);
+#endif
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--gi-decode-inventory") == 0) {
     EnsureConfigInitialized();
     return GiProbeTests::GiDecodeInventory(argv[2], argc == 4 ? argv[3] : nullptr);
@@ -49640,6 +49771,10 @@ int main(int argc, char **argv) {
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
+  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--compile-benchmark") == 0) {
+    EnsureConfigInitialized();
+    return CompileBenchmark(argc == 3 ? static_cast<u32>(std::strtoul(argv[2], nullptr, 10)) : 9u);
   }
   if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
     EnsureConfigInitialized();
