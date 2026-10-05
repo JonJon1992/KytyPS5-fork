@@ -338,6 +338,12 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/loader/*.h"
 )
 
+# Program cache preload catches thread-start failures while scanning cached records.
+if(LINUX)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
 set(gpu_tiler_shader_dir "${KYTY_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
