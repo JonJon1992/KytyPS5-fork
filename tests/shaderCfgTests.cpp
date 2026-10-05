@@ -6952,6 +6952,75 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+constexpr uint32_t EncodeMubufD16(uint32_t opcode, uint32_t offset = 0) {
+  return EncodeMubuf0(opcode, offset) | (((opcode >> 7u) & 1u) << 25u);
+}
+
+void TestNewShaderRecompilerMubufD16Translation() {
+  const uint32_t shader[] = {
+      EncodeMubufD16(0x80, 0),  EncodeMubuf1(20, 0, 1), // buffer_load_format_d16_x
+      EncodeMubufD16(0x81, 0),  EncodeMubuf1(21, 0, 1), // buffer_load_format_d16_xy
+      EncodeMubufD16(0x82, 0),  EncodeMubuf1(22, 0, 1), // buffer_load_format_d16_xyz
+      EncodeMubufD16(0x83, 0),  EncodeMubuf1(24, 0, 1), // buffer_load_format_d16_xyzw
+      EncodeMubufD16(0x26, 0),  EncodeMubuf1(26, 0, 1), // buffer_load_format_d16_hi_x
+      EncodeMubufD16(0x84, 0),  EncodeMubuf1(20, 0, 1), // buffer_store_format_d16_x
+      EncodeMubufD16(0x85, 0),  EncodeMubuf1(21, 0, 1), // buffer_store_format_d16_xy
+      EncodeMubufD16(0x86, 0),  EncodeMubuf1(22, 0, 1), // buffer_store_format_d16_xyz
+      EncodeMubufD16(0x87, 0),  EncodeMubuf1(24, 0, 1), // buffer_store_format_d16_xyzw
+      EncodeMubufD16(0x27, 0),  EncodeMubuf1(26, 0, 1), // buffer_store_format_d16_hi_x
+      EncodeMubufD16(0x20, 0),  EncodeMubuf1(40, 0, 1), // buffer_load_ubyte_d16
+      EncodeMubufD16(0x21, 1),  EncodeMubuf1(50, 0, 1), // buffer_load_ubyte_d16_hi
+      EncodeMubufD16(0x22, 2),  EncodeMubuf1(42, 0, 1), // buffer_load_sbyte_d16
+      EncodeMubufD16(0x23, 3),  EncodeMubuf1(43, 0, 1), // buffer_load_sbyte_d16_hi
+      EncodeMubufD16(0x24, 4),  EncodeMubuf1(44, 0, 1), // buffer_load_short_d16
+      EncodeMubufD16(0x25, 6),  EncodeMubuf1(51, 0, 1), // buffer_load_short_d16_hi
+      EncodeMubufD16(0x19, 8),  EncodeMubuf1(50, 0, 1), // buffer_store_byte_d16_hi
+      EncodeMubufD16(0x1b, 10), EncodeMubuf1(51, 0, 1), // buffer_store_short_d16_hi
+      0xbf810000u,
+  };
+
+  std::array<uint32_t, 64> user_data{};
+  user_data[1] = 8u << 16u;
+  user_data[2] = 64u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  for (const char* name :
+       {"BUFFER_LOAD_FORMAT_D16_X ", "BUFFER_LOAD_FORMAT_D16_XY ", "BUFFER_LOAD_FORMAT_D16_XYZ ",
+        "BUFFER_LOAD_FORMAT_D16_XYZW", "BUFFER_LOAD_FORMAT_D16_HI_X", "BUFFER_STORE_FORMAT_D16_X ",
+        "BUFFER_STORE_FORMAT_D16_XYZW", "BUFFER_STORE_FORMAT_D16_HI_X", "BUFFER_LOAD_UBYTE_D16 ",
+        "BUFFER_LOAD_SBYTE_D16_HI", "BUFFER_LOAD_SHORT_D16_HI", "BUFFER_STORE_BYTE_D16_HI",
+        "BUFFER_STORE_SHORT_D16_HI"}) {
+    Check(result.decoded_dump.find(name) != std::string::npos,
+          (std::string("new decoder did not decode ") + name).c_str());
+  }
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "MUBUF D16 opcode decoded as unsupported");
+  // D16 formats load and store at full component width; the stores consume the loads.
+  Check(CountSourceOccurrences(result.ir_dump, "LoadBufferU32x4 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x4 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "LoadBufferU32x3 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x3 ") == 1u,
+        "MUBUF D16 format accesses did not keep their component width");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("PackHalf2x16") != std::string::npos,
+        "D16 half-float load did not convert components to F16");
+  Check(source.find("UnpackHalf2x16") != std::string::npos,
+        "D16 half-float store did not widen components from F16");
+
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16UInt) << 12u;
+  options.user_data = user_data;
+  result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(DisassembleSpirvBinary(result.spirv).find("UnpackHalf2x16") == std::string::npos,
+        "D16 integer store converted components through F16");
+}
+
 void TestNewShaderRecompilerTypedBufferTranslation() {
   const uint32_t shader[] = {
       EncodeMtbuf0(0x00, 14, 7, 4),
@@ -14771,6 +14840,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerMubufD16Translation();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

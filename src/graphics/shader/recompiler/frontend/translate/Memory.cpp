@@ -231,6 +231,10 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
+		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X &&
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X) ||
+		    decoded.opcode == Decoder::Opcode::BUFFER_STORE_BYTE_D16_HI ||
+		    decoded.opcode == Decoder::Opcode::BUFFER_STORE_SHORT_D16_HI ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
 		     decoded.opcode <= Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
@@ -472,11 +476,51 @@ void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 	}
 }
 
+namespace {
+
+IR::MemoryInfo FormattedD16Access(const IR::MemoryInfo& memory) {
+	// The emitter converts each full-width component to or from its 16-bit form.
+	auto wide        = memory;
+	wide.data_dwords = memory.component_count;
+	wide.data_bits   = 32u;
+	wide.d16         = true;
+	return wide;
+}
+
+} // namespace
+
 void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
+	if (memory.formatted && bits == 16u) {
+		// Formatted D16: components pack in pairs, low half first, into data_dwords VGPRs
+		// (D16_HI_X writes the high half of its VGPR through the destination selector).
+		static constexpr std::array opcodes {
+		    IR::ValueOpcode::LoadBufferU32, IR::ValueOpcode::LoadBufferU32x2,
+		    IR::ValueOpcode::LoadBufferU32x3, IR::ValueOpcode::LoadBufferU32x4};
+		const auto count    = memory.component_count;
+		const auto resource = GetBufferResource(memory);
+		const auto address  = ReadBufferAddress(inst, 0);
+		const auto loaded   = ir.Emit(
+            opcodes.at(count - 1u),
+            {resource, address.index, address.offset, address.soffset, ir.GetExec()},
+            AddMemoryInfo(FormattedD16Access(memory), inst.pc));
+		const auto component = [&](uint32_t index) {
+			return count == 1u ? IR::U32(loaded) : ir.CompositeExtract(loaded, index);
+		};
+		for (uint32_t word = 0; word < memory.data_dwords; word++) {
+			auto packed = component(word * 2u);
+			if (word * 2u + 1u < count) {
+				packed = ir.BitwiseOr(packed, ir.ShiftLeftLogical(component(word * 2u + 1u),
+				                                                  IR::U32(IR::Value(16u))));
+			}
+			WriteOperand(OffsetOperand(inst.dst, word), packed);
+		}
+		WriteFetchStatus(inst, memory);
+		return;
+	}
 	switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
 		case 16u: opcode = IR::ValueOpcode::LoadBufferU16; break;
@@ -520,6 +564,36 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      address  = ReadBufferAddress(inst, 1);
 	const auto      data_src = MemorySourceAt(inst, 0);
 	const auto      data     = ReadU32(data_src);
+	if (memory.formatted && memory.data_bits == 16u) {
+		// Formatted D16: unpack the 16-bit components, low half first (D16_HI_X reads the high
+		// half of its VGPR through the source selector).
+		static constexpr std::array opcodes {
+		    IR::ValueOpcode::StoreBufferU32, IR::ValueOpcode::StoreBufferU32x2,
+		    IR::ValueOpcode::StoreBufferU32x3, IR::ValueOpcode::StoreBufferU32x4};
+		const auto                count = memory.component_count;
+		std::array<IR::Value, 4> components {};
+		for (uint32_t index = 0; index < count; index++) {
+			const auto word = index / 2u == 0u ? data : ReadU32(OffsetOperand(data_src, index / 2u));
+			components[index] =
+			    index % 2u == 0u
+			        ? ir.BitwiseAnd(word, IR::U32(IR::Value(0xffffu)))
+			        : ir.ShiftRightLogical(word, IR::U32(IR::Value(16u)));
+		}
+		IR::Value value = components[0];
+		if (count == 2u) {
+			value = ir.Emit(IR::ValueOpcode::CompositeConstructU32x2, {components[0], components[1]});
+		} else if (count == 3u) {
+			value = ir.Emit(IR::ValueOpcode::CompositeConstructU32x3,
+			                {components[0], components[1], components[2]});
+		} else if (count == 4u) {
+			value = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+			                {components[0], components[1], components[2], components[3]});
+		}
+		ir.Emit(opcodes.at(count - 1u),
+		        {resource, address.index, address.offset, address.soffset, value, ir.GetExec()},
+		        AddMemoryInfo(FormattedD16Access(memory), inst.pc));
+		return;
+	}
 	IR::ValueOpcode opcode;
 	IR::Value       value;
 	switch (memory.data_bits) {
@@ -1035,7 +1109,18 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
-		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZW: return BUFFER_LOAD(inst);
+		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16_HI: return BUFFER_LOAD(inst);
 
 		case Decoder::Opcode::BUFFER_STORE_DWORD:
 		case Decoder::Opcode::BUFFER_STORE_DWORDX2:
@@ -1050,7 +1135,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
-		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW: return BUFFER_STORE(inst);
+		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Decoder::Opcode::BUFFER_STORE_BYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_STORE_SHORT_D16_HI: return BUFFER_STORE(inst);
 
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap32);

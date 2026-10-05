@@ -756,6 +756,66 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	}
 }
 
+bool IsD16IntegerFormat(const Format::BufferFormatInfo& info) {
+	return info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint ||
+	       info.type == Format::ComponentType::Unknown;
+}
+
+// Formatted D16 loads return each component as 16 bits: a half float for float, normalized and
+// scaled formats and the low half of the integer otherwise.
+uint32_t FormattedToD16(EmitterState& state, const Format::BufferFormatInfo& info,
+                        uint32_t value) {
+	if (IsD16IntegerFormat(info)) {
+		return Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, ConstantU32(state, 0xffffu));
+	}
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+	                          Unary(state, spv::OpBitcast, TypeF32(state), value),
+	                          ConstantF32Value(state, 0.0f));
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state),
+	                          GLSLstd450PackHalf2x16, pair);
+	return packed;
+}
+
+uint32_t FormattedToD16(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t value,
+                        uint32_t components) {
+	auto&      state = ctx.state;
+	const auto info  = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (components == 1u) {
+		return FormattedToD16(state, info, value);
+	}
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto extracted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extracted, value,
+		                          component);
+		values[component] = FormattedToD16(state, info, extracted);
+	}
+	return ConstructU32Composite(state, components, values);
+}
+
+// Formatted D16 stores widen each 16-bit component back to the 32-bit value the format packs.
+uint32_t D16ToFormatted(EmitterState& state, const Format::BufferFormatInfo& info,
+                        uint32_t value) {
+	if (info.type == Format::ComponentType::Sint) {
+		const auto extended = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), extended,
+		                          Unary(state, spv::OpBitcast, TypeI32(state), value),
+		                          ConstantU32(state, 0), ConstantU32(state, 16));
+		return Unary(state, spv::OpBitcast, TypeU32(state), extended);
+	}
+	if (IsD16IntegerFormat(info)) {
+		return value;
+	}
+	const auto unpacked = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked,
+	                          GlslStd450(state), GLSLstd450UnpackHalf2x16, value);
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), low, unpacked, 0u);
+	return Unary(state, spv::OpBitcast, TypeU32(state), low);
+}
+
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
@@ -768,7 +828,8 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, 1u,
 		                                         FormattedAccess::Store);
 		EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
-			StoreFormattedInBounds(ctx, mem, plan, 0u, data);
+			StoreFormattedInBounds(ctx, mem, plan, 0u,
+			                       mem.d16 ? D16ToFormatted(ctx.state, info, data) : data);
 		});
 	});
 }
@@ -893,9 +954,11 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 				const auto count = std::min(components, plan.info.component_count);
 				uint32_t   word  = 0;
 				for (uint32_t component = 0; component < count; component++) {
-					const auto data = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
+					const auto extracted = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extracted,
 					                          composite, component);
+					const auto data =
+					    mem.d16 ? D16ToFormatted(state, plan.info, extracted) : extracted;
 					if (!plan.info.packed_bitfield) {
 						StoreFormattedInBounds(ctx, mem, plan, component, data);
 						continue;
@@ -1370,6 +1433,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadSubword(ctx, inst, mem, 16, false);
 	else
 		value = LoadWord(ctx, inst, mem);
+	if (mem.d16) value = FormattedToD16(ctx, mem, value, std::max(buffer_components, 1u));
 	ctx.Define(inst, value);
 }
 

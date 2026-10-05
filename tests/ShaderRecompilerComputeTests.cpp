@@ -37316,6 +37316,59 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
   return test;
 }
 
+TestCase VectorVopcCmpxLeNeGeU16ExecMask() {
+  using O = ShaderOpcode;
+  struct CompareCase {
+    u32 opcode;
+    u32 lhs;
+    u32 rhs;
+    u32 incoming_exec;
+    u32 expected_exec;
+  };
+  // Unsigned compares of the low halves; the high halves never matter.
+  const std::array<CompareCase, 12> cases{{
+      {0xbb, 0x12340001u, 0x56780002u, 1, 1}, // LE: 1 <= 2
+      {0xbb, 0x00000002u, 0xffff0002u, 1, 1}, // LE: equal low halves
+      {0xbb, 0x0000ffffu, 0x00000001u, 1, 0}, // LE: 0xffff is large, not negative
+      {0xbb, 0x00000000u, 0x00000001u, 0, 0}, // CMPX cannot reactivate a lane
+      {0xbd, 0x12340005u, 0x56780005u, 1, 0}, // NE: equal low halves
+      {0xbd, 0x00000005u, 0x00000006u, 1, 1},
+      {0xbd, 0x00008000u, 0x0000ffffu, 1, 1},
+      {0xbd, 0x00000005u, 0x00000006u, 0, 0},
+      {0xbe, 0x0000ffffu, 0x00000001u, 1, 1}, // GE: unsigned
+      {0xbe, 0xffff0003u, 0x00000003u, 1, 1},
+      {0xbe, 0x00000001u, 0x00008000u, 1, 0},
+      {0xbe, 0x00000009u, 0x00000001u, 0, 0},
+  }};
+  TestCase test;
+  test.name = "VectorVopcCmpxLeNeGeU16ExecMask";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.lhs);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 0, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 1, entry.rhs);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.incoming_exec)));
+    code.push_back(EncodeVopc(entry.opcode, 256u, 1u)); // v_cmpx_*_u16 v0, v1
+    code.push_back(EncodeSMovB32(20, 126)); // Snapshot EXEC before restoring it.
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1u)));
+    AppendStoreSgprPair(&code, 20, static_cast<u32>(cases.size()) + i * 2u);
+    test.expected.insert(test.expected.end(), {entry.expected_exec, 0u});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,     O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_LE_U16, O::V_CMPX_NE_U16, O::V_CMPX_GE_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_LE_U16", 4}, {"V_CMPX_NE_U16", 4}, {"V_CMPX_GE_U16", 4}};
+  test.required_spirv = {"OpULessThanEqual", "OpINotEqual", "OpUGreaterThanEqual"};
+  return test;
+}
+
 TestCase VectorVopcCmpNgtF16CapturedSdwaAndEdges() {
   using O = ShaderOpcode;
   enum Encoding { Captured, Compact, Vop3NegAbs, HighWord, ScalarDst, SdwaNegAbs };
@@ -44819,6 +44872,7 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(VectorVopcCmpxLtI16WaveMasks(wave_size));
   }
   AddCase(VectorVopcCmpxEqU16SdwaCompactVop3ExecMask);
+  AddCase(VectorVopcCmpxLeNeGeU16ExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
@@ -50481,6 +50535,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageAtomicExtendedVariants());
     RunCase(&vulkan, BufferAtomicExtendedVariants());
     RunCase(&vulkan, CacheInvalidateAndClauseAreNoOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-u16-ext-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpxLeNeGeU16ExecMask());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {

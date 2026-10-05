@@ -1001,7 +1001,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
 		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
 			return {};
-		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
+		if (!memory.formatted || memory.typed || memory.d16 || !memory.idxen || memory.offen ||
+		    memory.offset != 0 ||
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};

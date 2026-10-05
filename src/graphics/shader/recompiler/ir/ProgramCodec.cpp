@@ -310,6 +310,7 @@ void Write(CodecWriter& w, const MemoryInfo& v) {
 	w.Bool(v.offen);
 	w.Bool(v.coherent);
 	w.Bool(v.planning_only);
+	w.Bool(v.d16);
 }
 
 void Read(CodecReader& r, MemoryInfo& v) {
@@ -338,6 +339,7 @@ void Read(CodecReader& r, MemoryInfo& v) {
 	v.offen                    = r.Bool();
 	v.coherent                 = r.Bool();
 	v.planning_only            = r.Bool();
+	v.d16                      = r.Bool();
 }
 
 void Write(CodecWriter& w, const BufferResource& v) {

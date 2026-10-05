@@ -69,6 +69,9 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// Formatted D16 buffer access (MUBUF *_FORMAT_D16_*): each component travels as 16 bits in
+	// the low half of its dword, a half float for float/normalized/scaled formats.
+	bool d16 = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
