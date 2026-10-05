@@ -15989,6 +15989,11 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --srt-null-pointer-only: ok\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--break-region-only") == 0) {
+    TestTraversalLoopBreakRegion();
+    std::printf("shader_cfg --break-region-only: ok\n");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     TestWaveRowReduction();
     std::printf("shader_cfg --wave-reduction-only: ok\n");
@@ -16009,6 +16014,7 @@ int main(int argc, char **argv) {
   TestTypedBitcastViews();
   TestBindlessShaderContract();
   TestRayTracingDispatchDetection();
+  TestTraversalLoopBreakRegion();
   TestFrontendInstructionPrefixes();
   TestFrontendBufferAddresses();
   TestFrontendImageAddresses();

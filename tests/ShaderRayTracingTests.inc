@@ -264,3 +264,62 @@ void TestRayTracingDispatchDetection() {
   TestWolverineInstructions();
   TestUnsupportedBvhSkipsDispatch();
 }
+
+// The traversal-loop shape of Astro Bot's BVH shaders (380bb9d636390bae and 26 more failed spirv-val
+// with "Selection must be structured"), also in Astro's Playroom's lit passes (CS 5df28d2058caf728,
+// where RADV's spirv_to_nir rejected the module and crashed): the loop body's first conditional
+// either stays in the loop or enters a region with its own loop that leaves through the loop's
+// merge, and the body has another exit. The conditional must get a selection merge (a synthetic
+// block on the region's exit edge), not be treated as loop control.
+//   s0 = 0
+//   outer: if (s0 < 4) goto body
+//          s1 = 0; inner: s1 += 1; if (s1 < 3) goto inner; goto done   <- the break region
+//   body:  s0 += 1; if (s0 == 50) goto done; goto outer                <- the other exit
+//   done:  ...
+std::vector<uint32_t> TraversalLoopBreakRegionCode() {
+  return {
+      EncodeSMovB32(0, 128),            // 0: s_mov_b32 s0, 0
+      EncodeSopc(0x0a, 0, 132),         // 1: outer: s_cmp_lt_u32 s0, 4
+      EncodeSopp(0x05, 5),              // 2: s_cbranch_scc1 body
+      EncodeSMovB32(1, 128),            // 3: s_mov_b32 s1, 0
+      EncodeSop2(0x00, 1, 1, 129),      // 4: inner: s_add_u32 s1, s1, 1
+      EncodeSopc(0x0a, 1, 131),         // 5: s_cmp_lt_u32 s1, 3
+      EncodeSopp(0x05, 0xfffdu),        // 6: s_cbranch_scc1 inner
+      EncodeSopp(0x02, 4),              // 7: s_branch done
+      EncodeSop2(0x00, 0, 0, 129),      // 8: body: s_add_u32 s0, s0, 1
+      EncodeSopc(0x06, 0, 178),         // 9: s_cmp_eq_u32 s0, 50
+      EncodeSopp(0x05, 1),              // 10: s_cbranch_scc1 done
+      EncodeSopp(0x02, 0xfff5u),        // 11: s_branch outer
+      EncodeSopp(0x01),                 // 12: done: s_endpgm
+  };
+}
+
+void TestTraversalLoopBreakRegion() {
+  namespace D = ShaderRecompiler::Decoder;
+  namespace CFG = ShaderRecompiler::CFG;
+  const auto code = TraversalLoopBreakRegionCode();
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  auto graph = CFG::BuildGraph(decoded);
+  Check(!graph.unsupported && !graph.irreducible && CFG::Structurize(graph),
+        "traversal-loop break region did not structurize");
+  // The conditional at pc 4 (the loop's first body block) has a merge: a synthetic block that
+  // breaks to the loop merge.
+  const auto conditional = std::ranges::find_if(graph.blocks, [](const CFG::BasicBlock &block) {
+    return block.start_pc == 4u && block.inst_begin != block.inst_end &&
+           block.terminator.kind == CFG::TerminatorKind::ConditionalBranch;
+  });
+  Check(conditional != graph.blocks.end(), "traversal-loop conditional not found");
+  const auto *merge = graph.FindBlock(conditional->terminator.merge_block);
+  Check(merge != nullptr && merge->inst_begin == merge->inst_end &&
+            merge->terminator.kind == CFG::TerminatorKind::Branch &&
+            graph.FindBlock(merge->terminator.true_block) != nullptr &&
+            graph.FindBlock(merge->terminator.true_block)->start_pc == 48u,
+        "traversal-loop conditional lacks its synthetic merge before the loop exit");
+  for (const auto stage : {ShaderType::Compute, ShaderType::Pixel}) {
+    const auto compiled = RecompileForTest(code, MakeCompileOptions(stage));
+    Check(!compiled.program.dispatcher_fallback,
+          "traversal-loop shader fell back to the dispatcher");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
