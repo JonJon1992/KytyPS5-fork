@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -425,6 +426,11 @@ private:
 };
 
 class MaskedUseAnalysis {
+	struct Frame {
+		const Inst* inst;
+		size_t      next_use;
+	};
+
 public:
 	// `assumed`: selects taken to be unobserved where their condition is false (the fixpoint
 	// candidate set), or nullptr to count every phi use as an observation.
@@ -436,7 +442,8 @@ public:
 	// observations, so every No verdict still holds and the next pass stops at it; the Yes
 	// verdicts are recomputed.
 	void KeepObservedVerdicts() {
-		std::erase_if(m_memo, [](const auto& entry) { return entry.second != Verdict::No; });
+		// Bounded by MaxFixpointPasses. Retain storage and invalidate Yes lazily on lookup.
+		++m_generation;
 	}
 
 	// Whether lanes where `condition` is false can never observe `root`'s value.
@@ -445,11 +452,8 @@ public:
 		if (root_verdict != Verdict::Unknown) {
 			return root_verdict == Verdict::Yes;
 		}
-		struct Frame {
-			const Inst* inst;
-			size_t      next_use;
-		};
-		std::vector<Frame> stack;
+		auto& stack = m_stack;
+		stack.clear();
 		root_verdict = Verdict::Pending;
 		stack.push_back({root, 0});
 		while (!stack.empty()) {
@@ -519,8 +523,20 @@ private:
 		}
 	};
 
+	struct MemoEntry {
+		Verdict  verdict    = Verdict::Unknown;
+		uint32_t generation = 0;
+	};
+
 	Verdict& Lookup(const Inst* inst, const Inst* condition) {
-		return m_memo[{inst, condition}];
+		auto& entry = m_memo[{inst, condition}];
+		if (entry.generation != m_generation) {
+			if (entry.verdict != Verdict::No) {
+				entry.verdict = Verdict::Unknown;
+			}
+			entry.generation = m_generation;
+		}
+		return entry.verdict;
 	}
 
 	[[nodiscard]] bool UsesImplicitDerivatives(const Inst& sample) const {
@@ -596,7 +612,11 @@ private:
 	const Program&                               m_program;
 	const DominatorTree&                         m_dom;
 	const std::unordered_set<const Inst*>*       m_assumed;
-	std::unordered_map<Key, Verdict, KeyHash>    m_memo;
+	std::vector<Frame>                          m_stack;
+	// Per-analysis storage, never shared between shader compilations. Destroy the map first.
+	std::pmr::unsynchronized_pool_resource          m_pool;
+	std::pmr::unordered_map<Key, MemoEntry, KeyHash> m_memo {&m_pool};
+	uint32_t                                       m_generation = 0;
 };
 
 class BranchFacts {

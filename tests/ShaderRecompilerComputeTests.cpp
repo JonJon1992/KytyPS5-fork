@@ -1908,6 +1908,17 @@ void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
   if (!tools.Validate(spirv)) {
     Fail(shader_name, "SPIR-V validation", messages);
   }
+  // Optional artifacts for literal before/after comparisons, outside benchmark timings.
+  if (const auto *directory = std::getenv("KYTY_SPIRV_SNAPSHOT_DIR")) {
+    static size_t index = 0;
+    std::filesystem::create_directories(directory);
+    const auto path = std::filesystem::path(directory) /
+                      (std::to_string(index++) + ".spv");
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(spirv.data()),
+                 static_cast<std::streamsize>(spirv.size() * sizeof(u32)));
+    Require(shader_name, "SPIR-V snapshot", output.good(), path.string().c_str());
+  }
 }
 
 size_t CountText(const std::string &text, const std::string &needle) {
@@ -2625,10 +2636,10 @@ std::vector<u32> MakeCompileBenchmarkShader(u32 loops, u32 sections_per_loop, u3
   return code;
 }
 
-// --compile-benchmark [rounds]: times TranslateProgram and CompileProgram on generated shaders
-// and prints an FNV-1a digest of each SPIR-V module; equal digests across two builds mean the
-// change left the output byte-identical.
-int CompileBenchmark(u32 rounds) {
+// --compile-benchmark [rounds] [dump_ir=0|1]; the default matches production with logging off.
+// KYTY_SPIRV_SNAPSHOT_DIR saves validated modules for literal comparisons between builds.
+int CompileBenchmark(u32 rounds, bool dump_ir) {
+  Require("compile-benchmark", "rounds", rounds != 0, "rounds must be positive");
   using Clock = std::chrono::steady_clock;
   struct Shape {
     u32 loops, sections, alu;
@@ -2649,6 +2660,7 @@ int CompileBenchmark(u32 rounds) {
     compute.wave_size = 64;
     compute.host_subgroup_size = 64;
     ShaderRecompiler::CompileOptions options;
+    options.dump_ir = dump_ir;
     options.stage = ShaderType::Compute;
     options.wave_size = 64;
     options.input_info.compute = &compute;
@@ -2685,8 +2697,13 @@ int CompileBenchmark(u32 rounds) {
       for (const auto word : result.spirv) {
         hash = (hash ^ word) * 0x100000001b3ull;
       }
-      digest = hash;
-      spirv = result.spirv;
+      if (round == 0) {
+        digest = hash;
+        spirv = result.spirv;
+      } else {
+        Require("compile-benchmark", "determinism", spirv == result.spirv,
+                "SPIR-V changed between rounds");
+      }
     }
     ValidateSpirv("compile-benchmark", spirv);
     const auto words = spirv.size();
@@ -49772,9 +49789,10 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
   }
-  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--compile-benchmark") == 0) {
+  if (argc >= 2 && argc <= 4 && std::strcmp(argv[1], "--compile-benchmark") == 0) {
     EnsureConfigInitialized();
-    return CompileBenchmark(argc == 3 ? static_cast<u32>(std::strtoul(argv[2], nullptr, 10)) : 9u);
+    return CompileBenchmark(argc >= 3 ? static_cast<u32>(std::strtoul(argv[2], nullptr, 10)) : 9u,
+                            argc == 4 && std::strcmp(argv[3], "1") == 0);
   }
   if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
     EnsureConfigInitialized();

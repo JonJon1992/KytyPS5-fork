@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
@@ -573,15 +574,6 @@ bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, u
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
 }
 
-std::vector<uint32_t> AllBlockIds(uint32_t count) {
-	std::vector<uint32_t> ids;
-	ids.reserve(count);
-	for (uint32_t i = 0; i < count; i++) {
-		ids.push_back(i);
-	}
-	return ids;
-}
-
 std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
                                       const std::vector<uint32_t>& b) {
 	std::vector<uint32_t> ret;
@@ -725,81 +717,80 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
-// One step of the (post-)dominator fixpoint: the sets of the blocks in `edges` intersected, plus
-// `id` (just `id` without edges). Sets are sorted; `out` and `scratch` keep their capacity across
-// calls, so the passes stop allocating once the buffers have grown.
-void MeetSets(const Graph& graph, std::vector<uint32_t> BasicBlock::*sets,
-              const std::vector<uint32_t>& edges, uint32_t id, std::vector<uint32_t>& out,
-              std::vector<uint32_t>& scratch) {
-	out.clear();
-	if (!edges.empty()) {
-		const auto& first = graph.blocks[edges.front()].*sets;
-		out.assign(first.begin(), first.end());
-		for (uint32_t i = 1; i < edges.size() && !out.empty(); i++) {
-			const auto& other = graph.blocks[edges[i]].*sets;
-			scratch.clear();
-			std::set_intersection(out.begin(), out.end(), other.begin(), other.end(),
-			                      std::back_inserter(scratch));
-			out.swap(scratch);
+// Rewrites keep block IDs dense. Intersect transient bitsets instead of sorted vectors, then
+// publish the same ascending IDs. Keep the original greatest fixpoint and traversal order:
+// forwards for dominators, backwards for post-dominators, including cycles without an exit.
+template<bool Post>
+void ComputeDominatorSets(Graph& graph) {
+	const auto count = graph.blocks.size();
+	const auto words = (count + 63u) / 64u;
+	if (words == 0) {
+		return;
+	}
+	const auto final_mask = count % 64u ? (uint64_t {1} << (count % 64u)) - 1u : UINT64_MAX;
+	std::vector<uint64_t> sets(count * words, UINT64_MAX);
+	std::vector<uint64_t> next(words);
+	for (const auto& block: graph.blocks) {
+		auto* row = sets.data() + block.id * words;
+		row[words - 1u] = final_mask;
+		if (Post ? block.successors.empty() : block.id == graph.entry_block) {
+			std::fill_n(row, words, uint64_t {0});
+			row[block.id / 64u] = uint64_t {1} << (block.id % 64u);
 		}
 	}
-	const auto it = std::lower_bound(out.begin(), out.end(), id);
-	if (it == out.end() || *it != id) {
-		out.insert(it, id);
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (size_t index = 0; index < count; index++) {
+			const auto& block = graph.blocks[Post ? count - 1u - index : index];
+			if (!Post && block.id == graph.entry_block) {
+				continue;
+			}
+			const auto& edges = Post ? block.successors : block.predecessors;
+			if (edges.empty()) {
+				std::fill(next.begin(), next.end(), uint64_t {0});
+			} else {
+				std::copy_n(sets.data() + edges.front() * words, words, next.data());
+				for (size_t edge = 1; edge < edges.size(); edge++) {
+					const auto* other = sets.data() + edges[edge] * words;
+					for (size_t word = 0; word < words; word++) {
+						next[word] &= other[word];
+					}
+				}
+			}
+			next[block.id / 64u] |= uint64_t {1} << (block.id % 64u);
+			auto* row = sets.data() + block.id * words;
+			if (!std::equal(next.begin(), next.end(), row)) {
+				std::copy(next.begin(), next.end(), row);
+				changed = true;
+			}
+		}
+	}
+	for (auto& block: graph.blocks) {
+		auto&       out = Post ? block.post_dominators : block.dominators;
+		const auto* row = sets.data() + block.id * words;
+		out.clear();
+		size_t elements = 0;
+		for (size_t word = 0; word < words; word++) {
+			elements += std::popcount(row[word]);
+		}
+		out.reserve(elements);
+		for (size_t word = 0; word < words; word++) {
+			auto bits = row[word];
+			while (bits != 0) {
+				out.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
+				bits &= bits - 1u;
+			}
+		}
 	}
 }
 
 void ComputeDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
-	}
-
-	std::vector<uint32_t> next;
-	std::vector<uint32_t> scratch;
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			if (block.id == graph.entry_block) {
-				continue;
-			}
-			MeetSets(graph, &BasicBlock::dominators, block.predecessors, block.id, next, scratch);
-			if (next != block.dominators) {
-				block.dominators.swap(next);
-				changed = true;
-			}
-		}
-	}
+	ComputeDominatorSets<false>(graph);
 }
 
 void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
-	}
-
-	// Blocks are laid out in program order, so visiting them backwards sees most successors
-	// before their predecessors and the backward problem settles in a few passes. Any visiting
-	// order reaches the same greatest fixpoint from these starting sets; forward order needed
-	// about one pass per block of post-dominator depth, rerun after every merge split.
-	std::vector<uint32_t> next;
-	std::vector<uint32_t> scratch;
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: std::views::reverse(graph.blocks)) {
-			MeetSets(graph, &BasicBlock::post_dominators, block.successors, block.id, next, scratch);
-			if (next != block.post_dominators) {
-				block.post_dominators.swap(next);
-				changed = true;
-			}
-		}
-	}
+	ComputeDominatorSets<true>(graph);
 }
 
 void ComputeBackEdges(Graph& graph) {
