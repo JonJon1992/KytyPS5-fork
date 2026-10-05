@@ -7,6 +7,18 @@
 
 namespace Libs::Graphics {
 
+// Appended after the page-fault bitset. The first invocation claiming the record
+// writes its payload; the host reads it only after the submission completes.
+struct ShaderTrapRecord {
+	uint32_t claimed          = 0;
+	uint32_t shader_hash_low  = 0;
+	uint32_t shader_hash_high = 0;
+	uint32_t pc               = 0;
+	uint32_t code             = 0;
+	uint32_t reserved[3] {};
+};
+static_assert(sizeof(ShaderTrapRecord) == 32);
+
 inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
 
 enum class AgcDirectResourceType : uint32_t {

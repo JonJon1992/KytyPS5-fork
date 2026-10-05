@@ -11,4 +11,8 @@ struct Program;
 // become that predicate. Returns how many; 0 when the switch is off.
 uint32_t FoldLaneMasks(Program& program);
 
+struct Program;
+// Also replaces provably masked local-aperture global loads with zero.
+uint32_t SimplifyLocalAddressStores(Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

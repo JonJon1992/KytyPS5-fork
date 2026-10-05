@@ -118,6 +118,8 @@ uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, ui
 	return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
 }
 
+} // namespace
+
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
 	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
 	                              static_cast<uint32_t>(value),
@@ -131,6 +133,8 @@ uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high
 	                           ConstantDeviceAddress(state, 32));
 	return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low64, high64);
 }
+
+namespace {
 
 uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto& state = ctx.state;
@@ -1049,6 +1053,40 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), result,
+	                          state.bda_pointer_function, address);
+	return result;
+}
+
+void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code) {
+	constexpr auto record_word = BufferCache::CACHING_NUMPAGES / 8 / sizeof(uint32_t);
+	const auto     pointer     = FaultElementPointer(state, ConstantU32(state, record_word));
+	const auto     old         = state.builder.AllocateId();
+	// Only the winning invocation writes the payload. Queue completion, rather
+	// than another shader invocation, publishes those writes to the host.
+	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+	                          ConstantU32(state, 0), ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto won = Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+	EmitIfCondition(state, won, [&]() {
+		const auto store = [&](size_t offset, uint32_t value) {
+			state.builder.AddFunction(
+			    spv::OpStore,
+			    FaultElementPointer(state,
+			                        ConstantU32(state, record_word + offset / sizeof(uint32_t))),
+			    value);
+		};
+		store(offsetof(ShaderTrapRecord, shader_hash_low),
+		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)));
+		store(offsetof(ShaderTrapRecord, shader_hash_high),
+		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32)));
+		store(offsetof(ShaderTrapRecord, pc), pc);
+		store(offsetof(ShaderTrapRecord, code), code);
+	});
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
@@ -1064,6 +1102,11 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
+	// Reject noncanonical FLAT addresses before indexing the local 40-bit page table.
+	const auto in_aperture = Binary(state, spv::OpULessThan, TypeBool(state), address,
+	    ConstantDeviceAddress(state, BufferCache::CACHING_NUMPAGES * BufferCache::CACHING_PAGESIZE));
+	const auto mapped_address = EmitValueOrDefaultIfCondition(
+	    state, in_aperture, type, ConstantDeviceAddress(state, 0), [&]() {
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
@@ -1095,7 +1138,9 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
 	                          fault_label, available, available_label);
-	state.builder.AddFunction(spv::OpReturnValue, result);
+	return result;
+	});
+	state.builder.AddFunction(spv::OpReturnValue, mapped_address);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 

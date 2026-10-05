@@ -622,6 +622,15 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+file(GLOB shader_function_decode_sources CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp")
+add_executable(shader_function_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderFunctionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+	${shader_function_decode_sources})
+target_link_libraries(shader_function_tests common fmt::fmt xxhash)
+target_include_directories(shader_function_tests PRIVATE ${inc_headers})
+
 add_executable(buffer_robustness_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BufferRobustnessTests.cpp")
 target_include_directories(buffer_robustness_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
@@ -1171,6 +1180,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_frontend_optimization
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --frontend-optimization-only)
+	add_test(NAME wolverine_instructions_cpu
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --wolverine-instructions-only)
+	add_test(NAME wolverine_instruction_fixtures_cpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-instructions-codegen-only)
+	add_test(NAME shader_functions COMMAND $<TARGET_FILE:shader_function_tests>)
 	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
 	add_test(NAME shader_cfg_post_dominators
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --post-dominators-only)
@@ -2349,6 +2363,7 @@ if(BUILD_TESTING)
 		hang_watchdog_tests
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_function_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests

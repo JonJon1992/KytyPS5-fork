@@ -1198,6 +1198,10 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap) {
+			m_info.uses_dma = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);

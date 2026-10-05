@@ -571,19 +571,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing. Every stage is skipped: the decoder
-	// stopped at the BVH instruction, and building a CFG from that truncated program would
-	// abort on the unsupported opcode.
-	if (decoded.has_bvh) {
+	// IMAGE_BVH_INTERSECT_RAY with an eleven-DWORD full-float ray is lowered (spirvEmitterBvh.cpp).
+	// The other BVH forms (BVH64, A16 rays, without R128 or dmask 0xf) decode as unsupported, and
+	// the CFG builder would end the emulator on them: as for games that compile ray-tracing
+	// shaders before the player can select a mode without ray tracing, the dispatch or draw is
+	// skipped in every stage instead.
+	const auto unsupported_bvh =
+	    std::ranges::find_if(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::UNSUPPORTED &&
+		           inst.family == Decoder::Family::MIMG &&
+		           (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u);
+	    });
+	if (unsupported_bvh != decoded.instructions.end()) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			const auto& bvh = decoded.instructions.back();
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping dispatches and draws whose "
-			    "shaders contain BVH intersection instructions (stage={}, shader=0x{:016x}, "
-			    "pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    StageName(options.stage), options.shader_hash, bvh.pc, bvh.opcode_id));
+			    "Warning: unsupported BVH intersection form; skipping dispatches and draws whose "
+			    "shaders contain it (stage={}, shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}: "
+			    "{}).\n",
+			    StageName(options.stage), options.shader_hash, unsupported_bvh->pc,
+			    unsupported_bvh->opcode_id, unsupported_bvh->unsupported_reason));
 		}
 		return {.skip_dispatch = true};
 	}
@@ -670,6 +677,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (IR::SimplifyLocalAddressStores(ir) != 0) {
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);

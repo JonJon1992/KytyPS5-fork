@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_FAULTMANAGER_H_
 
 #include "common/abi.h"
+#include "graphics/shader/shaderBindings.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -19,13 +20,15 @@ public:
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);
 
-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
+	[[nodiscard]] Buffer* GetFaultBuffer() noexcept;
 	void                  ProcessFaultBuffer();
 
 private:
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;
+	size_t                                     m_download_area_size;
+	bool                                       m_initialized = false;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
