@@ -597,6 +597,8 @@ void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
         "point sampler variant duplicated the wrong runtime descriptor");
 }
 
+#include "BindlessMaterializationTests.inc"
+
 } // namespace
 
 namespace Common {
@@ -622,6 +624,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestBindlessSnapshots();
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();

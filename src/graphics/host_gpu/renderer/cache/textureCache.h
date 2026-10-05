@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -44,6 +45,7 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	std::function<void(ImageId)> on_bindless_unregister;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):

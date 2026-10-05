@@ -3120,6 +3120,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	KYTY_GPU_OP_SITE("draw.execute");
+	BeginBindlessUpdate();
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =

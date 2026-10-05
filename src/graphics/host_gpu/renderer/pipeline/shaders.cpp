@@ -265,12 +265,19 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 // Set 0 plus one push-constant range {push_stages, 0, NativePushConstantSize}; interned by
 // binding signature (pipelineLayoutCache.h, KYTY_LAYOUT_INTERN).
+static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+    return std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
+           std::ranges::any_of(program.info.samplers, &ShaderRecompiler::IR::SamplerResource::bindless);
+}
+
 static void AssignPipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                  std::span<const vk::DescriptorSetLayoutBinding> bindings,
                                  vk::ShaderStageFlags                            push_stages) {
 	EXIT_IF(pipeline.pipeline_layout != nullptr || pipeline.descriptor_set_layout != nullptr);
+	EXIT_IF(pipeline.uses_bindless && (!graphics.bindless_enabled || !graphics.bindless_layout));
 	const auto layouts = AcquirePipelineLayout(graphics, bindings, push_stages,
-	                                           ShaderRecompiler::IR::NativePushConstantSize);
+	                                           ShaderRecompiler::IR::NativePushConstantSize,
+                                               pipeline.uses_bindless ? graphics.bindless_layout : nullptr);
 	pipeline.descriptor_set_layout = layouts.set_layout;
 	pipeline.pipeline_layout       = layouts.pipeline_layout;
 	pipeline.uses_push_descriptors = layouts.uses_push_descriptors;
@@ -526,11 +533,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
+		pipeline.uses_bindless |= UsesBindless(*stage.stage.program);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
 	}
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
+		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
@@ -633,7 +642,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		// layout handles, so that signature identifies the definition. Not interned: each pipeline
 		// creates its layout from these bindings in this order, so the key keeps the order.
 		std::vector<uint32_t> layout_signature;
-		layout_signature.reserve(descriptor_bindings.size() * 4u + 4u);
+		layout_signature.reserve(descriptor_bindings.size() * 4u + 6u);
+        const auto bindless_layout_id = pipeline.uses_bindless
+            ? reinterpret_cast<uintptr_t>(static_cast<VkDescriptorSetLayout>(graphics.bindless_layout)) : 0u;
+        layout_signature.push_back(static_cast<uint32_t>(bindless_layout_id));
+        layout_signature.push_back(static_cast<uint32_t>(bindless_layout_id >> 32u));
 		if (PipelineLayoutInterningEnabled()) {
 			const auto canonical = MakePipelineLayoutSignature(
 			    descriptor_bindings, graphics_stages, ShaderRecompiler::IR::NativePushConstantSize,
@@ -717,6 +730,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
 	AssignPipelineLayout(graphics, pipeline, descriptor_bindings,

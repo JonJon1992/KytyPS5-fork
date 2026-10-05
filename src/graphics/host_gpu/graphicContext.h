@@ -45,6 +45,12 @@ RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
 
 struct GraphicContext {
+    bool bindless_supported = false;
+    bool bindless_enabled = false;
+    uint32_t bindless_images_per_array = 0;
+    uint32_t bindless_samplers_per_array = 0;
+    vk::DescriptorSetLayout bindless_layout = nullptr;
+    vk::DescriptorSet bindless_set = nullptr;
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;

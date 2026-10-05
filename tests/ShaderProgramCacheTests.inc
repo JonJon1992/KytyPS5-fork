@@ -138,6 +138,8 @@ void CheckSourceKeys() {
   differs("the plain LOD-stats variant", [](Inputs &in, Words &, Words &, Words &) {
     in.plain_mip_stats_variant = true;
   });
+  differs("bindless images", [](Inputs &in, Words &, Words &, Words &) { in.bindless_images = true; });
+  differs("bindless samplers", [](Inputs &in, Words &, Words &, Words &) { in.bindless_samplers = true; });
   differs("a code word", [](Inputs &, Words &, Words &c, Words &) { c[3] ^= 0x80000000u; });
   differs("the code length", [](Inputs &, Words &, Words &c, Words &) { c.push_back(0); });
   differs("a merged back half", [&](Inputs &, Words &, Words &, Words &b) { b = back_code; });

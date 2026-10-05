@@ -14609,6 +14609,8 @@ void TestExecSelectAnalysisFixpoint() {
   check_chain(10, true, false); // More than eight passes requires the safe fallback.
 }
 
+#include "BindlessShaderTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14616,6 +14618,11 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-only") == 0) {
+    TestBindlessShaderContract();
+    std::puts("ShaderCfgTests: bindless CPU/SPIR-V cases passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-only") == 0) {
     TestWolverineInstructions();
     TestRdna2LdsWaitcntBarrierAndFloatControls();
@@ -14667,6 +14674,7 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --wave-reduction-only: ok\n");
     return 0;
   }
+  TestBindlessShaderContract();
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

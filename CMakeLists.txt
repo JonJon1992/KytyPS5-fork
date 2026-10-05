@@ -1148,6 +1148,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME wolverine_instructions_cpu
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --wolverine-instructions-only)
+	add_test(NAME wolverine_bindless_cpu
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --bindless-only)
 	add_test(NAME wolverine_instruction_fixtures_cpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-instructions-codegen-only)
 	add_test(NAME shader_functions COMMAND $<TARGET_FILE:shader_function_tests>)

@@ -115,6 +115,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].bindless) continue;
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
@@ -157,8 +158,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
+		    return image.indirect_search_iterations != 0u || image.bindless;
+	    }) || std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}

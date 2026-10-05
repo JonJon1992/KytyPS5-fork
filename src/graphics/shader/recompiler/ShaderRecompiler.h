@@ -25,6 +25,8 @@ struct CompileOptions {
 	// Also emit CompileResult::spirv_plain for a GET_LOD_STATS-instrumented pixel shader
 	// (KYTY_LOD_STATS_PLAIN_VARIANT).
 	bool                        plain_mip_stats_variant = false;
+	bool                        bindless_images = false;
+	bool                        bindless_samplers = false;
 };
 
 struct TranslateResult {

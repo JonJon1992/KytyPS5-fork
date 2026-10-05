@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -590,6 +591,19 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
+        if (image.bindless) {
+            using D = Decoder::ImageDimension;
+            if (base.resource_class != ImageResourceClass::Sampled || base.written || base.atomic ||
+                base.depth_compare ||
+                (base.dimension != D::Dim2D && base.dimension != D::Dim2DArray &&
+                 base.dimension != D::Dim3D && base.dimension != D::Unknown))
+                return SpecializationFail("bindless requires a non-comparison sampled 2D, array, cube or 3D image");
+            image.numeric_class = Prospero::TextureNumericClass::Float;
+            image.dimension = base.dimension == D::Unknown ? D::Dim2D : base.dimension;
+            image.cube = base.cube;
+            image.mip_count = 1;
+            continue;
+        }
 		image.mip_count = StorageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
@@ -678,7 +692,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
-		if (root.indirect_root != root_index) {
+		if (root.indirect_root != root_index || root.bindless) {
 			continue;
 		}
 		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
@@ -742,9 +756,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t index = static_cast<uint32_t>(program.info.samplers.size());
 	     index < sampler_plan.sampler_count; index++) {
-		snapshot.samplers.push_back(snapshot.samplers[sampler_plan.bindings[index].source]);
+		const auto source = sampler_plan.bindings[index].source;
+        snapshot.samplers.push_back(snapshot.samplers[source]);
+        auto specialized = specialization.samplers[source];
+        if (specialized.bindless) {
+            specialized.bindless_mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+            snapshot.flattened_srt.resize(snapshot.flattened_srt.size() + 2u, 0u);
+            const auto heap = std::ranges::find(snapshot.bindless_sampler_heaps, source,
+                                               &BindlessSamplerHeapUse::sampler);
+            if (heap != snapshot.bindless_sampler_heaps.end()) {
+                auto clone = *heap;
+                clone.sampler = index;
+                clone.mapping_offset = specialized.bindless_mapping_offset;
+                snapshot.bindless_sampler_heaps.push_back(clone);
+            }
+        }
+        specialization.samplers.push_back(specialized);
 	}
-	ImageRemap(specialization).Apply(snapshot.images);
+    const ImageRemap remap(specialization);
+    for (auto& heap: snapshot.bindless_heaps) heap.image = remap[heap.image];
+    remap.Apply(snapshot.images);
 	return true;
 }
 
@@ -1010,6 +1041,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.memory_info                = program.memory_info;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	plan.bindless_images = program.bindless_images;
+	plan.bindless_samplers = program.bindless_samplers;
 	plan.has_address_writes         = program.has_address_writes;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
@@ -1048,6 +1081,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_image = source.indirect_image;
+		target.bindless_sampler = source.bindless_sampler;
 		if (target.indirect_image.has_value()) {
 			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
@@ -1115,6 +1149,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	// Last: the builders above may still assign memo slots. From here the plan is read-only.
+	for (const auto& sampler: plan.info.samplers) {
+        const auto* source = Source(plan, sampler.source);
+        if (source != nullptr && source->bindless_sampler) {
+            plan.requires_specialization_memory = true;
+            MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
+        }
+    }
 	SealEvaluationIndices(plan);
 	return plan;
 }
@@ -1123,6 +1164,8 @@ template <bool Optimize>
 static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                                     EvaluationScratch& scratch, ResourceSnapshot& snapshot,
                                     ResourceSpecialization& specialization) {
+	snapshot.bindless_heaps.clear();
+	snapshot.bindless_sampler_heaps.clear();
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1226,6 +1269,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			    .indirect_mapping_offset = image.indirect_mapping_offset,
 			    .indirect_search_iterations = image.indirect_search_iterations,
 			    .cube = image.cube,
+			    .bindless = image.bindless,
 			};
 		};
 		if constexpr (Optimize) {
@@ -1246,10 +1290,25 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			}
 			if (source->indirect_image.has_value()) {
 				snapshot.images[i] = {.dword_count = 8u};
-				if (!active.empty() && !active[image.source]) {
-					continue;
-				}
-				const auto& indirect = *source->indirect_image;
+                const auto& indirect = *source->indirect_image;
+                if (indirect.bindless) {
+                    const auto offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+                    snapshot.flattened_srt.resize(offset + 2u, 0u);
+                    auto& specialized = specialization.images[i];
+                    specialized.indirect_root = i;
+                    specialized.indirect_mapping_offset = offset;
+                    specialized.bindless = true;
+                    if (active.empty() || active[image.source]) {
+                        DescriptorValue table;
+                        ShaderBufferResource heap;
+                        if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+                            !DecodeBufferDescriptor(table, heap)) return false;
+                        snapshot.bindless_heaps.push_back({heap.Base48(), heap.GetSize(),
+                                                          indirect.table_offset, i, offset});
+                    }
+                    continue;
+                }
+                if (!active.empty() && !active[image.source]) continue;
 				DescriptorValue material;
 				DescriptorValue table;
 				if ((indirect.material_source != UINT32_MAX &&
@@ -1272,7 +1331,26 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::Specialization");
 		snapshot.samplers.resize(program.info.samplers.size());
+		specialization.samplers.assign(program.info.samplers.size(), {});
 		for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+            const auto source_index = program.info.samplers[i].source;
+            const auto* source = Source(program, source_index);
+            if (source != nullptr && source->bindless_sampler) {
+                const auto offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+                snapshot.flattened_srt.resize(offset + 2u, 0u);
+                snapshot.samplers[i] = {.dword_count = 4u};
+                std::ranges::copy(BindlessDefaultSampler, snapshot.samplers[i].dwords.begin());
+                specialization.samplers[i] = {true, offset};
+                if (active.empty() || active[source_index]) {
+                    DescriptorValue table;
+                    ShaderBufferResource heap;
+                    if (!clean.EvaluateDescriptor(source_index, table) ||
+                        !DecodeBufferDescriptor(table, heap)) return false;
+                    snapshot.bindless_sampler_heaps.push_back({heap.Base48(), heap.GetSize(),
+                        source->bindless_sampler->table_offset, i, offset});
+                }
+                continue;
+            }
 			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
 				return false;
 			}
@@ -1292,9 +1370,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
 		return setting != nullptr && std::strcmp(setting, "optimized") == 0;
 	}();
-	return optimized
+	const bool success = optimized
 	           ? MaterializeResourcesImpl<true>(program, runtime, scratch, snapshot, specialization)
 	           : MaterializeResourcesImpl<false>(program, runtime, scratch, snapshot, specialization);
+    if (!success) {
+        snapshot.bindless_heaps.clear();
+        snapshot.bindless_sampler_heaps.clear();
+        specialization.samplers.clear();
+    }
+    return success;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -1333,6 +1417,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.bindless = source.bindless;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
@@ -1346,14 +1431,22 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	SamplerPlan sampler_plan;
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
+    for (uint32_t i = 0; i < samplers.size() && i < specialization.samplers.size(); ++i) {
+        samplers[i].bindless = specialization.samplers[i].bindless;
+        samplers[i].bindless_mapping_offset = specialization.samplers[i].bindless_mapping_offset;
+    }
 	auto sampled_pairs = program.info.sampled_pairs;
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			samplers.push_back(program.info.samplers[binding.source]);
+			samplers.push_back(samplers[binding.source]);
 		}
-		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
+		if (index < specialization.samplers.size()) {
+            samplers[index].bindless = specialization.samplers[index].bindless;
+            samplers[index].bindless_mapping_offset = specialization.samplers[index].bindless_mapping_offset;
+        }
+        samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
 	for (auto& pair: sampled_pairs) {
@@ -1443,7 +1536,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
+			EXIT_IF(image.indirect_root == memory.resource && !image.bindless &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
