@@ -5855,6 +5855,58 @@ void TestNewShaderRecompilerImageGatherVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerImageGatherLodVariants() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x4c, 0x1),
+      EncodeMimg1(60, 0, 2, 4), // image_gather4_c_l
+      EncodeMimg0(0x54, 0x2),
+      EncodeMimg1(64, 0, 2, 8), // image_gather4_l_o
+      EncodeMimg0(0x5c, 0x1),
+      EncodeMimg1(68, 0, 2, 12), // image_gather4_c_l_o
+      // Keep the gathers live: a dead image op leaves no resource behind.
+      EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(60, 4, 1), // buffer_store_dword v60
+      EncodeMubuf0(0x1c, 4),
+      EncodeMubuf1(64, 4, 1), // buffer_store_dword v64
+      EncodeMubuf0(0x1c, 8),
+      EncodeMubuf1(68, 4, 1), // buffer_store_dword v68
+      0xbf810000u,
+  };
+
+  // An eight-dword T# at s0 (reserved bits clear), the S# at s8 and a raw V# at s16.
+  auto user_data = ImageTestUserData();
+  user_data[2] &= ~0x70003000u;
+  user_data[6] &= ~0x00007b00u;
+  user_data[16] = 0x1000u;
+  user_data[17] = 0u;
+  user_data[18] = 64u;
+  user_data[19] = 0u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "explicit-LOD gather decoded as unsupported");
+  // Address order: offset, compare, x, y, lod.
+  Check(result.decoded_dump.find("sample_flags=lod|compare addr_components=4") !=
+            std::string::npos,
+        "IMAGE_GATHER4_C_L did not expose lod+compare sample metadata");
+  Check(result.decoded_dump.find("sample_flags=lod|offset addr_components=4") !=
+            std::string::npos,
+        "IMAGE_GATHER4_L_O did not expose lod+offset sample metadata");
+  Check(result.decoded_dump.find("sample_flags=lod|compare|offset addr_components=5") !=
+            std::string::npos,
+        "IMAGE_GATHER4_C_L_O did not expose lod+compare+offset sample metadata");
+  Check(CountSourceOccurrences(result.ir_dump, "ImageGatherRaw ") == 3u,
+        "explicit-LOD gathers did not lower to IR ImageGatherRaw");
+  Check(SpirvContainsOpcode(result.spirv, 96),
+        "SPIR-V binary does not contain OpImageGather");
+  Check(SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary does not contain OpImageDrefGather");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerImageLoadVariants() {
   const uint32_t shader[] = {
       EncodeMimg0(0x00, 0x3),
@@ -14785,6 +14837,10 @@ int main(int argc, char **argv) {
     TestDeferredSpirvPhiPatching();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--gather-lod-only") == 0) {
+    TestNewShaderRecompilerImageGatherLodVariants();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--registered-shader-code-only") == 0) {
     TestRegisteredShaderCodeIdentity();
     return 0;
@@ -14841,6 +14897,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
   TestNewShaderRecompilerMubufD16Translation();
+  TestNewShaderRecompilerImageGatherLodVariants();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

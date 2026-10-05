@@ -29823,6 +29823,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_GATHER4_LZ_O:
   case Opcode::IMAGE_GATHER4_C_O:
   case Opcode::IMAGE_GATHER4_C_LZ_O:
+  case Opcode::IMAGE_GATHER4_C_L:
+  case Opcode::IMAGE_GATHER4_L_O:
+  case Opcode::IMAGE_GATHER4_C_L_O:
     return CoverageClass::NeedsImageCase;
 
   case Opcode::V_INTERP_P1_F32:
