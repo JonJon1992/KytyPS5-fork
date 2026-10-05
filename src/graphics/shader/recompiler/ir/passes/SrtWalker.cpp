@@ -1381,6 +1381,14 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 			return false;
 		}
 	} else {
+		// A descriptor pointer the guest has not written yet reads as null, and the fields behind
+		// it land in the first pages, which no guest maps (Ghost of Yotei reads 0x10). Fail that
+		// read like the GPU's faulting access instead of faulting the host.
+		constexpr uint64_t null_page_limit = 0x10000;
+		if (address < null_page_limit) {
+			ObserveSrtRead(m_runtime, address, {&word, 1}, false);
+			return false;
+		}
 		constexpr uint64_t gpu_limit = uint64_t {1} << 40u;
 		// Read the exact clean bytes without faulting on unrelated dirty bytes in
 		// the same protected page. A failed probe leaves the original read intact.
