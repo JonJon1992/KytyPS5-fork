@@ -101,14 +101,20 @@ public:
 		if (size == 0) {
 			return true;
 		}
+		const auto* source = static_cast<const uint8_t*>(data);
+		// The same bytes read again at once: Finish would merge the two records into one.
+		if (!m_reads.empty() && m_reads.back().address == address && m_reads.back().size == size &&
+		    std::memcmp(m_bytes.data() + m_reads.back().offset, source, size) == 0) {
+			return true;
+		}
 		if (m_reads.size() >= MaxReads || size > MaxBytes - m_bytes.size() ||
 		    address > UINT64_MAX - size) {
 			Fail(ReadFailure::Overflow);
 			return false;
 		}
 		const auto offset = static_cast<uint32_t>(m_bytes.size());
-		m_bytes.resize(m_bytes.size() + size);
-		std::memcpy(m_bytes.data() + offset, data, size);
+		// Appended in one copy (resize would zero the bytes first).
+		m_bytes.insert(m_bytes.end(), source, source + size);
 		m_reads.push_back({address, static_cast<uint32_t>(size), offset});
 		return true;
 	}
@@ -132,42 +138,55 @@ public:
 		if (m_failure != ReadFailure::None) {
 			return false;
 		}
-		m_order.resize(m_reads.size());
-		std::iota(m_order.begin(), m_order.end(), 0u);
-		std::sort(m_order.begin(), m_order.end(), [this](uint32_t a, uint32_t b) {
-			return m_reads[a].address < m_reads[b].address ||
-			       (m_reads[a].address == m_reads[b].address && m_reads[a].size > m_reads[b].size);
-		});
+		// The records themselves are sorted (each keeps the offset of its bytes); reads already in
+		// this order need no sort. Reads of equal address and size are interchangeable: the merge
+		// only compares them.
+		const auto before = [](const Read& a, const Read& b) {
+			return a.address < b.address || (a.address == b.address && a.size > b.size);
+		};
+		if (!std::is_sorted(m_reads.begin(), m_reads.end(), before)) {
+			std::sort(m_reads.begin(), m_reads.end(), before);
+		}
 		m_ranges.clear();
 		m_range_offsets.clear();
 		m_merged.clear();
-		for (const auto index: m_order) {
-			const auto& read  = m_reads[index];
+		// A range's bytes stay where they were recorded while they are contiguous there (a single
+		// read, or reads recorded one after the other); only a range whose bytes are not is copied
+		// into m_merged. Only the last range grows, so its copy is always at the end of m_merged.
+		const uint8_t* range_bytes = nullptr; // the bytes of the last range
+		for (const auto& read: m_reads) {
 			const auto* bytes = m_bytes.data() + read.offset;
 			const auto  end   = read.address + read.size;
 			if (!m_ranges.empty() &&
 			    (read.address < m_ranges.back().end ||
 			     (read.address == m_ranges.back().end && (read.address & (PageSize - 1u)) != 0))) {
 				auto&      range       = m_ranges.back();
-				const auto base        = m_range_offsets.back();
+				auto&      location    = m_range_offsets.back();
 				const auto overlap_end = std::min(end, range.end);
 				if (overlap_end > read.address &&
-				    std::memcmp(m_merged.data() + base + (read.address - range.begin), bytes,
+				    std::memcmp(range_bytes + (read.address - range.begin), bytes,
 				                overlap_end - read.address) != 0) {
 					Fail(ReadFailure::Inconsistent);
 					return false;
 				}
 				if (end > range.end) {
-					const auto tail = end - range.end;
-					m_merged.insert(m_merged.end(), bytes + (range.end - read.address),
-					                bytes + (range.end - read.address) + tail);
+					const auto  size = range.end - range.begin;
+					const auto* tail = bytes + (range.end - read.address);
+					if ((location & MergedBit) != 0 || tail != range_bytes + size) {
+						if ((location & MergedBit) == 0) {
+							location = static_cast<uint32_t>(m_merged.size()) | MergedBit;
+							m_merged.insert(m_merged.end(), range_bytes, range_bytes + size);
+						}
+						m_merged.insert(m_merged.end(), tail, tail + (end - range.end));
+						range_bytes = m_merged.data() + (location & ~MergedBit);
+					}
 					range.end = end;
 				}
 				continue;
 			}
 			m_ranges.push_back({read.address, end});
-			m_range_offsets.push_back(static_cast<uint32_t>(m_merged.size()));
-			m_merged.insert(m_merged.end(), bytes, bytes + read.size);
+			m_range_offsets.push_back(read.offset);
+			range_bytes = bytes;
 		}
 		m_finished = true;
 		return true;
@@ -203,8 +222,11 @@ public:
 		out.resize(merged);
 	}
 	[[nodiscard]] std::span<const uint8_t> RangeBytes(size_t index) const noexcept {
-		const auto& range = m_ranges[index];
-		return {m_merged.data() + m_range_offsets[index], range.end - range.begin};
+		const auto& range    = m_ranges[index];
+		const auto  location = m_range_offsets[index];
+		const auto* bytes    = (location & MergedBit) != 0 ? m_merged.data() + (location & ~MergedBit)
+		                                                   : m_bytes.data() + location;
+		return {bytes, range.end - range.begin};
 	}
 
 	// read(address, destination, size) -> bool: the coherent clean-backing read of the caller.
@@ -294,7 +316,9 @@ private:
 
 	std::vector<Read>             m_reads;
 	std::vector<uint8_t>          m_bytes;
-	std::vector<uint32_t>         m_order;
+	// Per range: the offset of its bytes in m_bytes, or with MergedBit in m_merged (MaxBytes keeps
+	// offsets far below it).
+	static constexpr uint32_t     MergedBit = 1u << 31u;
 	std::vector<Coherence::Range> m_ranges;
 	std::vector<uint32_t>         m_range_offsets;
 	std::vector<uint8_t>          m_merged;

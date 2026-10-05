@@ -133,6 +133,7 @@ bool     TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t 
                                       uint32_t bytes_per_element, uint32_t levels,
                                       TileSizeAlign& total_size, TileSizeOffset* level_sizes,
                                       TilePaddedSize* padded_size);
+// Omitting both mip outputs computes only the footprint, without materializing tiled mip records.
 void     TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
                             uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
                             TileSizeOffset* level_sizes, TilePaddedSize* padded_size);

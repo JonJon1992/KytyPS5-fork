@@ -365,9 +365,19 @@ struct WriteTimestampPacket {
 // structures field by field; pNext chains must be empty). Encoder and Replay call the same
 // function, from the caller's original arguments and from the rebuilt ones respectively.
 
+#if defined(KYTY_COMMAND_STREAM_TEST_HASH_COUNTS)
+// Unit-test instrumentation only. Production and benchmark builds omit this entirely.
+inline thread_local uint64_t testing_hash_calls = 0;
+#endif
+
 class Hasher {
 public:
-	explicit Hasher(Op op) noexcept { Add(static_cast<uint64_t>(op) + 0x51ed270b27ea1a3bull); }
+	explicit Hasher(Op op) noexcept {
+#if defined(KYTY_COMMAND_STREAM_TEST_HASH_COUNTS)
+		++testing_hash_calls;
+#endif
+		Add(static_cast<uint64_t>(op) + 0x51ed270b27ea1a3bull);
+	}
 	void Add(uint64_t value) noexcept {
 		m_state ^= value + 0x9e3779b97f4a7c15ull + (m_state << 6u) + (m_state >> 2u);
 		m_state *= 0xff51afd7ed558ccdull;
@@ -627,8 +637,12 @@ public:
 	void Begin(vk::CommandBuffer command, uint64_t tick, uint64_t record_ns);
 	// `submit` fields other than the digest; the encoder fills the verify digest and count.
 	void Submit(const SubmitPacket& submit);
-	// Returns the ring position just past the marker.
+	// Returns the ring position just past the marker. No production producer since
+	// CommandRecorder::Drain switched to Drain() below; only CpRecorderTests encode it. Removing
+	// the op renumbers Op (names table, verify hashes), so it is left for a protocol cleanup.
 	uint64_t DrainMarker(uint64_t serial);
+	// Producer-side drain; inline callers have already replayed their committed packets.
+	void Drain(const WaitPolicy& policy, WaitStats& stats);
 
 	void beginRendering(const vk::RenderingInfo& info);
 	void endRendering();

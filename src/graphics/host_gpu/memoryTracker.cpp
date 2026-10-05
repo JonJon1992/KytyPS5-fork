@@ -164,8 +164,10 @@ void MemoryTracker::NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept {
 }
 
 bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
-	std::scoped_lock lock(m_dirtied_mutex);
+	// The caller's set (its own thread's) is emptied before the lock: freeing its nodes would
+	// otherwise hold up the guest write faults that log under m_dirtied_mutex.
 	ranges.Clear();
+	std::scoped_lock lock(m_dirtied_mutex);
 	std::swap(ranges, m_dirtied);
 	epoch                 = m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	const bool complete   = !m_dirtied_overflow;

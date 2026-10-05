@@ -721,6 +721,22 @@ target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_lookup_memo_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineLookupMemoTests.cpp")
+target_include_directories(pipeline_lookup_memo_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(pipeline_vertex_input_state_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineVertexInputStateTests.cpp")
+target_include_directories(pipeline_vertex_input_state_tests PRIVATE ${inc_headers})
+target_link_libraries(pipeline_vertex_input_state_tests PRIVATE Vulkan::Headers)
+
+add_executable(pipeline_cold_cache_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineColdCacheTests.cpp")
+target_include_directories(pipeline_cold_cache_tests PRIVATE ${inc_headers})
+target_link_libraries(pipeline_cold_cache_tests PRIVATE Vulkan::Headers)
+
+# CPU-only mechanism benchmark; excluded from the test suite and the normal build.
+add_executable(pipeline_lookup_benchmark EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_pipeline_lookup.cpp")
+target_include_directories(pipeline_lookup_benchmark PRIVATE ${inc_headers} "${KYTY_THIRD_PARTY_DIR}/xxHash")
+target_link_libraries(pipeline_lookup_benchmark PRIVATE Vulkan::Headers xxhash)
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -937,6 +953,34 @@ add_executable(tile_hardware_reference_tests EXCLUDE_FROM_ALL
 target_link_libraries(tile_hardware_reference_tests common fmt::fmt)
 target_include_directories(tile_hardware_reference_tests PRIVATE ${inc_headers})
 
+add_executable(tile_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileSizeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp")
+target_link_libraries(tile_size_tests PRIVATE common fmt::fmt)
+target_include_directories(tile_size_tests PRIVATE ${inc_headers})
+
+add_library(tile_size_counted_format OBJECT "${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp")
+set_target_properties(tile_size_counted_format PROPERTIES EXCLUDE_FROM_ALL TRUE)
+target_link_libraries(tile_size_counted_format PRIVATE common fmt::fmt)
+target_include_directories(tile_size_counted_format PRIVATE ${inc_headers})
+target_compile_definitions(tile_size_counted_format PRIVATE NumBytesPerElement=TileSizeUncachedNumBytesPerElement)
+add_executable(tile_size_reuse_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileSizeReuseTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	$<TARGET_OBJECTS:tile_size_counted_format>)
+target_link_libraries(tile_size_reuse_tests PRIVATE common fmt::fmt)
+target_include_directories(tile_size_reuse_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(tile_size_reuse_tests PRIVATE Threads::Threads)
+endif()
+
+add_executable(pm4_dump_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Pm4DumpTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4.cpp")
+target_link_libraries(pm4_dump_tests PRIVATE common fmt::fmt)
+target_include_directories(pm4_dump_tests PRIVATE ${inc_headers})
+
 # CP recorder command stream (renderer/commandStream.h): ring, encoder, replay and verify mode,
 # without a Vulkan device (KYTY_CP_RECORDER).
 add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
@@ -945,8 +989,20 @@ add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(cp_recorder_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(cp_recorder_tests PRIVATE ${inc_headers})
+target_compile_definitions(cp_recorder_tests PRIVATE KYTY_COMMAND_STREAM_TEST_HASH_COUNTS=1)
+
+# Uses the production stream flags, without the unit-test hash counter.
+add_executable(cp_recorder_benchmark EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpRecorderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp")
+target_link_libraries(cp_recorder_benchmark PRIVATE common fmt::fmt Vulkan::Headers)
+target_include_directories(cp_recorder_benchmark PRIVATE ${inc_headers})
+
+add_executable(command_pool_reuse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommandPoolReuseTests.cpp")
+target_include_directories(command_pool_reuse_tests PRIVATE "${KYTY_SOURCE_DIR}")
 if(LINUX)
 	target_link_libraries(cp_recorder_tests Threads::Threads)
+	target_link_libraries(cp_recorder_benchmark PRIVATE Threads::Threads)
 endif()
 
 # P3 op stream (command_processor/cpOps.h): every op kind through the op ring, wrap-around and a
@@ -1100,8 +1156,15 @@ if(BUILD_TESTING)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME tile_hardware_reference COMMAND $<TARGET_FILE:tile_hardware_reference_tests>)
+	add_test(NAME tile_size COMMAND $<TARGET_FILE:tile_size_tests>)
+	add_test(NAME tile_size_reuse COMMAND $<TARGET_FILE:tile_size_reuse_tests>)
+	set_tests_properties(tile_size_reuse PROPERTIES TIMEOUT 30)
+	add_test(NAME pm4_dump COMMAND $<TARGET_FILE:pm4_dump_tests>)
+	set_tests_properties(tile_size pm4_dump PROPERTIES TIMEOUT 30)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
+	add_test(NAME command_pool_reuse COMMAND $<TARGET_FILE:command_pool_reuse_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
+	set_tests_properties(cp_recorder command_pool_reuse cp_sequencer PROPERTIES TIMEOUT 30)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
@@ -1143,6 +1206,9 @@ if(BUILD_TESTING)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME pipeline_cold_cache COMMAND $<TARGET_FILE:pipeline_cold_cache_tests>)
+	add_test(NAME pipeline_lookup_memo COMMAND $<TARGET_FILE:pipeline_lookup_memo_tests>)
+	add_test(NAME pipeline_vertex_input_state COMMAND $<TARGET_FILE:pipeline_vertex_input_state_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
 	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
@@ -2048,6 +2114,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
 	set_tests_properties(async_pipeline PROPERTIES TIMEOUT 90
 		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=20;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_memo_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_memo_off PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_PIPELINE_MEMO=0;KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=20;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
 	add_test(NAME async_pipeline_wait_publication
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
 	set_tests_properties(async_pipeline_wait_publication PROPERTIES TIMEOUT 90
@@ -2208,6 +2278,12 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		tile_size_tests pm4_dump_tests
+		tile_size_reuse_tests
+		command_pool_reuse_tests
+		pipeline_cold_cache_tests
+		pipeline_lookup_memo_tests
+		pipeline_vertex_input_state_tests
 		buffer_robustness_tests
 		http_wait_request_tests
 		av_player_sync_tests

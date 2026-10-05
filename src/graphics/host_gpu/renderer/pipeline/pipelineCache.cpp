@@ -21,6 +21,9 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLookupMemo.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBlendState.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrefetchAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
@@ -3824,6 +3827,7 @@ struct PipelineCache::PrefetchState {
 	struct Pending {
 		std::future<Result> future;
 		uint64_t ticket;
+		bool required = false;
 	};
 	explicit PrefetchState(PipelineCache& owner, size_t threads)
 	    : cache(owner), queue(threads, 128) {}
@@ -3837,8 +3841,9 @@ struct PipelineCache::PrefetchState {
 			ReleasePipelineLayout(cache.m_graphics, result.pipeline->pipeline_layout,
 			                      result.pipeline->descriptor_set_layout);
 		}
-		PipelineCacheLog("Pipeline prefetch: submitted {}, used {}, unused {}; worker compile {} ms, "
+		PipelineCacheLog("Pipeline prefetch: submitted {}, used {}, unused {}, retired {}, saturated {}; worker compile {} ms, "
 		                 "CP wait {} ms (worst {} ms)", submitted.load(), used.load(), pending.size(),
+		                 retired.load(), saturated.load(),
 		                 compile_ns.load() / 1000000, wait_ns.load() / 1000000, max_wait_ns.load() / 1000000);
 	}
 	void Stop() {
@@ -3851,7 +3856,33 @@ struct PipelineCache::PrefetchState {
 	void Request(const GraphicsPipelineKey& key, const ShaderVertexInputInfo& vertex,
 	             const ShaderPixelInputInfo* pixel, const GraphicsPrograms& programs) {
 		std::lock_guard lock(mutex);
-		if (stopped || pending.size() >= 128 || pending.contains(key)) return;
+		if (stopped || pending.contains(key)) return;
+		if (pending.size() >= 128) {
+			static const bool reclaim = EnvU64("KYTY_PIPELINE_PREFETCH_RECLAIM", 1) != 0;
+			// Only a finished task makes an entry retirable (new entries are unfinished; Reserve
+			// and Take only remove candidates): a scan that found none holds until the next one
+			// finishes, so a backlog does not poll every future on each request under the mutex.
+			auto       oldest      = pending.end();
+			const auto completions = finished.load(std::memory_order_acquire);
+			if (reclaim && completions != scanned_completions) {
+				oldest = FindCompletedPrefetchToRetire(pending);
+				if (oldest == pending.end()) {
+					scanned_completions = completions;
+				}
+			}
+			if (oldest == pending.end()) {
+				saturated.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			// This object was never published or used in a command buffer. The worker has
+			// completed, and no consuming draw owns it, so its Vulkan resources can die now.
+			auto unused = oldest->second.future.get();
+			cache.m_graphics.device.destroyPipeline(unused.pipeline->pipeline, nullptr);
+			ReleasePipelineLayout(cache.m_graphics, unused.pipeline->pipeline_layout,
+			                      unused.pipeline->descriptor_set_layout);
+			pending.erase(oldest);
+			retired.fetch_add(1, std::memory_order_relaxed);
+		}
 		// Interface/resource arrays are copied. Compiled program metadata and shader modules
 		// are immutable and owned by ProgramCache until after Stop has joined every task.
 		auto task = std::make_shared<std::packaged_task<Result()>>(
@@ -3878,10 +3909,24 @@ struct PipelineCache::PrefetchState {
 		    });
 		auto future = task->get_future();
 		const auto ticket = ++next_ticket;
-		if (queue.Submit([task] { (*task)(); }, ticket)) {
+		// Counted once the future is ready (the packaged task has stored its result).
+		if (queue.Submit(
+		        [this, task] {
+			        (*task)();
+			        finished.fetch_add(1, std::memory_order_release);
+		        },
+		        ticket)) {
 			pending.emplace(key, Pending {std::move(future), ticket});
 			submitted.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			saturated.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+	// Called while the pipeline-map lock still excludes new speculative requests. Protects
+	// the exact result between releasing that lock and Take acquiring the pending-map lock.
+	void Reserve(const GraphicsPipelineKey& key) {
+		std::lock_guard lock(mutex);
+		if (auto it = pending.find(key); it != pending.end()) it->second.required = true;
 	}
 	Result Take(const GraphicsPipelineKey& key) {
 		std::future<Result> future;
@@ -3916,7 +3961,11 @@ struct PipelineCache::PrefetchState {
 	uint64_t next_ticket = 0;
 	std::unordered_map<GraphicsPipelineKey, Pending, GraphicsPipelineKeyHash> pending;
 	std::atomic<uint64_t> submitted {0}, used {0}, compile_ns {0}, wait_ns {0}, max_wait_ns {0};
-	PipelineCompileQueue queue;
+	std::atomic<uint64_t> retired {0}, saturated {0};
+	// Tasks whose future is ready, and the count at the last retire scan that found none (mutex).
+	std::atomic<uint64_t> finished {0};
+	uint64_t              scanned_completions = 0;
+	PipelineCompileQueue queue; // last: joins its workers before the members above are destroyed
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -4450,6 +4499,7 @@ void RecordLibraryPipeline(const GraphicsPipelineLibrary::Result& result, std::s
 //   0 is BlendFactor::kZero / BlendOp::kAdd, which GetBlendFactor/GetBlendOp accept.
 // - Alpha factors and op with separate alpha blending off: CreatePipelineInternal then copies the
 //   color factors and op into the alpha ones and never reads these.
+// - Factors for MIN/MAX blend operations: the Vulkan equation uses the components directly.
 // - The depth-bounds test without a depth/stencil attachment: CreatePipelineInternal passes no
 //   VkPipelineDepthStencilStateCreateInfo at all (pDepthStencilState is null).
 // - Depth-bounds min/max while the test is disabled: they are only inputs of that test.
@@ -4462,6 +4512,8 @@ void RecordLibraryPipeline(const GraphicsPipelineLibrary::Result& result, std::s
 // (set per draw from the same registers) and leave the key entirely.
 void NormalizePipelineKey(PipelineStaticParameters& params, bool with_depth) {
 	if (PipelineKeyNormalizationEnabled()) {
+		static const bool normalize_minmax = EnvU64("KYTY_PIPELINE_BLEND_MINMAX_NORMALIZE", 1) != 0;
+		if (normalize_minmax) NormalizeMinMaxBlendFactors(params);
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if (!params.blend_enable[slot]) {
 				params.color_srcblend[slot]       = 0;
@@ -4788,13 +4840,9 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 
 void PipelineCache::PipelineKeyHash::MixStaticParams(std::size_t& hash,
                                                     const PipelineStaticParameters& params) {
-	if (Common::RendererBatchEnabled()) {
-		// Equality already compares this exact byte representation, including padding.
-		Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
-		return;
-	}
-	const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-	for (std::size_t i = 0; i < sizeof(params); ++i) Mix(hash, bytes[i]);
+	// Packed, padding-free parameters; equality compares exactly these bytes. This hash only
+	// indexes in-memory maps, so it need not depend on renderer batching or the disk cache.
+	Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 }
 
 ShaderProgram PipelineCache::PlainPixelProgram(const StagePrep& prep) {
@@ -5040,26 +5088,22 @@ PipelineCache::PlanLookup PipelineCache::FindGraphicsPipelineForPlan(
 	                              primitive_restart_enable, programs, false, key)) {
 		return PlanLookup::Unsupported;
 	}
-	// A per-thread memo of the keys this thread found. An entry keeps the generation its object
-	// was found under: while it is unchanged the map still holds that object for the key (objects
-	// are never freed, a replacement bumps the generation, and every cache instance counts its
-	// generations in a range of its own). It points at the map's own key: map nodes are never
-	// erased and their keys never change, so the key is read only while the generation proves the
-	// entry is this cache's.
-	struct Remembered {
-		const PipelineCache*       cache      = nullptr;
-		const GraphicsPipelineKey* key        = nullptr;
-		const Pipeline*            pipeline   = nullptr;
-		uint64_t                   generation = 0;
-		std::size_t                hash       = 0;
-	};
-	static thread_local std::array<Remembered, 1024> memo {};
-	const auto hash    = GraphicsPipelineKeyHash {}(key);
-	auto&      entry   = memo[hash % memo.size()];
+	return FindGraphicsPipelineForPlan(key, pipeline, generation);
+}
+
+PipelineCache::PlanLookup PipelineCache::FindGraphicsPipelineForPlan(
+    const GraphicsPipelineKey& key, const Pipeline*& pipeline, uint64_t& generation) {
+	pipeline = nullptr;
+	static thread_local PipelineLookupMemo<GraphicsPipelineKey, const Pipeline> memo;
 	const auto current = m_pipeline_generation.load(std::memory_order_acquire);
-	if (entry.cache == this && entry.generation == current && entry.hash == hash &&
-	    entry.key != nullptr && *entry.key == key) {
-		pipeline   = entry.pipeline;
+	if (auto* found = memo.FindLast(this, current, key)) {
+		pipeline   = found;
+		generation = current;
+		return PlanLookup::Found;
+	}
+	const auto hash = GraphicsPipelineKeyHash {}(key);
+	if (auto* found = memo.Find(this, current, key, hash)) {
+		pipeline   = found;
 		generation = current;
 		return PlanLookup::Found;
 	}
@@ -5089,11 +5133,7 @@ PipelineCache::PlanLookup PipelineCache::FindGraphicsPipelineForPlan(
 	if (found == nullptr) {
 		return PlanLookup::Absent;
 	}
-	entry.cache      = this;
-	entry.key        = found_key;
-	entry.pipeline   = found;
-	entry.generation = found_generation;
-	entry.hash       = hash;
+	memo.Remember(this, found_generation, *found_key, *found, hash);
 	pipeline         = found;
 	generation       = found_generation;
 	return PlanLookup::Found;
@@ -5109,7 +5149,8 @@ PipelineCache::PrefetchTotals PipelineCache::GetPrefetchTotals() const {
 	if (m_prefetch == nullptr) return {};
 	return {m_prefetch->submitted.load(), m_prefetch->used.load(), m_prefetch->compile_ns.load(),
 	        m_prefetch->wait_ns.load(), m_prefetch->max_wait_ns.load(),
-	        m_program_cache->speculative_programs.load()};
+	        m_program_cache->speculative_programs.load(), m_prefetch->retired.load(),
+	        m_prefetch->saturated.load()};
 }
 
 bool PipelineCache::PipelinePrefetchEnabled() const noexcept {
@@ -5126,13 +5167,13 @@ void PipelineCache::PrefetchGraphicsPipeline(const PipelineTargets& targets, con
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
 	if (!PipelinePrefetchEnabled() || programs.VertexStageCount() != 1 ||
 	    topology == vk::PrimitiveTopology::ePatchList || graphics_debug_dump_enabled()) return;
-	const Pipeline* pipeline = nullptr;
-	uint64_t generation = 0;
-	if (FindGraphicsPipelineForPlan(targets, ctx, user_config, vertex_info, pixel_info,
-	    topology, primitive_restart_enable, programs, pipeline, generation) != PlanLookup::Absent) return;
 	GraphicsPipelineKey key {};
 	if (!BuildGraphicsPipelineKey(targets, ctx, user_config, vertex_info, pixel_info, topology,
-	    primitive_restart_enable, programs, false, key) || !m_mutex.TryLock()) return;
+	    primitive_restart_enable, programs, false, key)) return;
+	const Pipeline* pipeline = nullptr;
+	uint64_t generation = 0;
+	if (FindGraphicsPipelineForPlan(key, pipeline, generation) != PlanLookup::Absent ||
+	    !m_mutex.TryLock()) return;
 	// Recheck under the map lock: CP creation cannot race a speculative request into a second job.
 	if (!m_graphics_pipelines.contains(key)) m_prefetch->Request(key, vertex_info, pixel_info, programs);
 	m_mutex.Unlock();
@@ -5218,38 +5259,35 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	                               programs, true, key);
 	NoteExecOnNoop(depth, ps_input_info);
 
-	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
-	// the comparison is the map's own key equality, and pipeline objects are never destroyed
-	// before the cache is; an object replaced by an optimized build (pipeline libraries) bumps
-	// m_pipeline_generation, which invalidates every memo.
+	// KYTY_PIPELINE_MEMO: consecutive keys skip hashing; recurring keys skip the map lock.
+	// Only fully published pipelines enter the memo. Generation checks invalidate replacements
+	// and cache destruction before any remembered map key can be dereferenced.
 	static const bool memo_enabled = [] {
 		const auto* value = std::getenv("KYTY_PIPELINE_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
-	struct LastPipeline {
-		const PipelineCache* cache      = nullptr;
-		Pipeline*            pipeline   = nullptr;
-		uint64_t             generation = 0;
-		GraphicsPipelineKey  key {};
-	};
-	static thread_local LastPipeline last;
+	static thread_local PipelineLookupMemo<GraphicsPipelineKey, Pipeline> memo;
+	std::size_t key_hash = 0;
 	if (memo_enabled) {
-		if (last.cache == this && last.pipeline != nullptr &&
-		    last.generation == m_pipeline_generation.load(std::memory_order_acquire) &&
-		    last.key == key) {
+		const auto generation = m_pipeline_generation.load(std::memory_order_acquire);
+		if (auto* found = memo.FindLast(this, generation, key)) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
 			FlushCompileStall();
-			return last.pipeline;
+			return found;
+		}
+		key_hash = GraphicsPipelineKeyHash {}(key);
+		if (auto* found = memo.Find(this, generation, key, key_hash)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
+			FlushCompileStall();
+			return found;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
 	}
 	// Called with m_mutex held, so the generation read matches the object found.
-	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
+	const auto remember = [&](const GraphicsPipelineKey& stored_key, Pipeline& pipeline) -> Pipeline& {
 		if (memo_enabled) {
-			last.cache      = this;
-			last.pipeline   = &pipeline;
-			last.generation = m_pipeline_generation.load(std::memory_order_relaxed);
-			last.key        = key;
+			memo.Remember(this, m_pipeline_generation.load(std::memory_order_relaxed),
+			              stored_key, pipeline, key_hash);
 		}
 		FlushCompileStall();
 		return pipeline;
@@ -5290,11 +5328,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		{
 			Common::LockGuard lock(m_mutex);
 			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-				return &remember(*iter->second);
+				return &remember(iter->first, *iter->second);
 			}
 			// Reserve the key before releasing the map. Other preparation threads may submit
 			// independent keys while this draw waits, allowing compiles to overlap each other.
 			if (PipelinePrefetchEnabled()) m_prefetch->Request(key, vs_input_info, ps_input_info, programs);
+			m_prefetch->Reserve(key);
 		}
 		wait_begin = CompileClockNs();
 		ready = m_prefetch->Take(key);
@@ -5309,7 +5348,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			                      ready.pipeline->descriptor_set_layout);
 			m_prefetch->Complete(key);
 		}
-		return &remember(*iter->second);
+		return &remember(iter->first, *iter->second);
 	}
 	const auto create_begin = wait_begin != 0 ? wait_begin : CompileClockNs();
 
@@ -5396,10 +5435,11 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		job.setup_ns   = setup_ns;
 		job.detail     = detail.empty() ? "async" : "async " + detail;
 		AddCompileStall(setup_ns);
+		const auto* stored_key = &iter->first;
 		auto& target = *iter->second;
 		if (m_async->Enqueue(job)) {
 			if (WaitForQueuedPipeline(target)) {
-				return &remember(target);
+				return &remember(*stored_key, target);
 			}
 			m_async->deferred_draws.fetch_add(1, std::memory_order_relaxed);
 			FlushCompileStall();
@@ -5415,7 +5455,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		iter->second->pipeline = created;
 		iter->second->pending  = false;
-		return &remember(*iter->second);
+		return &remember(iter->first, *iter->second);
 	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -5473,7 +5513,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 	AddCompileStall(create_ns);
 	if (!prefetched) NotePipelineCreated(create_ns);
-	return &remember(*iter->second);
+	return &remember(iter->first, *iter->second);
 }
 
 PipelineCache::Pipeline&

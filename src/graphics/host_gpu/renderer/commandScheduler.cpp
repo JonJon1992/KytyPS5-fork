@@ -10,6 +10,7 @@
 #include "common/rendererBatch.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandPoolReuse.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
@@ -80,35 +81,20 @@ size_t CommandScheduler::CommandPool::Grow() {
 }
 
 vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
-	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
-		for (size_t index = begin; index < end; ++index) {
-			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
-				return index;
-			}
-		}
-		return std::nullopt;
-	};
-
-	auto found = search(m_hint, m_ticks.size());
-	if (!found) {
+	// Reuse any slot already known to be retired before querying the driver's timeline.
+	auto found = FindReusableCommandSlot(m_ticks, m_hint, m_master.KnownGpuTick(), [this] {
 		m_master.Refresh();
-		gpu_tick = m_master.KnownGpuTick();
-		found    = search(m_hint, m_ticks.size());
-	}
-	if (!found) {
-		found = search(0, m_hint);
-	}
+		return m_master.KnownGpuTick();
+	});
 	if (!found) {
 		if (m_recorder != nullptr) {
 			// vkAllocateCommandBuffers needs the pool the recorder may be recording from.
 			m_recorder->Drain(nullptr, false);
 		}
-		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		found = Grow();
 	}
 
+	m_ticks[*found] = m_master.CurrentTick();
 	m_hint = (*found + 1) % m_ticks.size();
 	return m_buffers[*found];
 }

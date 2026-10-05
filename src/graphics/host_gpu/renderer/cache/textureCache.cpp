@@ -397,7 +397,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		LOGF("Image lookup: first-page exact search\n");
 	}
 	const auto* dirty_query = std::getenv("KYTY_DIRTY_IMAGE_QUERY");
-	m_direct_dirty_image_query = dirty_query != nullptr && std::strcmp(dirty_query, "direct") == 0;
+	// The direct search of a one-page query applies FindImagesInRegion's filter to the page's owner
+	// list, where an image appears once, so it finds the same images. =legacy uses the region search.
+	m_direct_dirty_image_query = dirty_query == nullptr || std::strcmp(dirty_query, "legacy") != 0;
 	const auto* clean_proofs = std::getenv("KYTY_TEXTURE_CLEAN_PROOFS");
 	m_clean_image_proofs = clean_proofs != nullptr && std::strcmp(clean_proofs, "1") == 0;
 	if (m_direct_dirty_image_query) {
@@ -760,8 +762,23 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	// The registered range grows. For everything keyed on the page owner index (clean-page
 	// proofs, lookups, binding identity caches) this is an unregister and a register.
 	const bool registered = image.registered;
-	const auto old_end    = image.live.End();
+	const auto old_live   = image.live;
+	const auto old_end    = old_live.End();
+	// Lock-free readers of the page counts (NoImagesOnPages: IsRegionGpuModified, the fault and
+	// GPU-write fast paths) must not see these pages empty between the unregister and the
+	// register below, which may wait for a sparse bind: the old range stays counted until the new
+	// one is, so they take m_lock and find the image registered again.
+	const auto pin_pages = [this, &old_live](bool pin) {
+		ForEachPage(old_live.address, old_live.size, [this, pin](uint64_t page) {
+			if (pin) {
+				m_image_page_counts[page].fetch_add(1, std::memory_order_seq_cst);
+			} else {
+				m_image_page_counts[page].fetch_sub(1, std::memory_order_seq_cst);
+			}
+		});
+	};
 	if (registered) {
+		pin_pages(true);
 		UnregisterImage(id);
 	}
 	image.resident_first = new_first;
@@ -773,6 +790,7 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	}
 	if (registered) {
 		RegisterImage(id);
+		pin_pages(false);
 	}
 	// The newly registered bytes were outside every overlap resolution so far: an image created
 	// there meanwhile (the partially resident one was invisible to its lookup) now overlaps this
@@ -1425,6 +1443,51 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		});
 	});
 	return result;
+}
+
+bool TextureCache::AnyImageInRegion(uint64_t address, uint64_t size, bool page_overlap) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return false;
+	}
+	for (auto page = pages.first; page < pages.last_exclusive; ++page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr) {
+			continue;
+		}
+		for (const auto id: *owners) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->Overlaps(address, size, page_overlap)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+template <typename Accept>
+ImageId TextureCache::FindOnFirstPage(const GuestRange& data, bool last, Accept&& accept) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(data.address, data.size, pages)) {
+		return {};
+	}
+	const auto* owners = m_image_page_table.Find(pages.first);
+	if (owners == nullptr) {
+		return {};
+	}
+	ImageId found {};
+	for (const auto id: *owners) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->Overlaps(data.address, data.size, false) ||
+		    !accept(id, *image)) {
+			continue;
+		}
+		found = id;
+		if (!last) {
+			break;
+		}
+	}
+	return found;
 }
 
 ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
@@ -2682,7 +2745,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	};
 	{
 		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (AnyImageInRegion(range.address, range.size, false)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
@@ -2753,7 +2816,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 			case Support::Format: return Event::DccFallbackFormat;
 			case Support::Unsupported: return Event::DccFallbackUnsupported;
 		}
-		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+		if (AnyImageInRegion(range.address, range.size, false)) {
 			return Event::DccFallbackMetadataAliased;
 		}
 		return std::nullopt;
@@ -2988,7 +3051,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		MetadataNoop decided;
 		if (known) {
 			std::scoped_lock lock {m_lock};
-			unaliased = FindImagesInRegion(range.address, range.size, false).empty();
+			unaliased = !AnyImageInRegion(range.address, range.size, false);
 			pages     = noop != nullptr && CaptureMetadataPages(range, decided);
 		}
 		const uint32_t known_byte = known ? (*known & 0xffu) : 0u;
@@ -3076,7 +3139,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 							                                          image->info.data.size)
 							             ? 32u
 							             : 0u) |
-							        (!FindImagesInRegion(range.address, range.size, false).empty()
+							        (AnyImageInRegion(range.address, range.size, false)
 							             ? 64u
 							             : 0u);
 							native_format = static_cast<uint32_t>(image->backing.format);
@@ -3289,15 +3352,23 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		    {range.address + slice_size * metadata_base_layer, slice_size * view.layer_count},
 		    decided);
 	}
-	// Slices whose GPU-owned bytes only a native inspection or a readback can decide.
-	std::vector<uint8_t> native(view.layer_count, 0);
+	// Slices whose GPU-owned bytes only a native inspection or a readback can decide (on the stack
+	// for the usual few layers: this runs on every lookup of a target with a valid CMASK).
+	std::array<uint8_t, 8> native_inline {};
+	std::vector<uint8_t>   native_heap;
+	if (view.layer_count > native_inline.size()) {
+		native_heap.assign(view.layer_count, 0);
+	}
+	const std::span<uint8_t> native = native_heap.empty()
+	                                      ? std::span<uint8_t>(native_inline.data(), view.layer_count)
+	                                      : std::span<uint8_t>(native_heap);
 	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
 		const GuestRange metadata {range.address + slice_size * (metadata_base_layer + slice),
 		                           slice_size};
 		{
 			std::scoped_lock lock {m_lock};
 			// Bytes some image also covers are not proven to be this surface's CMASK.
-			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
+			if (AnyImageInRegion(metadata.address, metadata.size, false)) {
 				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
 				continue;
 			}
@@ -3326,7 +3397,9 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			}
 		} else {
 			provable = false;
-			std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+			// Reused (GPU thread, nothing below re-enters): guest-owned slices repeat every draw.
+			auto& words = m_cmask_words;
+			words.resize(metadata.size / sizeof(uint32_t));
 			if (LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size) &&
 			    std::all_of(words.begin(), words.end(),
 			                [first = words.front()](uint32_t word) { return word == first; })) {
@@ -3467,14 +3540,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
-	ImageId association {};
-	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
-		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data == stencil &&
-		    owner->info.extent == depth.info.extent) {
-			association = id;
-		}
-	}
+	// The last such image, as a scan of FindImagesInRegion(stencil) that keeps every match.
+	ImageId association = FindOnFirstPage(stencil, true, [&](ImageId, const Image& owner) {
+		return owner.info.data == stencil && owner.info.extent == depth.info.extent;
+	});
 	if (!association) {
 		ImageInfo info {};
 		info.data   = stencil;
@@ -3909,12 +3978,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc,
 	// KYTY_ALIAS_BYTES: the draw can write only inside its scissor. The target owns the 64 KiB
 	// blocks under it; other images keep the rest of its range.
 	WriteClaim claim;
-	// KYTY_CP_COMMIT=targetalloc: the block list is a reused member (m_lock held), so an empty one
-	// costs no heap allocation (a std::map allocates its head node when constructed).
-	std::optional<RangeSet> local_blocks;
-	RangeSet&               blocks = CpCommit::Enabled(CpCommit::Part::TargetAlloc)
-	                                     ? m_claim_blocks
-	                                     : local_blocks.emplace();
+	// The block list is a reused member (m_lock held), so an empty one costs no heap allocation (a
+	// std::map allocates its head node when constructed). Formerly KYTY_CP_COMMIT=targetalloc only.
+	RangeSet& blocks = m_claim_blocks;
 	blocks.Clear();
 	if (written != nullptr && AliasBytesEnabled() && !image.OwnsAllBytes()) {
 		auto rect = ClampRect(*written, image.info.extent.width, image.info.extent.height);
@@ -3953,14 +4019,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasMetadata()) {
 		const MetaDataInfo entry {.type       = MetaDataInfo::Type::HTile,
 		                          .clear_mask = image.info.htile_clear_mask};
-		bool inserted = false;
-		if (CpCommit::Enabled(CpCommit::Part::TargetAlloc)) {
-			// Inserts exactly when emplace would (the key is absent), without building and freeing
-			// a node every draw when it is present.
-			inserted = m_surface_metas.try_emplace(desc.info.metadata.range.address, entry).second;
-		} else {
-			inserted = m_surface_metas.emplace(desc.info.metadata.range.address, entry).second;
-		}
+		// Inserts exactly when emplace would (the key is absent), without building and freeing a
+		// node every draw when it is present.
+		const bool inserted =
+		    m_surface_metas.try_emplace(desc.info.metadata.range.address, entry).second;
 		// The only insertion into m_surface_metas (EraseSurfaceMeta). Every draw with this target
 		// asks again; only an added entry is a change (KYTY_META_CLEAR_MEMO's generation).
 		m_surface_meta_inserts += inserted ? 1u : 0u;
@@ -4022,63 +4084,64 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 	}
 	// A kept alias (same memory, another format) is stale when another interpretation wrote the
 	// memory since. Reinterpret the owner's contents, as the recreate path used to, and take over.
-	for (const auto other_id: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
-		const auto* other = m_slot_images.try_get(other_id);
-		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
-		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
-		    other->info.HasStencil() || other->info.data != image.info.data ||
-		    other->info.extent != image.info.extent ||
-		    other->backing.samples != image.backing.samples) {
-			continue;
-		}
-		++m_lookup_side_effects;
-		// Taking over the owner's contents makes this image GPU-owned: whole chain.
-		RequireFullResidency(id);
-		const auto trace_sync = [&](const char* reason, uint64_t bytes) {
-			HangTrace::RecordTransfer(HangTrace::TransferKind::AliasSync, reason, "",
-			                          image.info.data.address,
-			                          static_cast<uint32_t>(image.backing.format),
-			                          image.info.extent.width, image.info.extent.height, bytes, 0);
-		};
-		if (AliasBytesEnabled() && !other->OwnsAllBytes()) {
-			// The owner holds only some of the bytes (it wrote part of the range, or other writes
-			// took the rest): its contents are current only there. Its bytes go through the
-			// buffer, and this alias is rebuilt from there.
-			const auto moved = MaterializeOwnedBytes(image.info.data, other_id, {}, "alias-sync");
-			image.MarkBufferModified();
-			trace_sync("partial-owner", moved);
-			return;
-		}
-		// Skip the copy when this alias already holds exactly the owner's native bits: its last
-		// contents came from a lossless full copy of the owner (or the other way round) and
-		// neither image has been written since. Ownership moves exactly as after a copy.
-		if (AliasSyncSkipEnabled() && image.ContentSerial() != 0 &&
-		    image.ContentSerial() == other->ContentSerial() && !image.IsCpuDirty() &&
-		    !image.IsBufferModified()) {
-			// A CPU-dirty owner is refreshed first, exactly as CopyImage would; that upload is
-			// a write and gives it a new serial.
-			RefreshCopySource(other_id);
-			const auto& owner = m_slot_images[other_id];
-			if (image.ContentSerial() == owner.ContentSerial() && owner.IsGpuModified() &&
-			    !owner.IsBufferModified() && !image.IsCpuDirty() && !image.IsBufferModified()) {
-				const auto serial = owner.ContentSerial();
-				TrackImage(id);
-				CommitGpuWrite(image);
-				image.AdoptContentSerial(serial);
-				Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncSkips);
-				trace_sync("skip-same-contents", 0);
-				return;
-			}
-		}
-		const bool lossless = CopyImage(id, other_id, "alias-sync");
-		CommitGpuWrite(image);
-		if (lossless && AliasSyncSkipEnabled()) {
-			image.AdoptContentSerial(m_slot_images[other_id].ContentSerial());
-		}
-		Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncCopies);
-		trace_sync("copy", image.info.data.size);
+	// The first such owner FindImagesInRegion(image.info.data) would return (it must have the same
+	// backing range, so it is on the first page).
+	const auto other_id =
+	    FindOnFirstPage(image.info.data, false, [&](ImageId candidate, const Image& other) {
+		    return candidate != id && other.registered && !other.depth_id && other.alias_owner &&
+		           other.IsGpuModified() && !other.IsBufferModified() && !other.info.HasStencil() &&
+		           other.info.data == image.info.data && other.info.extent == image.info.extent &&
+		           other.backing.samples == image.backing.samples;
+	    });
+	if (!other_id) {
 		return;
 	}
+	const auto* other = m_slot_images.try_get(other_id);
+	++m_lookup_side_effects;
+	// Taking over the owner's contents makes this image GPU-owned: whole chain.
+	RequireFullResidency(id);
+	const auto trace_sync = [&](const char* reason, uint64_t bytes) {
+		HangTrace::RecordTransfer(HangTrace::TransferKind::AliasSync, reason, "",
+		                          image.info.data.address, static_cast<uint32_t>(image.backing.format),
+		                          image.info.extent.width, image.info.extent.height, bytes, 0);
+	};
+	if (AliasBytesEnabled() && !other->OwnsAllBytes()) {
+		// The owner holds only some of the bytes (it wrote part of the range, or other writes
+		// took the rest): its contents are current only there. Its bytes go through the
+		// buffer, and this alias is rebuilt from there.
+		const auto moved = MaterializeOwnedBytes(image.info.data, other_id, {}, "alias-sync");
+		image.MarkBufferModified();
+		trace_sync("partial-owner", moved);
+		return;
+	}
+	// Skip the copy when this alias already holds exactly the owner's native bits: its last
+	// contents came from a lossless full copy of the owner (or the other way round) and
+	// neither image has been written since. Ownership moves exactly as after a copy.
+	if (AliasSyncSkipEnabled() && image.ContentSerial() != 0 &&
+	    image.ContentSerial() == other->ContentSerial() && !image.IsCpuDirty() &&
+	    !image.IsBufferModified()) {
+		// A CPU-dirty owner is refreshed first, exactly as CopyImage would; that upload is
+		// a write and gives it a new serial.
+		RefreshCopySource(other_id);
+		const auto& owner = m_slot_images[other_id];
+		if (image.ContentSerial() == owner.ContentSerial() && owner.IsGpuModified() &&
+		    !owner.IsBufferModified() && !image.IsCpuDirty() && !image.IsBufferModified()) {
+			const auto serial = owner.ContentSerial();
+			TrackImage(id);
+			CommitGpuWrite(image);
+			image.AdoptContentSerial(serial);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncSkips);
+			trace_sync("skip-same-contents", 0);
+			return;
+		}
+	}
+	const bool lossless = CopyImage(id, other_id, "alias-sync");
+	CommitGpuWrite(image);
+	if (lossless && AliasSyncSkipEnabled()) {
+		image.AdoptContentSerial(m_slot_images[other_id].ContentSerial());
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncCopies);
+	trace_sync("copy", image.info.data.size);
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
@@ -5065,7 +5128,7 @@ bool TextureCache::SkipGpuWriteImageWalk(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyChecks);
 	m_gpu_write_skip_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
-	if (FindImagesInRegion(address, size, true).empty()) {
+	if (!AnyImageInRegion(address, size, true)) {
 		return false;
 	}
 	// Under m_lock a findable image's pages are counted: uncounted pages here are a broken
@@ -5366,6 +5429,11 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
+	// No image registered on these pages (lock-free page counts, NoImagesOnPages): nothing to find.
+	// Runs for every clean-read verdict miss, mostly on pages without images.
+	if (m_fault_fast_path && NoImagesOnPages(address, size)) {
+		return false;
+	}
 	std::scoped_lock lock {m_lock};
 	// A negative proof covers one complete 4 KiB page, while the owner index uses
 	// 1 MiB pages. Dirty neighboring bytes only prevent caching: the exact query
@@ -5464,8 +5532,11 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	return found != m_surface_metas.end();
+	return IsMetaLocked(address);
+}
+
+bool TextureCache::IsMetaLocked(uint64_t address) const {
+	return m_surface_metas.contains(address);
 }
 
 // Live switch (common/liveSwitch.h). Every change of m_surface_metas bumps m_surface_meta_generation
@@ -5516,7 +5587,11 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 
 bool TextureCache::ClearMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
+	return ClearMetaLocked(address);
+}
+
+bool TextureCache::ClearMetaLocked(uint64_t address) {
+	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}

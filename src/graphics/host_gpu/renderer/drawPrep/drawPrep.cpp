@@ -1238,20 +1238,11 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
 	        m_workers->window.Head() != position);
-	const std::function<void(Slot&)> patch = [submit_id, instance_count](Slot& slot) {
-		slot.submit_id = submit_id;
-		if (instance_count != UINT32_MAX) {
-			if (slot.kind == DrawKind::Index) {
-				slot.index_args.instance_count = instance_count;
-			} else {
-				slot.auto_args.instance_count = instance_count;
-			}
-		}
-	};
+	const HeadPatch patch {submit_id, instance_count};
 	CommitHead(&patch);
 }
 
-void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
+void Engine::CommitHead(const HeadPatch* patch) {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
 	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
@@ -1344,7 +1335,14 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	}
 	if (patch != nullptr) {
 		// The preparation (and the preparing thread's reads of the slot) is complete.
-		(*patch)(slot);
+		slot.submit_id = patch->submit_id;
+		if (patch->instance_count != UINT32_MAX) {
+			if (slot.kind == DrawKind::Index) {
+				slot.index_args.instance_count = patch->instance_count;
+			} else {
+				slot.auto_args.instance_count = patch->instance_count;
+			}
+		}
 	}
 	Commit(slot);
 	window.Retire();
@@ -1402,9 +1400,9 @@ void PrintDrawPrepSummary() {
 	static uint64_t last_fallbacks = 0;
 	static Head     last_head {};
 	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
-	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
+	// The clock is read every 256th commit (the line is due every 10 s).
 	static uint32_t calls = 0;
-	if (CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
+	if (last_ns != 0 && (++calls & 255u) != 0) {
 		return;
 	}
 	const auto now = NowNs();

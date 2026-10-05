@@ -155,7 +155,12 @@ void PrintSummary() {
 	static uint64_t                                          last_ns = 0;
 	static std::array<uint64_t, 13>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
-	const auto                                               now = NowNs();
+	static uint32_t                                          calls = 0;
+	// Runs after every commit: the clock is read on every 256th call only.
+	if (last_ns != 0 && (++calls & 255u) != 0) {
+		return;
+	}
+	const auto now = NowNs();
 	if (last_ns == 0) {
 		last_ns = now;
 		return;

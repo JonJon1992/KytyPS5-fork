@@ -260,6 +260,53 @@ void Check(VulkanHarness *vulkan) {
     Require(Name, "published reuse", lookup(true) == published &&
         plan() == PipelineCache::PlanLookup::Found && planned == published && gate.calls.load() == 1,
         "published pipeline was not reused by draw-prep and recording lookups");
+    // Alternating complete keys must reuse published objects without another map lookup.
+    // Use real pipelines with different assembly state, then return to the original draw.
+    const std::array topologies{vk::PrimitiveTopology::eTriangleList,
+        vk::PrimitiveTopology::eTriangleStrip};
+    std::array<PipelineCache::Pipeline *, topologies.size()> warm{};
+    const auto lookup_topology = [&](vk::PrimitiveTopology topology) {
+      return cache.TryGetGraphicsPipeline(std::span{&color, 1u}, depth,
+          std::span{query->vertex.data(), 1u}, scheduler.Current(), &query->pixel,
+          topology, false, query->programs, false);
+    };
+    for (size_t i = 0; i < topologies.size(); ++i) {
+      warm[i] = lookup_topology(topologies[i]);
+      Require(Name, "distinct assembly pipelines", warm[i] != nullptr && !warm[i]->pending &&
+          (i == 0 ? warm[i] == published : warm[i] != published), "assembly state was ignored");
+    }
+    const auto calls_before_memo = gate.calls.load();
+    const auto previous_sink = Profiler::Detail::g_event_sink.exchange(Profiler::Detail::CounterSink::Thread);
+    const auto hits_before_memo = Profiler::FrameEventTotal(Profiler::FrameEvent::PipelineMemoHits);
+    for (unsigned repeat = 0; repeat < 3; ++repeat) {
+      for (size_t i = 0; i < topologies.size(); ++i)
+        Require(Name, "alternating assembly reuse", lookup_topology(topologies[i]) == warm[i],
+            "memo returned a pipeline for another complete key");
+    }
+    const auto memo_hits = Profiler::FrameEventTotal(Profiler::FrameEvent::PipelineMemoHits) - hits_before_memo;
+    Profiler::Detail::g_event_sink.store(previous_sink);
+    if (const auto *bench = std::getenv("KYTY_TEST_PIPELINE_LOOKUP_BENCH");
+        bench != nullptr && std::strcmp(bench, "1") == 0) {
+      constexpr unsigned iterations = 200000;
+      for (bool alternating : {false, true}) {
+        const auto begin = std::chrono::steady_clock::now();
+        uintptr_t checksum = 0;
+        for (unsigned i = 0; i < iterations; ++i) {
+          const auto index = alternating ? i % topologies.size() : 0;
+          checksum += reinterpret_cast<uintptr_t>(lookup_topology(topologies[index]));
+        }
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::printf("PipelineLookupBench: %s %.3f ns/lookup iterations=%u checksum=%zu\n",
+            alternating ? "alternating" : "consecutive", static_cast<double>(ns) / iterations,
+            iterations, static_cast<size_t>(checksum));
+      }
+    }
+    const auto *memo_setting = std::getenv("KYTY_PIPELINE_MEMO");
+    const bool memo_enabled = memo_setting == nullptr || std::strcmp(memo_setting, "0") != 0;
+    Require(Name, "alternating memo hits", memo_hits == (memo_enabled ? 6u : 0u) &&
+        gate.calls.load() == calls_before_memo,
+        "warm alternating pipelines still miss the memo: " + std::to_string(memo_hits));
     TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(), color.image_id,
         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
     RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});

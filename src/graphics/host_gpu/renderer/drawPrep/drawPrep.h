@@ -301,9 +301,15 @@ public:
 private:
 	struct Workers;
 
+	// P3b: what the resolver learns of a published draw only at its commit.
+	struct HeadPatch {
+		uint64_t submit_id      = 0;
+		uint32_t instance_count = UINT32_MAX; // UINT32_MAX: the published one
+	};
+
 	void Commit(Slot& slot);
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
-	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	void CommitHead(const HeadPatch* patch = nullptr);
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

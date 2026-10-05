@@ -102,7 +102,20 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	bool operator==(const PipelineVertexInputState& other) const {
+		if (binding_count != other.binding_count || attribute_count != other.attribute_count) {
+			return false;
+		}
+		// Only active entries are hashed and passed to Vulkan. In particular mesh pipelines
+		// have no vertex input; comparing their unused arrays adds work to every memo hit.
+		for (size_t i = 0; i < binding_count && i < bindings.size(); ++i) {
+			if (!(bindings[i] == other.bindings[i])) return false;
+		}
+		for (size_t i = 0; i < attribute_count && i < attributes.size(); ++i) {
+			if (!(attributes[i] == other.attributes[i])) return false;
+		}
+		return true;
+	}
 };
 
 struct ShaderProgram {
@@ -258,6 +271,7 @@ public:
 	struct PrefetchTotals {
 		uint64_t submitted = 0, used = 0, compile_ns = 0, wait_ns = 0, max_wait_ns = 0;
 		uint64_t programs = 0;
+		uint64_t retired = 0, saturated = 0;
 	};
 	[[nodiscard]] PrefetchTotals GetPrefetchTotals() const;
 	void NoteProgramPrefetchWait(uint64_t ns);
@@ -414,6 +428,9 @@ private:
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs, bool fatal,
 	                              GraphicsPipelineKey& key) const;
+	// Shared by draw-prep lookup and prefetch so a miss builds the complete key only once.
+	PlanLookup FindGraphicsPipelineForPlan(const GraphicsPipelineKey& key,
+	                                      const Pipeline*& pipeline, uint64_t& generation);
 
 	void InitializeDriverCache();
 	void InitializeProgramDiskCache();

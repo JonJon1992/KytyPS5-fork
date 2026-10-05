@@ -3,7 +3,10 @@
 #include "common/assert.h"
 #include "common/file.h"
 
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <string_view>
 
 namespace Libs::Graphics::Pm4 {
 
@@ -98,6 +101,28 @@ constexpr auto MakeOpcodeNames() {
 constexpr auto g_register_names = MakeRegisterNames();
 constexpr auto g_opcode_names   = MakeOpcodeNames();
 
+void DumpPayload(Common::File* file, const uint32_t* words, uint32_t count) {
+	// File::Printf allocates, formats twice and expands newlines for each call. The payload
+	// has a fixed representation, so write a bounded batch with the same CRLF bytes instead.
+	constexpr std::string_view Line = "      | 0x00000000 | \r\n";
+	constexpr std::string_view Hex = "0123456789abcdef";
+	constexpr uint32_t Batch = 128;
+	std::array<char, Batch * Line.size()> text;
+	while (count != 0) {
+		const auto lines = std::min(count, Batch);
+		for (uint32_t i = 0; i < lines; ++i) {
+			auto* line = text.data() + i * Line.size();
+			std::memcpy(line, Line.data(), Line.size());
+			for (uint32_t digit = 0; digit < 8; ++digit) {
+				line[10 + digit] = Hex[(words[i] >> (28u - digit * 4u)) & 0xfu];
+			}
+		}
+		file->Write(text.data(), static_cast<uint32_t>(lines * Line.size()));
+		words += lines;
+		count -= lines;
+	}
+}
+
 } // namespace
 
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
@@ -136,9 +161,7 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 				             (op == IT_NOP ? g_register_names[r] : ""), op, sh_gx ? "GX" : "CX",
 				             len);
 
-				for (uint32_t i = 0; i < len; i++) {
-					file->Printf("      | 0x%08" PRIx32 " | \n", cmd[i]);
-				}
+				DumpPayload(file, cmd, len);
 
 				if ((op == IT_SET_CONTEXT_REG_INDIRECT || op == IT_SET_SH_REG_INDIRECT ||
 				     op == IT_SET_UCONFIG_REG_INDIRECT) &&
