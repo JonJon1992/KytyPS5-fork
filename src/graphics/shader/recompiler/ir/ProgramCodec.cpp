@@ -146,9 +146,9 @@ struct ProgramCodecAccess {
 	static ValueOpcode                Opcode(const Inst& inst) { return inst.opcode; }
 	static uint64_t                   Flags(const Inst& inst) { return inst.flags; }
 	static const Block*               Parent(const Inst& inst) { return inst.parent; }
-	static const std::vector<Value>&  Args(const Inst& inst) { return inst.args; }
-	static const std::vector<Block*>& PhiBlocks(const Inst& inst) { return inst.phi_blocks; }
-	static const std::vector<Use>&    Uses(const Inst& inst) { return inst.uses; }
+	static const auto& Args(const Inst& inst) { return inst.args; }
+	static const auto& PhiBlocks(const Inst& inst) { return inst.phi_blocks; }
+	static const auto& Uses(const Inst& inst) { return inst.uses; }
 	static uint32_t                   EvaluationIndex(const Inst& inst) {
 		return inst.evaluation_index;
 	}
@@ -156,9 +156,9 @@ struct ProgramCodecAccess {
 	static void Assign(Inst& inst, std::vector<Value> args, size_t phi_blocks,
 	                   std::vector<Use> uses, uint32_t evaluation_index) {
 		inst.parent           = nullptr;
-		inst.args             = std::move(args);
+		inst.args.assign(args.begin(), args.end());
 		inst.phi_blocks.assign(phi_blocks, nullptr);
-		inst.uses             = std::move(uses);
+		inst.uses.assign(uses.begin(), uses.end());
 		inst.evaluation_index = evaluation_index;
 	}
 

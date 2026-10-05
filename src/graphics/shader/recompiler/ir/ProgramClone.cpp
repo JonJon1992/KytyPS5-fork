@@ -98,7 +98,7 @@ bool CloneProgram(const Program& source, Program& target) {
 			map.Own(&inst, &instructions.emplace_back(inst.opcode, inst.flags));
 		}
 	}
-	std::list<Inst> value_storage;
+	std::list<Inst, IrAllocator<Inst>> value_storage;
 	for (const auto& inst: source.value_storage) {
 		map.Own(&inst, &value_storage.emplace_back(inst.opcode, inst.flags));
 	}
