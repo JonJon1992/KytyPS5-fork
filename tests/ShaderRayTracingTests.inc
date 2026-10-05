@@ -10,10 +10,13 @@ void TestRayTracingDispatchDetection() {
       Check(last.family == D::Family::MIMG &&
                 (last.opcode_id == 0xe6u || last.opcode_id == 0xe7u),
             "decoder continued past the first BVH instruction");
-      const auto result = ShaderRecompiler::TranslateProgram(
-          code, MakeCompileOptions(ShaderType::Compute));
-      Check(result.skip_dispatch && result.program.blocks.empty() && result.cfg_dump.empty(),
-            "BVH compute shader reached IR translation");
+      // Graphics stages too: a BVH pixel shader used to abort in the CFG builder.
+      for (const auto stage : {ShaderType::Compute, ShaderType::Vertex, ShaderType::Pixel}) {
+        const auto result =
+            ShaderRecompiler::TranslateProgram(code, MakeCompileOptions(stage));
+        Check(result.skip_dispatch && result.program.blocks.empty() && result.cfg_dump.empty(),
+              "BVH shader reached IR translation");
+      }
     }
   };
   const auto check = [&](std::initializer_list<uint32_t> code, bool expected,

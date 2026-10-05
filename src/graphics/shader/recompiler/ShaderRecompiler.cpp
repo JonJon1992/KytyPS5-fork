@@ -572,15 +572,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
 	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+	// the player can select a mode without ray tracing. Every stage is skipped: the decoder
+	// stopped at the BVH instruction, and building a CFG from that truncated program would
+	// abort on the unsupported opcode.
+	if (decoded.has_bvh) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
 			const auto& bvh = decoded.instructions.back();
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    options.shader_hash, bvh.pc, bvh.opcode_id));
+			    "Warning: ray tracing is not implemented; skipping dispatches and draws whose "
+			    "shaders contain BVH intersection instructions (stage={}, shader=0x{:016x}, "
+			    "pc=0x{:08x}, opcode=0x{:02x}).\n",
+			    StageName(options.stage), options.shader_hash, bvh.pc, bvh.opcode_id));
 		}
 		return {.skip_dispatch = true};
 	}
