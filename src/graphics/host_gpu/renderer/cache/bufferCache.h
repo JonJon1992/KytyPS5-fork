@@ -259,7 +259,10 @@ private:
 		uint64_t verify_structure_epoch = 0;
 		uint64_t verify_mismatch_pages  = 0;
 	};
-	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
+	// `cursor` (optional): the walk position of a previous call for a lower range of the same pass,
+	// updated to this range's first buffer (m_buffers is not changed during a pass).
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
+	                               BufferMap::iterator* cursor = nullptr);
 	// KYTY_BDA_NEW_BUFFER_SYNC: synchronizes the buffers registered since the last pass (their
 	// mapped parts) and records their hot runs; drops hot runs of buffers deleted since.
 	void SynchronizeBdaNewBuffers(const RangeSet& mapped_ranges);
@@ -314,7 +317,8 @@ private:
 	// dirtying serials (MemoryTracker::RangeDirtiedSignature) read before the lookup; only a
 	// difference no dirtying after that moment explains is a mismatch.
 	enum class RangeFact : uint8_t { Clean, Stream };
-	struct RangeMemo {
+	// One slot never straddles two cache lines (a lookup reads every field).
+	struct alignas(32) RangeMemo {
 		uint64_t  vaddr     = 0;
 		uint64_t  size      = 0;
 		uint64_t  signature = 0; // 0: empty
@@ -355,8 +359,9 @@ private:
 	[[nodiscard]] bool RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
 	                                        MemoryTracker::DirtyState& state);
 	[[nodiscard]] bool RelaxedNothingToUpload(uint64_t vaddr, uint64_t size);
-	// KYTY_CP_CPU_ONLY_QUERY (default off, live): omit the GPU mirror when only CPU dirtiness
-	// decides an upload. No cached state; the same mirrors and missing-region fallback apply.
+	// The GPU mirror is omitted (only CPU dirtiness decides an upload) unless
+	// KYTY_TRACKER_RELAXED_VERIFY compares it; KYTY_CP_CPU_ONLY_QUERY (live) omits it there too.
+	// No cached state; the same mirrors and missing-region fallback apply.
 	static bool QueryUploadSnapshot(const MemoryTracker& tracker, uint64_t vaddr, uint64_t size,
 	                                MemoryTracker::DirtyState& state, bool& cpu_only);
 	bool VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
@@ -405,7 +410,8 @@ private:
 	// In verify mode a cross-epoch hit finding CPU-dirty pages with the signature unchanged is a
 	// mismatch, not a race.
 	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
-	struct BindingMemo {
+	// One slot never straddles two cache lines (a lookup reads every field).
+	struct alignas(64) BindingMemo {
 		uint64_t        vaddr     = 0;
 		uint64_t        size      = 0;
 		uint64_t        epoch     = 0;
@@ -448,8 +454,9 @@ private:
 	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
 	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
 	// Whether a memo's structure guard still holds: the stream tick, or its buffer
-	// (KYTY_BINDING_MEMO_BUFFER_GUARD) or else the registry epoch.
-	[[nodiscard]] bool BindingMemoGuardHolds(const BindingMemo& memo);
+	// (KYTY_BINDING_MEMO_BUFFER_GUARD) or else the registry epoch. With the buffer guard, a holding
+	// guard stores the buffer it checked in *checked (when not null).
+	[[nodiscard]] bool BindingMemoGuardHolds(const BindingMemo& memo, Buffer** checked = nullptr);
 	// `cross`: the hit came from another epoch (KYTY_BINDING_MEMO_CROSS_EPOCH).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
 	                                                            std::pair<Buffer*, uint64_t> hit,
@@ -469,6 +476,8 @@ private:
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
 	                     std::vector<uint64_t>& demote, std::vector<uint64_t>& settle);
 	void EraseHotShadows(uint64_t vaddr, uint64_t size);
+	// EraseHotShadows of each copy's destination range, in order, with one walk of the shadows.
+	void EraseHotShadowsForCopies(const Buffer& buffer, std::span<const vk::BufferCopy> copies);
 	// Before (or right after recording) a GPU-side write of the range that tracked GPU ownership
 	// does not cover (image downloads into the buffer, unbounded address writers; size 0 = all):
 	// returns its hot pages to normal tracking, clean unless their contents changed since their
@@ -576,6 +585,10 @@ private:
 	mutable std::mutex               m_backing_publication_mutex;
 	std::vector<BackingPublication> m_backing_publications;
 	std::atomic<size_t>              m_backing_publication_count {0};
+	// Visits each pending publication with a range overlapping [vaddr, vaddr + size), under
+	// m_backing_publication_mutex, until `visit` returns true (bufferCache.cpp).
+	template <typename Visit>
+	void ForEachPendingPublication(uint64_t vaddr, uint64_t size, Visit&& visit) const;
 	uint64_t                        m_next_backing_publication_token = 0;
 
 	GraphicContext&                                   m_graphics;
@@ -703,6 +716,8 @@ private:
 	std::vector<std::unique_ptr<uint8_t[]>>           m_hot_shadow_free;
 	void ReleaseHotShadow(std::unique_ptr<uint8_t[]> data);
 	std::vector<uint8_t>                              m_hot_scratch;
+	// SettleHotPageList's settled pages, reused.
+	std::vector<uint64_t>                             m_settle_scratch;
 	// Non-zero while a BDA pass runs (SynchronizeBdaBuffers): a hot page compared once in the pass
 	// is not compared again by it (a page in a logged range is also in the recorded hot runs). A
 	// write between the two visits is a guest write racing the pass, seen by the next one, as a

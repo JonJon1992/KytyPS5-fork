@@ -3,11 +3,13 @@
 
 #include "common/common.h"
 
+#include <algorithm>
 #include <initializer_list>
 #include <iterator>
 #include <map>
 #include <set>
 #include <span>
+#include <unordered_map>
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <type_traits>
@@ -38,21 +40,22 @@ public:
 	uint32_t Import(const char* name);
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, const Args&... operands) {
-		return DeclareType(opcode, MakeTypeKey(opcode, operands...));
+		BuildTypeKey(opcode, operands...);
+		return DeclareType(opcode);
 	}
 
 	template <typename... Args>
 	uint32_t DecoratedType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations,
 	                       const Args&... operands) {
-		return DeclareDecoratedType(opcode, MakeTypeKey(opcode, operands...), annotations);
+		BuildTypeKey(opcode, operands...);
+		return DeclareDecoratedType(opcode, annotations);
 	}
 
 	template <typename... Args>
 	uint32_t Constant(spv::Op opcode, uint32_t type, const Args&... operands) {
-		std::vector<uint32_t> key;
-		key.reserve(2u + (0u + ... + OperandWordCount(operands)));
-		AppendOperands(key, opcode, type, operands...);
-		return DeclareConstant(opcode, std::move(key));
+		m_key.clear();
+		AppendOperands(m_key, opcode, type, operands...);
+		return DeclareConstant(opcode);
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
@@ -117,14 +120,31 @@ private:
 		}
 	}
 
+	// Declaration keys are built in m_key, reused across calls: a lookup that finds the
+	// declaration allocates nothing.
 	template <typename... Args>
-	static std::vector<uint32_t> MakeTypeKey(spv::Op opcode, const Args&... operands) {
+	void BuildTypeKey(spv::Op opcode, const Args&... operands) {
 		const auto operand_count = static_cast<uint32_t>((0u + ... + OperandWordCount(operands)));
-		std::vector<uint32_t> key;
-		key.reserve(2u + operand_count);
-		AppendOperands(key, opcode, operand_count, operands...);
-		return key;
+		m_key.clear();
+		AppendOperands(m_key, opcode, operand_count, operands...);
 	}
+
+	struct KeyHash {
+		using is_transparent = void;
+		size_t operator()(std::span<const uint32_t> key) const noexcept {
+			uint64_t hash = 0xcbf29ce484222325ull;
+			for (const auto word: key) {
+				hash = (hash ^ word) * 0x100000001b3ull;
+			}
+			return static_cast<size_t>(hash ^ (hash >> 32u));
+		}
+	};
+	struct KeyEqual {
+		using is_transparent = void;
+		bool operator()(std::span<const uint32_t> a, std::span<const uint32_t> b) const noexcept {
+			return std::ranges::equal(a, b);
+		}
+	};
 
 	template <typename... Args>
 	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
@@ -135,10 +155,10 @@ private:
 		section[offset] |= word_count << spv::WordCountShift;
 	}
 
-	uint32_t    DeclareType(spv::Op opcode, std::vector<uint32_t> key);
-	uint32_t    DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
+	uint32_t    DeclareType(spv::Op opcode);
+	uint32_t    DeclareDecoratedType(spv::Op opcode,
 	                                 std::initializer_list<TypeAnnotation> annotations);
-	uint32_t    DeclareConstant(spv::Op opcode, std::vector<uint32_t> key);
+	uint32_t    DeclareConstant(spv::Op opcode);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
 	uint32_t                                  m_next_id = 1;
@@ -156,7 +176,8 @@ private:
 	std::set<spv::Capability>                 m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	std::unordered_map<std::vector<uint32_t>, uint32_t, KeyHash, KeyEqual> m_declaration_ids;
+	std::vector<uint32_t>                     m_key;
 	size_t                                    m_unpatched_phi_incomings = 0;
 };
 

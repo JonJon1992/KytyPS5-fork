@@ -810,8 +810,10 @@ private:
 
 	// Small reads only: the lock matters for descriptor-sized probes, and they go through a
 	// bounce buffer so a failed read never modifies the destination (as on the locked path).
+	// 512 covers the batched vertex-buffer descriptor read (shader.cpp, 2 * MaxBatchWords words),
+	// which otherwise takes the mutex and two tree searches.
 	// Reads only: a write through a mapping being removed concurrently could not be undone.
-	static constexpr uint64_t MAX_CACHED_MAPPING_READ = 256;
+	static constexpr uint64_t MAX_CACHED_MAPPING_READ = 512;
 
 	bool TryReadCachedMapping(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || size == 0 || size > MAX_CACHED_MAPPING_READ ||

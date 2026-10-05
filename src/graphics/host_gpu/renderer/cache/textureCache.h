@@ -350,6 +350,16 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// !FindImagesInRegion(address, size, page_overlap).empty(), stopping at the first image (no
+	// list, no query epoch). Caller holds m_lock.
+	[[nodiscard]] bool AnyImageInRegion(uint64_t address, uint64_t size, bool page_overlap) const;
+	// The first (or with `last`, the last) image FindImagesInRegion(data, false) returns that
+	// `accept(id, image)` takes, when `accept` requires image.info.data == data: such images are all
+	// owners of data's first ImagePageTable page (an image registers the pages of its live range,
+	// which starts at info.data.address), which FindImagesInRegion visits first, in the same order.
+	// Only that page is read. Caller holds m_lock.
+	template <typename Accept>
+	[[nodiscard]] ImageId FindOnFirstPage(const GuestRange& data, bool last, Accept&& accept) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
 	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
 	                                                     bool exact_format) const;
@@ -526,14 +536,19 @@ private:
 	};
 	uint64_t                                          m_surface_meta_inserts = 0;
 	std::array<MetaErase, 64>                         m_meta_erases {};
-	// KYTY_CP_COMMIT=targetalloc: FindRenderTarget's bounded-claim block list (m_lock held).
+	// FindRenderTarget's bounded-claim block list (m_lock held), reused.
 	RangeSet                                          m_claim_blocks;
+	// MaterializeCmaskClear's read of a guest-owned CMASK slice (GPU thread), reused.
+	std::vector<uint32_t>                             m_cmask_words;
 	// Bumped under m_lock after every change of m_surface_metas (an entry added or removed, a
 	// clear_mask changed): validates m_meta_clear_memo (IsMetaCleared).
 	std::atomic<uint64_t> m_surface_meta_generation {0};
 	void                  NoteSurfaceMetaChange() noexcept {
 		m_surface_meta_generation.fetch_add(1, std::memory_order_release);
 	}
+	// IsMeta/ClearMeta for a caller holding m_lock (several lookups under one acquisition).
+	[[nodiscard]] bool IsMetaLocked(uint64_t address) const;
+	[[nodiscard]] bool ClearMetaLocked(uint64_t address);
 	struct MetaClearMemo {
 		uint64_t address    = 0;
 		uint64_t generation = 0;

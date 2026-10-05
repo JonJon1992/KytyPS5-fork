@@ -419,6 +419,79 @@ void TestReadSetInconsistent() {
 	Check(!partial.Finish(), "a partially overlapping read that disagrees fails");
 }
 
+// Random read sets (runs of sequential reads, overlaps, repeats, page boundaries) in one reused set:
+// every range's bytes equal memory, the ranges cover exactly the bytes read, and a read that
+// disagrees with an overlapping one fails the set.
+void TestReadSetRangeBytesRandom() {
+	std::mt19937_64 rng(0xb17e5u);
+	constexpr uint64_t Base   = 0x200000;
+	constexpr uint64_t Window = 0x5000;
+	std::vector<uint8_t> memory(Window);
+	for (auto& byte: memory) {
+		byte = static_cast<uint8_t>(rng());
+	}
+	DrawPrep::ReadSet set;
+	bool              bytes_equal = true;
+	bool              covered     = true;
+	bool              conflicts   = true;
+	for (int iteration = 0; iteration < 4000; iteration++) {
+		set.Reset();
+		std::vector<uint8_t> expected(Window, 0);
+		const bool           conflict = rng() % 4u == 0;
+		bool                 flipped  = false;
+		uint64_t             previous = 0;
+		uint64_t             previous_size = 0;
+		const auto           reads    = 1u + rng() % 40u;
+		for (uint64_t i = 0; i < reads; i++) {
+			const auto kind = rng() % 4u;
+			uint64_t   size   = 1u + rng() % 64u;
+			uint64_t   offset = rng() % (Window - size);
+			if (i != 0 && kind == 0 && previous + previous_size + size < Window) {
+				offset = previous + previous_size; // the next bytes, recorded right after
+			} else if (i != 0 && kind == 1) {
+				offset = previous; // the same read again
+				size   = previous_size;
+			} else if (i != 0 && kind == 2 && previous + previous_size + size < Window) {
+				offset = previous + rng() % previous_size; // overlapping the previous read
+			}
+			std::vector<uint8_t> data(memory.begin() + static_cast<ptrdiff_t>(offset),
+			                          memory.begin() + static_cast<ptrdiff_t>(offset + size));
+			if (conflict && !flipped && i != 0 && kind == 1) {
+				data[0] ^= 0x5au; // disagrees with the identical earlier read
+				flipped = true;
+			}
+			(void)set.Record(Base + offset, data.data(), size);
+			std::fill(expected.begin() + static_cast<ptrdiff_t>(offset),
+			          expected.begin() + static_cast<ptrdiff_t>(offset + size), uint8_t {1});
+			previous      = offset;
+			previous_size = size;
+		}
+		const bool finished = set.Finish();
+		if (flipped) {
+			conflicts &= !finished && set.Failure() == DrawPrep::ReadFailure::Inconsistent;
+			continue;
+		}
+		if (!finished) {
+			conflicts = false;
+			continue;
+		}
+		std::vector<uint8_t> coverage(Window, 0);
+		const auto           ranges = set.Ranges();
+		for (size_t i = 0; i < ranges.size(); i++) {
+			const auto bytes = set.RangeBytes(i);
+			bytes_equal &= bytes.size() == ranges[i].end - ranges[i].begin &&
+			               std::memcmp(bytes.data(), memory.data() + (ranges[i].begin - Base),
+			                           bytes.size()) == 0;
+			std::fill(coverage.begin() + static_cast<ptrdiff_t>(ranges[i].begin - Base),
+			          coverage.begin() + static_cast<ptrdiff_t>(ranges[i].end - Base), uint8_t {1});
+		}
+		covered &= coverage == expected;
+	}
+	Check(bytes_equal, "random read sets: every range's bytes equal memory");
+	Check(covered, "random read sets: the ranges cover exactly the bytes read");
+	Check(conflicts, "random read sets: a disagreeing read fails as Inconsistent, others finish");
+}
+
 void TestReadSetLimits() {
 	DrawPrep::ReadSet set;
 	std::vector<uint8_t> big(DrawPrep::ReadSet::MaxBytes);
@@ -1854,6 +1927,7 @@ int main(int argc, char** argv) {
 	TestReadSetCoalesces();
 	TestReadSetPageBoundary();
 	TestReadSetInconsistent();
+	TestReadSetRangeBytesRandom();
 	TestReadSetLimits();
 	TestReadSetDigests();
 	TestReadSetCertificate();

@@ -890,6 +890,12 @@ void Encoder::beginRendering(const vk::RenderingInfo& info) {
 	Close(w, m_options.verify ? VerifyHash::BeginRendering(info) : 0);
 }
 
+void Encoder::Drain(const WaitPolicy& policy, WaitStats& stats) {
+	// WaitConsumed publishes pending bytes. The released position follows their native calls,
+	// so a no-op marker adds no ordering and can needlessly block on ring capacity.
+	m_ring.WaitConsumed(m_ring.WritePosition(), policy, stats);
+}
+
 void Encoder::endRendering() {
 	auto w = Open(Op::EndRendering, 0, false);
 	Close(w, m_options.verify ? VerifyHash::EndRendering() : 0);

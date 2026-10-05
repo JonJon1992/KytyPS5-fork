@@ -369,8 +369,12 @@ uint32_t ConstantF32Value(EmitterState& state, float value) {
 }
 
 uint32_t ConstantBool(EmitterState& state, bool value) {
-	return state.builder.Constant(value ? spv::OpConstantTrue : spv::OpConstantFalse,
-	                              TypeBool(state));
+	const auto id =
+	    state.builder.Constant(value ? spv::OpConstantTrue : spv::OpConstantFalse, TypeBool(state));
+	if (value) {
+		state.constant_true = id;
+	}
+	return id;
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value) {

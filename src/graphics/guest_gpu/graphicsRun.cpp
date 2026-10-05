@@ -68,7 +68,6 @@ namespace Libs::Graphics {
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
-static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 // KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
 static thread_local bool g_sequencer_thread = false;
@@ -334,8 +333,10 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::NotifyProgress() {
-	// Cheap when nothing is blocked (called after every completion-runner operation).
-	if (!m_has_blocked.exchange(false, std::memory_order_acq_rel)) {
+	// Cheap when nothing is blocked (called after every completion-runner operation): a plain load
+	// first, so that case does not write the line with a locked exchange.
+	if (!m_has_blocked.load(std::memory_order_relaxed) ||
+	    !m_has_blocked.exchange(false, std::memory_order_acq_rel)) {
 		return;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpProgressWakeups);
@@ -349,6 +350,12 @@ void GuestGpu::NotifyProgress() {
 }
 
 bool GuestGpu::HasRunnableComputeWork() {
+	// No compute submission queued: no lock (the graphics slice asks every KYTY_GFX_SLICE_DRAWS
+	// draws, a starved resolver every few microseconds). An admission racing this load is seen at
+	// the next call, as one landing just after the scan below would be.
+	if (m_compute_queued.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	for (uint32_t id = 1; id < QueueCount; id++) {
 		if (!m_queues[id].empty() && !m_queues[id].front().blocked &&
@@ -760,6 +767,19 @@ static uint32_t IdleFlushMinDraws() {
 	return static_cast<uint32_t>(g_idle_flush_draws.Get());
 }
 
+// KYTY_IDLE_FLUSH_REFRESH_US (default 0: off): while the GPU is behind, the idle flush queries the
+// timeline (vkGetSemaphoreCounterValue) every 4th draw; with n set, also at most once per n
+// microseconds. The query is a kernel call on RADV (drmSyncobjQuery2, about 1.1 us; see
+// CLAUDE-DRAW-HOTPATH-2026-10-04.md) and a user-mode read on NVIDIA's Windows driver (under
+// 0.1 us). A longer interval detects an idle GPU up to n microseconds later. Live switch
+// (common/liveSwitch.h): compare in the same run, the way KYTY_PENDING_REFRESH_US was chosen.
+static Live::Switch g_idle_flush_refresh_us("KYTY_IDLE_FLUSH_REFRESH_US", [](const char* value) -> int64_t {
+	const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+	return static_cast<int64_t>(std::min(parsed, 100000ul));
+});
+// GPU thread (every command processor runs there): the last idle-flush query, with the interval on.
+static uint64_t g_last_idle_refresh_ns = 0;
+
 void CommandProcessor::MaybeFlushIdleGpu() {
 	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
 	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
@@ -792,6 +812,14 @@ void CommandProcessor::MaybeFlushIdleGpu() {
 		// Refresh the timeline value only every few draws (a driver query).
 		if ((m_idle_flush_draws % 4u) != 0) {
 			return;
+		}
+		if (const auto interval = static_cast<uint64_t>(g_idle_flush_refresh_us.Get()) * 1000u;
+		    interval != 0) {
+			const auto now = CpNowNs();
+			if (now - g_last_idle_refresh_ns < interval) {
+				return;
+			}
+			g_last_idle_refresh_ns = now;
 		}
 		master.Refresh();
 		if (master.KnownGpuTick() + 1u < current) {
@@ -1232,6 +1260,9 @@ void GuestGpu::Enqueue(Submission submission) {
 		intake.reset_processor   = submission.reset_processor;
 		m_sequencer->Admit(intake);
 	}
+	if (submission.queue_id != 0) {
+		m_compute_queued.fetch_add(1, std::memory_order_relaxed);
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -1253,7 +1284,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::RaiseCurrentThreadPriority();
 	// KYTY_CPU_RESERVE: its own physical core.
 	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
-	g_gpu_thread = true;
+	t_gpu_thread = true;
 	g_gpu_state  = gpu;
 	// KYTY_LIVE_FILE (common/liveSwitch.h): live switches, applied at this thread's flips.
 	Live::Start();
@@ -1357,6 +1388,9 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
+				if (selected_queue != 0) {
+					gpu->m_compute_queued.fetch_sub(1, std::memory_order_relaxed);
+				}
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
@@ -1368,7 +1402,7 @@ void GuestGpu::ThreadRun(void* data) {
 			// directly once commands are refused; finish them while this GuestGpu exists.
 			gpu->m_renderer.GetCommandScheduler().DrainPriorityOperations();
 			g_gpu_state  = nullptr;
-			g_gpu_thread = false;
+			t_gpu_thread = false;
 			return;
 		}
 
@@ -1431,6 +1465,10 @@ void GuestGpu::ThreadRun(void* data) {
 			spin_deadline = 0;
 		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (!complete && submission.queue_id != 0) {
+			// Back at its queue's front below, yielded or blocked.
+			gpu->m_compute_queued.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (!complete && submission.command_execution.Yielded()) {
 			// Yielded to other queues: runnable again in round-robin order.
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
@@ -1744,13 +1782,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	}
 }
 
+// CpSeq::PacketHashing is fixed for the process: read once here instead of calling into cpOps.cpp
+// at every packet.
+static bool PacketHashingEnabled() {
+	static const bool enabled = CpSeq::PacketHashing();
+	return enabled;
+}
+
 // KYTY_CP_SEQ: a completed (or skipped) packet of the stream is counted and, in verify mode,
 // hashed with its address: what the fronts parsed is compared through it.
 static void CountPacket(Pm4Execution& execution, const uint32_t* packet, uint32_t packet_dw,
                         uint64_t& packets, uint64_t& packets_hash, uint64_t guest_address) {
 	(void)execution;
 	packets++;
-	if (CpSeq::PacketHashing()) {
+	if (PacketHashingEnabled()) {
 		packets_hash = XXH3_64bits_withSeed(packet, uint64_t {packet_dw} * sizeof(uint32_t),
 		                                    packets_hash ^ guest_address);
 	}
@@ -1773,7 +1818,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 				m_draw_prep->Drain();
 				g_gpu_state->ProcessCommands();
 			}
-		} else {
+		} else if (g_gpu_state->HasPendingCommands()) {
 			g_gpu_state->ProcessCommands();
 		}
 	}
@@ -5299,10 +5344,6 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			return Pm4ProcessResult::Blocked;
 		}
 	}
-}
-
-bool GuestGpu::IsGpuThread() noexcept {
-	return g_gpu_thread;
 }
 
 } // namespace Libs::Graphics

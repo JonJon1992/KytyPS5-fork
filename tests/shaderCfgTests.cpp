@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -42,6 +43,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <span>
@@ -284,6 +287,16 @@ void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
     std::fprintf(stderr, "SPIR-V binary validation failed:\n%s\n",
                  messages.c_str());
     std::abort();
+  }
+  if (const auto *directory = std::getenv("KYTY_SPIRV_SNAPSHOT_DIR")) {
+    static size_t index = 0;
+    std::filesystem::create_directories(directory);
+    const auto path = std::filesystem::path(directory) /
+                      (std::to_string(index++) + ".spv");
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(binary.data()),
+                 static_cast<std::streamsize>(binary.size() * sizeof(uint32_t)));
+    Check(output.good(), "SPIR-V snapshot write failed");
   }
 }
 
@@ -8315,6 +8328,34 @@ void TestNewShaderRecompilerCfgPostDominatorsMatchPaths() {
   ShaderRecompiler::Decoder::DecodeProgram(std::span{trap}, decoded);
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   CheckPostDominatorsMatchPaths(graph, "a trap loop's post-dominators do not match its paths");
+
+  // Cross bitset word boundaries with both terminating chains and cycles without an exit.
+  for (const uint32_t count : {63u, 64u, 65u, 127u, 128u, 129u}) {
+    std::vector<uint32_t> chain(count, EncodeSopp(0x02));
+    chain.back() = EncodeSopp(0x01);
+    for (const bool cycle : {false, true}) {
+      if (cycle) {
+        chain.back() = EncodeSopp(0x02, static_cast<uint16_t>(-count));
+        chain.push_back(EncodeSopp(0x01)); // Unreachable decoder terminator.
+      }
+      decoded = {};
+      ShaderRecompiler::Decoder::DecodeProgram(std::span{chain}, decoded);
+      graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+      Check(graph.blocks.size() == count, "word-boundary CFG has the wrong block count");
+      CheckPostDominatorsMatchPaths(graph, "word-boundary post-dominators differ from paths");
+      for (const auto &block : graph.blocks) {
+        Check(block.dominators.size() == block.id + 1u &&
+                  block.dominators.front() == 0u && block.dominators.back() == block.id &&
+                  std::ranges::is_sorted(block.dominators),
+              "word-boundary dominators changed their ascending IDs");
+        Check(block.post_dominators.size() == (cycle ? count : count - block.id) &&
+                  block.post_dominators.front() == (cycle ? 0u : block.id) &&
+                  block.post_dominators.back() == count - 1u &&
+                  std::ranges::is_sorted(block.post_dominators),
+              "word-boundary post-dominators include padding or changed their ascending IDs");
+      }
+    }
+  }
 }
 
 void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
@@ -9736,42 +9777,64 @@ void TestComputeDispatchWaveSize() {
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
-  const uint32_t shader[] = {
-      EncodeMubuf0(0x0c),
-      EncodeMubuf1(0, 0, 1), // buffer_load_dword
-                             // v0
-      EncodeMubuf0(0x1c, 0, false),
-      EncodeMubuf1(0, 12, 0),
-      EncodeSopp(0x01),
+  // buffer_load_dword v0, then a store of it. With live_exec a v_cmpx against user data first
+  // leaves EXEC unknown; otherwise EXEC is the full entry mask, the module's constant true, and
+  // its guard is folded.
+  // robust_loads (KYTY_ROBUST_BUFFER_LOADS, default on) issues the storage-buffer load at its own
+  // index and selects zero out of bounds; off, the load sits in a bounds branch.
+  const auto check = [](bool live_exec, bool robust_loads) {
+    std::vector<uint32_t> shader;
+    if (live_exec) {
+      shader.push_back(EncodeVopc(0xd4, 4, 0)); // v_cmpx_gt_u32 s4, v0
+    }
+    for (const uint32_t word : {
+             EncodeMubuf0(0x0c), EncodeMubuf1(0, 0, 1), // buffer_load_dword v0
+             EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 12, 0), EncodeSopp(0x01)}) {
+      shader.push_back(word);
+    }
+
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    const auto saved = ShaderRecompiler::GetCodegenOptions();
+    auto codegen = saved;
+    codegen.robust_buffer_loads = robust_loads;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    auto result = RecompileForTest(shader, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
+          "buffer load guard regression did not decode MUBUF load");
+    CheckSpirvBinaryValidates(result.spirv);
+
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    const auto first_branch = source.find("OpBranchConditional", 0);
+    const auto array_length = source.find("OpArrayLength", 0);
+    Check(array_length != std::string::npos,
+          "buffer load SPIR-V lacks storage buffer array-length bounds check");
+    const auto element_access =
+        source.find("OpAccessChain %_ptr_StorageBuffer_uint", array_length);
+    Check(element_access != std::string::npos,
+          "buffer load SPIR-V lacks storage element access");
+    if (live_exec) {
+      Check(first_branch < array_length,
+            "buffer load bounds check was emitted outside EXEC guard");
+    } else {
+      Check(first_branch > array_length,
+            "buffer load kept an EXEC guard for the full entry mask");
+    }
+    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    if (robust_loads) {
+      const auto select = source.find("OpSelect %uint", element_access);
+      Check(select != std::string::npos && select < bounds_branch,
+            "storage buffer load was not branch-free under robust buffer access");
+    } else {
+      Check(bounds_branch < element_access,
+            "buffer load storage element pointer was formed before bounds guard");
+    }
   };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
-        "buffer load guard regression did not decode MUBUF load");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto exec_branch =
-      source.find("OpBranchConditional", 0);
-  const auto array_length =
-      source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
-  const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
-  Check(exec_branch != std::string::npos,
-        "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
-  Check(element_access != std::string::npos,
-        "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
-        "buffer load bounds check was emitted outside EXEC guard");
-  Check(bounds_branch < element_access,
-        "buffer load storage element pointer was formed before bounds guard");
+  check(false, true);
+  check(true, true);
+  check(false, false);
+  check(true, false);
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
@@ -14818,12 +14881,117 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
         "float controls were declared without device support");
 }
 
+void TestExecSelectAnalysisFixpoint() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto check_chain = [](uint32_t count, bool observed, bool frozen) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    for (uint32_t id = 0; id < 3; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    auto *entry = program.blocks[0];
+    auto *loop = program.blocks[1];
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    loop->AddBranch(program.blocks[2]);
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[2].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Return;
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+
+    std::vector<Inst *> conditions;
+    std::vector<Inst *> phis;
+    std::vector<Inst *> stores;
+    Inst *first_select = nullptr;
+    for (uint32_t i = 0; i < count; i++) {
+      auto &source = entry->AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      auto &condition = entry->AppendNewInst(
+          ValueOpcode::IEqual32, {Value(&source), Value(i + 1u)});
+      conditions.push_back(&condition);
+      auto &phi = loop->AppendNewInst(ValueOpcode::Phi);
+      phi.SetFlags(Type::U32);
+      phi.AddPhiOperand(entry, Value(0u));
+      phis.push_back(&phi);
+    }
+    program.block_info[1].condition = Value(conditions.front());
+    for (uint32_t i = 0; i < count; i++) {
+      // The previous select's back-edge phi feeds this false arm. Rejection of
+      // the last select therefore propagates backwards on subsequent passes.
+      auto &select = loop->AppendNewInst(
+          ValueOpcode::SelectU32,
+          {Value(conditions[i]), Value(i + 1u), Value(phis[i == 0 ? 0 : i - 1])});
+      phis[i]->AddPhiOperand(loop, Value(&select));
+      if (i == 0) first_select = &select;
+      const Value guard = observed && i + 1u == count
+                              ? Value(true)
+                              : Value(conditions[i]);
+      auto &store = loop->AppendNewInst(
+          ValueOpcode::WriteSharedU32,
+          {Value(i * 4u), Value(&select), guard});
+      store.SetFlags(MemoryFlags{.index = 0});
+      stores.push_back(&store);
+    }
+    if (frozen) program.dynamic_reads.push_back(Value(first_select));
+    ValidateProgram(program, true);
+    const auto stats = EliminateExecSelects(program, false);
+    ValidateProgram(program, true);
+    Check(stats.branch_known == 0u && stats.nested_folds == 0u,
+          "EXEC memo fixture unexpectedly folded branch or nested selects");
+    const bool eliminated = !observed && !frozen;
+    Check(stats.masked_uses == (eliminated ? count : 0u),
+          "EXEC masked-use fixpoint changed select elimination");
+    uint32_t remaining = 0;
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        remaining += inst.GetOpcode() == ValueOpcode::SelectU32;
+      }
+    }
+    Check(remaining == (eliminated ? 0u : count),
+          "EXEC masked-use fixpoint retained or removed the wrong selects");
+    for (uint32_t i = 0; i < count; i++) {
+      const auto value = stores[i]->Arg(1);
+      if (eliminated) {
+        Check(value.IsImmediate() && value.U32() == i + 1u,
+              "EXEC masked cycle did not retain the selected true value");
+      } else {
+        Check(value.TryInstruction() != nullptr &&
+                  value.Instruction()->GetOpcode() == ValueOpcode::SelectU32,
+              "EXEC observed or frozen select was rewritten");
+      }
+    }
+  };
+
+  check_chain(1, false, false); // A masked loop cycle can be eliminated.
+  check_chain(1, false, true);  // Frozen resource-plan values stay unchanged.
+  check_chain(1, true, false);  // An observed No verdict remains valid.
+  check_chain(2, true, false);  // Yes must be invalidated after assumed shrinks.
+  check_chain(10, true, false); // More than eight passes requires the safe fallback.
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  // The tests also validate the IR as translated (off in production).
+  if (std::getenv("KYTY_VALIDATE_IR") == nullptr) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_VALIDATE_IR", "1");
+#else
+    setenv("KYTY_VALIDATE_IR", "1", 1);
+#endif
+  }
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--frontend-optimization-only") == 0) {
     TestFrontendInstructionPrefixes();
@@ -14838,6 +15006,11 @@ int main(int argc, char **argv) {
     TestNewShaderRecompilerBufferLoadsGuardedByExec();
     TestCapturedBufferAtomicsX2();
     std::puts("ShaderCfgTests: frontend optimization cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--exec-select-analysis-only") == 0) {
+    TestExecSelectAnalysisFixpoint();
+    std::puts("ShaderCfgTests: EXEC-select analysis cases passed");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--post-dominators-only") == 0) {
@@ -14907,6 +15080,7 @@ int main(int argc, char **argv) {
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
+  TestExecSelectAnalysisFixpoint();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
   TestNggVertexEntryState();

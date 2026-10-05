@@ -1333,6 +1333,9 @@ private:
 	// DrawRunImagesChange: 0 when unchanged, else the first difference (verify-mode detail).
 	[[nodiscard]] uint32_t DrawRunImagesChange(bool compare_serials,
 	                                           bool attachments_only = false, bool log_change = false) const;
+	// The same, for a caller that already holds the texture cache's lock.
+	[[nodiscard]] uint32_t DrawRunImagesChangeLocked(bool compare_serials, bool attachments_only,
+	                                                 bool log_change) const;
 	[[nodiscard]] bool     DrawRunImagesUnchanged(bool compare_serials,
 	                                              bool attachments_only = false) const {
 		return DrawRunImagesChange(compare_serials, attachments_only) == 0;

@@ -311,6 +311,9 @@ void CheckFingerprint() {
     Require(name, "codegen switch list", !listed(excluded),
             std::string("the program cache's own switch is in the fingerprint: ") + excluded);
   }
+  // The recompiler tests set it; it validates the translated IR and changes no program.
+  Require(name, "codegen switch list", !listed("KYTY_VALIDATE_IR"),
+          "the validation-only KYTY_VALIDATE_IR is in the fingerprint");
   for (const char *variable : switches) {
     std::vector<uint8_t> one;
     std::vector<uint8_t> zero;

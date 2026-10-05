@@ -935,14 +935,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-// KYTY_BUFFER_LRU_SKIP=1 (default off): draws touch the same buffers many times per GC tick. The
-// buffer mirrors its LRU item's tick (lru_tick, set by Insert and every Touch, the only writers of
-// the item's tick), so a touch in a tick the item already holds, which LeastRecentlyUsedCache::Touch
-// would return from at once, skips reading the scattered item. The LRU order is unchanged.
+// KYTY_BUFFER_LRU_SKIP (default on; =0 off): draws touch the same buffers many times per GC tick.
+// The buffer mirrors its LRU item's tick (lru_tick, set by Insert and every Touch, the only writers
+// of the item's tick), so a touch in a tick the item already holds, which
+// LeastRecentlyUsedCache::Touch would return from at once, skips reading the scattered item. The
+// LRU order is unchanged.
 static bool BufferLruSkipEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_BUFFER_LRU_SKIP");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }
@@ -1370,6 +1371,45 @@ void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void BufferCache::EraseHotShadowsForCopies(const Buffer& buffer,
+                                           std::span<const vk::BufferCopy> copies) {
+	// EraseHotShadows of every copy's destination range, in order. Copies arrive in ascending
+	// address order (page runs of an upload), so the cursor continues from the previous copy:
+	// every shadow below it was already erased (or lies below this copy's first page) and the
+	// tree is descended again only for a copy below the previous one or a long gap.
+	if (m_hot_shadows.empty() || copies.empty()) {
+		return;
+	}
+	auto     it       = m_hot_shadows.end();
+	uint64_t previous = 0;
+	bool     started  = false;
+	for (const auto& copy: copies) {
+		const auto vaddr = buffer.CpuAddress() + copy.dstOffset;
+		const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto end   = vaddr + copy.size;
+		if (!started || vaddr < previous) {
+			it = m_hot_shadows.lower_bound(first);
+		} else {
+			uint32_t steps = 0;
+			while (it != m_hot_shadows.end() && it->first < first && ++steps <= 8u) {
+				++it;
+			}
+			if (it != m_hot_shadows.end() && it->first < first) {
+				it = m_hot_shadows.lower_bound(first);
+			}
+		}
+		started  = true;
+		previous = vaddr;
+		while (it != m_hot_shadows.end() && it->first < end) {
+			ReleaseHotShadow(std::move(it->second.data));
+			it = m_hot_shadows.erase(it);
+		}
+		if (m_hot_shadows.empty()) {
+			return;
+		}
+	}
+}
+
 void BufferCache::ReleaseHotShadow(std::unique_ptr<uint8_t[]> data) {
 	if (data != nullptr && m_hot_shadow_free.size() < m_memory_tracker.HotMax()) {
 		m_hot_shadow_free.push_back(std::move(data));
@@ -1387,8 +1427,9 @@ void BufferCache::SettleHotPageList(std::span<const uint64_t> pages) {
 	if (pages.empty() || m_memory_tracker.HotPageCount() == 0) {
 		return;
 	}
-	std::vector<uint64_t> settled;
-	settled.reserve(pages.size());
+	// Reused (GPU thread; nothing below settles a list again).
+	auto& settled = m_settle_scratch;
+	settled.clear();
 	{
 		// Every page is settled with its write-protect deferred; the scope's end protects each
 		// region's pages in one host call, before any compare below (as SettleHotPages needs).
@@ -2556,11 +2597,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
-	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
-	// GPU-written images; the BDA hot-pass verification scans in full.
-	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
+	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads still download
+	// GPU-written images, exactly as after an empty collection below; the BDA hot-pass
+	// verification scans in full.
+	if (!is_written && (stats == nullptr || stats->verify_fault_epoch == 0) &&
 	    RelaxedNothingToUpload(vaddr, size)) {
-		return false;
+		return is_texel_buffer ? SynchronizeBufferFromImage(buffer, vaddr, size) : false;
 	}
 	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
 	// READS do more than the tracker work below.)
@@ -2637,8 +2679,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint8_t* reserved = nullptr;
 	uint64_t reserved_offset = 0;
 	uint64_t reserved_size = 0;
-	if (Common::RendererBatchEnabled() && is_written && size <= MiB &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// Only decides whether to reserve: a page this misses is still collected under the tracker
+	// locks below and copied by UploadCopies. On the GPU thread the lock-free mirrors give the
+	// locked answer (memoryTracker.h, QueryDirtyRelaxed); a missing region asks with the locks.
+	const auto may_have_cpu_dirty = [&] {
+		bool dirty = false;
+		if (m_relaxed_queries && GuestGpu::IsGpuThread() &&
+		    m_memory_tracker.QueryCpuDirtyRelaxed(vaddr, size, dirty)) {
+			return dirty;
+		}
+		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	};
+	if (Common::RendererBatchEnabled() && is_written && size <= MiB && may_have_cpu_dirty()) {
 		// Reserve before entering writable tracker locks. The dirty set is collected
 		// again under those locks, so a concurrent CPU write cannot be missed.
 		const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -2683,9 +2735,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	auto&      host_copies = scratch->host_copies;
 	const auto upload = [&]() noexcept {
 		// A normal upload replaces whatever a hot page shadow described.
-		for (const auto& copy: copies) {
-			EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
-		}
+		EraseHotShadowsForCopies(buffer, copies);
 		guest_copies = copies.size();
 		host_base    = total_size;
 		if (!hot_ranges.empty()) {
@@ -2932,9 +2982,7 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 	auto&                       settle_hot  = scratch->settle_hot;
 	auto&                       host_copies = scratch->host_copies;
 	// A normal upload replaces whatever a hot page shadow described.
-	for (const auto& copy: copies) {
-		EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
-	}
+	EraseHotShadowsForCopies(buffer, copies);
 	const size_t   guest_copies = copies.size();
 	const uint64_t host_base    = total_size;
 	if (!pending.hot_ranges.empty()) {
@@ -3062,13 +3110,30 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies the guest runs from their backing alias.
+		// When one mapping holds the whole span of the runs, one lookup (a lock and a tree search)
+		// serves them all: within a mapping the alias is linear in the address. Otherwise each run
+		// is looked up on its own, as it may lie in another mapping.
+		const uint8_t* span_alias = nullptr;
+		uint64_t       span_begin = 0;
+		if (deferred != nullptr && guest_copies > 1) {
+			span_begin        = UINT64_MAX;
+			uint64_t span_end = 0;
+			for (size_t index = 0; index < guest_copies; index++) {
+				span_begin = std::min(span_begin, copies[index].dstOffset);
+				span_end   = std::max(span_end, copies[index].dstOffset + copies[index].size);
+			}
+			span_alias = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(
+			    buffer.CpuAddress() + span_begin, span_end - span_begin));
+		}
 		for (size_t index = 0; index < copies.size(); index++) {
 			auto& copy = copies[index];
 			const void* alias = nullptr;
 			if (deferred != nullptr && index < guest_copies) {
-				// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies from the backing alias.
-				alias = LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
-				                                             copy.size);
+				alias = span_alias != nullptr
+				            ? span_alias + (copy.dstOffset - span_begin)
+				            : LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
+				                                                   copy.size);
 			}
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
@@ -3157,7 +3222,9 @@ bool BufferCache::RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
 
 bool BufferCache::QueryUploadSnapshot(const MemoryTracker& tracker, uint64_t vaddr, uint64_t size,
                                       MemoryTracker::DirtyState& state, bool& cpu_only) {
-	cpu_only = g_cpu_only_query.On();
+	// Both callers decide from state.cpu alone; only KYTY_TRACKER_RELAXED_VERIFY compares the GPU
+	// bit, so outside it the GPU mirror is never read (the same CPU bit and missing-region result).
+	cpu_only = g_cpu_only_query.On() || RelaxedVerifyMode() == 0;
 	if (!cpu_only) {
 		return tracker.QueryDirtyRelaxed(vaddr, size, state);
 	}
@@ -3263,15 +3330,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 		_mm_prefetch(reinterpret_cast<const char*>(&memo), _MM_HINT_T0);
 #endif
 	}
-	const auto epoch  = SyncEpoch::Current();
-	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
+	const auto epoch   = SyncEpoch::Current();
+	const auto before  = m_memory_tracker.RangeSignature(vaddr, size);
+	Buffer*    guarded = nullptr; // the cache buffer the guard looked up, when it did
 	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
 	    memo.kind == BindingMemoKind::Empty) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
 	} else if (memo.signature != before) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
-	           !BindingMemoGuardHolds(memo)) {
+	           !BindingMemoGuardHolds(memo, &guarded)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
 	} else {
 		bool cross = false;
@@ -3316,7 +3384,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			} else {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCachedHits);
 				m_binding_memo_totals.cached_hits++;
-				hit.first = &m_slot_buffers[memo.id];
+				hit.first = guarded != nullptr ? guarded : &m_slot_buffers[memo.id];
 				TouchBuffer(*hit.first);
 			}
 			if (m_binding_memo_verify != 0) {
@@ -3332,7 +3400,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	return result;
 }
 
-bool BufferCache::BindingMemoGuardHolds(const BindingMemo& memo) {
+bool BufferCache::BindingMemoGuardHolds(const BindingMemo& memo, Buffer** checked) {
 	if (memo.kind == BindingMemoKind::Stream) {
 		return memo.guard == m_scheduler.CurrentTick();
 	}
@@ -3341,9 +3409,15 @@ bool BufferCache::BindingMemoGuardHolds(const BindingMemo& memo) {
 	}
 	// KYTY_BINDING_MEMO_BUFFER_GUARD (bufferCache.h): the range is still in the same registered
 	// buffer at the same offset.
-	const auto* buffer = m_slot_buffers.try_get(memo.id);
-	return buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(memo.vaddr, memo.size) &&
-	       buffer->Offset(memo.vaddr) == memo.offset;
+	auto* buffer = m_slot_buffers.try_get(memo.id);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(memo.vaddr, memo.size) ||
+	    buffer->Offset(memo.vaddr) != memo.offset) {
+		return false;
+	}
+	if (checked != nullptr) {
+		*checked = buffer;
+	}
+	return true;
 }
 
 void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
@@ -3365,10 +3439,11 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 		entry.guard     = m_scheduler.CurrentTick();
 		entry.kind      = BindingMemoKind::Stream;
 	} else {
-		const auto structure = m_buffer_registry_epoch.load(std::memory_order_acquire);
-		const auto after     = m_memory_tracker.RangeSignature(vaddr, size);
-		if (structure == UINT64_MAX || after == 0 || IsBufferInvalid(id) ||
-		    &m_slot_buffers[id] != result.first) {
+		const auto  structure = m_buffer_registry_epoch.load(std::memory_order_acquire);
+		const auto  after     = m_memory_tracker.RangeSignature(vaddr, size);
+		const auto* recorded  = m_slot_buffers.try_get(id);
+		if (structure == UINT64_MAX || after == 0 || recorded == nullptr || recorded->is_deleted ||
+		    recorded != result.first) {
 			return;
 		}
 		if (size <= CACHING_PAGESIZE) {
@@ -3548,13 +3623,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		}
 	}
 
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
-		id = FindBuffer(vaddr, size);
+	// One slot lookup for the caller's id (IsBufferInvalid is try_get == nullptr || is_deleted).
+	Buffer* found = m_slot_buffers.try_get(id);
+	if (found == nullptr || found->is_deleted || !found->IsInBounds(vaddr, size)) {
+		id    = FindBuffer(vaddr, size);
+		found = &m_slot_buffers[id];
 	}
 	if (obtained != nullptr) {
 		*obtained = id;
 	}
-	auto& buffer = m_slot_buffers[id];
+	auto& buffer = *found;
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -3590,10 +3668,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 			     range.address, range.size, vaddr, size);
 		}
 	}
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
-		id = FindBuffer(vaddr, size);
+	Buffer* found = m_slot_buffers.try_get(id);
+	if (found == nullptr || found->is_deleted || !found->IsInBounds(vaddr, size)) {
+		id    = FindBuffer(vaddr, size);
+		found = &m_slot_buffers[id];
 	}
-	auto& buffer = m_slot_buffers[id];
+	auto& buffer = *found;
 	TouchBuffer(buffer);
 	// Bytes the shader cannot write only need the upload a read binding gets. Each written range
 	// then uploads anything dirtied meanwhile and becomes GPU-owned under the same tracker locks,
@@ -4044,27 +4124,44 @@ void BufferCache::EndBackingPublication(uint64_t token) {
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);
 }
 
-bool BufferCache::HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const {
-	return PendingBackingPublicationTick(vaddr, size).has_value();
-}
-
-std::optional<uint64_t> BufferCache::PendingBackingPublicationTick(uint64_t vaddr,
-	                                                               uint64_t size) const {
+template <typename Visit>
+void BufferCache::ForEachPendingPublication(uint64_t vaddr, uint64_t size, Visit&& visit) const {
 	const GuestRange query {vaddr, size};
 	EXIT_IF(!query.Valid());
 	if (m_backing_publication_count.load(std::memory_order_acquire) == 0) {
-		return std::nullopt;
+		return;
 	}
 	std::lock_guard lock(m_backing_publication_mutex);
-	std::optional<uint64_t> latest;
 	for (const auto& entry: m_backing_publications) {
 		for (const auto& range: entry.ranges) {
 			if (range.address < query.End() && query.address < range.End()) {
-				latest = latest ? std::max(*latest, entry.tick) : entry.tick;
+				if (visit(entry)) {
+					return;
+				}
 				break;
 			}
 		}
 	}
+}
+
+bool BufferCache::HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const {
+	// PendingBackingPublicationTick(...).has_value(), stopping at the first overlapping range (it
+	// runs for every clean-read check, also on draw-prep workers, under the publications' mutex).
+	bool found = false;
+	ForEachPendingPublication(vaddr, size, [&found](const BackingPublication&) {
+		found = true;
+		return true;
+	});
+	return found;
+}
+
+std::optional<uint64_t> BufferCache::PendingBackingPublicationTick(uint64_t vaddr,
+	                                                               uint64_t size) const {
+	std::optional<uint64_t> latest;
+	ForEachPendingPublication(vaddr, size, [&latest](const BackingPublication& entry) {
+		latest = latest ? std::max(*latest, entry.tick) : entry.tick;
+		return false;
+	});
 	return latest;
 }
 
@@ -4666,10 +4763,12 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 		const UploadBatch upload_batch(*this);
 		BdaSyncStats      hot_stats;
 		RunBdaPass([&] {
+			// The logged ranges ascend: each continues the buffer walk where the previous one stood.
+			auto cursor = m_buffers.end();
 			m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
 				logged++;
 				mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
-					SynchronizeBuffersInRange(start, finish - start, &stats);
+					SynchronizeBuffersInRange(start, finish - start, &stats, &cursor);
 				});
 			});
 			if (check_hot) {
@@ -4778,11 +4877,34 @@ bool BufferCache::SynchronizeBdaHotRanges(BdaSyncStats& stats) {
 	return true;
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats) {
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
+                                            BufferMap::iterator* cursor) {
 	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+	// The last buffer starting at or below vaddr (or the first buffer). A cursor left by the
+	// previous, lower range of an ascending walk is advanced a few entries instead of descending
+	// the tree again; the result is the same entry.
+	auto it = m_buffers.end();
+	if (cursor != nullptr && *cursor != m_buffers.end() && (*cursor)->first <= vaddr) {
+		it = *cursor;
+		for (uint32_t steps = 0; steps < 8u; steps++) {
+			const auto next = std::next(it);
+			if (next == m_buffers.end() || next->first > vaddr) {
+				break;
+			}
+			it = next;
+		}
+		if (const auto next = std::next(it); next != m_buffers.end() && next->first <= vaddr) {
+			it = m_buffers.end(); // too far: descend
+		}
+	}
+	if (it == m_buffers.end()) {
+		it = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+	}
+	if (cursor != nullptr) {
+		*cursor = it;
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
 		auto&      buffer = m_slot_buffers[it->second];

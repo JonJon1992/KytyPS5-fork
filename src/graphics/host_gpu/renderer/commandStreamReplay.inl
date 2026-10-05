@@ -48,11 +48,13 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 
 	// Compares the producer's hash of its original arguments with this side's hash of the
 	// arguments passed to the executor, and the sequence number; folds the packet into the
-	// command-buffer digest.
-	const auto check = [&](uint64_t hash) {
+	// command-buffer digest. `hash_of` computes this side's hash; it runs only for a packet with a
+	// verify block, so the non-verify replay never hashes.
+	const auto check = [&](auto&& hash_of) {
 		if (verify == nullptr) {
 			return;
 		}
+		const uint64_t hash = hash_of();
 		state.checks++;
 		if (verify->sequence != state.sequence + 1) {
 			state.mismatches++;
@@ -86,7 +88,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 		case Op::Count: EXIT("CommandStream: unexpected packet %u\n", static_cast<uint32_t>(op));
 		case Op::DrainMarker: {
 			const auto& p = reader.Get<DrainMarkerPacket>();
-			check(VerifyHash::DrainMarker(p.serial));
+			check([&] { return VerifyHash::DrainMarker(p.serial); });
 			exec.DrainMarker(p.serial);
 			break;
 		}
@@ -94,7 +96,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p    = reader.Get<BeginPacket>();
 			state.cb_digest  = 0;
 			state.cb_packets = 0;
-			check(VerifyHash::Begin(p.command, p.tick));
+			check([&] { return VerifyHash::Begin(p.command, p.tick); });
 			exec.Begin(p);
 			break;
 		}
@@ -108,7 +110,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 					            state.cb_digest);
 				}
 			}
-			check(VerifyHash::Submit(p));
+			check([&] { return VerifyHash::Submit(p); });
 			exec.Submit(p);
 			break;
 		}
@@ -128,12 +130,12 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			info.pColorAttachments    = colors;
 			info.pDepthAttachment     = depth;
 			info.pStencilAttachment   = stencil;
-			check(VerifyHash::BeginRendering(info));
+			check([&] { return VerifyHash::BeginRendering(info); });
 			exec.beginRendering(info);
 			break;
 		}
 		case Op::EndRendering: {
-			check(VerifyHash::EndRendering());
+			check([&] { return VerifyHash::EndRendering(); });
 			exec.endRendering();
 			break;
 		}
@@ -147,7 +149,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			info.pBufferMemoryBarriers = reader.GetArray<vk::BufferMemoryBarrier2>(p.buffer_count);
 			info.imageMemoryBarrierCount = p.image_count;
 			info.pImageMemoryBarriers    = reader.GetArray<vk::ImageMemoryBarrier2>(p.image_count);
-			check(VerifyHash::PipelineBarrier2(info));
+			check([&] { return VerifyHash::PipelineBarrier2(info); });
 			exec.pipelineBarrier2(info);
 			break;
 		}
@@ -156,9 +158,11 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto* memory  = reader.GetArray<vk::MemoryBarrier>(p.memory_count);
 			const auto* buffers = reader.GetArray<vk::BufferMemoryBarrier>(p.buffer_count);
 			const auto* images  = reader.GetArray<vk::ImageMemoryBarrier>(p.image_count);
-			check(VerifyHash::PipelineBarrier(p.src_stages, p.dst_stages, p.flags, p.memory_count,
-			                                  memory, p.buffer_count, buffers, p.image_count,
-			                                  images));
+			check([&] {
+				return VerifyHash::PipelineBarrier(p.src_stages, p.dst_stages, p.flags, p.memory_count,
+				                                   memory, p.buffer_count, buffers, p.image_count,
+				                                   images);
+			});
 			exec.pipelineBarrier(p.src_stages, p.dst_stages, p.flags, p.memory_count, memory,
 			                     p.buffer_count, buffers, p.image_count, images);
 			break;
@@ -166,44 +170,50 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 		case Op::CopyBuffer: {
 			const auto& p       = reader.Get<CopyBufferPacket>();
 			const auto* regions = reader.GetArray<vk::BufferCopy>(p.count);
-			check(VerifyHash::CopyBuffer(p.source, p.destination, p.count, regions));
+			check([&] {
+				return VerifyHash::CopyBuffer(p.source, p.destination, p.count, regions);
+			});
 			exec.copyBuffer(p.source, p.destination, p.count, regions);
 			break;
 		}
 		case Op::CopyBufferToImage: {
 			const auto& p       = reader.Get<CopyBufferToImagePacket>();
 			const auto* regions = reader.GetArray<vk::BufferImageCopy>(p.count);
-			check(
-			    VerifyHash::CopyBufferToImage(p.source, p.destination, p.layout, p.count, regions));
+			check([&] {
+				return VerifyHash::CopyBufferToImage(p.source, p.destination, p.layout, p.count, regions);
+			});
 			exec.copyBufferToImage(p.source, p.destination, p.layout, p.count, regions);
 			break;
 		}
 		case Op::CopyImageToBuffer: {
 			const auto& p       = reader.Get<CopyImageToBufferPacket>();
 			const auto* regions = reader.GetArray<vk::BufferImageCopy>(p.count);
-			check(
-			    VerifyHash::CopyImageToBuffer(p.source, p.layout, p.destination, p.count, regions));
+			check([&] {
+				return VerifyHash::CopyImageToBuffer(p.source, p.layout, p.destination, p.count, regions);
+			});
 			exec.copyImageToBuffer(p.source, p.layout, p.destination, p.count, regions);
 			break;
 		}
 		case Op::CopyImage: {
 			const auto& p       = reader.Get<CopyImagePacket>();
 			const auto* regions = reader.GetArray<vk::ImageCopy>(p.count);
-			check(VerifyHash::CopyImage(p.source, p.source_layout, p.destination,
-			                            p.destination_layout, p.count, regions));
+			check([&] {
+				return VerifyHash::CopyImage(p.source, p.source_layout, p.destination,
+				                             p.destination_layout, p.count, regions);
+			});
 			exec.copyImage(p.source, p.source_layout, p.destination, p.destination_layout, p.count,
 			               regions);
 			break;
 		}
 		case Op::FillBuffer: {
 			const auto& p = reader.Get<FillBufferPacket>();
-			check(VerifyHash::FillBuffer(p.buffer, p.offset, p.size, p.value));
+			check([&] { return VerifyHash::FillBuffer(p.buffer, p.offset, p.size, p.value); });
 			exec.fillBuffer(p.buffer, p.offset, p.size, p.value);
 			break;
 		}
 		case Op::BindPipeline: {
 			const auto& p = reader.Get<BindPipelinePacket>();
-			check(VerifyHash::BindPipeline(p.point, p.pipeline));
+			check([&] { return VerifyHash::BindPipeline(p.point, p.pipeline); });
 			exec.bindPipeline(p.point, p.pipeline);
 			break;
 		}
@@ -211,8 +221,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto& p       = reader.Get<BindDescriptorSetsPacket>();
 			const auto* sets    = reader.GetArray<vk::DescriptorSet>(p.set_count);
 			const auto* offsets = reader.GetArray<uint32_t>(p.dynamic_count);
-			check(VerifyHash::BindDescriptorSets(p.point, p.layout, p.first_set, p.set_count, sets,
-			                                     p.dynamic_count, offsets));
+			check([&] {
+				return VerifyHash::BindDescriptorSets(p.point, p.layout, p.first_set, p.set_count, sets,
+				                                      p.dynamic_count, offsets);
+			});
 			exec.bindDescriptorSets(p.point, p.layout, p.first_set, p.set_count, sets,
 			                        p.dynamic_count, offsets);
 			break;
@@ -223,8 +235,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto* infos   = reader.GetArray<DescriptorInfo>(p.info_count);
 			Detail::RebuildDescriptorWrites(state, records, p.write_count, infos, p.info_count,
 			                                nullptr);
-			check(VerifyHash::PushDescriptorSet(p.point, p.layout, p.set, p.write_count,
-			                                    state.writes.data()));
+			check([&] {
+				return VerifyHash::PushDescriptorSet(p.point, p.layout, p.set, p.write_count,
+				                                     state.writes.data());
+			});
 			exec.pushDescriptorSetKHR(p.point, p.layout, p.set, p.write_count, state.writes.data());
 			break;
 		}
@@ -234,14 +248,18 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto* infos   = reader.GetArray<DescriptorInfo>(p.info_count);
 			Detail::RebuildDescriptorWrites(state, records, p.write_count, infos, p.info_count,
 			                                p.set);
-			check(VerifyHash::UpdateDescriptorSets(p.set, p.write_count, state.writes.data()));
+			check([&] {
+				return VerifyHash::UpdateDescriptorSets(p.set, p.write_count, state.writes.data());
+			});
 			exec.updateDescriptorSets(p.set, p.write_count, state.writes.data());
 			break;
 		}
 		case Op::PushConstants: {
 			const auto& p    = reader.Get<PushConstantsPacket>();
 			const auto* data = reader.GetArray<uint8_t>(p.size);
-			check(VerifyHash::PushConstants(p.layout, p.stages, p.offset, p.size, data));
+			check([&] {
+				return VerifyHash::PushConstants(p.layout, p.stages, p.offset, p.size, data);
+			});
 			exec.pushConstants(p.layout, p.stages, p.offset, p.size, data);
 			break;
 		}
@@ -253,161 +271,174 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			    p.has_sizes != 0 ? reader.GetArray<vk::DeviceSize>(p.count) : nullptr;
 			const auto* strides =
 			    p.has_strides != 0 ? reader.GetArray<vk::DeviceSize>(p.count) : nullptr;
-			check(
-			    VerifyHash::BindVertexBuffers2(p.first, p.count, buffers, offsets, sizes, strides));
+			check([&] {
+				return VerifyHash::BindVertexBuffers2(p.first, p.count, buffers, offsets, sizes, strides);
+			});
 			exec.bindVertexBuffers2(p.first, p.count, buffers, offsets, sizes, strides);
 			break;
 		}
 		case Op::BindIndexBuffer: {
 			const auto& p = reader.Get<BindIndexBufferPacket>();
-			check(VerifyHash::BindIndexBuffer(p.buffer, p.offset, p.type));
+			check([&] { return VerifyHash::BindIndexBuffer(p.buffer, p.offset, p.type); });
 			exec.bindIndexBuffer(p.buffer, p.offset, p.type);
 			break;
 		}
 		case Op::SetViewportWithCount: {
 			const auto& p         = reader.Get<CountPacket>();
 			const auto* viewports = reader.GetArray<vk::Viewport>(p.count);
-			check(VerifyHash::Viewports(p.count, viewports));
+			check([&] { return VerifyHash::Viewports(p.count, viewports); });
 			exec.setViewportWithCount(p.count, viewports);
 			break;
 		}
 		case Op::SetScissorWithCount: {
 			const auto& p        = reader.Get<CountPacket>();
 			const auto* scissors = reader.GetArray<vk::Rect2D>(p.count);
-			check(VerifyHash::Scissors(p.count, scissors));
+			check([&] { return VerifyHash::Scissors(p.count, scissors); });
 			exec.setScissorWithCount(p.count, scissors);
 			break;
 		}
 		case Op::SetLineWidth: {
 			const auto& p = reader.Get<FloatPacket>();
-			check(VerifyHash::Floats(op, &p.value, 1));
+			check([&] { return VerifyHash::Floats(op, &p.value, 1); });
 			exec.setLineWidth(p.value);
 			break;
 		}
 		case Op::SetBlendConstants: {
 			const auto& p = reader.Get<Float4Packet>();
-			check(VerifyHash::Floats(op, p.values, 4));
+			check([&] { return VerifyHash::Floats(op, p.values, 4); });
 			exec.setBlendConstants(p.values);
 			break;
 		}
 		case Op::SetDepthTestEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setDepthTestEnable(p.value);
 			break;
 		}
 		case Op::SetDepthWriteEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setDepthWriteEnable(p.value);
 			break;
 		}
 		case Op::SetDepthCompareOp: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setDepthCompareOp(static_cast<vk::CompareOp>(p.value));
 			break;
 		}
 		case Op::SetDepthBiasEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setDepthBiasEnable(p.value);
 			break;
 		}
 		case Op::SetDepthBias: {
 			const auto& p = reader.Get<Float3Packet>();
-			check(VerifyHash::Floats(op, p.values, 3));
+			check([&] { return VerifyHash::Floats(op, p.values, 3); });
 			exec.setDepthBias(p.values[0], p.values[1], p.values[2]);
 			break;
 		}
 		case Op::SetStencilTestEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setStencilTestEnable(p.value);
 			break;
 		}
 		case Op::SetStencilOp: {
 			const auto& p = reader.Get<StencilOpPacket>();
-			check(VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces),
-			                        static_cast<uint64_t>(p.fail), static_cast<uint64_t>(p.pass),
-			                        static_cast<uint64_t>(p.depth_fail),
-			                        static_cast<uint64_t>(p.compare)));
+			check([&] {
+				return VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces),
+				                         static_cast<uint64_t>(p.fail), static_cast<uint64_t>(p.pass),
+				                         static_cast<uint64_t>(p.depth_fail),
+				                         static_cast<uint64_t>(p.compare));
+			});
 			exec.setStencilOp(p.faces, p.fail, p.pass, p.depth_fail, p.compare);
 			break;
 		}
 		case Op::SetStencilCompareMask: {
 			const auto& p = reader.Get<StencilValuePacket>();
-			check(VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value));
+			check([&] {
+				return VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value);
+			});
 			exec.setStencilCompareMask(p.faces, p.value);
 			break;
 		}
 		case Op::SetStencilWriteMask: {
 			const auto& p = reader.Get<StencilValuePacket>();
-			check(VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value));
+			check([&] {
+				return VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value);
+			});
 			exec.setStencilWriteMask(p.faces, p.value);
 			break;
 		}
 		case Op::SetStencilReference: {
 			const auto& p = reader.Get<StencilValuePacket>();
-			check(VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value));
+			check([&] {
+				return VerifyHash::Value(op, static_cast<VkStencilFaceFlags>(p.faces), p.value);
+			});
 			exec.setStencilReference(p.faces, p.value);
 			break;
 		}
 		case Op::SetCullMode: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setCullMode(vk::CullModeFlags(p.value));
 			break;
 		}
 		case Op::SetFrontFace: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setFrontFace(static_cast<vk::FrontFace>(p.value));
 			break;
 		}
 		case Op::SetDepthBoundsTestEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setDepthBoundsTestEnable(p.value);
 			break;
 		}
 		case Op::SetDepthBounds: {
 			const auto& p = reader.Get<Float2Packet>();
-			check(VerifyHash::Floats(op, p.values, 2));
+			check([&] { return VerifyHash::Floats(op, p.values, 2); });
 			exec.setDepthBounds(p.values[0], p.values[1]);
 			break;
 		}
 		case Op::SetColorWriteEnable: {
 			const auto& p       = reader.Get<CountPacket>();
 			const auto* enables = reader.GetArray<vk::Bool32>(p.count);
-			check(VerifyHash::ColorWriteEnable(p.count, enables));
+			check([&] { return VerifyHash::ColorWriteEnable(p.count, enables); });
 			exec.setColorWriteEnableEXT(p.count, enables);
 			break;
 		}
 		case Op::SetAttachmentFeedbackLoopEnable: {
 			const auto& p = reader.Get<UintPacket>();
-			check(VerifyHash::Value(op, p.value));
+			check([&] { return VerifyHash::Value(op, p.value); });
 			exec.setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags(p.value));
 			break;
 		}
 		case Op::Draw: {
 			const auto& p = reader.Get<DrawPacket>();
-			check(VerifyHash::Value(op, p.vertex_count, p.instance_count, p.first_vertex,
-			                        p.first_instance));
+			check([&] {
+				return VerifyHash::Value(op, p.vertex_count, p.instance_count, p.first_vertex,
+				                         p.first_instance);
+			});
 			exec.draw(p.vertex_count, p.instance_count, p.first_vertex, p.first_instance);
 			break;
 		}
 		case Op::DrawIndexed: {
 			const auto& p = reader.Get<DrawIndexedPacket>();
-			check(VerifyHash::Value(op, p.index_count, p.instance_count, p.first_index,
-			                        static_cast<uint32_t>(p.vertex_offset), p.first_instance));
+			check([&] {
+				return VerifyHash::Value(op, p.index_count, p.instance_count, p.first_index,
+				                         static_cast<uint32_t>(p.vertex_offset), p.first_instance);
+			});
 			exec.drawIndexed(p.index_count, p.instance_count, p.first_index, p.vertex_offset,
 			                 p.first_instance);
 			break;
 		}
 		case Op::DrawMeshTasks: {
 			const auto& p = reader.Get<Groups3Packet>();
-			check(VerifyHash::Value(op, p.x, p.y, p.z));
+			check([&] { return VerifyHash::Value(op, p.x, p.y, p.z); });
 			exec.drawMeshTasksEXT(p.x, p.y, p.z);
 			break;
 		}
@@ -418,7 +449,9 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    buffer_bits = 0;
 			const auto  raw         = static_cast<VkBuffer>(p.buffer);
 			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
-			check(VerifyHash::Value(op, buffer_bits, p.offset, p.draw_count, p.stride));
+			check([&] {
+				return VerifyHash::Value(op, buffer_bits, p.offset, p.draw_count, p.stride);
+			});
 			if (op == Op::DrawMeshTasksIndirect) {
 				exec.drawMeshTasksIndirectEXT(p.buffer, p.offset, p.draw_count, p.stride);
 			} else if (op == Op::DrawIndirect) {
@@ -438,8 +471,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto  raw_count   = static_cast<VkBuffer>(p.count_buffer);
 			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
 			std::memcpy(&count_bits, &raw_count, sizeof(count_bits));
-			check(VerifyHash::Value(op, buffer_bits, p.offset, count_bits, p.count_offset,
-			                        p.max_count, p.stride));
+			check([&] {
+				return VerifyHash::Value(op, buffer_bits, p.offset, count_bits, p.count_offset,
+				                         p.max_count, p.stride);
+			});
 			if (op == Op::DrawMeshTasksIndirectCount) {
 				exec.drawMeshTasksIndirectCountEXT(p.buffer, p.offset, p.count_buffer,
 				                                   p.count_offset, p.max_count, p.stride);
@@ -454,7 +489,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 		}
 		case Op::Dispatch: {
 			const auto& p = reader.Get<Groups3Packet>();
-			check(VerifyHash::Value(op, p.x, p.y, p.z));
+			check([&] { return VerifyHash::Value(op, p.x, p.y, p.z); });
 			exec.dispatch(p.x, p.y, p.z);
 			break;
 		}
@@ -463,7 +498,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    buffer_bits = 0;
 			const auto  raw         = static_cast<VkBuffer>(p.buffer);
 			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
-			check(VerifyHash::Value(op, buffer_bits, p.offset));
+			check([&] { return VerifyHash::Value(op, buffer_bits, p.offset); });
 			exec.dispatchIndirect(p.buffer, p.offset);
 			break;
 		}
@@ -473,7 +508,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    pool_bits = 0;
 			const auto  raw       = static_cast<VkQueryPool>(p.pool);
 			std::memcpy(&pool_bits, &raw, sizeof(pool_bits));
-			check(VerifyHash::Value(op, pool_bits, p.first, p.count));
+			check([&] { return VerifyHash::Value(op, pool_bits, p.first, p.count); });
 			if (op == Op::ResetQueryPool) {
 				exec.resetQueryPool(p.pool, p.first, p.count);
 			} else {
@@ -486,8 +521,10 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    pool_bits = 0;
 			const auto  raw       = static_cast<VkQueryPool>(p.pool);
 			std::memcpy(&pool_bits, &raw, sizeof(pool_bits));
-			check(VerifyHash::Value(op, pool_bits, p.query,
-			                        static_cast<VkQueryControlFlags>(p.flags)));
+			check([&] {
+				return VerifyHash::Value(op, pool_bits, p.query,
+				                         static_cast<VkQueryControlFlags>(p.flags));
+			});
 			exec.beginQuery(p.pool, p.query, p.flags);
 			break;
 		}
@@ -499,10 +536,12 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			const auto  raw_dest  = static_cast<VkBuffer>(p.destination);
 			std::memcpy(&pool_bits, &raw_pool, sizeof(pool_bits));
 			std::memcpy(&dest_bits, &raw_dest, sizeof(dest_bits));
-			check(VerifyHash::Value(
-			    op, pool_bits, p.first, p.count, dest_bits, p.offset,
-			    p.stride ^
-			        (static_cast<uint64_t>(static_cast<VkQueryResultFlags>(p.flags)) << 40u)));
+			check([&] {
+				return VerifyHash::Value(
+				     op, pool_bits, p.first, p.count, dest_bits, p.offset,
+				     p.stride ^
+				         (static_cast<uint64_t>(static_cast<VkQueryResultFlags>(p.flags)) << 40u));
+			});
 			exec.copyQueryPoolResults(p.pool, p.first, p.count, p.destination, p.offset, p.stride,
 			                          p.flags);
 			break;
@@ -512,7 +551,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    pool_bits = 0;
 			const auto  raw       = static_cast<VkQueryPool>(p.pool);
 			std::memcpy(&pool_bits, &raw, sizeof(pool_bits));
-			check(VerifyHash::Value(op, pool_bits, p.query, p.stage));
+			check([&] { return VerifyHash::Value(op, pool_bits, p.query, p.stage); });
 			const auto stage = vk::PipelineStageFlags2(static_cast<VkPipelineStageFlags2>(p.stage));
 			exec.writeTimestamp2(stage, p.pool, p.query);
 			break;
@@ -522,7 +561,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			uint64_t    buffer_bits = 0;
 			const auto  raw         = static_cast<VkBuffer>(p.buffer);
 			std::memcpy(&buffer_bits, &raw, sizeof(buffer_bits));
-			check(VerifyHash::Value(op, buffer_bits, p.offset, p.flags));
+			check([&] { return VerifyHash::Value(op, buffer_bits, p.offset, p.flags); });
 			vk::ConditionalRenderingBeginInfoEXT info {};
 			info.buffer = p.buffer;
 			info.offset = p.offset;
@@ -532,7 +571,7 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			break;
 		}
 		case Op::EndConditionalRendering: {
-			check(VerifyHash::Value(op, 0));
+			check([&] { return VerifyHash::Value(op, 0); });
 			exec.endConditionalRenderingEXT();
 			break;
 		}

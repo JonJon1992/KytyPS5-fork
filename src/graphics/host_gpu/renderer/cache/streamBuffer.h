@@ -84,7 +84,7 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
-	// KYTY_BUFFER_LRU_SKIP=1 (BufferCache::TouchBuffer): the tick the LRU item last received.
+	// KYTY_BUFFER_LRU_SKIP (BufferCache::TouchBuffer): the tick the LRU item last received.
 	mutable uint64_t lru_tick = 0;
 
 protected:

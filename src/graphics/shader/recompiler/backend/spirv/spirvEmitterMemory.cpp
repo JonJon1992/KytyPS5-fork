@@ -313,17 +313,38 @@ uint32_t DeviceDwordLoadInBounds(EmitterState& state, uint32_t index) {
 	              ConstantU32(state, 0x40000000u));
 }
 
+uint32_t PlainLoadInBounds(EmitterState& state, const MemoryResourceAccess& resource,
+                           uint32_t index) {
+	return DeviceChecksDwordLoad(resource) ? DeviceDwordLoadInBounds(state, index)
+	                                       : EmitMemoryElementInBounds(state, resource, index);
+}
+
+// `load()` if `in_bounds`, else zero. The device always enables robustBufferAccess, so a load
+// through a storage-buffer descriptor at an out-of-bounds index cannot fault (it reads zero or
+// some value of the buffer): it is issued unconditionally and only its value is replaced, instead
+// of a branch and a phi per load. The AMD compiler's cost follows control flow; see "Branch-free
+// storage-buffer loads" in docs/performance-amd.md. LDS, GDS and scratch have no such guarantee
+// and keep the branch, as does KYTY_ROBUST_BUFFER_LOADS=0.
+template <typename Fn>
+uint32_t LoadOrZero(EmitterState& state, const MemoryResourceAccess& resource, uint32_t in_bounds,
+                    Fn&& load) {
+	const bool storage_buffer = resource.kind == IR::ResourceKind::Buffer ||
+	                            resource.kind == IR::ResourceKind::ScalarBuffer;
+	if (!storage_buffer || !GetCodegenOptions().robust_buffer_loads) {
+		return EmitValueOrZeroIfCondition(state, in_bounds, std::forward<Fn>(load));
+	}
+	const auto value = load();
+	if (in_bounds == state.constant_true) {
+		return value;
+	}
+	return Select(state, TypeU32(state), in_bounds, value, ConstantU32(state, 0));
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
-	if (DeviceChecksDwordLoad(resource)) {
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, DeviceDwordLoadInBounds(ctx.state, index),
-		    [&]() { return LoadWordInBounds(ctx, resource, index); });
-	}
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	return LoadOrZero(ctx.state, resource, PlainLoadInBounds(ctx.state, resource, index),
+	                  [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -340,15 +361,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto raw_index = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
-	if (DeviceChecksDwordLoad(resource)) {
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, DeviceDwordLoadInBounds(ctx.state, index),
-		    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend); });
-	}
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	return LoadOrZero(ctx.state, resource, PlainLoadInBounds(ctx.state, resource, index), [&]() {
+		return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
+	});
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -1393,15 +1408,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
-	if (DeviceChecksDwordLoad(access)) {
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, DeviceDwordLoadInBounds(state, element), [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
-	           }));
-		return;
-	}
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
+	ctx.Define(inst, LoadOrZero(state, access, PlainLoadInBounds(state, access, element), [&]() {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
 		               state, EmitMemoryElementPointer(state, access, element));
 	           }));

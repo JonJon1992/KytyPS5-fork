@@ -643,9 +643,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	if (idle) {
 		m_idle_drains++;
 	} else {
-		const auto end = m_encoder.DrainMarker(++m_drain_serial);
 		if (m_mode == Mode::Thread) {
-			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+			m_encoder.Drain(m_drain_policy, m_drain_stats);
 		}
 	}
 	const auto now = NowNs();

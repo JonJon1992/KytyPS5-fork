@@ -1909,6 +1909,17 @@ void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
   if (!tools.Validate(spirv)) {
     Fail(shader_name, "SPIR-V validation", messages);
   }
+  // Optional artifacts for literal before/after comparisons, outside benchmark timings.
+  if (const auto *directory = std::getenv("KYTY_SPIRV_SNAPSHOT_DIR")) {
+    static size_t index = 0;
+    std::filesystem::create_directories(directory);
+    const auto path = std::filesystem::path(directory) /
+                      (std::to_string(index++) + ".spv");
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(spirv.data()),
+                 static_cast<std::streamsize>(spirv.size() * sizeof(u32)));
+    Require(shader_name, "SPIR-V snapshot", output.good(), path.string().c_str());
+  }
 }
 
 size_t CountText(const std::string &text, const std::string &needle) {
@@ -2581,6 +2592,133 @@ int CorpusSpirvStats(const char *path, const char *disassembly_path = nullptr) {
   if (!valid) {
     std::printf("%s,invalid,%s\n", path, messages.c_str());
   }
+  return 0;
+}
+
+// A compute shader shaped like the large game shaders that dominate compile time: uniform loops
+// around EXEC-masked if-blocks, each with a constant-buffer load, a buffer load and VALU work.
+std::vector<u32> MakeCompileBenchmarkShader(u32 loops, u32 sections_per_loop, u32 alu) {
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v_lshlrev_b32 v1, 2, v0
+  code.push_back(EncodeVop1(0x01, 5, InlineU32(0)));    // v_mov_b32 v5, 0
+  code.push_back(EncodeVop1(0x01, 7, InlineU32(0)));    // v_mov_b32 v7, 0
+  for (u32 loop = 0; loop < loops; loop++) {
+    code.push_back(EncodeSMovB32(20, InlineU32(3))); // s_mov_b32 s20, 3
+    const auto header = code.size();
+    for (u32 section = 0; section < sections_per_loop; section++) {
+      const u32 sgpr = 40u + section % 16u;
+      AppendSmemLoadOpcode(&code, 0x08, sgpr, (section % 32u) * 4u); // s_buffer_load_dword
+      code.push_back(EncodeVopc(0xc2, InlineU32(section % 8u), 0));   // v_cmp_eq_u32 vcc
+      code.push_back(EncodeSop1(0x24, 10, 106)); // s_and_saveexec_b64 s[10:11], vcc
+      const auto branch = code.size();
+      code.push_back(0);
+      AppendBufferLoadDword(&code, 4, 1);
+      for (u32 i = 0; i < alu; i++) {
+        switch (i % 4u) {
+        case 0: code.push_back(EncodeVop2(0x03, 5, Vgpr(4), 5)); break; // v_add_f32
+        case 1: code.push_back(EncodeVop2(0x08, 6, Vgpr(5), 4)); break; // v_mul_f32
+        case 2: code.push_back(EncodeVop2(0x25, 7, sgpr, 7)); break;    // v_add_nc_u32
+        default: code.push_back(EncodeVop2(0x1d, 7, Vgpr(6), 7)); break; // v_xor_b32
+        }
+      }
+      code[branch] = EncodeSopp(0x08, static_cast<u32>(code.size() - branch - 1u)); // execz
+      code.push_back(EncodeSop1(0x04, 126, 10)); // s_mov_b64 exec, s[10:11]
+    }
+    code.push_back(EncodeSop2(0x01, 20, 20, InlineU32(1))); // s_sub_u32 s20, s20, 1
+    code.push_back(EncodeSopc(0x07, 20, InlineU32(0)));     // s_cmp_lg_u32 s20, 0
+    const auto back = static_cast<int32_t>(header) - static_cast<int32_t>(code.size()) - 1;
+    code.push_back(EncodeSopp(0x05, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc1
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 64);
+  AppendEnd(&code);
+  return code;
+}
+
+// --compile-benchmark [rounds] [dump_ir=0|1]; the default matches production with logging off.
+// KYTY_SPIRV_SNAPSHOT_DIR saves validated modules for literal comparisons between builds.
+int CompileBenchmark(u32 rounds, bool dump_ir) {
+  Require("compile-benchmark", "rounds", rounds != 0, "rounds must be positive");
+  using Clock = std::chrono::steady_clock;
+  struct Shape {
+    u32 loops, sections, alu;
+  };
+  const Shape shapes[] = {{2, 8, 8}, {4, 16, 12}, {8, 24, 16}, {12, 32, 16}};
+  std::vector<u32> initial(4096, 0x3f800000u);
+  double total_translate = 0;
+  double total_compile = 0;
+  for (const auto &shape : shapes) {
+    const auto code = MakeCompileBenchmarkShader(shape.loops, shape.sections, shape.alu);
+    auto user_data = MakeNativeUserData(nullptr);
+    user_data[2] = static_cast<u32>(initial.size() * sizeof(u32));
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 1;
+    compute.wave_size = 64;
+    compute.host_subgroup_size = 64;
+    ShaderRecompiler::CompileOptions options;
+    options.dump_ir = dump_ir;
+    options.stage = ShaderType::Compute;
+    options.wave_size = 64;
+    options.input_info.compute = &compute;
+    options.user_data = user_data;
+    std::vector<double> translate_ms;
+    std::vector<double> compile_ms;
+    uint64_t digest = 0;
+    std::vector<u32> spirv;
+    for (u32 round = 0; round < rounds; round++) {
+      const auto t0 = Clock::now();
+      auto translated = ShaderRecompiler::TranslateProgram(code, options);
+      const auto t1 = Clock::now();
+      const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+      ShaderRecompiler::IR::ResourceSnapshot resources;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      const ShaderRecompiler::IR::SrtRuntime runtime{
+          .user_data = options.user_data,
+          .shader_base = reinterpret_cast<uint64_t>(code.data()),
+          .read_memory = ReadTestMemory,
+          .userdata = &initial,
+      };
+      if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                      specialization)) {
+        std::printf("compile-benchmark: resources could not be materialized\n");
+        return 1;
+      }
+      const auto t2 = Clock::now();
+      const auto result =
+          ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+      const auto t3 = Clock::now();
+      translate_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+      compile_ms.push_back(std::chrono::duration<double, std::milli>(t3 - t2).count());
+      uint64_t hash = 0xcbf29ce484222325ull;
+      for (const auto word : result.spirv) {
+        hash = (hash ^ word) * 0x100000001b3ull;
+      }
+      if (round == 0) {
+        digest = hash;
+        spirv = result.spirv;
+      } else {
+        Require("compile-benchmark", "determinism", spirv == result.spirv,
+                "SPIR-V changed between rounds");
+      }
+    }
+    ValidateSpirv("compile-benchmark", spirv);
+    const auto words = spirv.size();
+    std::sort(translate_ms.begin(), translate_ms.end());
+    std::sort(compile_ms.begin(), compile_ms.end());
+    const auto translate = translate_ms[translate_ms.size() / 2];
+    const auto compile = compile_ms[compile_ms.size() / 2];
+    total_translate += translate;
+    total_compile += compile;
+    std::printf("shape loops=%u sections=%u alu=%u guest_words=%zu spirv_words=%zu "
+                "digest=%016llx translate_ms=%.3f compile_ms=%.3f\n",
+                shape.loops, shape.sections, shape.alu, code.size(), words,
+                static_cast<unsigned long long>(digest), translate, compile);
+  }
+  std::printf("total (medians) translate_ms=%.3f compile_ms=%.3f\n", total_translate,
+              total_compile);
   return 0;
 }
 
@@ -11303,18 +11441,16 @@ public:
       compatible_desc.view_info.format = compatible_desc.info.pixel_format;
       const auto compatible = texture_cache.FindImage(compatible_desc);
       // A first-page hit resolves without a region query. Every FindImage then runs
-      // SyncAliasFromOwner, which scans the region once for a stale-alias owner while
-      // aliases age by frames (5acad01d; KYTY_IMAGE_ALIAS_AGE=ticks disables it), so the
-      // two hits cost exactly that many scans and no lookup scans.
+      // SyncAliasFromOwner, whose stale-alias owner has the same backing range and is looked
+      // up on the first page only (FindOnFirstPage), so the two hits cost no region scans.
+      // Aliases age by frames (5acad01d) unless KYTY_IMAGE_ALIAS_AGE=ticks.
       const char *alias_age = std::getenv("KYTY_IMAGE_ALIAS_AGE");
       const bool aliases_age_by_frames =
           alias_age == nullptr || std::strcmp(alias_age, "ticks") != 0;
-      const uint32_t alias_sync_scans = aliases_age_by_frames ? 1u : 0u;
       Require(name, "normalized FindImage",
               first && repeated == first && compatible == first &&
                   (!TextureCacheTestAccess::UsesFirstPageLookup(texture_cache) ||
-                   TextureCacheTestAccess::QueryEpoch(texture_cache) ==
-                       exact_query_epoch + 2u * alias_sync_scans) &&
+                   TextureCacheTestAccess::QueryEpoch(texture_cache) == exact_query_epoch) &&
                   TextureCacheTestAccess::LookupVerificationHealthy(texture_cache) &&
                   texture_cache.GetImage(first).info.pixel_format ==
                       vk::Format::eR8G8B8A8Srgb,
@@ -50338,6 +50474,16 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // The tests also validate the IR as translated (off in production); the compile benchmark
+  // measures the production configuration.
+  if (std::getenv("KYTY_VALIDATE_IR") == nullptr &&
+      (argc < 2 || std::strcmp(argv[1], "--compile-benchmark") != 0)) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_VALIDATE_IR", "1");
+#else
+    setenv("KYTY_VALIDATE_IR", "1", 1);
+#endif
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--gi-decode-inventory") == 0) {
     EnsureConfigInitialized();
     return GiProbeTests::GiDecodeInventory(argv[2], argc == 4 ? argv[3] : nullptr);
@@ -50345,6 +50491,11 @@ int main(int argc, char **argv) {
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
+  if (argc >= 2 && argc <= 4 && std::strcmp(argv[1], "--compile-benchmark") == 0) {
+    EnsureConfigInitialized();
+    return CompileBenchmark(argc >= 3 ? static_cast<u32>(std::strtoul(argv[2], nullptr, 10)) : 9u,
+                            argc == 4 && std::strcmp(argv[3], "1") == 0);
   }
   if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
     EnsureConfigInitialized();

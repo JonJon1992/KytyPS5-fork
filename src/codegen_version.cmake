@@ -4,7 +4,8 @@
 #   content hash), this script, and the compiler identity and flags. Cache files written by a build
 #   with another version are not used.
 # - KYTY_CODEGEN_SWITCH_LIST: every "KYTY_*" string literal in those files (the environment
-#   switches the codegen fingerprint records), except the program cache's own switches.
+#   switches the codegen fingerprint records), except the program cache's own switches and
+#   KYTY_VALIDATE_IR (validation only).
 # The build fails when a file of the set includes a project header that is neither in the set nor
 # exempt below: the version would not see changes to it. Exempt headers cannot change what a
 # translation produces, or the fingerprint records the values they contribute (rendererBatch.h:
@@ -50,7 +51,8 @@ foreach(path IN LISTS files)
 	string(REGEX MATCHALL "\"KYTY_[A-Z0-9_]+\"" names "${content}")
 	foreach(name IN LISTS names)
 		string(REPLACE "\"" "" name "${name}")
-		if(NOT name MATCHES "^KYTY_PROGRAM_CACHE")
+		# KYTY_VALIDATE_IR only checks the translated IR: the same program either way.
+		if(NOT name MATCHES "^KYTY_PROGRAM_CACHE" AND NOT name STREQUAL "KYTY_VALIDATE_IR")
 			list(APPEND switches "${name}")
 		endif()
 	endforeach()

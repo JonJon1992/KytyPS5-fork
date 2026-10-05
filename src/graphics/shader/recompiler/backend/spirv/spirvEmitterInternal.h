@@ -93,6 +93,8 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
+	// The OpConstantTrue id once ConstantBool declared it: branches on it are not emitted.
+	uint32_t                                        constant_true = 0;
 	uint32_t                                        u32_type = 0;
 	uint32_t                                        native_u64_type = 0;
 	uint32_t                                        i32_type = 0;
@@ -564,6 +566,8 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.
+// A condition that is the constant true (an EXEC that starts full, a check the host makes
+// unnecessary) emits `fn` inline instead of a selection construct around it.
 template <typename Fn>
 auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,
                         uint32_t result_type, Fn&& emit) {
@@ -605,6 +609,10 @@ auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_coun
 
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition != 0u && condition == state.constant_true) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
@@ -618,6 +626,9 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition != 0u && condition == state.constant_true) {
+		return fn();
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();

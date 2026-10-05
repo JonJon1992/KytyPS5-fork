@@ -1019,6 +1019,17 @@ bool StartsWithLiveExec(const Decoder::Program& decoded, const TranslateOptions&
 	return false;
 }
 
+// KYTY_VALIDATE_IR=1 also validates the IR as translated, before SSA: a check of the translator
+// itself that cost about a tenth of the compile time of large shaders. The SSA IR is always
+// validated before SPIR-V emission. The recompiler tests turn it on.
+bool ValidateTranslatedIr() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_VALIDATE_IR");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
@@ -1427,7 +1438,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 		lds_write_pending = translator.LdsWritePending();
 	}
-	IR::ValidateProgram(result, false);
+	if (ValidateTranslatedIr()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 

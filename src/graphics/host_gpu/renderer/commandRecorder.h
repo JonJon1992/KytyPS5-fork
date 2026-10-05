@@ -146,7 +146,6 @@ private:
 	std::atomic<bool>        m_test_stall {false};
 	std::atomic<uint64_t>    m_busy_ns {0};
 	bool                     m_stopped      = false;
-	uint64_t                 m_drain_serial = 0;
 
 	// Producer-side counters published at every Submit (FrameEvents / FrameWaits).
 	uint64_t m_published_packets  = 0;
