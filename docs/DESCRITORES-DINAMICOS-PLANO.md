@@ -217,6 +217,13 @@ da Fase 0.
 Rodar no Yōtei e em outros jogos que usam `KYTY_SRT_VARIANT_READS`. Resultado esperado: a fração dos
 110 shaders que a opção A cobre. *Critério:* se A cobrir a maioria, seguir com A.
 
+**Estado (branch `desc-dyn-phase0`):** implementado o relatório. `KYTY_RUNTIME_DESCRIPTOR_REPORT=1`
+imprime, uma vez por shader, dword e pc, uma linha `KYTY_RUNTIME_DESCRIPTOR` com a árvore de operações
+do dword que não pôde ser resolvido na CPU (`ResourceTracking.cpp`, `GetHandle`). É diagnóstico: não
+altera o código gerado nem o fingerprint do cache. `tools/descriptor_report.py <log>` agrupa as linhas por
+tipo de recurso, origem da tabela, origem da chave e forma do offset, e conta shaders distintos.
+Os testes de tracking passam com e sem a variável. Falta a execução no Yōtei, que o usuário roda.
+
 **Fase 1: infraestrutura de arrays de descritores** (sem mudar o comportamento):
 1. **Features:** habilitar as de descriptor indexing quando existirem (opcionais, com caminho atual
    como fallback).

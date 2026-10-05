@@ -5,8 +5,14 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <mutex>
+#include <set>
 #include <span>
+#include <string>
+#include <tuple>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -78,6 +84,84 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	const auto count = std::max(memory.data_dwords, 1u);
 	const auto end   = static_cast<uint64_t>(memory.offset) + static_cast<uint64_t>(bytes) * count;
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
+}
+
+// KYTY_RUNTIME_DESCRIPTOR_REPORT=1: one line per descriptor the tracker cannot resolve on the CPU,
+// with the operation tree of the dword that failed, so the shapes of runtime descriptors can be
+// counted (docs/DESCRITORES-DINAMICOS-PLANO.md, Fase 0). Diagnostic only: it does not change the
+// generated code, so it is not part of the codegen fingerprint.
+bool RuntimeDescriptorReportEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RUNTIME_DESCRIPTOR_REPORT");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Operation tree of a value: immediates as #hex, other instructions as Opcode(args). Stops at
+// `depth` levels and caps the text so one bad dword cannot flood the log.
+void AppendValueTree(std::string& text, Value value, uint32_t depth) {
+	constexpr size_t MaxLength = 800;
+	if (text.size() > MaxLength) {
+		return;
+	}
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		// Read each immediate through the accessor of its own type: the accessors exit on a type
+		// mismatch, and a diagnostic must never be the thing that stops the recompiler.
+		switch (value.GetType()) {
+			case Type::U1: text += value.U1() ? "#1" : "#0"; break;
+			case Type::U8: text += fmt::format("#{:x}", value.U8()); break;
+			case Type::U16: text += fmt::format("#{:x}", value.U16()); break;
+			case Type::U32: text += fmt::format("#{:x}", value.U32()); break;
+			case Type::U64: text += fmt::format("#{:x}", value.U64()); break;
+			default: text += "#?"; break;
+		}
+		return;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		text += "?";
+		return;
+	}
+	text += ValueOpcodeName(inst->GetOpcode());
+	if (depth == 0 || inst->NumArgs() == 0) {
+		if (inst->NumArgs() != 0) {
+			text += "(..)";
+		}
+		return;
+	}
+	text += "(";
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		if (index != 0) {
+			text += ", ";
+		}
+		AppendValueTree(text, inst->Arg(index), depth - 1u);
+	}
+	text += ")";
+}
+
+void ReportRuntimeDescriptor(const Program& program, const char* kind, uint32_t pc,
+                             uint32_t bad_dword, Value failing) {
+	if (!RuntimeDescriptorReportEnabled()) {
+		return;
+	}
+	static std::mutex                                            mutex;
+	static std::set<std::tuple<uint64_t, uint32_t, uint32_t, int>> reported;
+	{
+		std::scoped_lock lock(mutex);
+		if (!reported.emplace(program.shader_hash, pc, bad_dword, static_cast<int>(program.stage))
+		         .second) {
+			return;
+		}
+	}
+	std::string tree;
+	AppendValueTree(tree, failing, 12);
+	std::fprintf(stderr,
+	             "KYTY_RUNTIME_DESCRIPTOR: stage=%s hash=0x%016llx kind=%s pc=0x%08x dword=%u "
+	             "tree=%s\n",
+	             StageName(program.stage), static_cast<unsigned long long>(program.shader_hash),
+	             kind, pc, bad_dword, tree.c_str());
 }
 
 class Tracker {
@@ -1179,6 +1263,11 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
+			ReportRuntimeDescriptor(m_program, expected == ValueOpcode::GetImageResource ? "image"
+			                                    : expected == ValueOpcode::GetSamplerResource
+			                                        ? "sampler"
+			                                        : "buffer",
+			                        pc, bad_dword, descriptor.dwords[bad_dword]);
 			if (m_indirect_scalar_buffers) {
 				MarkUnresolved(pc);
 				return false;
