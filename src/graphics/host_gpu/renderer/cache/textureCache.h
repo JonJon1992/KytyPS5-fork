@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/cache/htileSliceState.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -249,8 +250,8 @@ private:
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		Type            type;
+		HtileSliceState clear_slices {true};
 	};
 
 	struct OverlapResult {
@@ -543,7 +544,7 @@ private:
 	// MaterializeCmaskClear's read of a guest-owned CMASK slice (GPU thread), reused.
 	std::vector<uint32_t>                             m_cmask_words;
 	// Bumped under m_lock after every change of m_surface_metas (an entry added or removed, a
-	// clear_mask changed): validates m_meta_clear_memo (IsMetaCleared).
+	// slice's clear state changed): validates m_meta_clear_memo (IsMetaCleared).
 	std::atomic<uint64_t> m_surface_meta_generation {0};
 	void                  NoteSurfaceMetaChange() noexcept {
 		m_surface_meta_generation.fetch_add(1, std::memory_order_release);
@@ -551,10 +552,12 @@ private:
 	// IsMeta/ClearMeta for a caller holding m_lock (several lookups under one acquisition).
 	[[nodiscard]] bool IsMetaLocked(uint64_t address) const;
 	[[nodiscard]] bool ClearMetaLocked(uint64_t address);
+	// The 64-slice word of the last IsMetaCleared lookup (HtileSliceState::Word(word_index)).
 	struct MetaClearMemo {
 		uint64_t address    = 0;
 		uint64_t generation = 0;
-		uint32_t clear_mask = 0;
+		uint64_t word       = 0;
+		uint32_t word_index = 0;
 		bool     found      = false;
 		bool     valid      = false;
 	} m_meta_clear_memo;

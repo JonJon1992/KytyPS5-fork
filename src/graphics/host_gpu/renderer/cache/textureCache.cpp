@@ -4039,8 +4039,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		const MetaDataInfo entry {.type       = MetaDataInfo::Type::HTile,
-		                          .clear_mask = image.info.htile_clear_mask};
+		const MetaDataInfo entry {.type         = MetaDataInfo::Type::HTile,
+		                          .clear_slices = HtileSliceState(image.info.htile_clear_mask != 0)};
 		// Inserts exactly when emplace would (the key is absent), without building and freeing a
 		// node every draw when it is present.
 		const bool inserted =
@@ -5614,23 +5614,28 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 		const auto generation = m_surface_meta_generation.load(std::memory_order_acquire) ^
 		                        (g_meta_clear_memo_epoch.load(std::memory_order_relaxed) << 48u);
 		auto&      memo       = m_meta_clear_memo;
-		if (!memo.valid || memo.address != address || memo.generation != generation) {
+		if (slice >= HtileSliceState::MaxSlices) {
+			return false;
+		}
+		const uint32_t word_index = slice / 64u;
+		if (!memo.valid || memo.address != address || memo.generation != generation ||
+		    memo.word_index != word_index) {
 			std::scoped_lock lock {m_lock};
 			const auto       found = m_surface_metas.find(address);
 			memo = {.address    = address,
 			        .generation = generation,
-			        .clear_mask = found != m_surface_metas.end() ? found->second.clear_mask : 0u,
+			        .word       = found != m_surface_metas.end()
+			                          ? found->second.clear_slices.Word(word_index)
+			                          : 0u,
+			        .word_index = word_index,
 			        .found      = found != m_surface_metas.end(),
 			        .valid      = true};
 		}
-		return memo.found && slice < 32 && (memo.clear_mask & (1u << slice)) != 0;
+		return memo.found && ((memo.word >> (slice % 64u)) & 1u) != 0;
 	}
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
-		return false;
-	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found != m_surface_metas.end() && found->second.clear_slices.Test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -5643,7 +5648,7 @@ bool TextureCache::ClearMetaLocked(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_slices.SetAll(true);
 	NoteSurfaceMetaChange();
 	return true;
 }
@@ -5651,16 +5656,10 @@ bool TextureCache::ClearMetaLocked(uint64_t address) {
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= HtileSliceState::MaxSlices) {
 		return false;
 	}
-	const auto previous = found->second.clear_mask;
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
-	if (found->second.clear_mask != previous) {
+	if (found->second.clear_slices.Set(slice, is_clear)) {
 		NoteSurfaceMetaChange();
 	}
 	return true;

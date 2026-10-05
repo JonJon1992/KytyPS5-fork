@@ -601,7 +601,7 @@ struct TextureCacheTestAccess {
     cache.m_surface_meta_inserts += cache.m_surface_metas.contains(address) ? 0u : 1u;
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.clear_slices.SetAll(false);
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -15256,6 +15256,120 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "BGRA16 direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // HTile clear state of a depth array past slice 31 (DB_DEPTH_VIEW.SLICE_MAX is 11 bits, so 2048
+  // slices). Ghost of Yotei binds a depth view with at least 32 slices; the clear state used to fit
+  // one 32-bit mask. A 40-slice D32 depth target with HTile is bound like FindDepthTarget's draw
+  // path, then a depth clear and per-slice consumption run past slice 31 and to the last slice.
+  // Separate from CheckUnifiedTextureCacheFlow, which stops earlier on RADV (D24S8 is refused).
+  void CheckHtileHighSlices() {
+    constexpr const char *name = "HtileHighSlices";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t layers = 40;
+    constexpr uint64_t depth_offset = 0x0;
+    constexpr uint64_t htile_offset = 0x10000;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "HTile slice test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "HTile slice test fixed mapping failed");
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, allocation_size);
+
+      ImageDesc depth{};
+      depth.type = BindingType::DepthTarget;
+      depth.info.data = {base + depth_offset, sizeof(uint32_t) * layers};
+      depth.info.pixel_format = vk::Format::eD32Sfloat;
+      depth.info.guest_format = Prospero::BufferFormat::k32Float;
+      depth.info.type = Prospero::ImageType::kColor2D;
+      depth.info.extent = {1, 1, 1};
+      depth.info.resources = {1, layers};
+      depth.info.pitch = 1;
+      depth.info.bytes_per_block = sizeof(uint32_t);
+      depth.info.samples = 1;
+      depth.info.tile_mode = Prospero::TileMode::kLinear;
+      depth.info.mip_layout[0] = {0, sizeof(uint32_t), 1, 1};
+      depth.info.metadata.kind = ImageMetadataKind::Htile;
+      depth.info.metadata.range = {base + htile_offset, 0x80};
+      depth.info.htile_clear_mask = 0;
+      depth.view_info.format = vk::Format::eD32Sfloat;
+      depth.view_info.type = vk::ImageViewType::e2DArray;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.layer_count = layers;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = texture_cache.FindImage(depth);
+      const auto depth_view = texture_cache.FindDepthTarget(depth_id, depth);
+      const auto htile = base + htile_offset;
+      Require(name, "binding", depth_view != nullptr && texture_cache.IsMeta(htile),
+              "a 40-slice depth target with HTile was not registered");
+
+      bool none_cleared = true;
+      for (uint32_t slice = 0; slice < layers; slice++) {
+        none_cleared = none_cleared && !texture_cache.IsMetaCleared(htile, slice);
+      }
+      Require(name, "uncleared seed", none_cleared,
+              "a depth target seeded uncleared read a slice as cleared");
+
+      // A depth clear marks every slice, then each layer's draw consumes its own slice.
+      Require(name, "depth clear", texture_cache.ClearMeta(htile),
+              "the depth clear did not reach the HTile state");
+      bool consumed_in_order = true;
+      for (uint32_t slice = 0; slice < layers; slice++) {
+        consumed_in_order = consumed_in_order && texture_cache.IsMetaCleared(htile, slice) &&
+                            texture_cache.TouchMeta(htile, slice, false) &&
+                            !texture_cache.IsMetaCleared(htile, slice) &&
+                            (slice + 1u == layers ||
+                             texture_cache.IsMetaCleared(htile, slice + 1u));
+      }
+      Require(name, "per-slice consumption", consumed_in_order,
+              "a slice past 31 lost its clear state or shared it with another slice");
+
+      // The hardware range ends at slice 2047; the memoized lookup follows the slice across its
+      // 64-slice words.
+      Require(name, "full slice range",
+              texture_cache.ClearMeta(htile) && texture_cache.IsMetaCleared(htile, 2047) &&
+                  texture_cache.TouchMeta(htile, 2047, false) &&
+                  !texture_cache.IsMetaCleared(htile, 2047) &&
+                  texture_cache.IsMetaCleared(htile, 2046) &&
+                  texture_cache.IsMetaCleared(htile, 63) &&
+                  texture_cache.IsMetaCleared(htile, 64) &&
+                  !texture_cache.IsMetaCleared(htile, 2048) &&
+                  !texture_cache.TouchMeta(htile, 2048, false),
+              "the last slices or the out-of-range slice were tracked wrongly");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "HTile slice test fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "HTile slice test direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -51269,6 +51383,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--htile-slices-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHtileHighSlices();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {

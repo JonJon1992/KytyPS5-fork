@@ -720,6 +720,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(htile_slice_state_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HtileSliceStateTests.cpp"
+)
+target_include_directories(htile_slice_state_tests PRIVATE ${inc_headers})
+
 # KYTY_FUNCTION_ARRAY_SHRINK: the SPIR-V pass that shrinks Function-storage arrays to their proven
 # index bound (graphics/host_gpu/spirvLocalArrays.h).
 add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
@@ -1253,6 +1258,7 @@ if(BUILD_TESTING)
 	add_test(NAME dispatcher_cap
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME htile_slice_state COMMAND $<TARGET_FILE:htile_slice_state_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
 	add_test(NAME spirv_optimizer COMMAND $<TARGET_FILE:spirv_optimizer_tests>)
@@ -1397,6 +1403,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
+	add_test(NAME texture_cache_htile_high_slices
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-slices-only)
 	add_test(NAME cpu_copy_page_skip_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	add_test(NAME cpu_copy_page_skip_alias_bytes
@@ -2376,6 +2384,7 @@ if(BUILD_TESTING)
 		lod_stats_report_tests
 		game_patch_filter_tests
 		lru_cache_tests
+		htile_slice_state_tests
 		spirv_local_arrays_tests
 		spirv_optimizer_tests
 		vram_budget_tests
