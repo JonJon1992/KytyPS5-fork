@@ -203,6 +203,8 @@ bool IsCapture(VkCommandBuffer cb) noexcept {
 // The recording thread's composition of the guest command buffer (TakeComposition). Begin, every
 // hooked command and the timing ring's EndCommand run on the thread that owns the buffer.
 thread_local GpuCommandComposition t_composition;
+// The guest command buffer's bound compute pipeline on the recording thread (composition).
+thread_local uint64_t t_bound_compute = 0;
 
 void NoteComposition(VkCommandBuffer cb) noexcept {
 	if (IsGuest(cb)) {
@@ -427,6 +429,24 @@ struct PipelineInfo {
 std::mutex                                 g_registry_mutex;
 std::unordered_map<uint64_t, ShaderInfo>   g_shaders;
 std::unordered_map<uint64_t, PipelineInfo> g_pipelines;
+
+// Composition: the guest compute shader of a dispatch into the guest command buffer, through the
+// bound pipeline's registered program (hash 0 when it was not registered).
+void NoteDispatchShader(VkCommandBuffer cb, uint64_t groups) noexcept {
+	if (!IsGuest(cb) || !CompositionEnabled()) {
+		return;
+	}
+	uint64_t hash = 0;
+	{
+		std::lock_guard lock(g_registry_mutex);
+		if (const auto pipeline = g_pipelines.find(t_bound_compute); pipeline != g_pipelines.end()) {
+			if (const auto shader = g_shaders.find(pipeline->second.compute); shader != g_shaders.end()) {
+				hash = shader->second.hash;
+			}
+		}
+	}
+	t_composition.AddDispatch(hash, groups);
+}
 
 std::mutex                             g_view_mutex;
 std::unordered_map<uint64_t, VkFormat> g_view_formats;
@@ -1189,6 +1209,9 @@ Writer& GetWriter() {
 VKAPI_ATTR void VKAPI_CALL HookCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point,
                                                VkPipeline pipeline) {
 	g_real.vkCmdBindPipeline(cb, point, pipeline);
+	if (point == VK_PIPELINE_BIND_POINT_COMPUTE && IsGuest(cb)) {
+		t_bound_compute = HandleBits(pipeline);
+	}
 	if (IsCapture(cb)) [[unlikely]] {
 		std::lock_guard lock(g_state.mutex);
 		if (point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -1315,6 +1338,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                            uint32_t z) {
 	NoteComposition(cb);
+	NoteDispatchShader(cb, uint64_t {x} * y * z);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1331,6 +1355,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint3
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                    VkDeviceSize offset) {
 	NoteComposition(cb);
+	NoteDispatchShader(cb, 0);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1976,8 +2001,10 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier2, &HookCmdPipelineBarrier2);
 	KYTY_GPU_OP_HOOK(vkCmdBeginRendering, &HookCmdBeginRendering);
 	if (!capture && CompositionEnabled()) {
-		// KYTY_GPU_LONG_CB_MS alone: the commands TakeComposition counts, without the capture's
-		// query pool, timestamps, pipeline, submission or image-view hooks.
+		// KYTY_GPU_LONG_CB_MS alone: the commands TakeComposition counts and the compute bind
+		// that names their shaders, without the capture's query pool, timestamps, submission or
+		// image-view hooks.
+		KYTY_GPU_OP_HOOK(vkCmdBindPipeline, &HookCmdBindPipeline);
 		KYTY_GPU_OP_HOOK(vkCmdDraw, &HookCmdDraw);
 		KYTY_GPU_OP_HOOK(vkCmdDrawIndexed, &HookCmdDrawIndexed);
 		KYTY_GPU_OP_HOOK(vkCmdDrawIndirect, &HookCmdDrawIndirect);
@@ -2187,7 +2214,7 @@ void OnGuestFlip() {
 }
 
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash) {
-	if (!CaptureEnabled()) {
+	if (!CaptureEnabled() && !CompositionEnabled()) {
 		return;
 	}
 	std::lock_guard lock(g_registry_mutex);
@@ -2196,7 +2223,7 @@ void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash)
 
 void RegisterGraphicsPipeline(vk::Pipeline pipeline, const uint64_t* vertex_program_ids,
                               uint32_t vertex_program_count, uint64_t pixel_program_id) {
-	if (!CaptureEnabled() || pipeline == nullptr) {
+	if ((!CaptureEnabled() && !CompositionEnabled()) || pipeline == nullptr) {
 		return;
 	}
 	PipelineInfo info;
@@ -2211,7 +2238,7 @@ void RegisterGraphicsPipeline(vk::Pipeline pipeline, const uint64_t* vertex_prog
 }
 
 void RegisterComputePipeline(vk::Pipeline pipeline, uint64_t compute_program_id) {
-	if (!CaptureEnabled() || pipeline == nullptr) {
+	if ((!CaptureEnabled() && !CompositionEnabled()) || pipeline == nullptr) {
 		return;
 	}
 	PipelineInfo info;

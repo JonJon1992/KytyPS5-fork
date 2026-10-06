@@ -227,6 +227,18 @@ static void ReportLongCommandBuffers(const std::vector<Span>& spans, double peri
 		if (sample.composition.other != 0) {
 			sites += fmt::format(", +{} other", sample.composition.other);
 		}
+		for (uint32_t shader = 0; shader < GpuCommandComposition::MaxDispatchShaders; shader++) {
+			if (sample.composition.dispatch_counts[shader] == 0) {
+				break;
+			}
+			sites += fmt::format("{} cs:0x{:016x} x{} ({} groups)", shader == 0 ? "; dispatched" : ",",
+			                     sample.composition.dispatch_hashes[shader],
+			                     sample.composition.dispatch_counts[shader],
+			                     sample.composition.dispatch_groups[shader]);
+		}
+		if (sample.composition.dispatch_other != 0) {
+			sites += fmt::format(", +{} other dispatches", sample.composition.dispatch_other);
+		}
 		const double wait_ms = calibrated && sample.dispatch_ns != 0
 		                           ? (to_steady(span.start) - static_cast<double>(sample.dispatch_ns)) / 1e6
 		                           : -1.0;

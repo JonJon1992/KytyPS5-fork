@@ -59,6 +59,25 @@ struct GpuCommandComposition {
 	std::array<const char*, MaxSites> sites {};
 	std::array<uint32_t, MaxSites>    counts {};
 	uint32_t                          other = 0; // commands of sites past MaxSites
+	// Guest compute shaders dispatched (hash 0: not registered), with their total thread groups
+	// (0 for an indirect dispatch).
+	static constexpr uint32_t         MaxDispatchShaders = 4;
+	std::array<uint64_t, MaxDispatchShaders> dispatch_hashes {};
+	std::array<uint64_t, MaxDispatchShaders> dispatch_groups {};
+	std::array<uint32_t, MaxDispatchShaders> dispatch_counts {};
+	uint32_t                                 dispatch_other = 0;
+
+	void AddDispatch(uint64_t hash, uint64_t groups) noexcept {
+		for (uint32_t index = 0; index < MaxDispatchShaders; index++) {
+			if (dispatch_counts[index] == 0 || dispatch_hashes[index] == hash) {
+				dispatch_hashes[index] = hash;
+				dispatch_groups[index] += groups;
+				dispatch_counts[index]++;
+				return;
+			}
+		}
+		dispatch_other++;
+	}
 
 	void Add(const char* site) noexcept {
 		for (uint32_t index = 0; index < MaxSites; index++) {
