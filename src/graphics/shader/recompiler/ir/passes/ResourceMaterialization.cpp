@@ -100,8 +100,8 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		return false;
 	}
 	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
-	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead
-	// of being treated as what it is: eight dwords that are not a descriptor.
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
+	// being treated as what it is: eight dwords that are not a descriptor.
 	if (!Prospero::IsDefinedBufferFormat(format)) {
 		return false;
 	}
@@ -162,10 +162,10 @@ template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
 	// Integer formats have no linear filtering (Vulkan requires a nearest filter for them, and the
 	// hardware samples them point-wise), so unsigned ones force point filtering like signed ones
-	// (fxpw/KytyPS5 505190d2).
+	// (fxpw/KytyPS5 505190d2). A converted format that samples as float (8-bit scaled textures read
+	// through UNORM, 7ad4ccd2) keeps bilinear filtering.
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	    image.numeric_class == Prospero::TextureNumericClass::Uint ||
-	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
+	    image.numeric_class == Prospero::TextureNumericClass::Uint) {
 		return SamplerClass::PointInteger;
 	}
 	return SamplerClass::Float;
@@ -1586,15 +1586,24 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
+	// Dead-code elimination can remove an image operation (an unused IMAGE_GET_LOD result) before
+	// resource tracking, which leaves its memory entry behind with the frontend's descriptor
+	// register as the resource: no image was tracked for it, so it is not remapped.
+	std::vector<bool> memory_used(memory_info.size(), false);
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
 				inst.SetFlags(image_remap[inst.Flags<uint32_t>()]);
+			} else if (ImageOpcodeInfoOf(inst.GetOpcode()).access != ImageAccess::None) {
+				const auto index = inst.Flags<MemoryFlags>().index;
+				EXIT_IF(index >= memory_info.size());
+				memory_used[index] = true;
 			}
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+	for (size_t index = 0; index < memory_info.size(); index++) {
+		auto& memory = memory_info[index];
+		if (memory.kind == ResourceKind::Image && !memory.planning_only && memory_used[index]) {
 			memory.resource = image_remap[memory.resource];
 		}
 	}

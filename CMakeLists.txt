@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18...4.3)
+cmake_minimum_required(VERSION 3.19...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -764,6 +764,17 @@ target_link_libraries(pipeline_cold_cache_tests PRIVATE Vulkan::Headers)
 add_executable(pipeline_lookup_benchmark EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_pipeline_lookup.cpp")
 target_include_directories(pipeline_lookup_benchmark PRIVATE ${inc_headers} "${KYTY_THIRD_PARTY_DIR}/xxHash")
 target_link_libraries(pipeline_lookup_benchmark PRIVATE Vulkan::Headers xxhash)
+# Shader precompile (KYTY_SHADER_PRECOMPILE): the journal file and the replay driver.
+add_executable(shader_precompile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderPrecompileTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp"
+)
+target_link_libraries(shader_precompile_tests xxhash)
+target_include_directories(shader_precompile_tests PRIVATE ${inc_headers})
+
+# KYTY_PIPELINE_FAST_FIRST: scheduling, retirement and accounting (pipeline/pipelineFastFirst.h).
+add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
+target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
 
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
@@ -941,6 +952,9 @@ add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImageCacheGcPolicyTests.cpp"
 )
 target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(image_clear_range_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImageClearRangeTests.cpp")
+target_include_directories(image_clear_range_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
 add_executable(host_input_pulse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputPulseTests.cpp")
 target_include_directories(host_input_pulse_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -1207,6 +1221,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
+	add_test(NAME image_clear_range COMMAND $<TARGET_FILE:image_clear_range_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
@@ -1278,7 +1293,19 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_lookup_memo COMMAND $<TARGET_FILE:pipeline_lookup_memo_tests>)
 	add_test(NAME pipeline_vertex_input_state COMMAND $<TARGET_FILE:pipeline_vertex_input_state_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
+	add_test(NAME shader_precompile COMMAND $<TARGET_FILE:shader_precompile_tests>)
+	set_tests_properties(shader_precompile PROPERTIES TIMEOUT 60)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
+	add_test(NAME pipeline_fast_first COMMAND $<TARGET_FILE:pipeline_fast_first_tests>)
+	set_tests_properties(pipeline_fast_first PROPERTIES TIMEOUT 60)
+	add_test(NAME pipeline_fast_first_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_fast_first_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
+		TIMEOUT 180)
+	add_test(NAME pipeline_fast_first_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
+	set_tests_properties(pipeline_fast_first_draw_run PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=131"
+		TIMEOUT 180)
 	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_prefetch_rendering PROPERTIES
 		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_THREADS=2;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=127"
@@ -2380,6 +2407,7 @@ if(BUILD_TESTING)
 		shader_function_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		image_clear_range_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
@@ -2391,9 +2419,11 @@ if(BUILD_TESTING)
 		htile_slice_state_tests
 		spirv_local_arrays_tests
 		spirv_optimizer_tests
+		pipeline_fast_first_tests
 		vram_budget_tests
 		bda_hot_ranges_tests
 		device_compat_tests
+		shader_precompile_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -2440,6 +2470,14 @@ option(KYTY_EMULATOR_IPO "Enable release interprocedural optimization for the em
 if(KYTY_EMULATOR_IPO)
 	set_property(TARGET kyty_emulator PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()
+set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
+add_custom_target(kyty_trophy_sound
+	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_TROPHY_UNLOCK_SOUND}"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds/trophy-unlock.wav"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_trophy_sound)
+install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

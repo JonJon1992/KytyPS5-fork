@@ -4,8 +4,64 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-- Adaptive triggers: a vibration trigger now reports "firing" only while it is pressed. In Astro's Playroom the gun
-  fired by itself with the trigger untouched. Nothing else changed since int11; program caches stay valid.
+int15 (main release): int14 plus the changes below.
+
+- Images read as colour over memory the texture cache holds as a plain D32 depth image (Astro Bot reuses depth memory
+  as an RG16F DCC target at its 3328x1872 and 3840x2160 dynamic-resolution tiers) get a colour alias instead of
+  stopping with "unsupported sampled depth image"; anything still unsupported binds a null texture and is reported
+  once.
+- `TextureCache::ClearImage` validates its range before any state change and skips a rejected clear with one
+  `TextureCache: ClearImage skipped (<fault>): site=...` line per signature instead of exiting (leaving an extra
+  level in Sky Garden stopped the emulator). DCC and CMASK fast-clear metadata is no longer applied to depth images
+  (`TextureCache: DCC|CMASK metadata skipped for a depth image`).
+- Upstream KytyPS5 (through 72e4989b1, reviewed and partly hand-ported): shader opcode and precision fixes (DS float
+  min/max, DS_PERMUTE, DS masked OR, FP64 min/max/rounding, 64-bit image atomics, SDWA, V_CMPX_NE_U16, FLAT D16
+  loads, ALIGNBYTE), no RTE rounding mode for FP64 shaders (an NVIDIA pipeline compile hang), image formats that name
+  nothing bound empty (#1019), null SRT pointers read as zero (#987), guest thread priorities (#1050), the BDA page
+  table cleared before first use (#1065), polygon draws as triangle fans, partially resident depth flags, libFont
+  kerning and metrics, trophy notifications. Not taken: the FP32 MAD rounding change (it conflicts with our
+  position-invariant MAD mode) and the readback-window removal.
+- Release notes correction for int14: the shader precompile mainly helps after an emulator update, when the program
+  cache is rebuilt; with an unchanged emulator the program cache already covers revisits.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 34.8 fps (int14 34.1), snow level 21.2 fps (int14 21.7).
+
+From the int14 pre-release (`u59-windows-20261005-int14-pre`):
+
+- Shader precompile (`KYTY_SHADER_PRECOMPILE=1` in the preset): every shader variant the emulator translates is
+  recorded in `_PipelineCache\<title>.shaders.journal`, and the next launch translates the recorded ones again on two
+  low-priority background threads before the game asks for them. Sky Garden on a cold program cache: 437 shaders
+  (12.3 s of translation) were built during play on the first run and 8 (0.3 s) on the second, after 433 were
+  rebuilt in 6.4 s at startup. The first launch gains nothing; places never visited still compile on first use. The
+  journal is tied to the GPU model; delete it after a driver update if in doubt. `KYTY_SHADER_PRECOMPILE=0` turns it
+  off.
+- Fast first pipelines (`KYTY_PIPELINE_FAST_FIRST=1` in the preset): a new pipeline is first built without driver
+  optimization, so the draw does not wait for a full compile, and the optimized pipeline is built on two background
+  threads and swapped in. Sky Garden on an empty pipeline cache: draws waited 0.31 s for pipelines instead of 1.38 s.
+  `KYTY_PIPELINE_FAST_FIRST=0` turns it off; `KYTY_PIPELINE_FAST_FIRST_PROBE=1` asks the driver cache first (on NVIDIA
+  the driver's own disk cache answers it, so pipelines are then built optimized as before).
+- A pixel shader that samples one of several textures chosen at run time, with texture-LOD feedback, produced invalid
+  SPIR-V (an `OpPhi` naming the wrong block); Demon's Souls stopped at character creation.
+- With the launcher's Vulkan validation option on, validation errors are written to `_kyty_vulkan_validation.log`
+  and no longer stop the game (Astro Bot stopped at boot on a known vertex/pixel interface message).
+  `KYTY_VULKAN_VALIDATION_MODE=exit` restores stopping at the first error. Validation makes games much slower.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 33.0 fps with both new switches on against 33.4 fps for
+  int13 built the same way (two alternating runs each; the difference is within run-to-run noise).
+
+From the int13 pre-release (`u59-windows-20261005-int13-pre`):
+
+- Adaptive triggers (also in int13): a vibration trigger reports "firing" only while it is pressed; in Astro's
+  Playroom the gun fired by itself.
+- The launcher's "AMD CPU patch" (`--amd-cpu`) now runs 11,026 of the game's 11,069 `VRSQRTPS` instructions as
+  native code (43 still trap, 1,088 before): Sky Garden 34.5 fps with the option on (31.6 in int9 and int10, about
+  the same as without the option now). The improved code analysis also applies to the red-zone protection.
+- Game file reads into memory the emulator protects (Windows errors 998 and 1784) are retried through a temporary
+  buffer instead of looking like an empty file to the game.
+- When VRAM runs out while a texture is converted, idle scratch buffers are freed and the allocation retried, instead
+  of stopping.
+- A compute shader whose texture-LOD query result is unused no longer stops the shader translator (any GPU).
+- Intel GPUs: mesh and pixel shaders require the subgroup width the guest wave needs (NVIDIA and AMD unchanged).
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): all 342 tests pass; Sky Garden 33-35 fps and Creamy Canyon 21.8 fps,
+  as int11. Program caches stay valid.
 
 From int11 (`u59-windows-20261005-int11`):
 

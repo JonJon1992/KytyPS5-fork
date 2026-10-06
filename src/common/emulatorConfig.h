@@ -48,7 +48,7 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	std::optional<ControllerColor> controller_color;
-	uint32_t               controller_speaker_volume      = 100;
+	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
@@ -75,6 +75,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   perf_overlay_enabled        = false;
+	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -136,6 +137,7 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool PerfOverlayEnabled();
+bool TrophyEnabled();
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

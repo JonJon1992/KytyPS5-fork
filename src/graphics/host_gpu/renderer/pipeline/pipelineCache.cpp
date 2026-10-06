@@ -21,12 +21,14 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLookupMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBlendState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelinePrefetchAdmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderCodeSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -310,6 +312,8 @@ struct CompileTotals {
 	std::atomic<uint64_t> disk_load_ns {0};
 	std::atomic<uint64_t> disk_verify_checks {0};
 	std::atomic<uint64_t> disk_verify_mismatches {0};
+	// Permutations published by the shader precompile replay (KYTY_SHADER_PRECOMPILE).
+	std::atomic<uint64_t> replayed {0};
 };
 CompileTotals g_compile_totals;
 
@@ -1457,6 +1461,8 @@ struct PipelineCache::ProgramCache {
 		std::unordered_set<CallFreeKey, CallFreeKeyHash> call_free;
 		std::vector<uint8_t> validation;
 		std::array<LookupMemo, LookupMemoStages> memos;
+		// CompileAndPublish sets it when it published a new permutation (the caller clears it).
+		bool                 published_new = false;
 	};
 
 	static bool LookupMemoEnabled() {
@@ -2807,17 +2813,21 @@ struct PipelineCache::ProgramCache {
 	                                     ShaderRecompiler::IR::EvaluationScratch& evaluation,
 	                                     ProgramScratch& scratch, StagePrep& prep,
 	                                     ShaderReadAttempt& read_attempt, bool prep_materialized,
-	                                     bool speculative = false) {
+	                                     bool speculative = false, bool replay = false) {
 		// Cache hits returned before this. This covers translation through native shader-module
 		// creation; readiness failures can retry, so count successful creations separately.
-		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
+		// A precompile replay (ReplayEntry) runs on a background thread with `prep` already
+		// holding the permutation's stored specialization: nothing is read from guest memory, no
+		// draw waits for it, and the journal already has it.
+		std::optional<Profiler::ScopedFrameWait> shader_miss;
+		if (!replay) shader_miss.emplace(Profiler::FrameWait::ShaderProgramMiss);
 		// Everything from here on, lock and in-flight waits included, is compile time of the
 		// waiting draw.
 		struct StallScope {
 			uint64_t begin = CompileClockNs();
 			bool account;
 			~StallScope() { if (account) AddCompileStall(CompileClockNs() - begin); }
-		} stall {.account = !speculative};
+		} stall {.account = !speculative && !replay};
 		std::vector<uint32_t> owned_code;
 		// A call-free hit in BuildKey skipped the caller snapshot; take it for this miss.
 		if (key.stage == ShaderType::Compute && key.function_code.empty() &&
@@ -2843,7 +2853,9 @@ struct PipelineCache::ProgramCache {
 			                                              : std::span<const uint32_t>(key.function_code);
 		}
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
-			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
+			if (ResourceReuseEnabled() && !replay) {
+				source.reuse.current.permutation_index = permutation.index;
+			}
 			return &permutation;
 		};
 		// Declared before `lock`, so destroyed after it is released on every return.
@@ -3058,7 +3070,7 @@ struct PipelineCache::ProgramCache {
 				dropped.clear();
 				g_compile_totals.disk_source_hits.fetch_add(1, std::memory_order_relaxed);
 				const bool materialized =
-				    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+				    replay || Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 				lock.lock();
 				if (!materialized) {
 					FinishInFlight(record);
@@ -3103,7 +3115,7 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			const bool materialized =
-			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+			    replay || Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			lock.lock();
 			if (!materialized) {
 				FinishInFlight(record);
@@ -3242,8 +3254,9 @@ struct PipelineCache::ProgramCache {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationReuses);
 		}
 		times.from_disk   = from_disk;
-		const auto detail = fmt::format("{}{}{}{}", reason, times.reused ? "+reused" : "",
-		                                from_disk ? "+disk" : "", speculative ? "+prefetch" : "");
+		const auto detail = fmt::format("{}{}{}{}{}", reason, times.reused ? "+reused" : "",
+		                                from_disk ? "+disk" : "", speculative ? "+prefetch" : "",
+		                                replay ? "+replay" : "");
 		if (speculative) speculative_programs.fetch_add(1, std::memory_order_relaxed);
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
 		                     CompileClockNs() - stall.begin, detail);
@@ -3278,6 +3291,7 @@ struct PipelineCache::ProgramCache {
 			check.stored_spirv_plain = reloaded->spirv_plain;
 			SubmitBackgroundCheck(std::move(check));
 		}
+		scratch.published_new = true;
 		if (store) {
 			// The published permutation is immutable; its metadata is encoded from it.
 			std::vector<uint8_t> info;
@@ -3285,7 +3299,149 @@ struct PipelineCache::ProgramCache {
 			disk->AddPermutation(disk_key.digest, push_data_cursor, specialization_bytes, info,
 			                     words.spirv, words.spirv_plain);
 		}
+		if (journal != nullptr && !replay) {
+			JournalPermutation(params, translation_code, key, options, input_info,
+			                   push_data_cursor, permutation.specialization, specialization_bytes,
+			                   code_words);
+		}
 		return publish_index(*source, permutation);
+	}
+
+	// Shader precompile (shaderPrecompile.h; KYTY_SHADER_PRECOMPILE): null when off.
+	ShaderJournal* journal = nullptr;
+
+	template <typename InputInfo>
+	static constexpr ShaderJournal::Kind JournalKind() {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return ShaderJournal::Kind::Vertex;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderJournal::Kind::Pixel;
+		} else {
+			return ShaderJournal::Kind::Compute;
+		}
+	}
+
+	// Journals a published permutation's inputs. Only programs whose guest hash is the content
+	// hash of their code are journaled (every headerless shader: Astro Bot's all), so that a
+	// replayed source can only stand for the code it names; merged-stage back halves are not.
+	// `specialization_bytes` and `code_words` are filled when the persistent program cache already
+	// encoded and copied them. Cost: once per new permutation, on its compile.
+	template <typename InputInfo>
+	void JournalPermutation(const ShaderParams& params, std::span<const uint32_t> code,
+	                        const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
+	                        const InputInfo& input_info, uint32_t push_data_cursor,
+	                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                        std::vector<uint8_t>& specialization_bytes,
+	                        const std::vector<uint32_t>& code_words) {
+		static_assert(std::is_trivially_copyable_v<InputInfo>);
+		if (!params.back_code.empty() || code.empty() || key.code_size != code.size()) return;
+		ShaderJournal::Source source;
+		source.stage                   = static_cast<uint32_t>(key.stage);
+		source.kind                    = JournalKind<InputInfo>();
+		source.hash                    = key.hash;
+		source.user_data_count         = key.user_data_count;
+		source.code_size               = key.code_size;
+		source.wave_size               = options.wave_size;
+		source.user_data_base          = options.user_data_base;
+		source.plain_mip_stats_variant = options.plain_mip_stats_variant;
+		source.static_state            = key.static_state;
+		if (!journal->HasSource(source)) {
+			if (!code_words.empty()) {
+				source.code = code_words;
+			} else {
+				source.code.resize(code.size());
+				if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
+				                                               source.code.data(), code.size_bytes())) {
+					std::memcpy(source.code.data(), code.data(), code.size_bytes());
+				}
+			}
+			if (XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != key.hash) {
+				return;
+			}
+			InputInfo copy = input_info;
+			copy.stage     = {};
+			source.input_info.assign(reinterpret_cast<const uint8_t*>(&copy),
+			                         reinterpret_cast<const uint8_t*>(&copy) + sizeof(copy));
+		}
+		if (specialization_bytes.empty()) {
+			ShaderRecompiler::IR::EncodeSpecialization(specialization, specialization_bytes);
+		}
+		journal->Record(std::move(source), push_data_cursor, specialization_bytes);
+	}
+
+	template <typename InputInfo>
+	ShaderPrecompiler::Outcome ReplayWith(InputInfo& input_info, ShaderParams& params,
+	                                      const ShaderJournal::Source& source,
+	                                      const ShaderJournal::Entry& entry,
+	                                      ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		using Outcome = ShaderPrecompiler::Outcome;
+		if (source.input_info.size() != sizeof(InputInfo)) return Outcome::Skipped;
+		std::memcpy(static_cast<void*>(&input_info), source.input_info.data(), sizeof(InputInfo));
+		input_info.stage = {};
+		auto& scratch = ThreadScratch();
+		ProgramKey key;
+		BuildKey(params, input_info, key);
+		// The journal's key must be what this build derives from the stored input info.
+		if (key.stage != static_cast<ShaderType>(source.stage) || key.static_state != source.static_state ||
+		    key.code_size != source.code_size) {
+			return Outcome::Skipped;
+		}
+		if (const auto* existing = FindSource(key)) {
+			if (existing->skip_dispatch.load(std::memory_order_relaxed)) return Outcome::Skipped;
+			if (FindPermutation(*existing, specialization, entry.push_data_cursor)) {
+				return Outcome::Present;
+			}
+		}
+		StagePrep prep;
+		prep.specialization = std::move(specialization);
+		const ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data   = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base = params.Base(),
+		};
+		ShaderReadAttempt attempt;
+		scratch.published_new = false;
+		CompileAndPublish(params, input_info, entry.push_data_cursor, key, runtime,
+		                  ShaderRecompiler::IR::ThreadEvaluationScratch(), scratch, prep, attempt, true,
+		                  false, true);
+		if (!scratch.published_new) return Outcome::Skipped;
+		g_compile_totals.replayed.fetch_add(1, std::memory_order_relaxed);
+		return Outcome::Compiled;
+	}
+
+	// One journal entry compiled and published as the draw that first needed it would have: the
+	// same CompileAndPublish (disk cache, translation reuse, in-flight sharing with the command
+	// processor's own compiles), from the stored specialization instead of guest memory.
+	ShaderPrecompiler::Outcome ReplayEntry(const ShaderJournal::Source& source,
+	                                       const ShaderJournal::Entry&  entry) {
+		using Outcome = ShaderPrecompiler::Outcome;
+		ShaderParams params;
+		if (source.code.empty() || source.code.size() != source.code_size ||
+		    source.user_data_count > params.user_data.size() ||
+		    XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != source.hash) {
+			return Outcome::Skipped;
+		}
+		params.code            = source.code;
+		params.user_data_count = source.user_data_count;
+		params.hash            = source.hash;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		if (!ShaderRecompiler::IR::DecodeSpecialization(entry.specialization, specialization)) {
+			return Outcome::Skipped;
+		}
+		switch (source.kind) {
+			case ShaderJournal::Kind::Vertex: {
+				auto info = std::make_unique<ShaderVertexInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+			case ShaderJournal::Kind::Pixel: {
+				auto info = std::make_unique<ShaderPixelInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+			case ShaderJournal::Kind::Compute: {
+				auto info = std::make_unique<ShaderComputeInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+		}
+		return Outcome::Skipped;
 	}
 
 	// Per-stage totals of compiled permutations (equal to the sum of every source's
@@ -4050,6 +4206,324 @@ bool PipelineCache::WaitForQueuedPipeline(const Pipeline& target) {
 	return ready;
 }
 
+// Fast-first pipeline creation (KYTY_PIPELINE_FAST_FIRST, pipelineFastFirst.h): the unoptimized
+// first build, the background optimized compiles and the retirement of replaced pipelines.
+struct PipelineCache::FastFirstState {
+	// Deep copy of a compute create info (with its optional required-subgroup-size structure)
+	// for the background compile. The module is owned by the program cache, the layout is interned
+	// or lives in the cached Pipeline object (which is copied, not freed, on replacement).
+	struct ComputeSnapshot {
+		vk::ComputePipelineCreateInfo                         info {};
+		vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {};
+
+		static std::shared_ptr<ComputeSnapshot> Capture(const vk::ComputePipelineCreateInfo& in) {
+			if (in.flags != vk::PipelineCreateFlags {} || in.pNext != nullptr ||
+			    in.stage.flags != vk::PipelineShaderStageCreateFlags {} ||
+			    in.stage.pSpecializationInfo != nullptr || in.basePipelineHandle != nullptr) {
+				return nullptr;
+			}
+			auto snapshot  = std::make_shared<ComputeSnapshot>();
+			snapshot->info = in;
+			if (in.stage.pNext != nullptr) {
+				const auto* base = static_cast<const vk::BaseInStructure*>(in.stage.pNext);
+				if (base->sType !=
+				        vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo ||
+				    base->pNext != nullptr) {
+					return nullptr;
+				}
+				snapshot->subgroup = *static_cast<
+				    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo*>(in.stage.pNext);
+				snapshot->info.stage.pNext = &snapshot->subgroup;
+			}
+			return snapshot;
+		}
+	};
+
+	// What a fast build hands to the code that publishes the pipeline.
+	struct GraphicsFast {
+		std::shared_ptr<GraphicsPipelineSnapshot> snapshot;
+		uint64_t                                  fast_ns = 0;
+	};
+	struct ComputeFast {
+		std::shared_ptr<ComputeSnapshot> snapshot;
+		uint64_t                         fast_ns = 0;
+	};
+
+	explicit FastFirstState(PipelineCache& owner)
+	    : cache(owner),
+	      scheduler(static_cast<size_t>(std::clamp<uint64_t>(
+	                    FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_THREADS", 2), 1, 8)),
+	                static_cast<size_t>(std::clamp<uint64_t>(
+	                    FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_MAX_PENDING", 1024), 1, 1u << 20))),
+	      retire_age_ns(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_RETIRE_S", 60) * 1'000'000'000ull),
+	      drain_ms(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_DRAIN_S", 5) * 1000ull),
+	      probe(owner.m_graphics.pipeline_creation_cache_control_enabled &&
+	            FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_PROBE", 0) != 0),
+	      reporter([this](std::stop_token stop) { Report(stop); }) {}
+	FastFirstState(const FastFirstState&)            = delete;
+	FastFirstState& operator=(const FastFirstState&) = delete;
+
+	void Log(const char* when) {
+		PipelineCacheLog("{} ({})", FormatFastFirst(SnapshotFastFirst(counters, scheduler.Pending())),
+		                 when);
+	}
+	// Every 60 s, active or not, so a killed process still leaves its counts in the log.
+	void Report(const std::stop_token& stop) {
+		std::unique_lock lock(report_mutex);
+		while (!report_cv.wait_for(lock, stop, std::chrono::seconds(60), [] { return false; }) &&
+		       !stop.stop_requested()) {
+			Log("60 s report");
+		}
+	}
+	// One early line after the first 100 new pipelines.
+	void NoteSeen() {
+		if (counters.seen.fetch_add(1, std::memory_order_relaxed) + 1 == 100) Log("first 100 pipelines");
+	}
+
+	// Exit: queued optimized compiles run until the drain budget is spent (the driver cache saved
+	// after this holds them), the rest is dropped and their fast pipelines stay.
+	void Stop() {
+		if (scheduler.Stopped()) return;
+		reporter.request_stop();
+		if (reporter.joinable()) reporter.join();
+		scheduler.Stop(drain_ms);
+		Log("exit");
+	}
+
+	vk::Result CreateGraphics(const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline* pipeline,
+	                          GraphicsFast& out) {
+		auto&      device = cache.m_graphics.device;
+		const auto plain  = [&] {
+            return device.createGraphicsPipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
+		};
+		NoteSeen();
+		auto snapshot = GraphicsPipelineSnapshot::Capture(info);
+		if (snapshot == nullptr) {
+			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
+			return plain();
+		}
+		if (probe) {
+			auto probe_info  = info;
+			probe_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+			vk::Pipeline cached      = nullptr;
+			const auto   probe_begin = CompileClockNs();
+			const auto   probed =
+			    device.createGraphicsPipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
+			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
+			if (probed == vk::Result::eSuccess && cached != nullptr) {
+				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
+				*pipeline = cached;
+				return probed;
+			}
+			if (cached != nullptr) device.destroyPipeline(cached, nullptr);
+		}
+		if (!scheduler.TryReserve()) {
+			counters.cap_fallbacks.fetch_add(1, std::memory_order_relaxed);
+			return plain();
+		}
+		// No driver cache: the unoptimized pipeline would otherwise be stored in it. The
+		// optimized build fills the cache.
+		auto fast_info = info;
+		fast_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		const auto begin  = CompileClockNs();
+		const auto result = device.createGraphicsPipelines(nullptr, 1, &fast_info, nullptr, pipeline);
+		if (result != vk::Result::eSuccess || *pipeline == nullptr) {
+			scheduler.Release();
+			counters.fast_failed.fetch_add(1, std::memory_order_relaxed);
+			if (*pipeline != nullptr) device.destroyPipeline(*pipeline, nullptr);
+			*pipeline = nullptr;
+			return plain();
+		}
+		out.snapshot = std::move(snapshot);
+		out.fast_ns  = CompileClockNs() - begin;
+		counters.graphics_fast.fetch_add(1, std::memory_order_relaxed);
+		counters.fast_ns.fetch_add(out.fast_ns, std::memory_order_relaxed);
+		return result;
+	}
+
+	vk::Result CreateCompute(const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline,
+	                         ComputeFast& out) {
+		auto&      device = cache.m_graphics.device;
+		const auto plain  = [&] {
+            return device.createComputePipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
+		};
+		NoteSeen();
+		auto snapshot = ComputeSnapshot::Capture(info);
+		if (snapshot == nullptr) {
+			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
+			return plain();
+		}
+		if (probe) {
+			auto probe_info  = info;
+			probe_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+			vk::Pipeline cached      = nullptr;
+			const auto   probe_begin = CompileClockNs();
+			const auto   probed =
+			    device.createComputePipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
+			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
+			if (probed == vk::Result::eSuccess && cached != nullptr) {
+				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
+				*pipeline = cached;
+				return probed;
+			}
+			if (cached != nullptr) device.destroyPipeline(cached, nullptr);
+		}
+		if (!scheduler.TryReserve()) {
+			counters.cap_fallbacks.fetch_add(1, std::memory_order_relaxed);
+			return plain();
+		}
+		auto fast_info = info;
+		fast_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		const auto begin  = CompileClockNs();
+		const auto result = device.createComputePipelines(nullptr, 1, &fast_info, nullptr, pipeline);
+		if (result != vk::Result::eSuccess || *pipeline == nullptr) {
+			scheduler.Release();
+			counters.fast_failed.fetch_add(1, std::memory_order_relaxed);
+			if (*pipeline != nullptr) device.destroyPipeline(*pipeline, nullptr);
+			*pipeline = nullptr;
+			return plain();
+		}
+		out.snapshot = std::move(snapshot);
+		out.fast_ns  = CompileClockNs() - begin;
+		counters.compute_fast.fetch_add(1, std::memory_order_relaxed);
+		counters.fast_ns.fetch_add(out.fast_ns, std::memory_order_relaxed);
+		return result;
+	}
+
+	// The pipeline is cached under the key: hand its optimized compile to a worker. The slot was
+	// reserved by the fast build.
+	void EnqueueGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, GraphicsFast& in) {
+		const auto fast_ns = in.fast_ns;
+		scheduler.Submit(
+		    [this, key, fast, fast_ns, snapshot = std::move(in.snapshot)] {
+			    OptimizeGraphics(key, fast, fast_ns, *snapshot);
+		    },
+		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
+	}
+	void EnqueueCompute(uint64_t id, vk::Pipeline fast, ComputeFast& in) {
+		const auto fast_ns = in.fast_ns;
+		scheduler.Submit(
+		    [this, id, fast, fast_ns, snapshot = std::move(in.snapshot)] {
+			    OptimizeCompute(id, fast, fast_ns, *snapshot);
+		    },
+		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
+	}
+
+	static void NameThread() {
+		static thread_local bool named = false;
+		if (!named) {
+			named = true;
+			Profiler::SetThreadName("PipelineOptimizer");
+		}
+	}
+
+	void OptimizeGraphics(const GraphicsPipelineKey* key, vk::Pipeline fast, uint64_t fast_ns,
+	                      const GraphicsPipelineSnapshot& snapshot) {
+		NameThread();
+		vk::Pipeline        optimized = nullptr;
+		const auto          begin     = CompileClockNs();
+		HangWatchdog::Scope compile("graphics-pipeline-optimize",
+		                            reinterpret_cast<uint64_t>(static_cast<VkPipeline>(fast)),
+		                            key->vertex_shader_ids[0], key->ps_shader_id);
+		const auto          result = cache.m_graphics.device.createGraphicsPipelines(
+            cache.m_driver_cache, 1, &snapshot.Info(), nullptr, &optimized);
+		Finish(result, optimized, begin, [&](uint64_t ns) {
+			cache.ReplaceFastPipeline(key, 0, fast, optimized, fast_ns, ns);
+		});
+	}
+	void OptimizeCompute(uint64_t id, vk::Pipeline fast, uint64_t fast_ns,
+	                     const ComputeSnapshot& snapshot) {
+		NameThread();
+		vk::Pipeline        optimized = nullptr;
+		const auto          begin     = CompileClockNs();
+		HangWatchdog::Scope compile("compute-pipeline-optimize",
+		                            reinterpret_cast<uint64_t>(static_cast<VkPipeline>(fast)), id);
+		const auto          result = cache.m_graphics.device.createComputePipelines(
+            cache.m_driver_cache, 1, &snapshot.info, nullptr, &optimized);
+		Finish(result, optimized, begin, [&](uint64_t ns) {
+			cache.ReplaceFastPipeline(nullptr, id, fast, optimized, fast_ns, ns);
+		});
+	}
+	template <class Replace>
+	void Finish(vk::Result result, vk::Pipeline optimized, uint64_t begin, Replace&& replace) {
+		const auto ns = CompileClockNs() - begin;
+		Profiler::AddFrameWait(Profiler::FrameWait::PipelineOptimize, 1, ns);
+		if (result != vk::Result::eSuccess || optimized == nullptr) {
+			// The unoptimized pipeline stays; it renders the same state.
+			counters.optimize_failed.fetch_add(1, std::memory_order_relaxed);
+			if (optimized != nullptr) cache.m_graphics.device.destroyPipeline(optimized, nullptr);
+			return;
+		}
+		counters.optimize_ns.fetch_add(ns, std::memory_order_relaxed);
+		// The driver cache just received the optimized pipeline: schedule the periodic save.
+		cache.NotePipelineCreated(ns);
+		replace(ns);
+	}
+
+	PipelineCache&     cache;
+	FastFirstCounters  counters;
+	FastFirstScheduler scheduler;
+	const uint64_t     retire_age_ns;
+	const uint64_t     drain_ms;
+	const bool         probe;
+	std::mutex                  report_mutex;
+	std::condition_variable_any report_cv;
+	std::jthread               reporter;
+	// Guarded by PipelineCache::m_mutex. Objects stay allocated until the cache goes (other
+	// threads may hold a reference to one; it is a few words); only the Vulkan handle of a
+	// replaced pipeline is destroyed, after retire_age_ns, because recorded command buffers may
+	// still use it.
+	FastFirstRetireList<vk::Pipeline>      retired_handles;
+	std::vector<std::unique_ptr<Pipeline>> retired_objects;
+};
+
+void PipelineCache::ReplaceFastPipeline(const GraphicsPipelineKey* graphics_key, uint64_t compute_id,
+                                        vk::Pipeline fast, vk::Pipeline optimized,
+                                        uint64_t fast_ns, uint64_t optimize_ns) {
+	auto&                      state = *m_fast_first;
+	Common::LockGuard          lock(m_mutex);
+	std::unique_ptr<Pipeline>* slot = nullptr;
+	if (graphics_key != nullptr) {
+		if (auto entry = m_graphics_pipelines.find(*graphics_key);
+		    entry != m_graphics_pipelines.end()) {
+			slot = &entry->second;
+		}
+	} else if (auto entry = m_compute_pipelines.find(compute_id);
+	           entry != m_compute_pipelines.end()) {
+		slot = &entry->second;
+	}
+	if (slot == nullptr || (*slot)->pipeline != fast) {
+		m_graphics.device.destroyPipeline(optimized, nullptr);
+		state.counters.swaps_dropped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	// A new object, not a changed handle: threads that already hold the old Pipeline& keep a
+	// consistent (still valid) pipeline; the generation makes their memos look it up again.
+	auto replacement      = std::make_unique<Pipeline>(**slot);
+	replacement->pipeline = optimized;
+	state.retired_objects.push_back(std::move(*slot));
+	*slot = std::move(replacement);
+	if (graphics_key != nullptr) {
+		GpuOpProfiler::RegisterGraphicsPipeline(
+		    optimized, graphics_key->vertex_shader_ids.data(),
+		    static_cast<uint32_t>(graphics_key->vertex_shader_ids.size()),
+		    graphics_key->ps_shader_id);
+	} else {
+		GpuOpProfiler::RegisterComputePipeline(optimized, compute_id);
+	}
+	m_pipeline_generation.fetch_add(1, std::memory_order_release);
+
+	const auto now = FastFirstNowNs();
+	state.retired_handles.Add(fast, now);
+	state.counters.swaps.fetch_add(1, std::memory_order_relaxed);
+	state.counters.saved_ns.fetch_add(optimize_ns > fast_ns ? optimize_ns - fast_ns : 0,
+	                                  std::memory_order_relaxed);
+	for (const auto handle: state.retired_handles.TakeExpired(now, state.retire_age_ns)) {
+		m_graphics.device.destroyPipeline(handle, nullptr);
+		state.counters.handles_destroyed.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 namespace {
 // Numbers PipelineCache instances for their generation ranges (see the constructor).
 std::atomic<uint64_t> g_pipeline_cache_instances {0};
@@ -4219,6 +4693,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
 	}
 	InitializeProgramDiskCache();
+	InitializeShaderPrecompile();
 	if (GraphicsPipelineLibrary::Enabled(m_graphics)) {
 		m_library = std::make_unique<LibraryState>(*this);
 		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
@@ -4241,9 +4716,26 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			                 m_async->threads.size());
 		}
 	}
-	// The prefetch pool and KYTY_ASYNC_PIPELINES both own pending graphics pipelines; one at a time.
+	if (PipelineFastFirstRequested()) {
+		if (m_library != nullptr) {
+			PipelineCacheLog("Pipeline fast-first: KYTY_PIPELINE_LIBRARY already links pipelines "
+			                 "without optimization; fast-first is off");
+		} else if (m_async != nullptr) {
+			// Both would own the creation of a new pipeline; the asynchronous path was asked for
+			// explicitly (KYTY_ASYNC_PIPELINES).
+			PipelineCacheLog("Pipeline fast-first: off (asynchronous pipelines are on)");
+		} else {
+			m_fast_first = std::make_unique<FastFirstState>(*this);
+			PipelineCacheLog("Pipeline fast-first: new pipelines are built unoptimized and "
+			                 "optimized in the background (driver-cache probe {}); pipeline "
+			                 "prefetch is off",
+			                 m_graphics.pipeline_creation_cache_control_enabled ? "on" : "off");
+		}
+	}
+	// The prefetch pool, KYTY_ASYNC_PIPELINES and fast-first all own pending graphics pipelines;
+	// one at a time.
 	if ((g_pipeline_prefetch.On() || EnvU64("KYTY_PIPELINE_PREFETCH_POOL", 0) != 0) && m_library == nullptr &&
-	    m_async == nullptr) {
+	    m_async == nullptr && m_fast_first == nullptr) {
 		const auto threads = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_PREFETCH_THREADS", 2), 1, 4);
 		m_prefetch = std::make_unique<PrefetchState>(*this, threads);
 		PipelineCacheLog("Pipeline prefetch: {} compile workers; draws always wait for their exact pipeline", threads);
@@ -4252,6 +4744,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 PipelineCache::~PipelineCache() {
 	m_program_cache->StopAsyncTranslations();
+	StopShaderPrecompile();
 	m_program_cache->StopBackgroundChecks();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	LogCompileTotals();
@@ -4277,6 +4770,13 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	if (m_fast_first != nullptr) {
+		// Replaced unoptimized pipelines still waiting for their retirement age; the optimized
+		// builds that replaced them were destroyed with their entries above.
+		for (const auto handle: m_fast_first->retired_handles.TakeAll()) {
+			m_graphics.device.destroyPipeline(handle, nullptr);
+		}
+	}
 	if (m_library != nullptr) {
 		// Replaced linked pipelines: only their handles. Their layouts are the live entries'
 		// (copied with the entry), released once above.
@@ -4624,6 +5124,7 @@ uint64_t PipelineCache::WriteDriverCacheLocked(const char* kind, bool capped) {
 void PipelineCache::Save() {
 	// Background translations insert sources and add them to the disk cache.
 	m_program_cache->StopAsyncTranslations();
+	StopShaderPrecompile();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	if (m_program_disk != nullptr) {
 		// Pending background checks are dropped; a check never outlives the disk cache.
@@ -4641,6 +5142,11 @@ void PipelineCache::Save() {
 	// Background compiles of pending pipelines finish first, so no entry stays pending.
 	if (m_async != nullptr) {
 		m_async->Stop();
+	}
+	// Queued optimized compiles finish within the drain budget so that the cache saved below holds
+	// them; an unoptimized pipeline still in use stays so.
+	if (m_fast_first != nullptr) {
+		m_fast_first->Stop();
 	}
 	Common::LockGuard lock(m_mutex);
 	if (m_driver_cache == nullptr) {
@@ -4660,6 +5166,89 @@ void PipelineCache::WaitProgramChecks() {
 	m_program_cache->WaitBackgroundChecks();
 }
 
+void PipelineCache::WaitShaderPrecompile() {
+	if (m_shader_precompiler != nullptr) m_shader_precompiler->Wait();
+	if (m_shader_journal != nullptr) m_shader_journal->Flush();
+}
+
+// KYTY_SHADER_PRECOMPILE=1 (default off): journals the inputs of every program permutation this
+// run compiles (shaderPrecompile.h) and replays the ones an earlier run journaled on background
+// threads from start-up, so the game finds them published. KYTY_SHADER_PRECOMPILE_PATH names
+// another journal file (tests; the default is _PipelineCache/<title>.shaders.journal),
+// KYTY_SHADER_PRECOMPILE_REPLAY=0 only records, KYTY_SHADER_PRECOMPILE_THREADS (default 2, 1..8)
+// sets the replay threads, KYTY_SHADER_PRECOMPILE_MAX (default 30000, 0 = all) the entries
+// replayed, KYTY_SHADER_PRECOMPILE_WAIT=1 makes start-up wait for the replay to finish. KYTY_RESOURCE_REUSE=1 keeps it off (that mode serializes preparation on a mutex the
+// replay does not take).
+void PipelineCache::InitializeShaderPrecompile() {
+	if (EnvU64("KYTY_SHADER_PRECOMPILE", 0) == 0) {
+		return;
+	}
+	if (ResourceReuseEnabled()) {
+		PipelineCacheLog("Shader precompile: off (KYTY_RESOURCE_REUSE=1)");
+		return;
+	}
+	std::filesystem::path path;
+	if (const auto* custom = std::getenv("KYTY_SHADER_PRECOMPILE_PATH");
+	    custom != nullptr && *custom != '\0') {
+		path = std::filesystem::path(custom);
+	} else {
+		const auto title_id = PipelineCacheTitleId();
+		if (title_id.empty()) {
+			return;
+		}
+		path = std::filesystem::path("_PipelineCache") / (title_id + ".shaders.journal");
+	}
+	// The identity holds what the stored inputs depend on besides the game: the device (subgroup
+	// and mesh limits are part of the stage input infos) and the sizes of the input structs. The
+	// translator is not part of it: the journal holds inputs, not outputs.
+	const auto& properties = m_graphics.GetPhysicalDeviceProperties();
+	const auto  identity   = fmt::format(
+        "kyty shader journal; device {:08x}:{:08x}; input infos {} {} {}", properties.vendorID,
+        properties.deviceID, sizeof(ShaderVertexInputInfo), sizeof(ShaderPixelInputInfo),
+        sizeof(ShaderComputeInputInfo));
+	ShaderJournal::Settings settings;
+	settings.path     = path;
+	settings.identity = std::vector<uint8_t>(identity.begin(), identity.end());
+	settings.log      = [](const std::string& message) { PipelineCacheLog("{}", message); };
+	m_shader_journal  = std::make_unique<ShaderJournal>(std::move(settings));
+	m_program_cache->journal = m_shader_journal.get();
+	const auto stats = m_shader_journal->GetStats();
+	PipelineCacheLog("Shader precompile: journal {}: {} sources, {} permutations loaded ({:.0f} ms{}{})",
+	                 Common::PathToString(path), m_shader_journal->Sources().size(),
+	                 m_shader_journal->Entries().size(), static_cast<double>(stats.load_ns) / 1.0e6,
+	                 stats.damaged_bytes != 0 ? "; damaged tail ignored" : "",
+	                 stats.header_rejected ? "; another device or format, replaced" : "");
+	if (EnvU64("KYTY_SHADER_PRECOMPILE_REPLAY", 1) == 0 || m_shader_journal->Entries().empty()) {
+		return;
+	}
+	ShaderPrecompiler::Settings replay;
+	replay.threads     = static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", 2), 1, 8));
+	replay.max_entries = EnvU64("KYTY_SHADER_PRECOMPILE_MAX", 30000);
+	replay.thread_init = [](uint32_t) { Profiler::SetThreadName("ShaderPrecompile"); };
+	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
+	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
+	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
+	    *m_shader_journal, std::move(replay),
+	    [this](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
+		    return m_program_cache->ReplayEntry(source, entry);
+	    });
+	if (EnvU64("KYTY_SHADER_PRECOMPILE_WAIT", 0) != 0) {
+		// Start-up waits for the replay (the best case of precompiling: tests, measurements).
+		m_shader_precompiler->Wait();
+	}
+}
+
+// Stops the replay (entries in progress finish) and drops the loaded journal content; the journal
+// keeps recording until the cache goes.
+void PipelineCache::StopShaderPrecompile() {
+	if (m_shader_precompiler != nullptr) {
+		m_shader_precompiler->Stop();
+		m_shader_precompiler.reset(); // joins the workers
+		if (m_shader_journal != nullptr) m_shader_journal->ReleaseLoaded();
+	}
+	if (m_shader_journal != nullptr) m_shader_journal->Flush();
+}
+
 PipelineCache::ProgramTotals PipelineCache::Totals() {
 	const auto& t = g_compile_totals;
 	return {.programs          = t.programs.load(std::memory_order_relaxed),
@@ -4667,7 +5256,8 @@ PipelineCache::ProgramTotals PipelineCache::Totals() {
 	        .source_hits       = t.disk_source_hits.load(std::memory_order_relaxed),
 	        .permutation_hits  = t.disk_permutation_hits.load(std::memory_order_relaxed),
 	        .verify_checks     = t.disk_verify_checks.load(std::memory_order_relaxed),
-	        .verify_mismatches = t.disk_verify_mismatches.load(std::memory_order_relaxed)};
+	        .verify_mismatches = t.disk_verify_mismatches.load(std::memory_order_relaxed),
+	        .replayed          = t.replayed.load(std::memory_order_relaxed)};
 }
 
 bool PipelineDynamicRasterStateEnabled() {
@@ -5441,6 +6031,11 @@ PipelineCache::PrefetchTotals PipelineCache::GetPrefetchTotals() const {
 	        m_prefetch->saturated.load()};
 }
 
+FastFirstSnapshot PipelineCache::GetFastFirstTotals() const {
+	if (m_fast_first == nullptr) return {};
+	return SnapshotFastFirst(m_fast_first->counters, m_fast_first->scheduler.Pending());
+}
+
 bool PipelineCache::PipelinePrefetchEnabled() const noexcept {
 	return m_prefetch != nullptr && g_pipeline_prefetch.On();
 }
@@ -5657,6 +6252,13 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// fast-link it and hand back the create info for the background optimized compile.
 	GraphicsPipelineLibrary::Result library_result;
 	GraphicsPipelineCreateHook      library_hook;
+	FastFirstState::GraphicsFast    fast_result;
+	if (m_fast_first != nullptr && !prefetched && !m_fast_first->scheduler.Stopped()) {
+		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+		                   std::span<const uint32_t>, vk::Pipeline* pipeline) {
+			return m_fast_first->CreateGraphics(info, pipeline, fast_result);
+		};
+	}
 	if (m_library != nullptr) {
 		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
 		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
@@ -5689,9 +6291,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		    ps_id);
 		CreatePipelineInternal(m_graphics, *cached, key.rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, key.static_params, m_driver_cache,
-		                       async                 ? &async_hook
-		                       : m_library != nullptr ? &library_hook
-		                                              : nullptr);
+		                       async          ? &async_hook
+		                       : library_hook ? &library_hook
+		                                      : nullptr);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	if (async_snapshot != nullptr) {
@@ -5757,6 +6359,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto [iter, inserted]       = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
 	if (prefetched) m_prefetch->Complete(key);
+	if (fast_result.snapshot != nullptr) {
+		m_fast_first->EnqueueGraphics(&iter->first, created_pipeline, fast_result);
+	}
 	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize) {
 		m_library->Enqueue({.key      = &iter->first,
 		                    .linked   = created_pipeline,
@@ -5800,7 +6405,8 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		                          .detail      = detail});
 	}
 	AddCompileStall(create_ns);
-	if (!prefetched) NotePipelineCreated(create_ns);
+	// A fast build left the driver cache untouched; its optimized build notes the creation.
+	if (!prefetched && fast_result.snapshot == nullptr) NotePipelineCreated(create_ns);
 	return &remember(iter->first, *iter->second);
 }
 
@@ -5828,14 +6434,26 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	HangWatchdog::Scope compile(
 	    "compute-pipeline", input_info.stage.program ? input_info.stage.program->shader_hash : 0,
 	    compute_program.id);
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	FastFirstState::ComputeFast fast_result;
+	ComputePipelineCreateHook   fast_hook;
+	if (m_fast_first != nullptr && m_fast_first->scheduler.Stopped() == false) {
+		fast_hook = [&](const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline) {
+			return m_fast_first->CreateCompute(info, pipeline, fast_result);
+		};
+	}
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
+	                       fast_hook ? &fast_hook : nullptr);
 	GpuOpProfiler::RegisterComputePipeline(cached->pipeline, compute_program.id);
+	const auto created_pipeline = cached->pipeline;
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	if (fast_result.snapshot != nullptr) {
+		m_fast_first->EnqueueCompute(compute_program.id, created_pipeline, fast_result);
+	}
 
 	const auto create_ns = CompileClockNs() - create_begin;
 	g_compile_totals.cs_pipelines.fetch_add(1, std::memory_order_relaxed);
@@ -5852,7 +6470,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 	AddCompileStall(create_ns);
 	FlushCompileStall();
-	NotePipelineCreated(create_ns);
+	if (fast_result.snapshot == nullptr) NotePipelineCreated(create_ns);
 	return *iter->second;
 }
 } // namespace Libs::Graphics

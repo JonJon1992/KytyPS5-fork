@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -182,6 +183,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
 	SurfaceCapabilities best_capabilities;
+	std::tuple<int, int, uint64_t> best_rank {};
+	std::string                    best_name;
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -384,14 +387,43 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		// Automatic choice: a discrete GPU over an integrated one (a Ryzen iGPU next to an RTX card),
+		// a native driver over a layered one (Microsoft's D3D12-based "Dozen" driver can list the same
+		// card again as a discrete GPU), then the most device-local memory; the first wins a tie.
+		vk::PhysicalDeviceDriverProperties driver_properties {};
+		vk::PhysicalDeviceProperties2      properties2 {};
+		properties2.pNext = &driver_properties;
+		device.getProperties2(&properties2);
+		const auto memory_properties = device.getMemoryProperties();
+		uint64_t   local_bytes       = 0;
+		for (uint32_t i = 0; i < memory_properties.memoryHeapCount; i++) {
+			if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local_bytes = std::max<uint64_t>(local_bytes, memory_properties.memoryHeaps[i].size);
+			}
+		}
+		const bool layered = driver_properties.driverID == vk::DriverId::eMesaDozen;
+		const int  type_rank =
+		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu     ? 3
+		    : device_properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu ? 2
+		    : device_properties.deviceType == vk::PhysicalDeviceType::eVirtualGpu    ? 1
+		                                                                             : 0;
+		const auto rank = std::make_tuple(layered ? 0 : 1, type_rank, local_bytes);
+		LOGF("Vulkan device candidate: %s (type %d, driver %d, %.1f GiB device-local)\n",
+		     device_properties.deviceName.data(), type_rank, static_cast<int>(driver_properties.driverID),
+		     static_cast<double>(local_bytes) / (1024.0 * 1024.0 * 1024.0));
+		if (best_device == nullptr || rank > best_rank) {
 			best_device       = device;
 			best_queue_family = queue_family;
 			best_capabilities = std::move(candidate_capabilities);
+			best_rank         = rank;
+			best_name         = device_properties.deviceName.data();
 		}
 	}
 
+	if (best_device != nullptr) {
+		std::printf("Kyty GPU: %s (%s)\n", best_name.c_str(),
+		            Config::GetGpuIndex() >= 0 ? "selected in the launcher" : "automatic choice");
+	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
@@ -700,9 +732,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.pipeline_library_enabled = library_fast_linking &&
 	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
-	// Only used by the library path's driver-cache probe; the default device stays unchanged.
+	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
+	// default device stays unchanged.
 	graphics.pipeline_creation_cache_control_enabled =
-	    graphics.pipeline_library_enabled &&
+	    (graphics.pipeline_library_enabled || Libs::Graphics::PipelineFastFirstRequested()) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
 	     pipeline_library_extension ? "true" : "false",
@@ -996,11 +1029,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		}
 	}
 	// Native FP64 arithmetic (upstream 16b83a034) declares SignedZeroInfNanPreserve for 64-bit
-	// floats and RTE rounding for 32-bit ones.
+	// floats; 32-bit rounding stays native, like ordinary FP32 arithmetic (upstream 7992aecb7).
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
-	    properties12.shaderSignedZeroInfNanPreserveFloat64 &&
-	    properties12.shaderRoundingModeRTEFloat32;
+	    properties12.shaderSignedZeroInfNanPreserveFloat64;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 #if defined(__APPLE__)
@@ -1219,14 +1251,15 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
-// KYTY_VULKAN_VALIDATION_MODE=log: diagnostic runs record validation errors and warnings in a
-// file (KYTY_VULKAN_VALIDATION_LOG, default _kyty_vulkan_validation.log) and keep running,
-// instead of exiting on the first error. Each message id is written in full for its first five
-// occurrences, then as a count at every power of two.
+// Validation errors and warnings are recorded in a file (KYTY_VULKAN_VALIDATION_LOG, default
+// _kyty_vulkan_validation.log) and the game keeps running: users turn the launcher's validation
+// option on while troubleshooting, and a known message would otherwise stop every game at boot.
+// KYTY_VULKAN_VALIDATION_MODE=exit restores exiting on the first validation error. Each message
+// id is written in full for its first five occurrences, then as a count at every power of two.
 static bool VulkanValidationLogOnly() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_VULKAN_VALIDATION_MODE");
-		return value != nullptr && std::strcmp(value, "log") == 0;
+		return value == nullptr || std::strcmp(value, "exit") != 0;
 	}();
 	return enabled;
 }
@@ -1293,6 +1326,12 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	if (VulkanValidationLogOnly() &&
 	    (message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ||
 	     message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning)) {
+		static std::once_flag announce;
+		std::call_once(announce, [] {
+			LOGF("Vulkan validation: errors and warnings are written to the validation log file and "
+			     "do not stop the game (KYTY_VULKAN_VALIDATION_MODE=exit stops at the first error); "
+			     "validation makes the game much slower\n");
+		});
 		RecordVulkanValidationMessage(
 		    message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "E" : "W",
 		    callback_data);

@@ -171,6 +171,7 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
+	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -246,6 +247,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
+	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

@@ -288,8 +288,14 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto address = ByteAddress(ctx, inst, mem);
+	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
+		// RDNA2 DS region addresses retain bits [15:2] after adding the byte offset.
+		address = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
+		                 ConstantU32(ctx.state, 0xffffu));
+	}
 	return Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
-	              ByteAddress(ctx, inst, mem), ConstantU32(ctx.state, 2));
+	              address, ConstantU32(ctx.state, 2));
 }
 
 struct PreparedMemoryElement {
@@ -1390,20 +1396,10 @@ uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem       = ctx.Memory(inst);
 	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
-	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		EmitIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    // DS_MIN_F32/DS_MAX_F32 take only ADDR and DATA0; the result follows the
-			    // same NaN and signed-zero rules as the buffer and image float atomics.
-			    const auto data = ctx.Arg(inst, 1);
-			    AtomicUpdate(
-			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-			        mem.kind, [&](uint32_t old) {
-				        return EmitFloatAtomicReplacement(ctx.state, old, data, max_value);
-			        });
-		    });
-	});
+	EmitAtomicUpdate(ctx, inst, mem,
+	                 [max_value](EmitterState& state, uint32_t old, uint32_t value) {
+		                 return EmitDsFloatAtomicReplacement(state, old, value, max_value);
+	                 });
 }
 
 uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1662,6 +1658,15 @@ uint32_t EmitAtomicIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement);
 }
 
+void EmitSharedAtomicMaskedOr32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto keep = Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), ctx.Arg(inst, 1));
+	EmitAtomicUpdate(ctx, inst, ctx.Memory(inst),
+	                 [keep](EmitterState& state, uint32_t old, uint32_t value) {
+		                 return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+		                               Binary(state, spv::OpBitwiseAnd, TypeU32(state), old, keep), value);
+	                 });
+}
+
 uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	state.builder.AddFunction(spv::OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 0));
@@ -1669,6 +1674,52 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto target = EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
 	                                            inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
+}
+
+uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state   = ctx.state;
+	auto       lane    = EmitSubgroupLocalInvocationId(state);
+	if (state.lane_count == 2) {
+		lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
+	}
+	const auto address = ctx.Arg(inst, 1);
+	const auto word    = Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane,
+	                            ConstantU32(state, 5));
+	const auto ballot_word = [&](uint32_t predicate) {
+		const auto ballot = state.builder.AllocateId();
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+		state.builder.AddFunction(spv::OpVectorExtractDynamic, TypeU32(state), result, ballot, word);
+		return result;
+	};
+	// RDNA2 permutes independently within each 32-lane half. Intersect the source
+	// address bit ballots to find this destination's enabled writers without LDS.
+	auto writers = ballot_word(ctx.Arg(inst, 2));
+	for (uint32_t bit = 0; bit < 5; ++bit) {
+		const auto address_bit = Binary(state, spv::OpBitwiseAnd, TypeU32(state), address,
+		                                ConstantU32(state, 1u << (bit + 2)));
+		const auto mask = ballot_word(Binary(state, spv::OpINotEqual, TypeBool(state),
+		                                      address_bit, ConstantU32(state, 0)));
+		const auto lane_bit = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane,
+		                             ConstantU32(state, 1u << bit));
+		const auto selected = Select(
+		    state, TypeU32(state),
+		    Binary(state, spv::OpINotEqual, TypeBool(state), lane_bit, ConstantU32(state, 0)),
+		    mask, Unary(state, spv::OpNot, TypeU32(state), mask));
+		writers = Binary(state, spv::OpBitwiseAnd, TypeU32(state), writers, selected);
+	}
+	const auto active = Binary(state, spv::OpINotEqual, TypeBool(state), writers,
+	                           ConstantU32(state, 0));
+	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane,
+	                         ConstantU32(state, ~31u));
+	const auto source = Select(state, TypeU32(state), active,
+	                           Binary(state, spv::OpBitwiseOr, TypeU32(state), base,
+	                                  EmitFindUMsb32(state, writers)), lane);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
 }
 
 uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
