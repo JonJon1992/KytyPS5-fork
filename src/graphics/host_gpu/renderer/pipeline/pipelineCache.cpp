@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "kernel/fileSystem.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
@@ -126,11 +127,41 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
+// A game without sce_sys/param.json (TITLE_ID and CONTENT_ID unknown) still gets both caches,
+// keyed by the content of its executable: "NOID-<XXH3-64 of /app0/eboot.bin>". Ghost of Yotei's
+// extracted folder had no param file, so every boot translated every shader and compiled every
+// pipeline again. Only the caches use this key; the sandbox and save directories keep theirs.
+// Program records are matched on their full guest code, so the key only selects the file.
+std::string ExecutableCacheId() {
+	static const std::string id = []() -> std::string {
+		const auto path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/eboot.bin");
+		std::FILE* file = path.empty() ? nullptr : std::fopen(path.string().c_str(), "rb");
+		if (file == nullptr) {
+			return {};
+		}
+		XXH3_state_t* state = XXH3_createState();
+		XXH3_64bits_reset(state);
+		std::vector<char> buffer(1u << 20u);
+		size_t            read = 0;
+		while ((read = std::fread(buffer.data(), 1, buffer.size(), file)) != 0) {
+			XXH3_64bits_update(state, buffer.data(), read);
+		}
+		std::fclose(file);
+		const auto hash = XXH3_64bits_digest(state);
+		XXH3_freeState(state);
+		const auto key = fmt::format("NOID-{:016x}", hash);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Pipeline caches: no TITLE_ID or CONTENT_ID; keyed by the executable as {}\n", key));
+		return key;
+	}();
+	return id;
+}
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
 	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
+		return ExecutableCacheId();
 	}
 	if (!std::ranges::all_of(title_id, [](unsigned char c) {
 		    return std::isalnum(c) != 0 || c == '-' || c == '_';
@@ -694,9 +725,34 @@ private:
 	bool m_recordable = false;
 };
 
+// KYTY_DUMP_SHADERS=<hash>[,<hash>...] (hex, 0x optional): the shader dumps below (original code and
+// its RDNA2 disassembly, SPIR-V, IR and compile inputs) for those guest shaders only, without
+// --graphics-debug-dump. The IR is dumped only for programs translated in this run.
+bool ShaderDumpRequested(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> parsed;
+		if (const auto* list = std::getenv("KYTY_DUMP_SHADERS"); list != nullptr) {
+			std::string_view text(list);
+			while (!text.empty()) {
+				const auto comma = text.find(',');
+				const std::string token(text.substr(0, comma));
+				if (!token.empty()) {
+					parsed.push_back(std::strtoull(token.c_str(), nullptr, 16));
+				}
+				if (comma == std::string_view::npos) {
+					break;
+				}
+				text.remove_prefix(comma + 1);
+			}
+		}
+		return parsed;
+	}();
+	return !hashes.empty() && std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !ShaderDumpRequested(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -714,7 +770,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code, const std::string& decoded_dump) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !ShaderDumpRequested(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -747,12 +803,14 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
                              const char* stage_name, std::span<const uint32_t> static_state,
                              uint32_t push_data_start_dword,
                              const std::vector<uint32_t>& spirv, std::string_view ir_dump) {
-	if (!Config::GraphicsDebugDumpEnabled() ||
-	    !((options.stage == ShaderType::Pixel && options.shader_hash == 0x3b809f9d156a95ddull) ||
-	      (options.stage == ShaderType::Vertex && (options.shader_hash == 0xe5398a1c6007f356ull ||
-	                                               options.shader_hash == 0xcf1834bb2d5ac83dull ||
-	                                               options.shader_hash == 0xd9cc5c62178518faull)) ||
-	      (options.stage == ShaderType::Compute && options.shader_hash == 0x305afd0aa0f66b9aull))) {
+	const bool listed =
+	    (options.stage == ShaderType::Pixel && options.shader_hash == 0x3b809f9d156a95ddull) ||
+	    (options.stage == ShaderType::Vertex && (options.shader_hash == 0xe5398a1c6007f356ull ||
+	                                             options.shader_hash == 0xcf1834bb2d5ac83dull ||
+	                                             options.shader_hash == 0xd9cc5c62178518faull)) ||
+	    (options.stage == ShaderType::Compute && options.shader_hash == 0x305afd0aa0f66b9aull);
+	if (!(Config::GraphicsDebugDumpEnabled() && listed) &&
+	    !ShaderDumpRequested(options.shader_hash)) {
 		return;
 	}
 
@@ -2371,7 +2429,7 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = job.hash;
 		options.user_data   = job.user_data;
 		options.back_code   = job.back_code;
-		options.dump_ir     = false;
+		options.dump_ir     = ShaderDumpRequested(job.hash);
 		options.early_dump  = false;
 		options.dump_label  = "ShaderRecompiler (background)";
 		// A union: set only the member of the job's stage.
@@ -2487,7 +2545,7 @@ struct PipelineCache::ProgramCache {
 		options.wave_size               = job.wave_size;
 		options.user_data_base          = job.user_data_base;
 		options.plain_mip_stats_variant = job.plain_mip_stats_variant;
-		options.dump_ir                 = false;
+		options.dump_ir                 = ShaderDumpRequested(job.shader_hash);
 		options.early_dump              = false;
 		options.dump_label              = "ProgramCache check";
 		// Translation reads the user data's size only (the count is part of the key).
@@ -2859,8 +2917,8 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = runtime.user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
+		options.early_dump  = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.dump_ir     = options.early_dump || ShaderDumpRequested(params.hash);
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.plain_mip_stats_variant =

@@ -398,7 +398,10 @@ void Umount(const std::string& folder_or_point) {
 }
 
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
-
+	// Before the filesystem lifecycle (or in tests without it) nothing is mounted.
+	if (g_mount_points == nullptr) {
+		return {};
+	}
 	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
