@@ -160,12 +160,15 @@ enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 
 template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
+	// Integer formats have no linear filtering (Vulkan requires a nearest filter for them, and the
+	// hardware samples them point-wise), so unsigned ones force point filtering like signed ones
+	// (fxpw/KytyPS5 505190d2).
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	    image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
 		return SamplerClass::PointInteger;
 	}
-	return image.numeric_class == Prospero::TextureNumericClass::Uint ? SamplerClass::Integer
-	                                                               : SamplerClass::Float;
+	return SamplerClass::Float;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
@@ -1535,6 +1538,15 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 						default: break;
 					}
 					inst.ReplaceUsesWith(result);
+				}
+				continue;
+			}
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write) {
+				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
+				if (memory.kind == ResourceKind::Buffer &&
+				    specialization.buffers[memory.resource].zero_stride_oob) {
+					// The same bounds check drops every vector store (fxpw/KytyPS5 fea16d46).
+					inst.Invalidate();
 				}
 				continue;
 			}

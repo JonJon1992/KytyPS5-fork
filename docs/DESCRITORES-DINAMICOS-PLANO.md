@@ -45,8 +45,12 @@ enumeração na CPU da opção A.
 **Falta:**
 1. **Causa dos dispatches lixo** com compute strided ligado. Sem isso o CS `0x34be…` e os outros
    CSs com registros continuam desligados por padrão.
-2. **Comparação no bindless:** sombras (`image_sample_c`) seguem pelo caminho antigo ou são
-   descartadas.
+2. **Comparação no bindless (prioridade baixa):** sombras (`image_sample_c`) seguem pelo caminho
+   sem bindless. Pelo `58e06b15`, esses draws já renderizam por ele, porque as tabelas deles são
+   enumeráveis na CPU. Só vale implementar se aparecer uma tabela de sombras com chave da GPU que o
+   caminho antigo não resolva. Cuidado ao implementar: o heap resolve todas as chaves da tabela com
+   o recurso de comparação, e uma tabela que misture texturas de cor e de profundidade quebraria
+   nessa validação.
 3. **`IMAGE_LOAD` e storage através de registro:** o PS `0x617c7166f3308810` continua descartado
    (Fase 3).
 4. **V# calculado no shader** (8 dos 14 do relatório): o `IndirectBuffer` só cobre leituras raw
