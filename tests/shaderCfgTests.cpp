@@ -8826,6 +8826,142 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// A skipped shared tail is reached again only after the loop backedge. That
+// reachability must not prevent routing the overlapping selection in this iteration.
+void TestCfgLoopSharedContinuation() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 13),       // header -> end
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 4),       // outer -> right arm
+      EncodeSopc(0x06, 2, 128),
+      EncodeSopp(0x04, 5),       // inner -> skip shared tail
+      EncodeSMovB32(3, 129),     // left arm
+      EncodeSopp(0x02, 1),       // left -> shared tail
+      EncodeSMovB32(4, 130),     // right arm -> shared tail
+      EncodeSMovB32(5, 131),     // shared tail
+      EncodeSopp(0x02, 0),       // shared tail -> skipped target
+      EncodeSMovB32(6, 132),     // skipped target
+      EncodeSopp(0x02, 0),
+      EncodeSop2(0x00, 7, 7, 129), // latch
+      EncodeSopp(0x02, 0xfff1u), // repeat -> header
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original = graph;
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.natural_loops.size() == 1u, "shared-continuation loop fixture");
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared-continuation routing duplicated or discarded guest instructions");
+
+  // Compare execution paths against the original guest CFG for every combination
+  // of the two decisions across three iterations. Routing state must be refreshed
+  // on each iteration, and neither arm may execute the shared tail twice.
+  const auto trace = [&](const ShaderRecompiler::CFG::Graph &cfg, uint32_t choices) {
+    std::vector<uint32_t> executed;
+    std::vector<bool> routes(cfg.blocks.size(), false);
+    uint32_t iteration = 0;
+    auto id = cfg.entry_block;
+    for (uint32_t steps = 0; steps < 256; ++steps) {
+      const auto *block = cfg.FindBlock(id);
+      Check(block != nullptr, "shared-continuation trace lost a target");
+      for (auto i = block->inst_begin; i < block->inst_end; ++i) executed.push_back(i);
+      const auto &term = block->terminator;
+      if (term.goto_value >= 0) routes.at(term.goto_variable) = term.goto_value != 0;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::Return) return executed;
+      bool take = false;
+      if (term.condition == ShaderRecompiler::CFG::BranchCondition::GotoVariable) {
+        take = routes.at(term.goto_variable);
+      } else if (term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+        if (block->start_pc == 0) {
+          take = iteration++ == 3;
+        } else {
+          const auto decision = block->start_pc == 8 ? 0u : 1u;
+          take = (choices & (1u << ((iteration - 1u) * 2u + decision))) != 0;
+        }
+      }
+      id = term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch && !take
+               ? term.false_block : term.true_block;
+    }
+    Check(false, "shared-continuation trace did not terminate");
+    return executed;
+  };
+  for (uint32_t choices = 0; choices < 64; ++choices) {
+    Check(trace(graph, choices) == trace(original, choices),
+          "shared-continuation routing changed a guest execution path");
+  }
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
+            !SpirvContainsOpcode(result.spirv, 251),
+        "shared-continuation loop did not emit native structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// --structurize-file <guest.bin> [...]: builds and structurizes the CFG of dumped guest compute
+// shaders (KYTY_DUMP_SHADERS writes _Shaders/original/*.bin) and translates the structured ones.
+// Exit status 1 when any of them would take the dispatcher fallback.
+int StructurizeFiles(std::span<char *const> paths) {
+  int status = 0;
+  for (const char *path : paths) {
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<char> bytes{std::istreambuf_iterator<char>(file), {}};
+    if (bytes.empty() || bytes.size() % 4u != 0u) {
+      std::printf("%s: not a guest shader binary (%zu bytes)\n", path, bytes.size());
+      status = 1;
+      continue;
+    }
+    std::vector<uint32_t> words(bytes.size() / 4u);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(words, decoded);
+    auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+    const auto blocks = graph.blocks.size();
+    const bool structured = !graph.irreducible && ShaderRecompiler::CFG::Structurize(graph);
+    uint32_t routes = 0;
+    for (const auto &block : graph.blocks) {
+      routes += block.terminator.goto_value >= 0 ? 1u : 0u;
+    }
+    std::printf("%s: %zu instructions, %zu blocks -> %zu, %zu loops, %u route sets: %s%s\n", path,
+                decoded.instructions.size(), blocks, graph.blocks.size(),
+                graph.natural_loops.size(), routes, structured ? "structured" : "dispatcher, ",
+                structured ? "" : graph.unsupported_reason.c_str());
+    if (!structured) {
+      status = 1;
+      continue;
+    }
+    ShaderComputeInputInfo compute{};
+    ShaderRecompiler::Frontend::TranslateOptions translate_options{};
+    translate_options.stage = ShaderType::Compute;
+    translate_options.wave_size = 64u;
+    translate_options.input_info.compute = &compute;
+    const auto program = ShaderRecompiler::Frontend::TranslateProgram(decoded, graph, translate_options);
+    std::printf("%s: translated, %zu IR blocks, dispatcher_fallback=%d\n", path,
+                program.blocks.size(), program.dispatcher_fallback ? 1 : 0);
+    status |= program.dispatcher_fallback ? 1 : 0;
+    // The whole pipeline to validated SPIR-V, with every resource the shader reads from guest
+    // memory null (the dump has its user data, not the memory behind it).
+    if (std::getenv("KYTY_STRUCTURIZE_FILE_SPIRV") != nullptr) {
+      const auto zero_memory = [](void *, uint64_t, std::span<uint32_t> values) {
+        std::ranges::fill(values, 0u);
+        return true;
+      };
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      const auto result = RecompileForTest(words, options, zero_memory, nullptr);
+      std::printf("%s: SPIR-V %zu words, dispatcher_fallback=%d, OpLoopMerge %u, OpSwitch %u\n",
+                  path, result.spirv.size(), result.program.dispatcher_fallback ? 1 : 0,
+                  SpirvInstructionOpcodeCount(result.spirv, 246),
+                  SpirvInstructionOpcodeCount(result.spirv, 251));
+      CheckSpirvBinaryValidates(result.spirv);
+      status |= result.program.dispatcher_fallback ? 1 : 0;
+    }
+  }
+  return status;
+}
+
 void TestNewShaderRecompilerCfgExecSccSharedArm() {
   const uint32_t shader[] = {
       EncodeSop2(0x15, 126, 4, 126), // s_andn2_b64 exec, s4, exec
@@ -15052,6 +15188,13 @@ int main(int argc, char **argv) {
 #endif
   }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--loop-shared-continuation-only") {
+    TestCfgLoopSharedContinuation();
+    return 0;
+  }
+  if (argc >= 3 && std::string_view(argv[1]) == "--structurize-file") {
+    return StructurizeFiles(std::span<char *const>(argv + 2, static_cast<size_t>(argc - 2)));
+  }
   if (argc == 2 && std::strcmp(argv[1], "--frontend-optimization-only") == 0) {
     TestFrontendInstructionPrefixes();
     TestFrontendBufferAddresses();
@@ -15224,6 +15367,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgMultipleLoopLatches();
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
+  TestCfgLoopSharedContinuation();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();

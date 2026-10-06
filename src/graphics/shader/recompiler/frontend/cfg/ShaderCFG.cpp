@@ -1842,8 +1842,14 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 
 			const auto continuation = graph.FindNearestCommonPostDominator(shared, body);
 			const auto* continuation_block = graph.FindBlock(continuation);
-			if (continuation_block == nullptr || continuation == other ||
-			    CanReachBefore(graph, other, continuation, UINT32_MAX)) {
+			// The exit must not lead into the continuation within this iteration. Inside a loop,
+			// reaching it again through the backedge is the next iteration's selection, so the
+			// search stops at the loop header (Ghost of Yotei's 0xe52e19c6923301d0 skips its
+			// shared tail this way in both of its loops).
+			const auto* loop          = FindInnermostContainingLoop(graph, outer_id);
+			const auto  iteration_end = loop != nullptr ? loop->header : UINT32_MAX;
+			if (continuation_block == nullptr || continuation == other || other == iteration_end ||
+			    CanReachBefore(graph, other, continuation, iteration_end)) {
 				continue;
 			}
 			std::vector<uint32_t> outer_predecessors;
