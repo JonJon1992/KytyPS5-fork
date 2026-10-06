@@ -1783,6 +1783,7 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  u32 size_bytes = 0; // Zero maps the remaining backing, as in the existing cases.
 };
 
 struct TestCase {
@@ -7904,7 +7905,7 @@ public:
   }
 
   // KYTY_READBACK_EAGER (BufferCache::IssueEagerReadbacks): a page whose GPU-written bytes a
-  // reader needed read back is published when the submission after its writer completes, so a
+  // reader needed read back is published when its writer submission completes, so a
   // later read finds it clean; a reader during that copy waits for it; a newer writer keeps the
   // page protected; a GPU-thread read makes a writer request an early submission; =0 disables.
   void CheckEagerReadback() {
@@ -8108,14 +8109,43 @@ public:
                   !protected_page(guest_page),
               "the first readback did not publish the value");
 
-      // 2. The next write of the page is copied by the submission after its writer, and
-      // published (page unprotected) when that submission completes.
+      // Measure how many submissions a hot page needs before publication can complete.
+      // issue_submissions counts only the submit() calls up to copy issuance; complete() adds
+      // a finishing submission per round. Timing includes both and fixture/worker overhead,
+      // not just GPU copy latency or game frame time.
+      constexpr unsigned rounds = 64;
+      unsigned submissions = 0;
+      const auto benchmark_start = std::chrono::steady_clock::now();
+      for (unsigned round = 0; round < rounds; ++round) {
+        cache.AdvanceFrame();
+        gpu_write(guest_offset, 0x10000000u + round);
+        hold_runner();
+        unsigned attempts = 0;
+        do {
+          submit();
+          ++attempts;
+        } while (attempts < 3 &&
+                 !cache.HasPendingBackingPublication(base + guest_offset, 4));
+        const bool pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+        release_runner();
+        Require(name, "benchmark issue", pending, "hot page never issued an eager copy");
+        complete();
+        Require(name, "benchmark value",
+                backing(guest_offset) == 0x10000000u + round &&
+                    !protected_page(guest_page),
+                "benchmark publication lost a GPU update");
+        submissions += attempts;
+      }
+      const auto benchmark_us = std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - benchmark_start).count();
+      std::printf("[eager-profile] copies=%u issue_submissions=%u us/copy=%.3f bytes/copy=4\n",
+                  rounds, submissions, benchmark_us / rounds);
+      std::fflush(stdout);
+      cache.AdvanceFrame();
+
+      // 2. At the packet boundary every writer has been recorded: copy with the producer,
+      // retaining protection until the producer submission and publication complete.
       gpu_write(guest_offset, 0x22222222u);
-      submit();
-      Require(name, "writer submission",
-              cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
-                  !cache.HasPendingBackingPublication(base + guest_offset, 4),
-              "an eager copy was issued with its writer's own submission");
       hold_runner();
       submit();
       const bool issued = !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
@@ -8123,7 +8153,7 @@ public:
                           protected_page(guest_page);
       release_runner();
       Require(name, "eager issue", issued,
-              "the submission after the writer did not issue an eager copy, "
+              "the producer submission did not issue an eager copy, "
               "or unprotected the page before completion");
       complete();
       Require(name, "eager publication",
@@ -8136,14 +8166,16 @@ public:
       // copy still publishes its own (older) bytes, and the next read returns the newest.
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x33333333u);
-      submit();
       hold_runner();
       submit();
       const bool second_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
-      release_runner();
-      Require(name, "second eager issue", second_pending,
-              "a later writer of a hot page was not copied eagerly");
+      // Keep the publication blocked until the newer writer cancels its pending-page mark.
       gpu_write(guest_offset, 0x44444444u);
+      const bool newer_pending = cache.HasPendingBackingPublication(base + guest_offset, 4) &&
+                                 cache.HasGpuDirtyBytes(base + guest_offset, 4);
+      release_runner();
+      Require(name, "second eager issue", second_pending && newer_pending,
+              "a later writer was not registered while the older publication was pending");
       complete();
       Require(name, "newer writer retained",
               backing(guest_offset) == 0x33333333u &&
@@ -8160,14 +8192,14 @@ public:
       // issuing its own.
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x55555555u);
-      submit();
       hold_runner();
       submit();
       const bool third_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+      // The reader must publish the copy itself while the completion runner is blocked.
+      cache.ReadMemory(base + guest_offset, 1);
       release_runner();
       Require(name, "third eager issue", third_pending,
               "the eager copy was not pending before the read");
-      cache.ReadMemory(base + guest_offset, 1);
       Require(name, "read during copy",
               backing(guest_offset) == 0x55555555u &&
                   !protected_page(guest_page) &&
@@ -8206,7 +8238,6 @@ public:
               !cache.TakeEagerFlushRequest(false),
               "a writer of a guest-read page requested an early submission");
       hold_runner();
-      submit();
       submit();
       const bool both_pending = cache.HasPendingBackingPublication(base + cp_offset, 4) &&
                                 cache.HasPendingBackingPublication(base + guest_offset, 4);
@@ -25267,13 +25298,16 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, size_bytes] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
                 backing >= page_offset && backing < buffer.size,
                 "BDA test mapping begins outside its backing buffer");
-        const auto bytes = page_offset + buffer.size - backing;
+        Require(test.name, "dispatch", size_bytes <= buffer.size - backing,
+                "BDA test mapping extends outside its backing buffer");
+        const auto bytes = page_offset +
+                           (size_bytes == 0 ? buffer.size - backing : size_bytes);
         const auto pages =
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
@@ -50630,6 +50664,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 }
 
 #include "ShaderCodegenTests.inc"
+#include "ShaderGlobalWideTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
@@ -50952,6 +50987,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--global-wide-only") == 0) {
+    VulkanHarness vulkan;
+    CheckGlobalWideLoads(&vulkan);
+    CheckGlobalScalarLoads(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {
@@ -52055,6 +52096,7 @@ int main(int argc, char **argv) {
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   const auto tests = MakeCases();
+  CheckGlobalWideLoads(&vulkan);
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);
   for (const auto &test : tests) {

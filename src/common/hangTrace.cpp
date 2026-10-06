@@ -1182,7 +1182,9 @@ void Initialize() {
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
 	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
-	                             "last_gpu_write_age_ms,last_gpu_write_size");
+	                             "last_gpu_write_age_ms,last_gpu_write_size,cp_queue_us,issue_us,"
+	                             "side_gpu_wait_us,publication_lock_us,publish_us,drain_wait_us,"
+	                             "completion_wait_us,side_result");
 	g_files.occlusion = OpenFile("occlusion.csv",
 	                             "t_ms,event,address,value,scopes,width,height,colors,has_depth,"
 	                             "depth_format,depth_address,condition,skip,detail");
@@ -1622,7 +1624,7 @@ ReadbackKind GetReadbackKind() {
 }
 
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
-                    bool downloaded, uint64_t duration_ns) {
+                    bool downloaded, uint64_t duration_ns, const ReadbackTiming& timing) {
 	if (!Enabled()) {
 		return;
 	}
@@ -1655,6 +1657,11 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	                       kReadbackKindNames[static_cast<uint32_t>(kind)], vaddr, size, window_begin,
 	                       window_size, downloaded ? 1 : 0, duration_ns / 1000u, OsThreadId(),
 	                       CsvEscape(thread), pc, CsvEscape(callers), writer);
+	row += fmt::format(",{},{},{},{},{},{},{},{}", timing.cp_queue_ns / 1000u,
+	                   timing.issue_ns / 1000u, timing.side_gpu_wait_ns / 1000u,
+	                   timing.publication_lock_ns / 1000u, timing.publish_ns / 1000u,
+	                   timing.drain_wait_ns / 1000u, timing.completion_wait_ns / 1000u,
+	                   timing.side_result);
 	std::scoped_lock lock(g_readback_mutex);
 	if (g_readback_rows_total >= kReadbackRowLimit) {
 		return;

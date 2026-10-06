@@ -832,6 +832,18 @@ void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
 	const auto address = ReadAddressOperands(inst, 0);
 	const auto active  = ir.GetExec();
 	const auto count   = bits == 32u ? std::min(memory.data_dwords, 4u) : 1u;
+	if (memory.kind == IR::ResourceKind::Global && count > 1u) {
+		static constexpr std::array wide_ops {IR::ValueOpcode::LoadAddressU32x2,
+		                                     IR::ValueOpcode::LoadAddressU32x3,
+		                                     IR::ValueOpcode::LoadAddressU32x4};
+		const auto loaded = ir.Emit(wide_ops[count - 2u],
+		                            {address.resource, address.low, address.high, active},
+		                            AddMemoryInfo(memory, inst.pc));
+		for (uint32_t index = 0; index < count; ++index) {
+			WriteOperand(OffsetOperand(inst.dst, index), ir.CompositeExtract(loaded, index));
+		}
+		return;
+	}
 	for (uint32_t index = 0; index < count; index++) {
 		auto component = memory;
 		component.offset += index * 4u;

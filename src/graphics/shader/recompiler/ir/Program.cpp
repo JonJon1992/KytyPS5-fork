@@ -488,7 +488,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				              memory.component_count == 4u || memory.component_count == 8u ||
 				              memory.component_count == 16u
 				        : memory.component_count >= 1u && memory.component_count <= 4u;
-				if (memory.data_bits != address_info.data_bits || memory.data_dwords != 1u ||
+				if (memory.data_bits != address_info.data_bits ||
+				    memory.data_dwords != address_info.data_dwords ||
+				    (address_info.data_dwords > 1u &&
+				     (memory.kind != ResourceKind::Global || memory.component_index != 0u)) ||
 				    !valid_group_width || memory.component_index >= memory.component_count ||
 				    memory.sampler != 0u) {
 					return Fail(fmt::format("{} has inconsistent address-memory metadata",

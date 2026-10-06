@@ -255,23 +255,21 @@ public:
 		// so and its host unprotect had not landed yet, or another watcher (an image) protects it.
 		bool     already_dirty = false;
 	};
-	template <typename AheadFunc>
+	// on_dirty receives the exact newly dirtied pages after their serials/mirror are visible,
+	// before unprotect, under the region lock. Taking its epoch must never expose a clean mirror.
+	template <typename AheadFunc, typename DirtyFunc>
 	FaultResult MarkWriteFault(uint64_t vaddr, uint64_t size, const FaultPolicy& policy,
 	                           uint32_t frame, std::atomic_uint32_t& hot_count,
-	                           AheadFunc&& on_ahead) {
+	                           AheadFunc&& on_ahead, DirtyFunc&& on_dirty) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if (m_gpu_dirty.AnyInRange(start, end)) {
 			EXIT("CPU dirty state conflicts with GPU dirty state\n");
 		}
 		FaultResult result;
-		// Dirty bits (and possibly the hot set) change below.
-		Bump();
-		BumpDirtied();
 		// Only pages this tracker protected fault through it; already CPU-dirty pages fault for
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
 		result.already_dirty = already_dirty.Any();
-		m_cpu_dirty.SetRange(start, end);
 		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
 		size_t changed_begin = start;
 		size_t changed_end   = end;
@@ -282,19 +280,29 @@ public:
 			                                           TRACKER_REGION_PAGES);
 			changed_begin           = std::min(changed_begin, window_begin);
 			changed_end             = std::max(changed_end, window_end);
-			RegionBits all;
-			all.Fill();
-			const RegionBits window =
-			    RegionBits(all, window_begin, window_end) & ~m_gpu_dirty & ~m_cpu_dirty;
-			result.ahead_pages = window.Count();
-			m_cpu_dirty |= window;
-			for (const auto [first, last]: window) {
-				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE,
-				         (last - first) * TRACKER_PAGE_SIZE);
-			}
 		}
-		// Published before the pages become writable: a guest write can only land after it.
+		RegionBits dirty(~m_gpu_dirty & ~m_cpu_dirty, changed_begin, changed_end);
+		if (dirty.None()) {
+			// Another fault already opened the window (or another watcher caused this fault).
+			// No bits or hot history can change. The outer fault handler still reconciles host
+			// protection, including another thread's outstanding deferred unprotect.
+			return result;
+		}
+		Bump();
+		BumpDirtied();
+		m_cpu_dirty |= dirty;
+		// BDA consumers may skip the region lock when its mirror looks clean. Publish it before
+		// the log/epoch: consuming a notification must see the state that notification describes.
 		PublishCpuMirror(changed_begin, changed_end);
+		on_dirty(m_cpu_addr, dirty);
+		// Faulting bytes were invalidated by the caller; only newly opened neighbours need
+		// the fault-ahead callback (before any write is allowed to land).
+		dirty.UnsetRange(start, end);
+		result.ahead_pages = dirty.Count();
+		for (const auto [first, last]: dirty) {
+			on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+			         (last - first) * TRACKER_PAGE_SIZE);
+		}
 		UpdateProtection<false, false>();
 		if (policy.hot_frames == 0) {
 			return result;

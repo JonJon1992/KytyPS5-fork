@@ -219,7 +219,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
+uint32_t LoadBdaInline(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
@@ -232,10 +232,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		    bits == 8u ? ConstantBool(state, false)
 		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
-			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
-		});
+		const auto combine = [&](uint32_t second) {
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
 		const auto upper_shift =
@@ -248,10 +245,29 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
 		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
 		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
-		return bits == 32u ? merged
-		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
-		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+			return merged;
+		};
+		const auto load_second = [&]() {
+			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
+			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
+		};
+		// An aligned dword is already complete: no shifts, OR or zero tail are needed.
+		if (bits == 32u) {
+			return EmitValueOrDefaultIfCondition(state, crosses, TypeU32(state), first,
+			                                      [&]() { return combine(load_second()); });
+		}
+		const auto merged = combine(EmitValueOrZeroIfCondition(state, crosses, load_second));
+		return Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
+		              ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
+}
+
+uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
+	auto& state = ctx.state;
+	const auto function = state.bda_scalar_load_functions[bits == 8u ? 0 : bits == 16u ? 1 : 2];
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function, address, active);
+	return result;
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -1087,6 +1103,137 @@ void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code) {
 	});
 }
 
+namespace {
+
+// Share the exact guarded/unaligned body, including the wide-load slow path.
+void DefineScalarBdaLoads(EmitterState& state) {
+	std::array<bool, 3> widths {false, false, true}; // Indirect buffers and wide fallbacks use u32.
+	for (const auto* block : state.program.blocks) {
+		for (const auto& inst : *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU8) widths[0] = true;
+			if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU16) widths[1] = true;
+		}
+	}
+	const auto type = TypeU32(state);
+	const auto wide = TypeScalarU64(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, wide, TypeBool(state));
+	for (uint32_t index = 0; index < widths.size(); ++index) {
+		if (!widths[index]) continue;
+		const auto bits = 8u << index;
+		const auto function = state.builder.AllocateId();
+		state.bda_scalar_load_functions[index] = function;
+		state.builder.AddName(function, fmt::format("load_bda_u{}", bits).c_str());
+		state.builder.AddFunction(spv::OpFunction, type, function,
+		                          spv::FunctionControlMaskNone, function_type);
+		const auto address = state.builder.AllocateId();
+		const auto active = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, wide, address);
+		state.builder.AddFunction(spv::OpFunctionParameter, TypeBool(state), active);
+		EmitLabel(state, state.builder.AllocateId());
+		ValueEmitContext ctx(state);
+		const auto value = LoadBdaInline(ctx, address, active, bits);
+		state.builder.AddFunction(spv::OpReturnValue, value);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
+}
+
+// One body per width keeps the page-crossing fallback out of every load site.
+// The driver can inline this function while retaining one translation on the common path.
+void DefineWideBdaLoads(EmitterState& state) {
+	std::array<bool, 3> widths {};
+	for (const auto* block : state.program.blocks) {
+		for (const auto& inst : *block) {
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::LoadAddressU32x2: widths[0] = true; break;
+				case IR::ValueOpcode::LoadAddressU32x3: widths[1] = true; break;
+				case IR::ValueOpcode::LoadAddressU32x4: widths[2] = true; break;
+				default: break;
+			}
+		}
+	}
+	for (uint32_t count = 2; count <= 4; ++count) {
+		if (!widths[count - 2]) continue;
+		const auto type = TypeU32Composite(state, count);
+		const auto wide = TypeScalarU64(state);
+		const auto zero = state.builder.Constant(spv::OpConstantNull, type);
+		const auto function_type = state.builder.Type(spv::OpTypeFunction, type, wide, TypeBool(state));
+		const auto function = state.builder.AllocateId();
+		state.bda_wide_load_functions[count - 2] = function;
+		state.builder.AddName(function, fmt::format("load_bda_u32x{}", count).c_str());
+		state.builder.AddFunction(spv::OpFunction, type, function,
+		                          spv::FunctionControlMaskNone, function_type);
+		const auto address = state.builder.AllocateId();
+		const auto active = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionParameter, wide, address);
+		state.builder.AddFunction(spv::OpFunctionParameter, TypeBool(state), active);
+		EmitLabel(state, state.builder.AllocateId());
+		ValueEmitContext ctx(state);
+		const auto value = EmitValueOrDefaultIfCondition(state, active, type, zero, [&]() {
+			const auto offset = Binary(state, spv::OpBitwiseAnd, wide, address,
+			                           ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - 1));
+			const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state),
+			    Binary(state, spv::OpBitwiseAnd, wide, address, ConstantDeviceAddress(state, 3)),
+			    ConstantDeviceAddress(state, 0));
+			const auto same_page = Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
+			    ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - count * 4u));
+			const auto fast = AndCondition(state, aligned, same_page);
+			const auto fast_label = state.builder.AllocateId();
+			const auto slow_label = state.builder.AllocateId();
+			const auto merge = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+			state.builder.AddFunction(spv::OpBranchConditional, fast, fast_label, slow_label);
+			EmitLabel(state, fast_label);
+			const auto bda = GetBdaPointer(ctx, address);
+			const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                            ConstantDeviceAddress(state, 0));
+			const auto fast_value = EmitValueOrDefaultIfCondition(state, present, type, zero, [&]() {
+				const auto vector_type = TypeU32Vector(state, count);
+				const auto pointer_type = state.builder.Type(spv::OpTypePointer,
+				    spv::StorageClassPhysicalStorageBuffer, vector_type);
+				const auto pointer = Unary(state, spv::OpConvertUToPtr, pointer_type, bda);
+				const auto loaded = state.builder.AllocateId();
+				// Exactly N dwords, including x3: never overread the next page.
+				state.builder.AddFunction(spv::OpLoad, vector_type, loaded, pointer,
+				                          spv::MemoryAccessAlignedMask, 4u);
+				// U32x2 is represented as a logical pair in IR; physical memory uses a vector.
+				if (count == 2) {
+					const auto first = state.builder.AllocateId();
+					const auto second = state.builder.AllocateId();
+					const auto pair = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), first, loaded, 0u);
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), second, loaded, 1u);
+					state.builder.AddFunction(spv::OpCompositeConstruct, type, pair, first, second);
+					return pair;
+				}
+				return loaded;
+			});
+			const auto fast_exit = state.current_label;
+			state.builder.AddFunction(spv::OpBranch, merge);
+			EmitLabel(state, slow_label);
+			std::array<uint32_t, 4> components {};
+			for (uint32_t i = 0; i < count; ++i) {
+				const auto guest = i == 0 ? address : Binary(state, spv::OpIAdd, wide, address,
+				                                             ConstantDeviceAddress(state, i * 4u));
+				components[i] = LoadBda(ctx, guest, ConstantBool(state, true), 32u);
+			}
+			const auto slow_value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, type, slow_value,
+			                          std::span(components).first(count));
+			const auto slow_exit = state.current_label;
+			state.builder.AddFunction(spv::OpBranch, merge);
+			EmitLabel(state, merge);
+			const auto merged = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpPhi, type, merged, fast_value, fast_exit,
+			                          slow_value, slow_exit);
+			return merged;
+		});
+		state.builder.AddFunction(spv::OpReturnValue, value);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
+}
+
+} // namespace
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
@@ -1142,6 +1289,8 @@ void DefineGetBdaPointer(EmitterState& state) {
 	});
 	state.builder.AddFunction(spv::OpReturnValue, mapped_address);
 	state.builder.AddFunction(spv::OpFunctionEnd);
+	DefineScalarBdaLoads(state);
+	DefineWideBdaLoads(state);
 }
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1473,6 +1622,15 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
 		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+	else if (address_info.access == IR::AddressAccess::Read &&
+	         mem.kind == IR::ResourceKind::Global && mem.data_dwords > 1u) {
+		const auto count = mem.data_dwords;
+		EXIT_IF(count > 4u || ctx.state.bda_wide_load_functions[count - 2] == 0);
+		value = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(ctx.state, count), value,
+		    ctx.state.bda_wide_load_functions[count - 2], GuestAddress(ctx, inst, mem),
+		    ctx.Arg(inst, inst.NumArgs() - 1));
+	}
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

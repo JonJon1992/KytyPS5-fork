@@ -1377,6 +1377,246 @@ void TestDirtiedLog() {
   Release(memory);
 }
 
+// A fault logs transitions, not the whole fault-ahead window: GPU-owned holes and pages
+// already dirty must not invalidate the BDA epoch again. A partial upload rearms only its pages.
+void TestDirtiedFaultTransitions() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  UploadAll(tracker, address, 8 * page_size);
+  tracker.MarkRegionAsGpuModified(address + 3 * page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address + 6 * page_size, page_size);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  Check(WriteFault(tracker, address + page_size) == 0, "clean fault requested readback");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) &&
+            ranges.Contains(address, 3 * page_size) &&
+            ranges.Contains(address + 4 * page_size, 2 * page_size) &&
+            ranges.Contains(address + 7 * page_size, page_size) &&
+            !ranges.Intersects(address + 3 * page_size, page_size) &&
+            !ranges.Intersects(address + 6 * page_size, page_size),
+        "fault log includes GPU-owned or already CPU-dirty pages");
+  const auto first_epoch = epoch;
+  const auto signature = tracker.RangeSignature(address, 8 * page_size);
+  const auto dirtied = tracker.RangeDirtiedSignature(address, 8 * page_size);
+  ResetProtectionLog();
+  Check(WriteFault(tracker, address + 2 * page_size) == 0 &&
+            MemoryTracker::TakeFaultFoundDirty(), "duplicate fault was not recognized");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch == first_epoch &&
+            tracker.RangeSignature(address, 8 * page_size) == signature &&
+            tracker.RangeDirtiedSignature(address, 8 * page_size) == dirtied &&
+            g_protection_calls == 0 && tracker.HotPageCount() == 1,
+        "duplicate fault changed epochs, protection or hot-page history");
+
+  // A BDA consumer has taken the previous log and uploaded only page 4. A later fault
+  // on page 2 (still dirty, e.g. another watcher) must log and open page 4 again.
+  UploadAll(tracker, address + 4 * page_size, page_size);
+  Check(WriteFault(tracker, address + 2 * page_size) == 0, "partial rearm requested readback");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch != first_epoch && ranges.Size() == 1 &&
+            ranges.Contains(address + 4 * page_size, page_size) &&
+            !ranges.Intersects(address, 4 * page_size) &&
+            !ranges.Intersects(address + 5 * page_size, 3 * page_size) &&
+            tracker.IsRegionCpuModified(address + 4 * page_size, page_size) &&
+            tracker.IsRegionGpuModified(address + 3 * page_size, page_size) &&
+            Protection(memory + 3 * page_size) == PAGE_NOACCESS,
+        "partial rearm missed a dirty transition or disturbed GPU ownership");
+  tracker.UnmarkRegionAsGpuModified(address + 3 * page_size, page_size);
+  tracker.UntrackMemory(address, 8 * page_size);
+  Release(memory);
+}
+
+// Pause a fault at the existing ahead callback while a BDA-style consumer takes its log.
+// Taking the new epoch must make the new dirty mirror visible, or a lock-free clean fast
+// path could consume the notification without uploading its pages and never revisit them.
+void TestFaultLogPublishesDirtyMirror() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 2;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, 2 * TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  const auto before = epoch;
+  std::binary_semaphore published{0};
+  std::binary_semaphore resume{0};
+  std::thread writer([&] {
+    tracker.InvalidateRegionOnWriteFault(address, 1,
+        [] { Check(false, "publication test requested readback"); },
+        [&](uint64_t, uint64_t) noexcept {
+          published.release();
+          resume.acquire();
+        });
+  });
+  published.acquire();
+  const bool complete = tracker.TakeDirtiedRanges(ranges, epoch);
+  bool visible = complete && epoch != before && ranges.Contains(address, 2 * TRACKER_PAGE_SIZE);
+  for (uint64_t page = 0; page < 2; page++) {
+    bool dirty = false;
+    visible &= tracker.QueryCpuDirtyRelaxed(address + page * TRACKER_PAGE_SIZE,
+                                            TRACKER_PAGE_SIZE, dirty) && dirty;
+  }
+  const bool still_protected = !IsWritable(memory) && !IsWritable(memory + TRACKER_PAGE_SIZE);
+  resume.release();
+  writer.join();
+  Check(visible, "BDA consumed a new fault epoch with an old clean mirror");
+  Check(still_protected, "fault log was published after pages became writable");
+  tracker.UntrackMemory(address, 2 * TRACKER_PAGE_SIZE);
+  Release(memory);
+}
+
+void TestDuplicateFaultDeferredProtection() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  auto &pages = harness.page_manager;
+  tracker.EnableDirtiedLog();
+  auto *memory = Allocate(pages, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, 4 * TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  {
+    const PageManager::DeferUnprotectScope deferred;
+    WriteFault(tracker, address);
+    (void)tracker.TakeDirtiedRanges(ranges, epoch);
+    const auto first_epoch = epoch;
+    Check(!IsWritable(memory), "deferred fault protection was applied too soon");
+    WriteFault(tracker, address);
+    Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch == first_epoch,
+          "an in-flight duplicate invalidated the BDA log");
+    // RenderContext's nested-fault path must still open the faulting page before retrying.
+    pages.Reconcile(address, TRACKER_PAGE_SIZE, true);
+    Check(IsWritable(memory), "duplicate fault reconciliation left the page protected");
+    memory[0] = 0x7b;
+  }
+  Check(IsWritable(memory + 3 * TRACKER_PAGE_SIZE), "deferred fault lost its remaining releases");
+  tracker.UntrackMemory(address, 4 * TRACKER_PAGE_SIZE);
+  Release(memory);
+}
+
+void TestDirtiedFaultAcrossRegions() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 256;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto size = 2 * TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(size, Libs::Graphics::TRACKER_REGION_SIZE - TRACKER_PAGE_SIZE);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, size);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  // All the other pages start CPU-dirty and are unmapped. Neither the log nor the
+  // protection calls may widen the two real transitions to the two 1 MiB windows.
+  tracker.InvalidateRegionOnWriteFault(address, size,
+      [] { Check(false, "cross-region CPU fault requested readback"); },
+      [](uint64_t, uint64_t) noexcept { Check(false, "cross-region fault opened extra pages"); });
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Size() == 1 &&
+            ranges.Contains(address, size) && !ranges.Intersects(address - 1, 1) &&
+            !ranges.Intersects(address + size, 1) &&
+            IsWritable(memory) && IsWritable(memory + TRACKER_PAGE_SIZE),
+        "cross-region fault did not coalesce exactly its changed pages");
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestDirtiedFaultLogOverflow() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto size = (16 + 4095 * 2) * TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(size, 0);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.MarkRegionAsCpuModified(address, size); // create every region before collecting the log
+  UploadAll(tracker, address, 8 * TRACKER_PAGE_SIZE);
+  tracker.MarkRegionAsGpuModified(address + 3 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  tracker.MarkRegionAsGpuModified(address + 6 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  for (uint64_t i = 0; i < 4095; i++) {
+    tracker.MarkRegionAsCpuModified(address + (16 + i * 2) * TRACKER_PAGE_SIZE,
+                                    TRACKER_PAGE_SIZE);
+  }
+  const auto before = tracker.FaultMutationEpoch();
+  // The three disjoint transitions exceed the cap mid-mask. No partial log may be accepted.
+  WriteFault(tracker, address);
+  Check(!tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch != before,
+        "fragmented fault overflow was accepted as a complete BDA log");
+  UploadAll(tracker, address + 4 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  WriteFault(tracker, address);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Size() == 1 &&
+            ranges.Contains(address + 4 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE),
+        "fault log did not recover after overflow fallback");
+  tracker.UnmarkRegionAsGpuModified(address, 8 * TRACKER_PAGE_SIZE);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+// Synthetic handler work, not OS faults or game frames. No timing assertion: compare the same
+// executable/workload before and after. Each take models a BDA consumer between notifications.
+void BenchmarkDirtiedFaults() {
+  constexpr uint64_t pages = 256;
+  constexpr uint64_t iterations = 20000;
+  std::puts("case,notifications,ns_per_notification,logged_bytes,epoch_changes,protect_calls");
+  for (const bool rearm : {false, true}) {
+    MemoryTracker::FaultPolicy policy;
+    policy.ahead_pages = pages;
+    PolicyHarness harness(policy, true);
+    auto &tracker = harness.tracker;
+    tracker.EnableDirtiedLog();
+    const auto size = pages * TRACKER_PAGE_SIZE;
+    auto *memory = AllocateFixedGuestRange(size, 0);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    UploadAll(tracker, address, size);
+    const auto fault = [&] {
+      tracker.InvalidateRegionOnWriteFault(address, 1,
+          [] { Check(false, "benchmark unexpectedly requested readback"); },
+          [](uint64_t, uint64_t) noexcept {});
+    };
+    fault();
+    RangeSet ranges;
+    uint64_t epoch = 0;
+    (void)tracker.TakeDirtiedRanges(ranges, epoch);
+    const auto first_epoch = epoch;
+    uint64_t logged = 0;
+    ResetProtectionLog();
+    const auto start = std::chrono::steady_clock::now();
+    for (uint64_t i = 0; i < iterations; i++) {
+      if (rearm) UploadAll(tracker, address, TRACKER_PAGE_SIZE);
+      fault();
+      Check(tracker.TakeDirtiedRanges(ranges, epoch), "benchmark log overflowed");
+      ranges.ForEach([&](uint64_t begin, uint64_t end) { logged += end - begin; });
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::printf("%s,%llu,%.2f,%llu,%llu,%llu\n", rearm ? "one-page-rearm" : "duplicate",
+                static_cast<unsigned long long>(iterations), double(ns) / iterations,
+                static_cast<unsigned long long>(logged),
+                static_cast<unsigned long long>(epoch - first_epoch),
+                static_cast<unsigned long long>(g_protection_calls));
+    tracker.UntrackMemory(address, size);
+    Release(memory);
+  }
+}
+
 // KYTY_FAULT_AHEAD_ADAPT's classification of the PC (FaultCost::SlowLevelTracker): five slow
 // periods in a row raise the level, a fast period resets the streak, a slow startup benchmark
 // seeds it, and the level never falls (the larger window makes the calls cheaper again).
@@ -2990,6 +3230,10 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-dirtied-faults") == 0) {
+    BenchmarkDirtiedFaults();
+    return 0;
+  }
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
@@ -3021,6 +3265,11 @@ int main(int argc, char **argv) {
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
   TestDirtiedLog();
+  TestDirtiedFaultTransitions();
+  TestFaultLogPublishesDirtyMirror();
+  TestDuplicateFaultDeferredProtection();
+  TestDirtiedFaultAcrossRegions();
+  TestDirtiedFaultLogOverflow();
   TestFaultAheadOverride();
   TestSlowLevelTracker();
   TestFaultFoundDirty();

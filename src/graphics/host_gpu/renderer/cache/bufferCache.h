@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/hangTrace.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/eagerReadbackPages.h"
@@ -83,19 +84,21 @@ public:
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.
-	uint32_t CompleteSideReadbacks(uint64_t vaddr, uint64_t size);
+	uint32_t CompleteSideReadbacks(uint64_t vaddr, uint64_t size,
+	                              HangTrace::ReadbackTiming* timing = nullptr);
 	void     CompleteAllSideReadbacks();
 	// Eager readback publication (KYTY_READBACK_EAGER, default on; needs side readbacks). A page
 	// whose GPU-written bytes a CPU reader needed read back becomes read-hot. When a submission
-	// finds a hot page's dirty bytes all written by earlier (already submitted) recordings, it
-	// appends a copy of them to its own command buffer and registers their publication; the
+	// finds a hot page's dirty bytes, it appends a copy after their recorded producers (including
+	// writers in the current recording) and registers their publication; the
 	// completion runner publishes them and unprotects the page when that submission completes,
 	// unless a newer writer took the page meanwhile. A later read then finds the page clean
 	// instead of faulting; a read before completion waits for that copy as for a side readback.
 	// Values are unchanged: the bytes, their order against newer writers and the protection rules
 	// are those of a side readback of the same bytes, only issued before the read.
 	// The command processor calls this right before it submits the current recording, between
-	// packets (GPU thread); never from inside another cache operation.
+	// packets (GPU thread), after all producers have been recorded; never during draw preparation
+	// or from inside another cache operation. Current-tick eligibility relies on this boundary.
 	void IssueEagerReadbacks();
 	// True once after a recorded writer of a page the GPU thread reads back, outside a rendering
 	// instance: the command processor then submits the recording right away, so the producer runs
@@ -521,6 +524,7 @@ private:
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                        const std::shared_ptr<EarlyReleasedDownload>& early = {});
 	struct ReadMemoryTrace {
+		HangTrace::ReadbackTiming timing;
 		uint64_t begin      = 0;
 		uint64_t size       = 0;
 		bool     downloaded = false;
@@ -568,7 +572,7 @@ private:
 	[[nodiscard]] SideIssueResult TryIssueSideReadback(uint64_t vaddr, uint64_t size,
 	                                                  std::shared_ptr<SideReadback>& issued);
 	// Returns true when this call published the readback (false: it was already done).
-	bool CompleteSideReadback(SideReadback& readback);
+	bool CompleteSideReadback(SideReadback& readback, HangTrace::ReadbackTiming* timing = nullptr);
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
 	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
 	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);

@@ -129,6 +129,8 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bvh_intersect_function = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	std::array<uint32_t, 3>                          bda_scalar_load_functions {};
+	std::array<uint32_t, 3>                          bda_wide_load_functions {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -170,6 +172,12 @@ struct EmitterState {
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
 	std::unordered_map<const IR::Block*, uint32_t> labels;
+	// Typed views dominating the current block. Guards roll back views from their taken arm.
+	std::unordered_map<uint64_t, uint32_t> bitcasts;
+	std::vector<uint64_t>                 bitcast_insertions;
+	uint64_t                              bitcast_epoch = 0;
+	// Original sources dominate their bitcast results and all uses of those results.
+	std::unordered_map<uint32_t, uint64_t> bitcast_sources;
 	// Instructions whose values reach a position export (MadMode::Position), built on first use.
 	bool                                  position_slice_ready = false;
 	std::unordered_set<const IR::Inst*>   position_slice;
@@ -214,16 +222,65 @@ uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
 
-inline void EmitLabel(EmitterState& state, uint32_t label) {
+inline void EmitLabel(EmitterState& state, uint32_t label, bool preserve_bitcasts = false) {
+	if (!preserve_bitcasts) {
+		state.bitcasts.clear();
+		state.bitcast_insertions.clear();
+		++state.bitcast_epoch;
+	}
 	state.current_label = label;
 	state.builder.AddFunction(spv::OpLabel, label);
 }
 
+inline void RollbackBitcasts(EmitterState& state, size_t count, uint64_t epoch) {
+	// An unrelated CFG label inside the arm invalidates the saved scope entirely.
+	if (epoch != state.bitcast_epoch) {
+		state.bitcasts.clear();
+		state.bitcast_insertions.clear();
+		++state.bitcast_epoch;
+		return;
+	}
+	while (state.bitcast_insertions.size() > count) {
+		state.bitcasts.erase(state.bitcast_insertions.back());
+		state.bitcast_insertions.pop_back();
+	}
+}
+
 uint32_t TypeId(EmitterState& state, IR::Type type);
+
+inline uint32_t Bitcast(EmitterState& state, uint32_t type, uint32_t value,
+                        uint32_t source_type = 0) {
+	if (type == source_type) return value;
+	if (const auto source = state.bitcast_sources.find(value);
+	    source != state.bitcast_sources.end() && (source->second >> 32u) == type) {
+		return static_cast<uint32_t>(source->second);
+	}
+	const auto key = (static_cast<uint64_t>(type) << 32u) | value;
+	const auto [entry, inserted] = state.bitcasts.try_emplace(key, 0u);
+	if (inserted) {
+		entry->second = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, type, entry->second, value);
+		state.bitcast_insertions.push_back(key);
+	}
+	if (source_type != 0) {
+		state.bitcast_sources.try_emplace(entry->second,
+		    (static_cast<uint64_t>(source_type) << 32u) | value);
+	}
+	return entry->second;
+}
+
+template <IR::Type destination, IR::Type source>
+uint32_t EmitTypedBitcast(EmitterState& state, uint32_t value) {
+	return Bitcast(state, TypeId(state, destination), value, TypeId(state, source));
+}
 
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
+	if constexpr (opcode == spv::OpBitcast) {
+		static_assert(sizeof...(args) == 1);
+		return Bitcast(state, TypeId(state, type), args...);
+	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
 	if constexpr (type == IR::Type::F64 &&
@@ -241,6 +298,7 @@ uint32_t EmitGlsl(EmitterState& state, Args... args) {
 }
 
 inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t value) {
+	if (opcode == spv::OpBitcast) return Bitcast(state, type, value);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, type, result, value);
 	return result;
@@ -533,9 +591,9 @@ uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 
 uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
-inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
+inline constexpr auto EmitBitcastF32ToU32 = EmitTypedBitcast<IR::Type::U32, IR::Type::F32>;
 
-inline constexpr auto EmitBitcastU32ToF32 = EmitNative<spv::OpBitcast, IR::Type::F32, uint32_t>;
+inline constexpr auto EmitBitcastU32ToF32 = EmitTypedBitcast<IR::Type::F32, IR::Type::U32>;
 
 inline constexpr auto EmitAndU32 = EmitNative<spv::OpBitwiseAnd, IR::Type::U32, uint32_t, uint32_t>;
 
@@ -628,12 +686,15 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
+	const auto saved_bitcasts = state.bitcast_insertions.size();
+	const auto saved_epoch = state.bitcast_epoch;
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
-	EmitLabel(state, then_label);
+	EmitLabel(state, then_label, true);
 	fn();
 	state.builder.AddFunction(spv::OpBranch, merge_label);
-	EmitLabel(state, merge_label);
+	RollbackBitcasts(state, saved_bitcasts, saved_epoch);
+	EmitLabel(state, merge_label, true);
 }
 
 template <typename Fn>
@@ -645,13 +706,16 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 	const auto then_label  = state.builder.AllocateId();
 	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
+	const auto saved_bitcasts = state.bitcast_insertions.size();
+	const auto saved_epoch = state.bitcast_epoch;
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
-	EmitLabel(state, then_label);
+	EmitLabel(state, then_label, true);
 	const auto then_value = fn();
 	const auto then_exit  = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
-	EmitLabel(state, merge_label);
+	RollbackBitcasts(state, saved_bitcasts, saved_epoch);
+	EmitLabel(state, merge_label, true);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, type, value, then_value, then_exit, default_value,
 	                          header);

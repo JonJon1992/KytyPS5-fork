@@ -131,8 +131,9 @@ void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 MemoryTracker::~MemoryTracker() = default;
 
 void MemoryTracker::AdvanceCpuMutationEpoch() noexcept {
-	// Publish before dirtying/unprotecting under the region lock. A scanner observing this
-	// token still acquires that lock; saturation permanently disables token reuse, avoiding ABA.
+	// Publish under the region lock before unprotect. Write faults publish their mirror/serials
+	// first so BDA's lock-free clean checks see the transition when they consume its token.
+	// Saturation permanently disables token reuse, avoiding ABA.
 	auto epoch = m_cpu_mutation_epoch.load(std::memory_order_relaxed);
 	while (epoch != UINT64_MAX &&
 	       !m_cpu_mutation_epoch.compare_exchange_weak(epoch, epoch + 1,
@@ -163,6 +164,31 @@ void MemoryTracker::NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept {
 	AdvanceCpuMutationEpoch();
 }
 
+void MemoryTracker::NotifyCpuMutation(uint64_t base, const RegionBits& dirty) noexcept {
+	if (!m_track_cpu_mutations) {
+		return;
+	}
+	if (!m_dirtied_log.load(std::memory_order_acquire)) {
+		AdvanceCpuMutationEpoch();
+		return;
+	}
+	// The caller holds the region lock, has published the dirty mirror, and has not unprotected
+	// the pages. Publish all runs together: taking the new epoch sees both the complete log and
+	// the new mirror, including through BDA's lock-free clean fast path.
+	std::scoped_lock lock(m_dirtied_mutex);
+	if (!m_dirtied_overflow) {
+		for (const auto [first, last]: dirty) {
+			if (m_dirtied.Size() >= DirtiedLogMaxRanges) {
+				m_dirtied_overflow = true;
+				m_dirtied.Clear();
+				break;
+			}
+			m_dirtied.Add(base + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+	AdvanceCpuMutationEpoch();
+}
+
 bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
 	// The caller's set (its own thread's) is emptied before the lock: freeing its nodes would
 	// otherwise hold up the guest write faults that log under m_dirtied_mutex.
@@ -173,20 +199,6 @@ bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
 	const bool complete   = !m_dirtied_overflow;
 	m_dirtied_overflow    = false;
 	return complete;
-}
-
-std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset, uint64_t bytes,
-                                                         uint64_t ahead) noexcept {
-	// Page indices as RegionManager::MarkWriteFault computes its window.
-	const uint64_t start = offset / TRACKER_PAGE_SIZE;
-	const uint64_t end   = (offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
-	if (ahead <= 1) {
-		return {start * TRACKER_PAGE_SIZE, end * TRACKER_PAGE_SIZE};
-	}
-	const uint64_t window_begin = start / ahead * ahead;
-	const uint64_t window_end =
-	    std::min<uint64_t>((end + ahead - 1) / ahead * ahead, TRACKER_REGION_PAGES);
-	return {window_begin * TRACKER_PAGE_SIZE, std::max(end, window_end) * TRACKER_PAGE_SIZE};
 }
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG

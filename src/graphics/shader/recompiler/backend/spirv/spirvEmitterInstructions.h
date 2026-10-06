@@ -13,8 +13,8 @@ EMIT_NATIVE(BitCastU16F16, OpBitcast, U32, uint32_t)
 inline constexpr auto EmitBitCastF16U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
-inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
-EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
+inline constexpr auto EmitBitCastU32F32 = EmitTypedBitcast<IR::Type::U32, IR::Type::F32>;
+inline constexpr auto EmitBitCastF32U32 = EmitTypedBitcast<IR::Type::F32, IR::Type::U32>;
 EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
 EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
 uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
@@ -244,6 +244,9 @@ void                  EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst&
 inline constexpr auto EmitLoadAddressU8         = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU16        = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU32        = EmitLoadMemory;
+inline constexpr auto EmitLoadAddressU32x2       = EmitLoadMemory;
+inline constexpr auto EmitLoadAddressU32x3       = EmitLoadMemory;
+inline constexpr auto EmitLoadAddressU32x4       = EmitLoadMemory;
 inline constexpr auto EmitStoreAddressU8        = EmitStoreMemory;
 inline constexpr auto EmitStoreAddressU16       = EmitStoreMemory;
 inline constexpr auto EmitStoreAddressU32       = EmitStoreMemory;

@@ -53,6 +53,8 @@ namespace {
 
 Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
 Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
+// Live A/B control: 0 restores the previous extra-submission rule for eager publication.
+Live::Switch g_eager_current_tick("KYTY_READBACK_EAGER_CURRENT_TICK", Live::ParseDefaultOn);
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
@@ -549,6 +551,23 @@ uint32_t EagerFlushBudget() {
 	return static_cast<uint32_t>(
 	    std::min<uint64_t>(ParseEnvU64("KYTY_READBACK_EAGER_FLUSHES", 8), 100000));
 }
+
+// Optional diagnostic clocks only; no clock reads when HangTrace is disabled.
+class ReadbackPhase {
+public:
+	explicit ReadbackPhase(uint64_t* elapsed): m_elapsed(elapsed),
+	    m_start(elapsed != nullptr ? HangTrace::NowNs() : 0) {}
+	~ReadbackPhase() {
+		if (m_elapsed != nullptr) {
+			*m_elapsed += HangTrace::NowNs() - m_start;
+		}
+	}
+	ReadbackPhase(const ReadbackPhase&) = delete;
+	ReadbackPhase& operator=(const ReadbackPhase&) = delete;
+private:
+	uint64_t* m_elapsed;
+	uint64_t m_start;
+};
 
 // Reads larger than this are bulk readbacks (e.g. DCC metadata): their pages do not become hot.
 constexpr uint64_t EagerReadMaxBytes = 64 * 1024;
@@ -1642,6 +1661,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const auto      trace_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
 	ReadMemoryTrace trace;
+	auto* timing = trace_start != 0 ? &trace.timing : nullptr;
+	const auto issue = [&](std::shared_ptr<SideReadback>& issued) {
+		ReadbackPhase phase(timing != nullptr ? &timing->issue_ns : nullptr);
+		const auto result = TryIssueSideReadback(vaddr, size, issued);
+		if (timing != nullptr) {
+			constexpr const char* names[] = {"issued", "pending", "current-writer", "unbounded", "other"};
+			timing->side_result = names[static_cast<unsigned>(result)];
+		}
+		return result;
+	};
 	const auto      record = [&](std::optional<HangTrace::ReadbackKind> kind) {
 		if (!HangTrace::Enabled()) {
 			return;
@@ -1651,7 +1680,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			HangTrace::SetReadbackKind(*kind);
 		}
 		HangTrace::RecordReadback(vaddr, size, trace.begin, trace.size, trace.downloaded,
-		                          HangTrace::NowNs() - trace_start);
+		                          HangTrace::NowNs() - trace_start, trace.timing);
 		HangTrace::SetReadbackKind(previous);
 	};
 	auto&      gpu        = m_scheduler.Context().GetGpu();
@@ -1672,7 +1701,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint32_t eager = 0;
 		{
 			Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-			eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+			eager = CompleteSideReadbacks(page_begin, page_end - page_begin, timing);
 		}
 		if (eager != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackEagerWaits);
@@ -1697,7 +1726,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 	}
 	if (!side_path) {
+		const auto queued = timing != nullptr ? HangTrace::NowNs() : 0;
 		gpu.SendCommandSync([&, this, vaddr, size, is_write, gpu_thread] {
+			if (timing != nullptr) {
+				timing->cp_queue_ns += HangTrace::NowNs() - queued;
+			}
 			if (!is_write) {
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
@@ -1710,11 +1743,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (gpu_thread) {
 		NoteEagerRead(vaddr, size, true);
 		std::shared_ptr<SideReadback> issued;
-		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
+		const auto                    result = issue(issued);
 		if (result == SideIssueResult::Issued) {
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::GpuWaitSideCopy);
-				CompleteSideReadback(*issued);
+				CompleteSideReadback(*issued, timing);
 			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadSideCopies);
 			trace.begin      = issued->begin;
@@ -1740,9 +1773,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 	std::shared_ptr<SideReadback> issued;
 	auto                          result = SideIssueResult::Other;
+	const auto queued = timing != nullptr ? HangTrace::NowNs() : 0;
 	gpu.SendCommandSync([&, this, vaddr, size] {
+		if (timing != nullptr) {
+			timing->cp_queue_ns += HangTrace::NowNs() - queued;
+		}
 		NoteEagerRead(vaddr, size, false);
-		result = TryIssueSideReadback(vaddr, size, issued);
+		result = issue(issued);
 		if (result != SideIssueResult::Issued && result != SideIssueResult::Pending) {
 			ReadMemoryDrain(vaddr, size, false, trace);
 		}
@@ -1752,7 +1789,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// The GPU thread returned right after submitting; this guest thread waits.
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-				CompleteSideReadback(*issued);
+				CompleteSideReadback(*issued, timing);
 			}
 			trace.begin      = issued->begin;
 			trace.size       = issued->end - issued->begin;
@@ -1766,7 +1803,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			uint32_t eager = 0;
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-				eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+				eager = CompleteSideReadbacks(page_begin, page_end - page_begin, timing);
 			}
 			Profiler::CountFrameEvent(eager != 0 ? Profiler::FrameEvent::ReadbackEagerWaits
 			                                     : Profiler::FrameEvent::ReadbackSideDuplicateWaits);
@@ -1808,12 +1845,24 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 
 	trace.begin = window_begin;
 	trace.size  = window_end - window_begin;
-	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+	auto* timing = HangTrace::Enabled() ? &trace.timing : nullptr;
+	bool downloaded;
+	{
+		ReadbackPhase phase(timing != nullptr ? &timing->issue_ns : nullptr);
+		downloaded = DownloadBufferMemory(buffer, window_begin, window_end - window_begin);
+	}
+	if (downloaded) {
 		trace.downloaded = true;
 		const auto                    tick = m_scheduler.CurrentTick();
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		{
+			ReadbackPhase phase(timing != nullptr ? &timing->drain_wait_ns : nullptr);
+			m_scheduler.Wait(tick);
+		}
+		{
+			ReadbackPhase phase(timing != nullptr ? &timing->completion_wait_ns : nullptr);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
@@ -2128,11 +2177,15 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	return SideIssueResult::Issued;
 }
 
-bool BufferCache::CompleteSideReadback(SideReadback& readback) {
+bool BufferCache::CompleteSideReadback(SideReadback& readback, HangTrace::ReadbackTiming* timing) {
 	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
 	                         0, readback.eager);
 	HangWatchdog::DebugDelay("readback", readback.begin);
-	std::scoped_lock lock(readback.mutex);
+	std::unique_lock lock(readback.mutex, std::defer_lock);
+	{
+		ReadbackPhase phase(timing != nullptr ? &timing->publication_lock_ns : nullptr);
+		lock.lock();
+	}
 	if (readback.done.load(std::memory_order_acquire)) {
 		return false;
 	}
@@ -2143,14 +2196,17 @@ bool BufferCache::CompleteSideReadback(SideReadback& readback) {
 		// The copy ends the recording of master tick `value`, behind all of its commands. A GPU
 		// thread (CP) reader waiting here waits for that recording, never the current one.
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitSideCopy);
+		ReadbackPhase phase(timing != nullptr ? &timing->side_gpu_wait_ns : nullptr);
 		m_scheduler.GetMasterSemaphore().Wait(readback.value);
 		staging      = side.eager_staging.get();
 		staging_base = uint64_t {readback.slot} * TRACKER_PAGE_SIZE;
 	} else {
+		ReadbackPhase phase(timing != nullptr ? &timing->side_gpu_wait_ns : nullptr);
 		side.Wait(readback.value);
 		staging      = side.staging.get();
 		staging_base = uint64_t {readback.slot} * side.window;
 	}
+	ReadbackPhase publish(timing != nullptr ? &timing->publish_ns : nullptr);
 	staging->Invalidate(staging_base, readback.end - readback.begin);
 	const auto* staged = staging->Mapped().data() + staging_base;
 	for (const auto& range: readback.ranges) {
@@ -2211,7 +2267,8 @@ bool BufferCache::OverlapsPendingSideReadback(uint64_t begin, uint64_t end) cons
 	                   });
 }
 
-uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size) {
+uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size,
+                                              HangTrace::ReadbackTiming* timing) {
 	if (m_side == nullptr || m_side->pending_count.load(std::memory_order_acquire) == 0 ||
 	    !GuestRange {vaddr, size}.Valid()) {
 		return 0;
@@ -2230,7 +2287,7 @@ uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size) {
 	// order.
 	uint32_t eager = 0;
 	for (const auto& entry: overlapping) {
-		CompleteSideReadback(*entry);
+		CompleteSideReadback(*entry, timing);
 		eager += entry->eager ? 1u : 0u;
 	}
 	return eager;
@@ -2351,11 +2408,11 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 	if (dirty.empty()) {
 		return Result::Drop;
 	}
-	// Only bytes whose writers are already submitted: a writer registered by this recording may
-	// record its shader command after this submission (a submit in the middle of a draw's
-	// preparation), so its bytes wait for the next submission. That is the side-readback rule;
-	// here the copy additionally follows the whole of this recording in queue order.
-	if (newest >= tick) {
+	// IssueEagerReadbacks runs at a packet/commit boundary: all registered canonical-buffer
+	// producers have been recorded, including this tick's writers. Unlike an on-demand side
+	// readback during draw preparation, this copy can follow its producer in the same recording.
+	// Waiting for another submission would also wait for unrelated work recorded in that batch.
+	if (newest > tick || (newest == tick && !g_eager_current_tick.Get())) {
 		return Result::Retry;
 	}
 	// Dirty bytes keep their tracker page GPU-owned (MemoryTracker validates the pairing).
@@ -2389,8 +2446,8 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 		                    range.size);
 	}
 
-	// Recorded last in this recording: the barrier's first scope covers every earlier command on
-	// the queue, including all writers of these bytes (checked above to be submitted already).
+	// The barrier's first scope covers all preceding canonical-buffer producers, including
+	// this recording's writers. Handle() also flushes pending uploads and drains the recorder.
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();

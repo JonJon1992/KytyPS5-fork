@@ -99,7 +99,7 @@ public:
 	}
 	// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow). Once enabled, every transition
 	// FaultMutationEpoch() covers also records the range it can make CPU-dirty (a write fault's
-	// whole fault-ahead window, a whole new region, a demoted or swept region's hot pages, ...),
+	// newly dirtied pages including fault-ahead, a whole new region, demoted hot pages, ...),
 	// under the same log lock as its epoch advance. Needs the tracker's CPU-mutation tracking.
 	void EnableDirtiedLog() noexcept { m_dirtied_log.store(true, std::memory_order_release); }
 	[[nodiscard]] bool DirtiedLogEnabled() const noexcept {
@@ -170,15 +170,13 @@ private:
 					return true;
 				}
 				if (write_fault) {
-					const auto [begin, end] = FaultWindow(offset, bytes, policy.ahead_pages);
-					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
+					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
+					                                Frame(), m_hot_count, on_ahead,
+					                                [this](uint64_t base, const RegionBits& dirty) noexcept {
+						                                NotifyCpuMutation(base, dirty);
+					                                });
 				} else {
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
-				}
-				if (write_fault) {
-					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
-					                                Frame(), m_hot_count, on_ahead);
-				} else {
 					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 					                                             bytes);
 				}
@@ -462,11 +460,9 @@ private:
 	// CPU-dirty, and records the range in the dirtied log when that is enabled (both under the log
 	// lock, so a take sees the range together with the epoch it produced).
 	void           NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept;
+	// One fault's exact transition mask, published under one log lock with one epoch advance.
+	void           NotifyCpuMutation(uint64_t base, const RegionBits& dirty) noexcept;
 	void           AdvanceCpuMutationEpoch() noexcept;
-	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
-	// (RegionManager::MarkWriteFault's fault-ahead window of `ahead` pages).
-	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
-	                                                               uint64_t ahead) noexcept;
 	inline static std::atomic_uint32_t s_ahead_override {0};
 	inline static thread_local bool   t_fault_found_dirty = false;
 

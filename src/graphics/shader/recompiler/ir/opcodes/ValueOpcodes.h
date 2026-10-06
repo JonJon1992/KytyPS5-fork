@@ -25,6 +25,7 @@ enum class ImageResourceClass { None, Sampled, Storage };
 struct AddressOpcodeInfo {
 	AddressAccess access    = AddressAccess::None;
 	uint32_t      data_bits = 0;
+	uint32_t      data_dwords = 1;
 };
 
 struct ImageOpcodeInfo {

@@ -15313,6 +15313,8 @@ void TestExecSelectAnalysisFixpoint() {
 
 #include "BindlessShaderTests.inc"
 
+#include "ShaderTypedViewsTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -15328,6 +15330,11 @@ int main(int argc, char **argv) {
 #endif
   }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--typed-views-only") {
+    TestTypedBitcastViews();
+    std::puts("ShaderCfgTests: typed SSA views passed");
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--loop-shared-continuation-only") {
     TestCfgLoopSharedContinuation();
     return 0;
@@ -15427,6 +15434,7 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  TestTypedBitcastViews();
   TestBindlessShaderContract();
   TestRayTracingDispatchDetection();
   TestFrontendInstructionPrefixes();

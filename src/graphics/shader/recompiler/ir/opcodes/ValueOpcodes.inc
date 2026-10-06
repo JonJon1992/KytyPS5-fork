@@ -345,3 +345,8 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+
+// Keep a guest GLOBAL DWORDXn read together through lowering and BDA translation.
+VALUE_OPCODE(LoadAddressU32x2, U32x2, AddressResource, U32, U32, U1)
+VALUE_OPCODE(LoadAddressU32x3, U32x3, AddressResource, U32, U32, U1)
+VALUE_OPCODE(LoadAddressU32x4, U32x4, AddressResource, U32, U32, U1)

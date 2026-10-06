@@ -223,6 +223,9 @@ AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::LoadAddressU8: return {AddressAccess::Read, 8u};
 		case ValueOpcode::LoadAddressU16: return {AddressAccess::Read, 16u};
 		case ValueOpcode::LoadAddressU32: return {AddressAccess::Read, 32u};
+		case ValueOpcode::LoadAddressU32x2: return {AddressAccess::Read, 32u, 2u};
+		case ValueOpcode::LoadAddressU32x3: return {AddressAccess::Read, 32u, 3u};
+		case ValueOpcode::LoadAddressU32x4: return {AddressAccess::Read, 32u, 4u};
 		case ValueOpcode::StoreAddressU8: return {AddressAccess::Write, 8u};
 		case ValueOpcode::StoreAddressU16: return {AddressAccess::Write, 16u};
 		case ValueOpcode::StoreAddressU32: return {AddressAccess::Write, 32u};
