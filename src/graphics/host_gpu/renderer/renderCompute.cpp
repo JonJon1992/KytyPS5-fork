@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -220,6 +221,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
 			     thread_group_x, thread_group_y, thread_group_z, mode,
 			     sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		return;
+	}
+	// KYTY_DISPATCH_GROUP_LIMIT (default 2^24 workgroups, 0: off): a dispatch this large runs
+	// for seconds and the kernel resets the GPU (device lost). Ghost of Yotei issued hundreds of
+	// millions of groups to cs 0x9bf65b444f77235e from dimensions computed out of data the
+	// emulation got wrong; skipping such a dispatch keeps the device alive and names it.
+	static const uint64_t group_limit = [] {
+		const auto* value = std::getenv("KYTY_DISPATCH_GROUP_LIMIT");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1} << 24u;
+	}();
+	// With thread dimensions (initiator bit 5) the sizes count threads: allow 1024 per group.
+	const bool thread_dimensions = (mode & (1u << 5u)) != 0;
+	if (const uint64_t groups =
+	        uint64_t {thread_group_x} * thread_group_y * thread_group_z;
+	    group_limit != 0 && groups > (thread_dimensions ? group_limit * 1024u : group_limit)) {
+		static std::atomic<uint64_t> skipped {0};
+		const auto count = skipped.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 16u || (count & 1023u) == 0u) {
+			std::printf("Warning: dispatch of %ux%ux%u workgroups (%" PRIu64 ", over "
+			            "KYTY_DISPATCH_GROUP_LIMIT %" PRIu64 ") skipped, CS code 0x%016" PRIx64
+			            " (#%" PRIu64 ")\n",
+			            thread_group_x, thread_group_y, thread_group_z, groups, group_limit,
+			            sh_ctx.GetCs().cs_regs.data_addr, count);
 		}
 		return;
 	}
