@@ -48,13 +48,14 @@ void TestAt9ParseConfigData() {
   // by the buffer size it computes from the description); the fields after that byte say
   // 48 kHz, two channels per block, 8 frames of 1544 bytes per superframe.
   CheckParse({0x30, 0x72, 0xc0, 0xfe}, {2, 48000, 256, 2048, 12352});
+  // Its 8-channel streams (30 71 c0 fe) set what the classic layout calls the validation bit:
+  // without the sync byte that layout does not apply, so they are described too.
+  CheckParse({0x30, 0x71, 0xc0, 0xfe}, {1, 48000, 256, 2048, 12352});
 
-  // A set validation bit is still an error, with or without the sync byte, and so is no config.
+  // With the sync byte, a set validation bit is still an error, and so is no config.
   AjmDecAt9ConfigDataInfo info{};
   const std::array<uint8_t, 4> validation_bit = {0xfe, 0x73, 0x0f, 0xf0};
   CHECK(AjmDecAt9ParseConfigData(validation_bit.data(), &info) != 0);
-  const std::array<uint8_t, 4> unsynced_validation_bit = {0x30, 0x73, 0xc0, 0xfe};
-  CHECK(AjmDecAt9ParseConfigData(unsynced_validation_bit.data(), &info) != 0);
   CHECK(AjmDecAt9ParseConfigData(nullptr, &info) != 0);
   CHECK(AjmDecAt9ParseConfigData(validation_bit.data(), nullptr) != 0);
 }
@@ -74,6 +75,7 @@ void TestAt9DecoderKeepsSyncCheck() {
   };
   CHECK(initialize({0xfe, 0x72, 0x0f, 0xf0}) == 0);
   CHECK(initialize({0x30, 0x72, 0xc0, 0xfe}) != 0);
+  CHECK(initialize({0x30, 0x71, 0xc0, 0xfe}) != 0);
 }
 
 } // namespace
