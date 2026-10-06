@@ -12969,6 +12969,18 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+// Ghost of Yotei samples 8-bit signed integer textures.
+void TestSampledSignedByteTexture() {
+  constexpr auto format = Prospero::BufferFormat::k8SInt;
+  const auto surface = TextureGetSurfaceFormatInfo(format);
+  Check(Prospero::SampledTextureNumericClass(format) ==
+                Prospero::TextureNumericClass::Sint &&
+            Prospero::NumBytesPerElement(format) == 1u &&
+            surface.vk_format == vk::Format::eR8Sint &&
+            surface.conversion_format == Prospero::BufferFormat::kInvalid,
+        "8-bit signed integer texture is not sampled as R8_SINT");
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -15555,6 +15567,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
+  TestSampledSignedByteTexture();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
