@@ -58,6 +58,9 @@ game_index=-1
 for index in "${!command[@]}"; do
 	[[ ${command[$index]} == --game ]] && game_index=$((index + 1))
 done
-echo "run-u59: $(env | grep -c '^KYTY_') KYTY_ variables; build $(strings "$dir/kyty_emulator" | grep -m1 -E '^[0-9a-f]{8}$' || echo unknown); game ${command[$game_index]:-?}" >&2
+# KYTY_BUILD_LABEL (kytyGitVersion.h.in), the line a fatal error prints as "Source build <hash>".
+# grep -m1 closes the pipe early; without pipefail its SIGPIPE to strings is not a failure.
+build=$(set +o pipefail; strings "$dir/kyty_emulator" | grep -m1 '^Source build ' || true)
+echo "run-u59: $(env | grep -c '^KYTY_') KYTY_ variables; ${build:-build unknown}; game ${command[$game_index]:-?}" >&2
 cd "$dir"
 exec "${command[@]}"
