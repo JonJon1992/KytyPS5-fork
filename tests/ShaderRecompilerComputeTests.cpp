@@ -41298,7 +41298,10 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+// DS_MIN_F32/DS_MAX_F32 read only ADDR and DATA0 (LLVM and ACO emit them with
+// one data operand). DATA1 holds values that would flip both results if it
+// were compared against memory.
+TestCase DsFloatMinMaxIgnoresData1() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -41309,12 +41312,12 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendVMovLiteral(&code, 3, 0x40800000u);
   code.push_back(EncodeDs0(0x0d, 4));
   code.push_back(EncodeDs1(0, 3, 1));
-  AppendVMovLiteral(&code, 4, 0x41100000u);
-  AppendVMovLiteral(&code, 5, 0x40000000u);
+  AppendVMovLiteral(&code, 4, 0x40000000u);
+  AppendVMovLiteral(&code, 5, 0x41100000u);
   code.push_back(EncodeDs0(0x12, 0));
   code.push_back(EncodeDs1Ex(0, 5, 4, 1));
-  AppendVMovLiteral(&code, 6, 0x3f800000u);
-  AppendVMovLiteral(&code, 7, 0x40400000u);
+  AppendVMovLiteral(&code, 6, 0x40a00000u);
+  AppendVMovLiteral(&code, 7, 0x41000000u);
   code.push_back(EncodeDs0(0x13, 4));
   code.push_back(EncodeDs1Ex(0, 7, 6, 1));
   code.push_back(EncodeDs0(0x36, 0));
@@ -41326,10 +41329,10 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsFloatMinMaxIgnoresData1";
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
+  test.expected = {0x40000000u, 0x40a00000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -45348,7 +45351,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoresData1);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
