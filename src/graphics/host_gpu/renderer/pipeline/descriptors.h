@@ -43,6 +43,17 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+    struct BindlessPatch { uint32_t offset, region, entries; };
+    struct BindlessTexture {
+        TextureBinding binding;
+        ShaderRecompiler::IR::ImageResource resource;
+        ShaderRecompiler::IR::DescriptorValue value;
+        uint32_t array = 0;
+        uint32_t slot = 0;
+    };
+    std::vector<BindlessPatch> bindless_patches;
+    std::vector<BindlessTexture> bindless_textures;
+    std::vector<uint32_t> bindless_srt;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

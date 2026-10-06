@@ -652,6 +652,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	ir.bindless_images = options.bindless_images;
+	ir.bindless_samplers = options.bindless_samplers;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

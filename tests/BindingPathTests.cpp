@@ -2,6 +2,7 @@
 // signatures (pipelineLayoutCache.h) and same-command-buffer descriptor set reuse
 // (descriptorSetReuse.h).
 
+#include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
 
@@ -244,7 +245,42 @@ void TestDescriptorSetReuseAudit() {
 
 } // namespace
 
+void TestBindlessBudgets() {
+    vk::PhysicalDeviceDescriptorIndexingProperties p {};
+    vk::PhysicalDeviceLimits limits {};
+    limits.maxBoundDescriptorSets = 2;
+    limits.maxStorageBufferRange = 1u << 22u;
+    p.maxDescriptorSetUpdateAfterBindStorageBuffers = 10000;
+    p.maxPerStageDescriptorUpdateAfterBindStorageBuffers = 10000;
+    p.maxDescriptorSetUpdateAfterBindSamplers = 10000;
+    p.maxPerStageDescriptorUpdateAfterBindSamplers = 10000;
+    p.maxDescriptorSetUpdateAfterBindSampledImages = 100000;
+    p.maxPerStageDescriptorUpdateAfterBindSampledImages = 100000;
+    p.maxPerStageUpdateAfterBindResources = 100000;
+    p.maxUpdateAfterBindDescriptorsInAllPools = 100000;
+    Check(CalculateBindlessBudget(p, limits).images == 16384, "ample budgets retain all image slots");
+    limits.maxBoundDescriptorSets = 1;
+    Check(CalculateBindlessBudget(p, limits).images == 0, "set1 requires two bound sets");
+    limits.maxBoundDescriptorSets = 2;
+    p.maxUpdateAfterBindDescriptorsInAllPools = 4096 + 2 + 12;
+    Check(CalculateBindlessBudget(p, limits).images == 3, "single flagged pool includes buffers and samplers");
+    --p.maxUpdateAfterBindDescriptorsInAllPools;
+    Check(CalculateBindlessBudget(p, limits).images == 0, "pool cannot fit all typed placeholders");
+    p.maxUpdateAfterBindDescriptorsInAllPools = 100000;
+    p.maxPerStageUpdateAfterBindResources = 72 + 64*16 + 64 + 32 + 4096 + 2 + 12;
+    Check(CalculateBindlessBudget(p, limits).images == 3, "per-stage reserve includes storage mip arrays");
+    --p.maxPerStageUpdateAfterBindResources;
+    Check(CalculateBindlessBudget(p, limits).images == 0, "one missing stage resource rejects layout");
+    const auto a = MakePipelineLayoutSignature({}, {}, 0, 0);
+    const auto b = MakePipelineLayoutSignature({}, {}, 0, 0, FakeHandle<vk::DescriptorSetLayout>(0x7000));
+    const auto c = MakePipelineLayoutSignature({}, {}, 0, 0, FakeHandle<vk::DescriptorSetLayout>(0x8000));
+    Check(a != b && b != c, "optional set1 identity separates layouts");
+    Check(HashPipelineLayoutSignature(a) != HashPipelineLayoutSignature(b) &&
+          HashPipelineLayoutSignature(b) != HashPipelineLayoutSignature(c), "set1 identity contributes to hash");
+}
+
 int main() {
+  TestBindlessBudgets();
 	TestLayoutSignatures();
 	TestDescriptorSetReuse();
 	TestDescriptorSetReuseAudit();

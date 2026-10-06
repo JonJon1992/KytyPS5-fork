@@ -1,4 +1,5 @@
 #include <SDL3/SDL.h>
+#include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
 #include <SDL3/SDL_vulkan.h>
 
 #include "common/assert.h"
@@ -624,6 +625,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext  = &supported_depth_clip;
 	}
 	physical_device.getFeatures2(&supported_features2);
+    const auto* bindless_option = std::getenv("KYTY_BINDLESS");
+    graphics.bindless_supported = bindless_option != nullptr && bindless_option[0] == '1' &&
+        supported_features12.runtimeDescriptorArray &&
+        supported_features12.shaderSampledImageArrayNonUniformIndexing &&
+        supported_features12.descriptorBindingPartiallyBound &&
+        supported_features12.descriptorBindingSampledImageUpdateAfterBind &&
+        supported_features12.descriptorBindingUpdateUnusedWhilePending;
+    if (graphics.bindless_supported) {
+        features12.runtimeDescriptorArray = VK_TRUE;
+        features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        features12.descriptorBindingPartiallyBound = VK_TRUE;
+        features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    }
 	graphics.shader_image_int64_atomics_enabled =
 	    image_atomic_int64_extension && image_atomic_int64.shaderImageInt64Atomics == VK_TRUE;
 	graphics.conditional_rendering_enabled =
@@ -746,6 +761,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		properties2.pNext            = &robustness2_properties;
 	}
 	physical_device.getProperties2(&properties2);
+    if (graphics.bindless_supported) {
+        const auto budget = CalculateBindlessBudget(properties12, properties2.properties.limits);
+        graphics.bindless_images_per_array = budget.images;
+        graphics.bindless_samplers_per_array = budget.samplers;
+        graphics.bindless_supported = budget.images >= 3u && budget.samplers != 0u;
+    }
 	ConfigureShaderFloatControls(properties12);
 	// AMD's 4-byte robustness alignment is usable only with whole-dword descriptor ranges and
 	// nullDescriptor for ranges below one word. This pilot defaults off for controlled A/B tests.

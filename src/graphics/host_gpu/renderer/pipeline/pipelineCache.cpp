@@ -798,6 +798,8 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
 	     std::vector<uint32_t>(options.user_data.begin(), options.user_data.end())},
 	    {"captured_user_data_storage", params.user_data},
 	    {"compile_wave_size", options.wave_size},
+	    {"bindless_images", options.bindless_images},
+	    {"bindless_samplers", options.bindless_samplers},
 	    {"push_data_start_dword", push_data_start_dword},
 	};
 	metadata["program_key"] = {
@@ -805,6 +807,8 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
 	    {"hash", metadata["shader_hash"]},
 	    {"user_data_count", params.user_data_count},
 	    {"code_size_words", params.code.size()},
+	    {"bindless_images", options.bindless_images},
+	    {"bindless_samplers", options.bindless_samplers},
 	    {"static_state_words", metadata["static_state_words"]},
 	};
 	if (options.stage == ShaderType::Pixel) {
@@ -1122,6 +1126,8 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t> static_state;
 		// Exact translation input after calls are resolved; validated before every lookup.
 		std::vector<uint32_t> function_code;
+		bool bindless_images = false;
+		bool bindless_samplers = false;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -1190,7 +1196,8 @@ struct PipelineCache::ProgramCache {
 			};
 			return prepared_reads.CapacityBytes() + bytes(resources.buffers) + bytes(resources.images) +
 			       bytes(resources.samplers) + bytes(resources.flattened_srt) + bytes(resources.user_data) +
-			       bytes(specialization.buffers) + bytes(specialization.images);
+			       bytes(specialization.buffers) + bytes(specialization.images) + bytes(specialization.samplers) +
+                   bytes(resources.bindless_heaps) + bytes(resources.bindless_sampler_heaps);
 		}
 	};
 
@@ -1402,6 +1409,8 @@ struct PipelineCache::ProgramCache {
 		if (memo != nullptr) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramSourceMemoMisses);
 			if (source != nullptr) {
+				memo->key.bindless_images = key.bindless_images;
+				memo->key.bindless_samplers = key.bindless_samplers;
 				memo->key.stage           = key.stage;
 				memo->key.hash            = key.hash;
 				memo->key.user_data_count = key.user_data_count;
@@ -1658,9 +1667,11 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	static bool BuildKey(const ShaderParams& params, const InputInfo& input_info, ProgramKey& key,
+	bool BuildKey(const ShaderParams& params, const InputInfo& input_info, ProgramKey& key,
 	                     ProgramScratch& scratch, ShaderReadAttempt* attempt = nullptr,
 	                     bool speculative = false) {
+		key.bindless_images = bindless_images;
+		key.bindless_samplers = bindless_samplers;
 		key.stage           = StageOf(input_info);
 		key.hash            = params.hash;
 		key.user_data_count = params.user_data_count;
@@ -2047,6 +2058,8 @@ struct PipelineCache::ProgramCache {
 		     .wave_size               = options.wave_size,
 		     .user_data_base          = options.user_data_base,
 		     .plain_mip_stats_variant = options.plain_mip_stats_variant,
+             .bindless_images = options.bindless_images,
+             .bindless_samplers = options.bindless_samplers,
 		     .code                    = code_words,
 		     .back_code               = back_code_words},
 		    disk_key);
@@ -2295,6 +2308,8 @@ struct PipelineCache::ProgramCache {
 		job->hash = params.hash;
 		job->user_data.assign(key.user_data_count, 0u);
 		ShaderRecompiler::CompileOptions options;
+        options.bindless_images = bindless_images;
+        options.bindless_samplers = bindless_samplers;
 		ConfigureStageOptions(input_info, key.stage, options);
 		job->wave_size      = options.wave_size;
 		job->user_data_base = options.user_data_base;
@@ -2337,6 +2352,8 @@ struct PipelineCache::ProgramCache {
 	// permutation), under the job's in-flight record.
 	void RunTranslateJob(TranslateJob& job) {
 		ShaderRecompiler::CompileOptions options;
+        options.bindless_images = bindless_images;
+        options.bindless_samplers = bindless_samplers;
 		options.stage       = job.key.stage;
 		options.shader_hash = job.hash;
 		options.user_data   = job.user_data;
@@ -2450,6 +2467,8 @@ struct PipelineCache::ProgramCache {
 		HangWatchdog::Scope              compile("program-background-check", job.shader_hash,
 		                                         static_cast<uint64_t>(job.stage));
 		ShaderRecompiler::CompileOptions options;
+        options.bindless_images = bindless_images;
+        options.bindless_samplers = bindless_samplers;
 		options.stage                   = job.stage;
 		options.shader_hash             = job.shader_hash;
 		options.wave_size               = job.wave_size;
@@ -2821,6 +2840,8 @@ struct PipelineCache::ProgramCache {
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 		ShaderRecompiler::CompileOptions options;
+        options.bindless_images = bindless_images;
+        options.bindless_samplers = bindless_samplers;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = runtime.user_data;
@@ -3453,7 +3474,10 @@ struct PipelineCache::ProgramCache {
 		return Result::Ok;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(GraphicContext& graphics):
+        bindless_images(graphics.bindless_enabled),
+        bindless_samplers(graphics.bindless_enabled && EnvU64("KYTY_BINDLESS_SAMPLERS", 1) != 0),
+        device(graphics.device) {
 		if (Config::ShaderValidationEnabled() && SpirvValidator::AsyncEnabled()) {
 			validator = std::make_unique<SpirvValidator>();
 		}
@@ -3490,6 +3514,8 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	const bool bindless_images;
+	const bool bindless_samplers;
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	mutable std::shared_mutex                                   m_programs_mutex;
 	// Serializes O15 reuse-mode preparation; ordered before m_programs_mutex.
@@ -4094,7 +4120,7 @@ struct PipelineCache::PrefetchState {
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)),
       m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// Each cache counts its generations in its own range, so a per-thread lookup memo left by a
@@ -4689,7 +4715,8 @@ bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
                   const ShaderRecompiler::IR::ResourceSnapshot& b) {
 	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
 	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
-	       a.uniform_fill == b.uniform_fill;
+	       a.uniform_fill == b.uniform_fill && a.bindless_heaps == b.bindless_heaps &&
+           a.bindless_sampler_heaps == b.bindless_sampler_heaps;
 }
 
 // The oracle prepares copies of the stage inputs serially and compares every output that the

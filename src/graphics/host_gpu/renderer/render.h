@@ -992,6 +992,8 @@ public:
 	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
 	// keep_images (KYTY_DRAW_RUN continuation): the stage's texture and sampler bindings are the
 	// previous draw's, kept as they are; only the per-draw data is prepared.
+	void BeginBindlessUpdate();
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
 	                     DrawPrep::StagePlan* plan = nullptr, bool keep_images = false);
 	void                           FindBuffers(PreparedBindings& bindings);

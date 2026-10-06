@@ -147,6 +147,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool uses_bindless = false;
 		// KYTY_ASYNC_PIPELINES: `pipeline` is still being compiled on a background thread (null
 		// until then). Guarded by PipelineCache::m_mutex.
 		bool                    pending               = false;

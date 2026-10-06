@@ -56,6 +56,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// Bindless images read the bindless table, not a native group (AllocateBindings).
+		if (program.info.images[i].bindless) {
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
@@ -99,8 +103,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
+		     return image.indirect_search_iterations != 0u || image.bindless;
+	     }) || std::ranges::any_of(program.info.samplers, &IR::SamplerResource::bindless);
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}

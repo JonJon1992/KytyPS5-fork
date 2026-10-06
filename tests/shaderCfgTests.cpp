@@ -15035,6 +15035,8 @@ void TestExecSelectAnalysisFixpoint() {
   check_chain(10, true, false); // More than eight passes requires the safe fallback.
 }
 
+#include "BindlessShaderTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -15063,6 +15065,11 @@ int main(int argc, char **argv) {
     TestNewShaderRecompilerBufferLoadsGuardedByExec();
     TestCapturedBufferAtomicsX2();
     std::puts("ShaderCfgTests: frontend optimization cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-only") == 0) {
+    TestBindlessShaderContract();
+    std::puts("ShaderCfgTests: bindless CPU/SPIR-V cases passed");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-only") == 0) {
@@ -15132,6 +15139,7 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  TestBindlessShaderContract();
   TestRayTracingDispatchDetection();
   TestFrontendInstructionPrefixes();
   TestFrontendBufferAddresses();

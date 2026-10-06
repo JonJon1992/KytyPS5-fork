@@ -142,6 +142,7 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -159,6 +160,8 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	bool     bindless              = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -522,13 +525,19 @@ struct DescriptorSource {
 		uint32_t table_offset    = 0;
 		Value    key_count;
 		Value    selector_mask;
+		bool     bindless = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+		bool operator==(const BindlessSampler&) const = default;
+	};
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectImage> indirect_image;
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -737,6 +746,8 @@ struct ResourcePlan {
 	bool                                has_address_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	bool                                bindless_images = false;
+	bool                                bindless_samplers = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// Dense memo slot count. Unsealed programs still grow it lazily while evaluating;

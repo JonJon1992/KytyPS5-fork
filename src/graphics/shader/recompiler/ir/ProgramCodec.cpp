@@ -19,18 +19,18 @@ namespace {
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 12;
-// ImageResource 20; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ImageResource 20; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
-// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectImage
-// 7); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
-// ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 28;
-// ResourceSpecialization 2 (Buffer 3, Image 10).
+// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (IndirectImage
+// 8, BindlessSampler 1); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 30;
+// ResourceSpecialization 3 (Buffer 3, Image 11, Sampler 2).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 36, "IR::BufferResource changed: update ProgramCodec");
 static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
-static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
+static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
@@ -42,8 +42,8 @@ static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: upd
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
 static_assert(sizeof(CompiledShaderInfo) == 344, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 200, "IR::DescriptorSource changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource::IndirectImage) == 56,
+static_assert(sizeof(DescriptorSource) == 216, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource::IndirectImage) == 64,
               "IR::DescriptorSource::IndirectImage changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update ProgramCodec");
@@ -60,7 +60,7 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
 static_assert(sizeof(ResourcePlan) == 704, "IR::ResourcePlan changed: update ProgramCodec");
-static_assert(sizeof(ResourceSpecialization) == 48,
+static_assert(sizeof(ResourceSpecialization) == 72,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
               "IR::ResourceSpecialization::Buffer changed: update ProgramCodec");
@@ -389,6 +389,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.Bool(v.depth_compare);
 	w.Bool(v.cube);
 	w.Bool(v.r128);
+	w.Bool(v.bindless);
 	w.U32(v.indirect_root);
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
@@ -412,6 +413,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.depth_compare              = r.Bool();
 	v.cube                       = r.Bool();
 	v.r128                       = r.Bool();
+	v.bindless = r.Bool();
 	v.indirect_root              = r.U32();
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();
@@ -426,6 +428,8 @@ void Write(CodecWriter& w, const SamplerResource& v) {
 	w.Bool(v.depth_compare);
 	w.Bool(v.integer_border);
 	w.Bool(v.gather_lod);
+	w.Bool(v.bindless);
+	w.U32(v.bindless_mapping_offset);
 }
 
 void Read(CodecReader& r, SamplerResource& v) {
@@ -436,6 +440,8 @@ void Read(CodecReader& r, SamplerResource& v) {
 	v.depth_compare         = r.Bool();
 	v.integer_border        = r.Bool();
 	v.gather_lod            = r.Bool();
+	v.bindless = r.Bool();
+	v.bindless_mapping_offset = r.U32();
 }
 
 void Write(CodecWriter& w, const SampledResourcePair& v) {
@@ -549,6 +555,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.U32(v.indirect_search_iterations);
 	w.Bool(v.cube);
 	w.Bool(v.fmask);
+	w.Bool(v.bindless);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Image& v) {
@@ -562,6 +569,7 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.indirect_search_iterations = r.U32();
 	v.cube                       = r.Bool();
 	v.fmask                      = r.Bool();
+	v.bindless = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourcePlan::EvaluationOperand& v) {
@@ -592,6 +600,15 @@ void Write(CodecWriter& w, uint8_t value) {
 
 void Read(CodecReader& r, uint8_t& value) {
 	value = r.U8();
+}
+
+void Write(CodecWriter& w, const ResourceSpecialization::Sampler& v) {
+    w.Bool(v.bindless);
+    w.U32(v.bindless_mapping_offset);
+}
+void Read(CodecReader& r, ResourceSpecialization::Sampler& v) {
+    v.bindless = r.Bool();
+    v.bindless_mapping_offset = r.U32();
 }
 
 // Element types defined after the vector helpers (template lookup needs them declared first).
@@ -730,8 +747,11 @@ public:
 				w.U32(image.selector_stride);
 				w.U32(image.selector_offset);
 				w.U32(image.table_offset);
+				w.Bool(image.bindless);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}
+			w.Bool(source.bindless_sampler.has_value());
+			if (source.bindless_sampler) w.U32(source.bindless_sampler->table_offset);
 		}
 		w.U32(static_cast<uint32_t>(p.control_flow.size()));
 		for (const auto& block: p.control_flow) {
@@ -780,6 +800,8 @@ public:
 			w.U8(instruction.operand_count);
 		}
 		WriteVector(w, p.clean_flat_slots);
+		w.Bool(p.bindless_images);
+		w.Bool(p.bindless_samplers);
 		w.Bool(p.requires_specialization_memory);
 		w.Bool(p.has_address_writes);
 		w.Bool(p.srt_plan_complete);
@@ -950,8 +972,11 @@ public:
 				image.selector_stride = r.U32();
 				image.selector_offset = r.U32();
 				image.table_offset    = r.U32();
+				image.bindless = r.Bool();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}
+			source.bindless_sampler.reset();
+			if (r.Bool()) source.bindless_sampler = DescriptorSource::BindlessSampler {r.U32()};
 			if (r.Failed()) return false;
 		}
 		const auto blocks = r.Count(1);
@@ -1010,6 +1035,8 @@ public:
 			if (r.Failed()) return false;
 		}
 		ReadVector(r, p.clean_flat_slots);
+		p.bindless_images = r.Bool();
+		p.bindless_samplers = r.Bool();
 		p.requires_specialization_memory = r.Bool();
 		p.has_address_writes             = r.Bool();
 		p.srt_plan_complete              = r.Bool();
@@ -1112,12 +1139,14 @@ void EncodeSpecialization(const ResourceSpecialization& value, std::vector<uint8
 	CodecWriter writer(out);
 	WriteVector(writer, value.buffers);
 	WriteVector(writer, value.images);
+	WriteVector(writer, value.samplers);
 }
 
 bool DecodeSpecialization(std::span<const uint8_t> bytes, ResourceSpecialization& value) {
 	CodecReader reader(bytes);
 	ReadVector(reader, value.buffers);
 	ReadVector(reader, value.images);
+	ReadVector(reader, value.samplers);
 	return reader.AtEnd();
 }
 

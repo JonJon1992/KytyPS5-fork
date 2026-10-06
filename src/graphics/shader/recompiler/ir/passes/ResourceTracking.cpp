@@ -101,6 +101,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		PlanBindlessSamplers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -125,16 +126,23 @@ public:
 			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
 				plan.handle->SetArg(dword, plan.key);
 			}
-			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
-			}
+            for (uint32_t i = 0; i < plan.memory.size(); ++i) {
+                if (plan.exclusive[i]) m_program.memory_info[plan.memory[i]].planning_only = true;
+            }
 		}
+        for (const auto& plan: m_bindless_samplers) {
+            plan.handle->SetArg(0, plan.key);
+            for (uint32_t i = 0; i < 3u; ++i) plan.handle->SetArg(i + 1u, plan.table_roots[i]);
+            for (uint32_t i = 0; i < 4u; ++i) {
+                if (plan.exclusive[i]) m_program.memory_info[plan.memory[i]].planning_only = true;
+            }
+        }
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
+            if (inst == nullptr) return false;
+            uint32_t index = 0;
+            const auto* memory = ScalarReadMemory(*inst, index);
+            return memory != nullptr && memory->planning_only;
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -161,7 +169,18 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		std::array<bool, 8> exclusive {};
 	};
+
+    struct BindlessSamplerPlan {
+        Inst* handle = nullptr;
+        uint32_t source = 0;
+        Value key;
+        std::array<Value, 3> table_roots {};
+        std::array<Inst*, 4> reads {};
+        std::array<uint32_t, 4> memory {};
+        std::array<bool, 4> exclusive {};
+    };
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
@@ -315,7 +334,8 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image.has_value() != descriptor.indirect_image.has_value()) {
+			    current.indirect_image.has_value() != descriptor.indirect_image.has_value() ||
+                current.bindless_sampler != descriptor.bindless_sampler) {
 				continue;
 			}
 			if (current.indirect_image.has_value()) {
@@ -323,7 +343,7 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+				    a.table_offset != b.table_offset || a.bindless != b.bindless ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -489,8 +509,12 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t record_shift = 5u,
+	                      uint32_t* key_mask = nullptr) const {
 		offset = 0;
+		if (key_mask != nullptr) {
+			*key_mask = UINT32_MAX;
+		}
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -498,9 +522,28 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate == record_shift) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && key_mask != nullptr &&
+			    *key_mask == UINT32_MAX) {
+				// The mask must apply to the shift itself, not to a sum around it.
+				const uint32_t masked = ImmediateU32(inst->Arg(1), immediate)   ? 0u
+				                        : ImmediateU32(inst->Arg(0), immediate) ? 1u
+				                                                                : 2u;
+				const auto* shift = masked < 2u ? inst->Arg(masked).Resolve().TryInstruction()
+				                                : nullptr;
+				uint32_t    amount = 0;
+				if (shift == nullptr || (immediate & ((1u << record_shift) - 1u)) != 0u ||
+				    shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+				    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), amount) ||
+				    amount != record_shift) {
+					return false;
+				}
+				*key_mask = immediate >> record_shift;
+				value     = inst->Arg(masked);
+				continue;
 			}
 			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
 				return false;
@@ -873,6 +916,7 @@ private:
 		Inst* table_handle = nullptr;
 		Value key;
 		uint32_t table_offset = 0;
+		uint32_t key_mask = UINT32_MAX;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
@@ -886,6 +930,7 @@ private:
 			}
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
+			uint32_t current_mask = UINT32_MAX;
 			uint32_t offset = 0;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
@@ -894,23 +939,25 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, 5u, m_program.bindless_images ? &current_mask : nullptr) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
 			offset += memory->offset;
 			if (dword == 0u) {
 				key = current_key;
+				key_mask = current_mask;
 				table_offset = offset;
-			} else if (!EquivalentValue(m_program, key, current_key) ||
+			} else if (!EquivalentValue(m_program, key, current_key) || current_mask != key_mask ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
-				return false;
-			}
+            plan.exclusive[dword] = !read->Uses().empty() &&
+                std::ranges::all_of(read->Uses(), [](const Use& use) {
+                    return use.user->GetOpcode() == ValueOpcode::GetImageResource;
+                });
+            if (!plan.exclusive[dword] && !m_program.bindless_images) return false;
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
 		}
@@ -922,7 +969,9 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
-		if (table_source.dword_count == 2u) {
+        if (m_program.bindless_images && table_source.dword_count == 4u) {
+            indirect.bindless = true;
+        } else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
 			    selector->NumArgs() == 1u && !m_shader_writes &&
@@ -979,6 +1028,12 @@ private:
 		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
 		            image_source.dwords.begin() + 4u);
 		image_source.indirect_image = indirect;
+        if (key_mask != UINT32_MAX) {
+            const auto where = std::ranges::find_if(handle.Parent()->Instructions(),
+                [&](const Inst& inst) { return &inst == &handle; });
+            key = Value(&*handle.Parent()->PrependNewInst(where, ValueOpcode::BitwiseAnd32,
+                                                        {key, Value(key_mask)}));
+        }
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
 		plan.key = key;
@@ -995,12 +1050,15 @@ private:
 		return found == m_indirect_images.end() ? nullptr : &*found;
 	}
 
-	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
-	}
+    bool IsIndirectPlanningMemory(uint32_t index) const {
+        const auto matches = [index](const auto& plan) {
+            for (uint32_t i = 0; i < plan.memory.size(); ++i)
+                if (plan.memory[i] == index && plan.exclusive[i]) return true;
+            return false;
+        };
+        return std::ranges::any_of(m_indirect_images, matches) ||
+               std::ranges::any_of(m_bindless_samplers, matches);
+    }
 
 	void PlanIndirectImages() {
 		for (auto* block: m_program.blocks) {
@@ -1020,6 +1078,91 @@ private:
 			}
 		}
 	}
+
+	const BindlessSamplerPlan* FindBindlessSampler(const Inst& handle) const {
+		const auto found =
+		    std::ranges::find(m_bindless_samplers, &handle, &BindlessSamplerPlan::handle);
+		return found == m_bindless_samplers.end() ? nullptr : &*found;
+	}
+
+	bool TryMakeBindlessSampler(Inst& handle, uint32_t pc, BindlessSamplerPlan& plan) {
+		Inst*    table_handle = nullptr;
+		Value    key;
+		uint32_t table_offset = 0;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
+			    !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			auto*    current_handle = read->Arg(0).Resolve().TryInstruction();
+			Value    current_key;
+			uint32_t offset = 0;
+			if (current_handle == nullptr ||
+			    current_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (table_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, 4u) ||
+			    memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			if (dword == 0u) {
+				key          = current_key;
+				table_offset = offset;
+			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
+				return false;
+			}
+			table_handle          = current_handle;
+			plan.reads[dword]     = read;
+			plan.memory[dword]    = memory_index;
+			plan.exclusive[dword] =
+			    !read->Uses().empty() && std::ranges::all_of(read->Uses(), [](const Use& use) {
+				    return use.user->GetOpcode() == ValueOpcode::GetSamplerResource;
+			    });
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = 4u;
+		source.dwords.fill(Value(0u));
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			source.dwords[dword]    = table_source.dwords[dword];
+			plan.table_roots[dword] = table_source.dwords[dword];
+		}
+		source.bindless_sampler = DescriptorSource::BindlessSampler {.table_offset = table_offset};
+		plan.handle             = &handle;
+		plan.key                = key;
+		plan.source             = InternSource(source);
+		return true;
+	}
+
+    void PlanBindlessSamplers() {
+        if (!m_program.bindless_samplers) return;
+        for (auto* block: m_program.blocks) for (auto& inst: *block) {
+            if (!ImageOpcodeInfoOf(inst.GetOpcode()).needs_sampler || inst.NumArgs() < 2u) continue;
+            auto* handle = inst.Arg(1).Resolve().TryInstruction();
+            if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetSamplerResource ||
+                handle->NumArgs() != 4u || FindBindlessSampler(*handle) != nullptr) continue;
+            DescriptorSource source;
+            MakeSource(*handle, 4u, true, false, source, inst.Flags<MemoryFlags>().pc);
+            uint32_t bad = 0;
+            if (ValidateSource(source, bad)) continue;
+            BindlessSamplerPlan planned;
+            if (TryMakeBindlessSampler(*handle, inst.Flags<MemoryFlags>().pc, planned))
+                m_bindless_samplers.push_back(planned);
+        }
+    }
 
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
@@ -1122,6 +1265,7 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		image.bindless = m_sources[source].indirect_image && m_sources[source].indirect_image->bindless;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -1148,6 +1292,7 @@ private:
 			return UINT32_MAX;
 		}
 		m_info.samplers.push_back({source, pc});
+		m_info.samplers.back().bindless = m_sources[source].bindless_sampler.has_value();
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
@@ -1303,7 +1448,12 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+            auto* candidate = inst.Arg(1).Resolve().TryInstruction();
+            const auto* bindless = candidate != nullptr ? FindBindlessSampler(*candidate) : nullptr;
+            if (bindless != nullptr) {
+                sampler_handle = candidate;
+                sampler_source = bindless->source;
+            } else if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
 			               sampler_handle, sampler_source, true, sample_adjust)) {
 				return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped
 			}
@@ -1355,6 +1505,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<BindlessSamplerPlan> m_bindless_samplers;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	bool                                       m_indirect_scalar_buffers = false;

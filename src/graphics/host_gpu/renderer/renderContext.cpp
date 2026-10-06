@@ -31,7 +31,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
       m_command_scheduler(*this, graphics, CommandScheduler::Role::Guest),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
+      m_bindless_table(graphics, m_command_scheduler), m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
@@ -53,6 +53,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		return 1;
 	});
 	FaultCost::RunStartupBenchmark();
+    m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+        m_bindless_table.QueueUnregistered(id);
+    };
 }
 
 RenderContext::~RenderContext() {

@@ -84,6 +84,13 @@ struct SpirvRequirements {
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
 struct EmitterState {
+    std::map<uint32_t, uint32_t> bindless_image_variables;
+    uint32_t bindless_translation_variable = 0;
+    uint32_t bindless_feedback_variable = 0;
+    uint32_t bindless_slot = 0;
+    uint32_t bindless_sampler_variable = 0;
+    uint32_t bindless_sampler_slot = 0;
+
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),

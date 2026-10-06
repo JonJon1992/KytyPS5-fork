@@ -992,6 +992,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	if (on_bindless_unregister) on_bindless_unregister(id);
 	InvalidateCleanImageProofs(image.live.address, image.live.size,
 	                           Coherence::Source::ImageUnregister);
 	NoteStructureChange(image);
