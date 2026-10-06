@@ -1637,7 +1637,13 @@ struct PipelineCache::ProgramCache {
 		}
 		if (speculative || DrawPrep::Speculative()) return false;
 		if (NativeDccEnabled()) {
-			if (attempt != nullptr) attempt->Missing(address, words.size_bytes());
+			// Only guest-backed memory can become clean. Code without a backing (a module's image)
+			// gains nothing from a readiness retry: Synchronize reports progress and the read fails
+			// again, 64 times (Ghost of Yotei's compute shaders at 0x901e18200).
+			if (attempt != nullptr &&
+			    LibKernel::Memory::TryReadBacking(address, words.data(), words.size_bytes())) {
+				attempt->Missing(address, words.size_bytes());
+			}
 			return false;
 		}
 		if (!LibKernel::Memory::TryReadBacking(address, words.data(), words.size_bytes())) return false;
@@ -1656,10 +1662,15 @@ struct PipelineCache::ProgramCache {
 			scratch.function_caller_current = true;
 			return true;
 		}
-		if (attempt != nullptr && attempt->count != 0) attempt->materialization_failed = true;
-		if (!speculative && !DrawPrep::Speculative() && !NativeDccEnabled()) {
-			// Code outside guest-backed memory (shaders embedded in a module, the tests' host
-			// buffers) has no tracking to bypass: read it where the translation reads it.
+		// Code outside guest-backed memory (shaders embedded in a module, the tests' host buffers)
+		// has no tracking to bypass and no GPU writer, also with KYTY_DCC_GPU=1: read it where the
+		// translation reads it. Backed code that is not clean yet waits for readiness instead.
+		const bool unbacked = !LibKernel::Memory::TryReadBacking(
+		    params.Base(), scratch.function_caller.data(), params.code.size_bytes());
+		if (!unbacked && attempt != nullptr && attempt->count != 0) {
+			attempt->materialization_failed = true;
+		}
+		if (!speculative && !DrawPrep::Speculative() && (!NativeDccEnabled() || unbacked)) {
 			std::memcpy(scratch.function_caller.data(), params.code.data(),
 			            params.code.size_bytes());
 			scratch.function_caller_current = true;
