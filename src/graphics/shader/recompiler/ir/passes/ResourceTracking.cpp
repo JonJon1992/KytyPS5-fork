@@ -1119,7 +1119,7 @@ private:
 				current_mask = UINT32_MAX;
 				return bindless_images &&
 				       (m_program.stage != ShaderType::Compute ||
-				        GetCodegenOptions().bindless_strided_compute) &&
+				        BindlessStridedComputeApplies(m_program.shader_hash)) &&
 				       MatchStridedTableOffset(read->Arg(1), current_key, offset, current_stride);
 			};
 			if (current_handle == nullptr ||

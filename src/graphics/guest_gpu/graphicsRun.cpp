@@ -2814,6 +2814,16 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op) {
 	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(op.args_addr);
+		// Name where an implausible size came from (RenderExecutor::DispatchDirect skips it).
+		if (uint64_t {args.x} * args.y * args.z > (uint64_t {1} << 34u)) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("Warning: indirect dispatch of %ux%ux%u threads read at 0x%016" PRIx64
+				            ", CS code 0x%016" PRIx64 "\n",
+				            args.x, args.y, args.z, op.args_addr,
+				            CurrentBuffer().GetShaders().GetCs().cs_regs.data_addr);
+			}
+		}
 		CpSeq::DispatchDirectOp direct;
 		direct.x    = args.x;
 		direct.y    = args.y;

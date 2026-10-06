@@ -18,6 +18,22 @@ bool EnvFlag(const char* name, bool default_value) {
 	return std::strcmp(value, "0") != 0;
 }
 
+// Comma-separated hex shader hashes appended to `hashes`; unset adds none.
+void ParseHashList(const char* list, std::vector<uint64_t>& hashes) {
+	std::string_view text(list != nullptr ? list : "");
+	while (!text.empty()) {
+		const auto comma = text.find(',');
+		const auto token = std::string(text.substr(0, comma));
+		if (!token.empty()) {
+			hashes.push_back(std::strtoull(token.c_str(), nullptr, 16));
+		}
+		if (comma == std::string_view::npos) {
+			break;
+		}
+		text.remove_prefix(comma + 1);
+	}
+}
+
 CodegenOptions FromEnvironment() {
 	CodegenOptions options;
 	options.movrel_range = EnvFlag("KYTY_MOVREL_RANGE", options.movrel_range);
@@ -46,23 +62,12 @@ CodegenOptions FromEnvironment() {
 	if (const auto* budget = std::getenv("KYTY_LOOP_GUARD"); budget != nullptr) {
 		options.loop_guard_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
 	}
-	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
-		std::string_view text(list);
-		while (!text.empty()) {
-			const auto comma = text.find(',');
-			const auto token = std::string(text.substr(0, comma));
-			if (!token.empty()) {
-				options.loop_guard_shaders.push_back(std::strtoull(token.c_str(), nullptr, 16));
-			}
-			if (comma == std::string_view::npos) {
-				break;
-			}
-			text.remove_prefix(comma + 1);
-		}
-	}
+	ParseHashList(std::getenv("KYTY_LOOP_GUARD_SHADERS"), options.loop_guard_shaders);
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
 	options.bindless_strided_compute =
 	    EnvFlag("KYTY_BINDLESS_STRIDED_COMPUTE", options.bindless_strided_compute);
+	ParseHashList(std::getenv("KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS"),
+	              options.bindless_strided_compute_shaders);
 	options.runtime_buffer_stride =
 	    EnvFlag("KYTY_RUNTIME_BUFFER_STRIDE", options.runtime_buffer_stride);
 	options.realtime_clock    = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
@@ -109,6 +114,13 @@ bool LoopGuardApplies(uint64_t shader_hash) {
 	return options.loop_guard_budget != 0 &&
 	       std::ranges::find(options.loop_guard_shaders, shader_hash) !=
 	           options.loop_guard_shaders.end();
+}
+
+bool BindlessStridedComputeApplies(uint64_t shader_hash) {
+	const auto& options = Storage();
+	return options.bindless_strided_compute ||
+	       std::ranges::find(options.bindless_strided_compute_shaders, shader_hash) !=
+	           options.bindless_strided_compute_shaders.end();
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

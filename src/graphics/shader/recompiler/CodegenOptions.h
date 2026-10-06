@@ -133,6 +133,9 @@ struct CodegenOptions {
 	// of any stride. Off by default: in Ghost of Yotei the compute shaders it enabled produced
 	// command data the CP read as dispatch sizes (float bit patterns) and the GPU hung.
 	bool bindless_strided_compute = false;
+	// KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS=<hex hash>,...: the same for these compute shaders only
+	// (to find which of them breaks a title).
+	std::vector<uint64_t> bindless_strided_compute_shaders;
 	// KYTY_RUNTIME_BUFFER_STRIDE (default on; 0 disables): unswizzled structured buffers read
 	// their stride from the shader data instead of specializing on it (IR::PackedStrideRuntime).
 	bool runtime_buffer_stride = true;
@@ -186,6 +189,8 @@ struct CodegenOptions {
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);
+// KYTY_BINDLESS_STRIDED_COMPUTE, or the shader is listed in KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS.
+bool BindlessStridedComputeApplies(uint64_t shader_hash);
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only
