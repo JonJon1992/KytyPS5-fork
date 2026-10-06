@@ -2,6 +2,7 @@
 #include "common/ramStats.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -375,6 +376,8 @@ void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t 
                           std::string_view detail) {
 	auto& totals = g_compile_totals;
 	totals.programs.fetch_add(1, std::memory_order_relaxed);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ShadersCompiled);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ShaderCompileNs, total_ns);
 	totals.translate_ns.fetch_add(times.translate_ns, std::memory_order_relaxed);
 	totals.clone_ns.fetch_add(times.clone_ns, std::memory_order_relaxed);
 	if (times.reused) totals.translation_reuses.fetch_add(1, std::memory_order_relaxed);
@@ -4494,6 +4497,8 @@ struct PipelineCache::DriverCacheSaver {
 };
 
 void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelinesCreated);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::PipelineCreateNs, create_ns);
 	if (m_saver == nullptr) {
 		return;
 	}

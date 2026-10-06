@@ -245,6 +245,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

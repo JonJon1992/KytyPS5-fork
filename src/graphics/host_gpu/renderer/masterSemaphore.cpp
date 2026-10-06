@@ -1,12 +1,14 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/hangWatchdog.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <optional>
 
@@ -105,7 +107,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                         reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
 	                         tick, HangWatchdog::Enabled() ? KnownGpuTick() : 0, 0,
 	                         HangWatchdog::Enabled() ? CurrentTick() : 0);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_begin = std::chrono::steady_clock::now();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		HangWatchdog::Scope error("master-wait-error",
 		                          reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
@@ -117,6 +120,12 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		EXIT("MasterSemaphore: wait for tick %" PRIu64 " failed: %s (gpu tick %" PRIu64 ")\n", tick,
 		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuWaits);
+	Common::DebugCounters::Add(
+	    Common::DebugCounters::Counter::GpuWaitNs,
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - wait_begin)
+	                              .count()));
 	Refresh();
 }
 

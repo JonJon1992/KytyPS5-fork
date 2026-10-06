@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -467,8 +468,9 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
+	// The performance panel draws on presents that happen anyway; it only bumps the revision.
 	return {core.active || dialog.active || system.active,
-	        core.revision + dialog.revision + system.revision};
+	        core.revision + dialog.revision + system.revision + PerformanceOverlayRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -954,7 +956,8 @@ struct SystemOverlay::Impl {
 
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
+		if (!has_overlay && !PerformanceOverlayEnabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -985,14 +988,19 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+		// With only the performance panel up there is no session, and it must still be none here.
+		GetOverlaySnapshot(&snapshot);
+		if (snapshot.session != prepared_session) {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Dialog) {
-			DrawDialog(snapshot.dialog, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
+		DrawPerformanceOverlay(graphics, frame_extent);
+		if (has_overlay) {
+			if (snapshot.session.kind == OverlayKind::Dialog) {
+				DrawDialog(snapshot.dialog, frame_extent);
+			} else {
+				DrawIme(snapshot.ime, frame_extent);
+			}
 		}
 		ImGui::Render();
 		extent = frame_extent;

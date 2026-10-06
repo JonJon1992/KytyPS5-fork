@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/hangTrace.h"
 #include "common/emulatorConfig.h"
 #include "common/liveSwitch.h"
@@ -964,6 +965,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.lru_tick   = m_lru_cache.TickOf(image.lru_id);
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
+	Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::TextureCacheBytes,
+	                              static_cast<int64_t>(image.AccountedSize()));
+	Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::TextureImages, 1);
 	// Registration precedes the first TrackImage, so the tracking mode never changes while
 	// the image watches pages. Re-registration (a residency change) re-derives it.
 	if (!image.IsTracked()) {
@@ -1019,6 +1023,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_registered_image_memory -= accounted;
+	Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::TextureCacheBytes,
+	                              -static_cast<int64_t>(accounted));
+	Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::TextureImages, -1);
 	image.registered = false;
 }
 
@@ -2187,6 +2194,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			copy.bufferOffset += linear.offset;
 		}
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 	};
 
 	if (binding != BindingType::DepthTarget) {
@@ -5118,6 +5126,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	destination.Flush(offset, range.size);
 
 	DownloadImage(image, destination, offset, range.size, std::move(transfer));
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -5869,6 +5878,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id, HangTrace::ImageFreeReason::GarbageCollect);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

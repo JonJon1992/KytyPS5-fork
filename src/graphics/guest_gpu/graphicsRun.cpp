@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
@@ -2688,6 +2689,9 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 	if (draw_count == 0) {
 		return;
 	}
+	// Native indirect draws above read their count on the GPU and are not counted here.
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
+
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
 	// Every drawn record sets the count, so pending native sources cannot decide any more.

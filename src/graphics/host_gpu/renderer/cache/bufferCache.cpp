@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
@@ -927,6 +928,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              static_cast<int64_t>(buffer.Size()));
 		buffer.lru_id   = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.lru_tick = m_gc_tick;
 		std::vector<vk::DeviceAddress> addresses;
@@ -947,6 +950,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		// own bytes and must not underflow.
 		EXIT_IF(buffer.Size() > m_total_used_memory && !m_graphics.CanReportMemoryUsage());
 		m_total_used_memory -= std::min(m_total_used_memory, buffer.Size());
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              -static_cast<int64_t>(buffer.Size()));
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -1023,6 +1028,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	// A download larger than the staging ring gets a buffer of its own, released after the
@@ -3156,6 +3162,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 	// The first guest_copies read guest memory at their destination; the rest read host_data
 	// at (srcOffset - host_base).
 	const auto source_of = [&](size_t index, const vk::BufferCopy& copy) -> const void* {
@@ -4346,6 +4353,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});

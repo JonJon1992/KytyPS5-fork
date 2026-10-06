@@ -156,6 +156,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool PerfOverlayEnabled() {
+	return g_config->perf_overlay_enabled;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

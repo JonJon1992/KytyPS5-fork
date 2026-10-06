@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
@@ -804,6 +805,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			result = graphics.queue.submit(1, &submit_info, nullptr);
 		}
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics, tick);

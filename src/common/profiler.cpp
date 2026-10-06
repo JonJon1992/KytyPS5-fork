@@ -33,6 +33,7 @@
 #include <share.h>
 #include <sys/stat.h>
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -1276,8 +1277,17 @@ void EndBlock() {
 }
 
 void SetThreadName(const char* name) {
-	if (name != nullptr) HangWatchdog::SetThreadName(name);
-	if (tracy::ProfilerAvailable() && name != nullptr) {
+	if (name == nullptr) {
+		return;
+	}
+	HangWatchdog::SetThreadName(name);
+	// Name the OS thread too, so host tools and the performance panel can tell threads apart.
+#if defined(__APPLE__)
+	pthread_setname_np(name);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	pthread_setname_np(pthread_self(), std::string(name).substr(0, 15).c_str());
+#endif
+	if (tracy::ProfilerAvailable()) {
 		tracy::SetThreadName(name);
 	}
 }
