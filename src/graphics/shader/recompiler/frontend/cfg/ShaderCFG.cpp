@@ -11,6 +11,7 @@
 #include <set>
 #include <span>
 #include <stack>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -1502,6 +1503,130 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
+// Tail cloning bounds: the selection construct being rewritten (not the whole module), the copied
+// guest instructions, and the clones per structurization attempt.
+constexpr size_t   MaxTailCloneRegionBlocks  = 32;
+constexpr uint32_t MaxTailCloneInstructions  = 16;
+constexpr uint32_t MaxTailClonesPerStructure = 4;
+
+// An enclosing selection's arm enters the region of a nested selection that shares its merge
+// through a short straight-line block that falls into that merge:
+//   A: c0 -> P | T;  P -> ... -> B;  B: c1 -> C | T;  C -> M;  T -> M
+// The nested header gets its own copy of T, so its region has no external entry and the shared
+// merge can be split as usual. Copying is exact only because T runs straight into the merge.
+bool CloneExternallyEnteredTail(Graph& graph, uint32_t header, uint32_t merge,
+                                const std::vector<uint32_t>& region) {
+	uint32_t shared = UINT32_MAX;
+	for (const auto member: region) {
+		if (!graph.Dominates(header, member)) {
+			if (shared != UINT32_MAX) {
+				return false;
+			}
+			shared = member;
+		}
+	}
+	const auto* source = graph.FindBlock(shared);
+	if (source == nullptr || source->inst_end - source->inst_begin > MaxTailCloneInstructions ||
+	    source->terminator.kind != TerminatorKind::Branch || source->successors.size() != 1u ||
+	    source->successors.front() != merge) {
+		return false;
+	}
+	std::vector<uint32_t> redirected;
+	for (const auto predecessor: source->predecessors) {
+		if (graph.Dominates(header, predecessor)) {
+			redirected.push_back(predecessor);
+		}
+	}
+	if (redirected.empty()) {
+		return false;
+	}
+
+	BasicBlock clone = *source;
+	clone.id         = static_cast<uint32_t>(graph.blocks.size());
+	clone.predecessors.clear();
+	clone.dominators.clear();
+	clone.post_dominators.clear();
+	const auto clone_id = clone.id;
+	graph.blocks.push_back(std::move(clone));
+	for (const auto predecessor: redirected) {
+		auto* block = graph.FindBlock(predecessor);
+		ReplaceValue(block->successors, shared, clone_id);
+		ReplaceTerminatorTarget(block->terminator, shared, clone_id);
+	}
+	// Same layout as a split merge: the copy sits right before the merge it falls into.
+	MoveBlockBefore(graph, clone_id, merge);
+	return true;
+}
+
+bool CloneOneSharedSelectionTail(Graph& graph) {
+	std::vector<uint32_t> loop_headers;
+	loop_headers.reserve(graph.natural_loops.size());
+	for (const auto& loop: graph.natural_loops) {
+		AddUnique(loop_headers, loop.header);
+	}
+	// Selection merges are computed once per pass; the enclosing-header test below only compares them.
+	std::vector<std::pair<uint32_t, uint32_t>> selections;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
+		    Contains(loop_headers, block.id) || IsInnermostLoopControlConditional(graph, block)) {
+			continue;
+		}
+		const auto merge = FindSelectionMerge(graph, block);
+		if (merge != UINT32_MAX && graph.FindBlock(merge) != nullptr) {
+			selections.emplace_back(block.id, merge);
+		}
+	}
+
+	struct Candidate {
+		uint32_t              cost   = 0;
+		uint32_t              depth  = 0;
+		uint32_t              header = UINT32_MAX;
+		uint32_t              merge  = UINT32_MAX;
+		std::vector<uint32_t> region;
+	};
+	std::vector<Candidate> candidates;
+	for (const auto& [header, merge]: selections) {
+		const auto* block  = graph.FindBlock(header);
+		auto        region = SelectionRegion(graph, *block, merge);
+		if (region.size() > MaxTailCloneRegionBlocks) {
+			continue;
+		}
+		const auto external = std::ranges::find_if(region, [&](uint32_t member) {
+			const auto* member_block = graph.FindBlock(member);
+			return member_block != nullptr &&
+			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != header && !SortedContains(region, predecessor);
+			       });
+		});
+		if (external == region.end()) {
+			continue;
+		}
+		const bool enclosed = std::ranges::any_of(selections, [&](const auto& other) {
+			return other.first != header && other.second == merge &&
+			       graph.Dominates(other.first, header);
+		});
+		const auto* external_block = graph.FindBlock(*external);
+		if (enclosed && external_block != nullptr) {
+			candidates.push_back({external_block->inst_end - external_block->inst_begin,
+			                      static_cast<uint32_t>(block->dominators.size()), header, merge,
+			                      std::move(region)});
+		}
+	}
+	// Smallest copy first, then the outermost header.
+	std::ranges::sort(candidates, [](const Candidate& lhs, const Candidate& rhs) {
+		if (lhs.cost != rhs.cost) {
+			return lhs.cost < rhs.cost;
+		}
+		return lhs.depth != rhs.depth ? lhs.depth < rhs.depth : lhs.header < rhs.header;
+	});
+	for (const auto& candidate: candidates) {
+		if (CloneExternallyEnteredTail(graph, candidate.header, candidate.merge, candidate.region)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
@@ -1563,9 +1688,15 @@ bool SplitOneSelectionMerge(Graph& graph) {
 	return false;
 }
 
-bool SplitSharedMergeBlocks(Graph& graph) {
+bool SplitSharedMergeBlocks(Graph& graph, bool clone_tails) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
+	for (uint32_t clones = 0;
+	     clone_tails && clones < MaxTailClonesPerStructure && CloneOneSharedSelectionTail(graph);
+	     clones++) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
 		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
 			return !graph.unsupported;
@@ -2165,7 +2296,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 namespace {
 
-bool StructurizeImpl(Graph& graph) {
+bool StructurizeImpl(Graph& graph, bool clone_tails = false) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
 			graph.unsupported_reason = "unsupported CFG";
@@ -2176,7 +2307,7 @@ bool StructurizeImpl(Graph& graph) {
 	if (!CanonicalizeNaturalLoops(graph)) {
 		return false;
 	}
-	if (!SplitSharedMergeBlocks(graph)) {
+	if (!SplitSharedMergeBlocks(graph, clone_tails)) {
 		return false;
 	}
 	if (!IsolateSemanticLoopHeaders(graph)) {
@@ -2279,6 +2410,13 @@ bool Structurize(Graph& graph) {
 			graph = std::move(structured);
 			return true;
 		}
+	}
+	// Last tier before the dispatcher: copy short shared tails that a nested selection is entered
+	// through. Graphs that the tiers above structure keep their exact shape.
+	structured = graph;
+	if (StructurizeImpl(structured, true)) {
+		graph = std::move(structured);
+		return true;
 	}
 	SetFailure(graph, failure_kind, failure_block, failure_reason);
 	return false;

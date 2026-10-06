@@ -8901,6 +8901,72 @@ void TestCfgLoopSharedContinuation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// The outer selection enters the nested selection's region through its shared tail, and a block
+// separates the two headers, so goto routing does not apply. The last structurization tier
+// copies the tail for the nested header instead of taking the dispatcher.
+void TestCfgClonesExternallyEnteredTail() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 6),       // outer -> shared tail
+      EncodeSMovB32(3, 129),     // between the headers
+      EncodeSopp(0x02, 0),
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 2),       // nested -> shared tail
+      EncodeSMovB32(4, 130),     // nested arm
+      EncodeSopp(0x02, 2),       // nested arm -> merge
+      EncodeSMovB32(5, 131),     // shared tail
+      EncodeSopp(0x02, 0),
+      EncodeSMovB32(6, 132),     // merge (not terminal: both headers join here)
+      EncodeSopp(0x02, 0),
+      EncodeSMovB32(7, 133),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original = graph;
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+
+  const auto tail_copies = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.inst_begin == 8u && block.inst_end == 10u;
+  });
+  Check(tail_copies == 2, "shared tail was not copied for the nested selection");
+  Check(std::ranges::none_of(graph.blocks,
+                             [](const auto &block) {
+                               return block.terminator.goto_variable != UINT32_MAX;
+                             }),
+        "tail cloning fixture was routed instead");
+
+  // Both decisions, original against structured: same guest instructions in the same order.
+  const auto trace = [&](const ShaderRecompiler::CFG::Graph &cfg, uint32_t choices) {
+    std::vector<uint32_t> executed;
+    auto id = cfg.entry_block;
+    for (uint32_t steps = 0; steps < 64; ++steps) {
+      const auto *block = cfg.FindBlock(id);
+      Check(block != nullptr, "tail cloning trace lost a target");
+      for (auto i = block->inst_begin; i < block->inst_end; ++i) executed.push_back(i);
+      const auto &term = block->terminator;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::Return) return executed;
+      bool take = false;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+        take = (choices & (block->start_pc == 0 ? 1u : 2u)) != 0;
+      }
+      id = term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch && !take
+               ? term.false_block : term.true_block;
+    }
+    Check(false, "tail cloning trace did not terminate");
+    return executed;
+  };
+  for (uint32_t choices = 0; choices < 4; ++choices) {
+    Check(trace(graph, choices) == trace(original, choices),
+          "tail cloning changed a guest execution path");
+  }
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback && !SpirvContainsOpcode(result.spirv, 251),
+        "externally entered tail did not emit native structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 // --structurize-file <guest.bin> [...]: builds and structurizes the CFG of dumped guest compute
 // shaders (KYTY_DUMP_SHADERS writes _Shaders/original/*.bin) and translates the structured ones.
 // Exit status 1 when any of them would take the dispatcher fallback.
@@ -15337,6 +15403,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::string_view(argv[1]) == "--loop-shared-continuation-only") {
     TestCfgLoopSharedContinuation();
+    TestCfgClonesExternallyEnteredTail();
     return 0;
   }
   if (argc == 2 && std::string_view(argv[1]) == "--flat-address-space-only") {
@@ -15521,6 +15588,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestCfgLoopSharedContinuation();
+  TestCfgClonesExternallyEnteredTail();
   TestFlatStoreAboveAddressSpaceDropsGlobalPath();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
