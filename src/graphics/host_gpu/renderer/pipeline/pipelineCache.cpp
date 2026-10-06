@@ -36,6 +36,8 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuReadDelegate.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -4996,15 +4998,43 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+	ShaderReadAttempt read_attempt;
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
-		ShaderReadAttempt read_attempt;
+		read_attempt = {};
 		uint32_t push_data_cursor = 0;
 		const auto result = m_program_cache->Get(params, input_info, stage_prep, push_data_cursor,
 		                                         read_attempt, scratch, evaluation);
 		if (!read_attempt.materialization_failed) return result;
 		EXIT_IF(!read_attempt.Synchronize());
 	}
-	EXIT("compute resource readiness did not converge after 64 attempts\n");
+	// Every synchronization reported progress, yet the same reads failed again. With
+	// KYTY_DCC_GPU=1 the call analysis of the Wolverine shader functions (ReadShaderWords) reads the
+	// code only through the clean-backing gate, which refuses outside the GPU thread whatever was
+	// synchronized. Drop this dispatch like a graphics stage whose materialization fails (callers
+	// skip a null program), and say which reads never became ready.
+	static std::atomic_uint32_t reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16u) {
+		std::printf("Warning: compute shader 0x%016" PRIx64 " resource readiness did not converge "
+		            "after 64 attempts; its dispatch is dropped (gpu thread %d, read delegate %d, "
+		            "%zu missing range(s)%s)\n",
+		            params.hash, GuestGpu::IsGpuThread() ? 1 : 0,
+		            GpuReadDelegate::Active() ? 1 : 0, read_attempt.count,
+		            read_attempt.overflow ? ", overflow" : "");
+		std::vector<uint32_t> probe;
+		for (size_t index = 0; index < std::min<size_t>(read_attempt.count, 4u); index++) {
+			const auto& range = read_attempt.missing[index];
+			probe.resize((range.size + 3u) / 4u);
+			const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(
+			    range.address, probe.data(), probe.size() * sizeof(uint32_t));
+			const bool backing = LibKernel::Memory::TryReadBacking(
+			    range.address, probe.data(), probe.size() * sizeof(uint32_t));
+			std::printf("  [%zu] address=0x%016" PRIx64 " size=0x%" PRIx64
+			            " clean read %d, backing read %d\n",
+			            index, range.address, range.size, clean ? 1 : 0, backing ? 1 : 0);
+		}
+		std::fflush(stdout);
+	}
+	return {};
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
