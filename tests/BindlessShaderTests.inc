@@ -25,7 +25,18 @@ void TestBindlessStridedRecords() {
   options.input_info.compute = &compute;
   options.user_data = roots;
   options.bindless_images = true;
+  const auto saved_options = GetCodegenOptions();
+  auto codegen = saved_options;
+  codegen.srt_variant_reads = true;
+  // Compute shaders take strided records only with KYTY_BINDLESS_STRIDED_COMPUTE.
+  codegen.bindless_strided_compute = false;
+  SetCodegenOptions(codegen);
+  Check(TranslateProgram(code, options).skip_dispatch,
+        "compute strided record T# was tracked without KYTY_BINDLESS_STRIDED_COMPUTE");
+  codegen.bindless_strided_compute = true;
+  SetCodegenOptions(codegen);
   auto translated = TranslateProgram(code, options);
+  SetCodegenOptions(saved_options);
   Check(!translated.skip_dispatch && translated.program.info.images.size() == 1 &&
             translated.program.info.images[0].bindless,
         "strided record T# was not tracked as bindless");

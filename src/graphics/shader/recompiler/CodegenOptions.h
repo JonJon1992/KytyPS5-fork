@@ -129,6 +129,10 @@ struct CodegenOptions {
 	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
 	// evaluated before the dispatch keep their flat slots.
 	bool srt_variant_reads = false;
+	// KYTY_BINDLESS_STRIDED_COMPUTE=1: compute shaders also take bindless T#s embedded in records
+	// of any stride. Off by default: in Ghost of Yotei the compute shaders it enabled produced
+	// command data the CP read as dispatch sizes (float bit patterns) and the GPU hung.
+	bool bindless_strided_compute = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,

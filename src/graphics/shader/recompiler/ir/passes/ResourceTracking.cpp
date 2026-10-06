@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -1071,8 +1073,11 @@ private:
 					return true;
 				}
 				// Bindless only: other strides (records holding the T#) need no host enumeration.
+				// Compute shaders only with KYTY_BINDLESS_STRIDED_COMPUTE (CodegenOptions.h).
 				current_mask = UINT32_MAX;
 				return m_program.bindless_images &&
+				       (m_program.stage != ShaderType::Compute ||
+				        GetCodegenOptions().bindless_strided_compute) &&
 				       MatchStridedTableOffset(read->Arg(1), current_key, offset, current_stride);
 			};
 			if (current_handle == nullptr ||
