@@ -171,6 +171,9 @@ static bool WriteRangeImageStatsEnabled() {
 	return enabled;
 }
 
+static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
+                                             std::span<const uint32_t> data);
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
@@ -199,9 +202,22 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
 		// The shader indexes storage buffers in dwords; a base that is not dword aligned (RDNA
-		// allows any byte) has no binding here. Bind the null buffer, as for other unsupported
-		// resources: reads return zero, writes are dropped. Ghost of Yotei reached this once its
-		// bindless material shaders stopped being skipped.
+		// allows any byte) has no binding here. A small read-only buffer is copied to an upload
+		// that starts at its exact guest address (adjustment 0); a writable or atomic one has no
+		// copy to write back to.
+		constexpr uint64_t max_aligned_copy = 1u << 20u;
+		if (adjustment % sizeof(uint32_t) != 0 && resource.read && !resource.written &&
+		    !resource.atomic && size <= max_aligned_copy) {
+			std::vector<uint32_t> words(static_cast<size_t>((size + 3u) / 4u), 0u);
+			if (LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), size) ||
+			    (context.SynchronizeGpuBackingForRead(address, size) &&
+			     LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), size))) {
+				return NativeUpload(context, words);
+			}
+		}
+		// Otherwise bind the null buffer, as for other unsupported resources: reads return zero,
+		// writes are dropped. Ghost of Yotei reached this once its bindless material shaders
+		// stopped being skipped.
 		static std::atomic_uint64_t unaligned {0};
 		const auto count = unaligned.fetch_add(1, std::memory_order_relaxed) + 1u;
 		if (count <= 8u || (count & 1023u) == 0u) {
@@ -667,6 +683,16 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+// KYTY_PLACED_IMAGE_VIEWS=0 binds an image whose address is not aligned to its standalone
+// allocation as null again (the behaviour before placed views were accepted).
+static bool PlacedImageViewsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PLACED_IMAGE_VIEWS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static TextureCache::ImageDesc BuildTextureDescription(
     const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
@@ -754,11 +780,17 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
+	// size.align is the alignment of a standalone allocation. An SRD address has 256-byte
+	// granularity, and a small surface may be placed inside a larger allocation at that
+	// granularity (Ghost of Yotei packs a 16x16 down to 2x2 RGBA16F Standard4KB mip chain into
+	// one 4 KB block and binds each level on its own). The detiler computes every tiled offset
+	// from the SRD address, so such a placed view keeps its exact guest range.
+	const bool misaligned = (address & (static_cast<uint64_t>(size.align) - 1u)) != 0;
 	if (size.size == 0 || size.align == 0 ||
-	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+	    (misaligned && ((address & 0xffu) != 0 || !PlacedImageViewsEnabled()))) {
 		// A descriptor with no valid footprint (zero size, or a base address the tile layout
 		// cannot align to): bind a null image like a null descriptor. A storage image's writes
-		// are dropped (Ghost of Yotei binds a 16x16 Standard4KB storage image at 2 KB alignment).
+		// are dropped.
 		static std::atomic_uint32_t reported {0};
 		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
 			std::printf("Warning: %s with invalid footprint bound as null: addr=0x%016" PRIx64
