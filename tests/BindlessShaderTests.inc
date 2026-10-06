@@ -81,6 +81,42 @@ void TestBindlessStridedRecords() {
   Check(skipped.skip_dispatch, "strided record T# without bindless was not skipped");
 }
 
+// A depth-comparison sample is not served by the bindless arrays: with bindless images on, the
+// handle keeps the CPU-enumerated path (or the shader is skipped) instead of becoming a bindless
+// image whose draws ResourceMaterialization would drop ("bindless requires a non-comparison ...").
+void TestBindlessCompareStaysOff() {
+  using namespace ShaderRecompiler;
+  const uint32_t code[] = {
+      EncodeVop1(0x02, 8, 256),    // GPU-selected key: first lane of v0
+      EncodeSop2(0x1e, 9, 8, 133), // image key * 32
+      EncodeSmem0(0x0b, 32, 0), 9u << 25u,
+      EncodeMimg0(0x28, 0x1), EncodeMimg1(8, 8, 1, 1), // image_sample_c, S# from s[4:7]
+      EncodeMubuf0(0x1c, 0), EncodeMubuf1(8, 3, 1),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> roots {};
+  roots[0] = 0x10000; roots[2] = 4096;
+  roots[12] = 0x30000; roots[14] = 64;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute {};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.thread_ids_num = 1;
+  options.input_info.compute = &compute;
+  options.user_data = roots;
+  options.bindless_images = true;
+  const auto saved = GetCodegenOptions();
+  auto codegen = saved;
+  codegen.srt_variant_reads = true;
+  SetCodegenOptions(codegen);
+  const auto translated = TranslateProgram(code, options);
+  SetCodegenOptions(saved);
+  Check(translated.skip_dispatch || translated.program.info.images.empty() ||
+            !translated.program.info.images[0].bindless,
+        "depth-comparison sample became a bindless image");
+}
+
 void TestBindlessShaderContract() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -154,4 +190,5 @@ void TestBindlessShaderContract() {
   Check(SpirvHasDecorationValue(result.spirv, 34u, 1u), "bindless set1 declaration missing");
   CheckSpirvBinaryValidates(result.spirv);
   TestBindlessStridedRecords();
+  TestBindlessCompareStaysOff();
 }

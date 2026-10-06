@@ -1042,7 +1042,39 @@ private:
 		return {};
 	}
 
+	// Whether every use of an image handle is one the bindless arrays serve (the specialization
+	// check in ResourceMaterialization.cpp): a read through a sampler, no depth comparison, 2D,
+	// 2D array, cube or 3D. A handle used otherwise keeps the CPU-enumerated path (or is skipped)
+	// instead of becoming a bindless image whose draws would all be dropped.
+	bool BindlessCompatibleUses(const Inst& handle) const {
+		for (const auto& use: handle.Uses()) {
+			const auto* user = use.user;
+			if (user == nullptr || user->NumArgs() == 0u ||
+			    user->Arg(0).Resolve().TryInstruction() != &handle) {
+				continue;
+			}
+			const auto info = ImageOpcodeInfoOf(user->GetOpcode());
+			if (info.access != ImageAccess::Read || info.resource_class != ImageResourceClass::Sampled ||
+			    !info.needs_sampler) {
+				return false;
+			}
+			const auto index = user->Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[index];
+			using D = Decoder::ImageDimension;
+			if ((memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u ||
+			    (memory.image_dimension != D::Unknown && memory.image_dimension != D::Dim2D &&
+			     memory.image_dimension != D::Dim2DArray && memory.image_dimension != D::Dim3D)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		const bool bindless_images = m_program.bindless_images && BindlessCompatibleUses(handle);
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -1069,13 +1101,13 @@ private:
 			uint32_t current_stride = 32u;
 			const auto matched = [&] {
 				if (MatchTableOffset(read->Arg(1), current_key, offset, 5u,
-				                     m_program.bindless_images ? &current_mask : nullptr)) {
+				                     bindless_images ? &current_mask : nullptr)) {
 					return true;
 				}
 				// Bindless only: other strides (records holding the T#) need no host enumeration.
 				// Compute shaders only with KYTY_BINDLESS_STRIDED_COMPUTE (CodegenOptions.h).
 				current_mask = UINT32_MAX;
-				return m_program.bindless_images &&
+				return bindless_images &&
 				       (m_program.stage != ShaderType::Compute ||
 				        GetCodegenOptions().bindless_strided_compute) &&
 				       MatchStridedTableOffset(read->Arg(1), current_key, offset, current_stride);
@@ -1106,7 +1138,7 @@ private:
                 std::ranges::all_of(read->Uses(), [](const Use& use) {
                     return use.user->GetOpcode() == ValueOpcode::GetImageResource;
                 });
-            if (!plan.exclusive[dword] && !m_program.bindless_images) return false;
+            if (!plan.exclusive[dword] && !bindless_images) return false;
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
 		}
@@ -1118,7 +1150,7 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
-        if (m_program.bindless_images && table_source.dword_count == 4u) {
+        if (bindless_images && table_source.dword_count == 4u) {
             // The record must hold all 8 T# dwords: the host reads key * stride + offset.
             if (record_stride != 32u &&
                 (record_stride < 32u || (record_stride & 3u) != 0u || (table_offset & 3u) != 0u)) {
