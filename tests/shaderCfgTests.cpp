@@ -8918,6 +8918,11 @@ int StructurizeFiles(std::span<char *const> paths) {
     std::memcpy(words.data(), bytes.data(), bytes.size());
     ShaderRecompiler::Decoder::Program decoded;
     ShaderRecompiler::Decoder::DecodeProgram(words, decoded);
+    // KYTY_STRUCTURIZE_FILE_RDNA2=1: the decoded listing next to the binary (<guest.bin>.rdna2),
+    // for dumps taken before the emission that would have written it.
+    if (std::getenv("KYTY_STRUCTURIZE_FILE_RDNA2") != nullptr) {
+      std::ofstream(std::string(path) + ".rdna2") << ShaderRecompiler::Decoder::ProgramToString(decoded);
+    }
     auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
     const auto blocks = graph.blocks.size();
     const bool structured = !graph.irreducible && ShaderRecompiler::CFG::Structurize(graph);
@@ -8933,7 +8938,10 @@ int StructurizeFiles(std::span<char *const> paths) {
       status = 1;
       continue;
     }
+    // Scratch-backed FLAT accesses need a per-thread size; the dispatch's COMPUTE_TMPRING_SIZE
+    // is not in the dump, so any nonzero size stands in for it.
     ShaderComputeInputInfo compute{};
+    compute.scratch_size_dwords = 1024;
     ShaderRecompiler::Frontend::TranslateOptions translate_options{};
     translate_options.stage = ShaderType::Compute;
     translate_options.wave_size = 64u;
@@ -8942,24 +8950,73 @@ int StructurizeFiles(std::span<char *const> paths) {
     std::printf("%s: translated, %zu IR blocks, dispatcher_fallback=%d\n", path,
                 program.blocks.size(), program.dispatcher_fallback ? 1 : 0);
     status |= program.dispatcher_fallback ? 1 : 0;
-    // The whole pipeline to validated SPIR-V, with every resource the shader reads from guest
-    // memory null (the dump has its user data, not the memory behind it).
+    // KYTY_STRUCTURIZE_FILE_SPIRV=1: the recompiler's whole translation (every IR pass up to
+    // resource tracking), then the global address writes left for SPIR-V emission, which it
+    // refuses, and, when every resource materializes from null memory, validated SPIR-V.
     if (std::getenv("KYTY_STRUCTURIZE_FILE_SPIRV") != nullptr) {
-      const auto zero_memory = [](void *, uint64_t, std::span<uint32_t> values) {
-        std::ranges::fill(values, 0u);
-        return true;
-      };
       auto options = MakeCompileOptions(ShaderType::Compute);
-      const auto result = RecompileForTest(words, options, zero_memory, nullptr);
-      std::printf("%s: SPIR-V %zu words, dispatcher_fallback=%d, OpLoopMerge %u, OpSwitch %u\n",
-                  path, result.spirv.size(), result.program.dispatcher_fallback ? 1 : 0,
-                  SpirvInstructionOpcodeCount(result.spirv, 246),
-                  SpirvInstructionOpcodeCount(result.spirv, 251));
-      CheckSpirvBinaryValidates(result.spirv);
-      status |= result.program.dispatcher_fallback ? 1 : 0;
+      options.input_info.compute = &compute;
+      const auto translated = ShaderRecompiler::TranslateProgram(words, options);
+      uint32_t global_writes = 0;
+      for (const auto *block : translated.program.blocks) {
+        for (const auto &inst : *block) {
+          const auto access = ShaderRecompiler::IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+          if (access != ShaderRecompiler::IR::AddressAccess::Write) continue;
+          const auto index = inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+          global_writes += index < translated.program.memory_info.size() &&
+                           translated.program.memory_info[index].kind !=
+                               ShaderRecompiler::IR::ResourceKind::Scratch;
+        }
+      }
+      std::printf("%s: full translation, skip_dispatch=%d, global address writes %u\n", path,
+                  translated.skip_dispatch ? 1 : 0, global_writes);
+      status |= global_writes != 0 ? 1 : 0;
     }
   }
   return status;
+}
+
+// Ghost of Yotei's ray traversal stack (cs 0x4f07b07b3d8c8406): FLAT stores whose high address
+// dword is med3(s_brev_b32 1 = 0x80000000, 0x70000000, x) are LDS or scratch; the global path
+// they also translate to never runs (guest memory ends far below 0x70000000 << 32) and must not
+// reach SPIR-V emission, which refuses writable global addresses. A high dword that can be small
+// keeps its global store.
+void TestFlatStoreAboveAddressSpaceDropsGlobalPath() {
+  const auto global_writes = [](std::span<const uint32_t> shader) {
+    const auto translated =
+        ShaderRecompiler::TranslateProgram(shader, MakeCompileOptions(ShaderType::Compute));
+    uint32_t writes = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (ShaderRecompiler::IR::AddressOpcodeInfoOf(inst.GetOpcode()).access ==
+                ShaderRecompiler::IR::AddressAccess::Write &&
+            translated.program.memory_info[inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index]
+                    .kind == ShaderRecompiler::IR::ResourceKind::Global) {
+          writes++;
+        }
+      }
+    }
+    return writes;
+  };
+  const uint32_t stack[] = {
+      EncodeSop1(0x0b, 53, 129),                                     // s_brev_b32 s53, 1
+      EncodeSMovB32(2, 255), 0x70000000u,                            // s_mov_b32 s2, 0x70000000
+      EncodeVop3Word0(0x159, 12), EncodeVop3Word1(53, 2, 256 + 31), // v_med3_u32 v12, s53, s2, v31
+      EncodeVop1(0x01, 11, 256 + 0),                                 // v_mov_b32 v11, v0
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 5, 11),             // flat_store_dword v[11:12], v5
+      EncodeSopp(0x01),
+  };
+  Check(global_writes(stack) == 0,
+        "FLAT store above the guest address space kept its global path");
+  const uint32_t low[] = {
+      EncodeSMovB32(53, 128),                                        // s_mov_b32 s53, 0
+      EncodeSMovB32(2, 255), 0x00000010u,                            // s_mov_b32 s2, 0x10
+      EncodeVop3Word0(0x159, 12), EncodeVop3Word1(53, 2, 256 + 31), // v_med3_u32 v12, s53, s2, v31
+      EncodeVop1(0x01, 11, 256 + 0),
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 5, 11),
+      EncodeSopp(0x01),
+  };
+  Check(global_writes(low) == 1, "FLAT store that can reach guest memory lost its global path");
 }
 
 void TestNewShaderRecompilerCfgExecSccSharedArm() {
@@ -15192,6 +15249,10 @@ int main(int argc, char **argv) {
     TestCfgLoopSharedContinuation();
     return 0;
   }
+  if (argc == 2 && std::string_view(argv[1]) == "--flat-address-space-only") {
+    TestFlatStoreAboveAddressSpaceDropsGlobalPath();
+    return 0;
+  }
   if (argc >= 3 && std::string_view(argv[1]) == "--structurize-file") {
     return StructurizeFiles(std::span<char *const>(argv + 2, static_cast<size_t>(argc - 2)));
   }
@@ -15368,6 +15429,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestCfgLoopSharedContinuation();
+  TestFlatStoreAboveAddressSpaceDropsGlobalPath();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();

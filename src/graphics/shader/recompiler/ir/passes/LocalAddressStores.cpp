@@ -238,6 +238,43 @@ bool ExcludesLocal(Value predicate, Value high) {
 	       (Other(*b, SharedApertureHigh) == high && Other(*a, PrivateApertureHigh) == high);
 }
 
+void Conjuncts(Value predicate, std::vector<Value>& out, uint32_t depth = 0) {
+	const auto* both = Op(predicate, ValueOpcode::LogicalAnd);
+	if (both == nullptr || depth > 16) {
+		out.push_back(predicate.Resolve());
+		return;
+	}
+	Conjuncts(both->Arg(0), out, depth + 1);
+	Conjuncts(both->Arg(1), out, depth + 1);
+}
+
+// FLAT_APERTURE guards its global access with `high < bound` (the end of the address space the
+// buffer cache maps). A high dword that is never below the bound never takes that path, whether
+// or not the local apertures can be told apart: Ghost of Yotei's ray traversal stack addresses
+// use med3(0x80000000, 0x70000000, x), so they lie in [0x70000000, 0x80000000] and are LDS or
+// scratch, while the hole between the apertures is outside guest memory.
+struct AddressSpaceGuard {
+	Value              guard;
+	uint32_t           bound = 0;
+	std::vector<Value> conjuncts; // of the whole predicate, the guard included
+};
+
+std::optional<AddressSpaceGuard> FindAddressSpaceGuard(Value predicate, Value high) {
+	AddressSpaceGuard found;
+	Conjuncts(predicate, found.conjuncts);
+	high = high.Resolve();
+	for (const auto conjunct: found.conjuncts) {
+		const auto* guard = Op(conjunct, ValueOpcode::ULessThan32);
+		if (guard == nullptr || !(guard->Arg(0).Resolve() == high)) continue;
+		const auto bound = guard->Arg(1).Resolve();
+		if (!bound.IsImmediate() || bound.GetType() != Type::U32) continue;
+		found.guard = conjunct;
+		found.bound = bound.U32();
+		return found;
+	}
+	return std::nullopt;
+}
+
 // The phis of every DFS backedge destination: cutting each CFG cycle there. Do not rely on
 // block storage order to identify loop-carried values: it need not be topological.
 std::unordered_set<const Inst*> LoopPhis(const Program& program) {
@@ -310,6 +347,20 @@ uint32_t SimplifyLocalAddressStores(Program& program) {
 			}
 			const auto* mask = Op(predicate, ValueOpcode::LogicalAnd);
 			if (!mask) continue;
+			if (const auto guard = FindAddressSpaceGuard(predicate, inst.Arg(2))) {
+				if (!loop_phis) loop_phis = LoopPhis(program);
+				// The predicate is unsatisfiable if its other conjuncts leave no high dword below
+				// the bound, so they may be assumed while bounding it.
+				Evaluator evaluator {*loop_phis, program.wave_size == 32};
+				for (const auto conjunct: guard->conjuncts) {
+					if (!(conjunct == guard->guard)) evaluator.Assume(conjunct);
+				}
+				if (std::ranges::all_of(evaluator.Get(inst.Arg(2)),
+				                        [&](Interval r) { return r.lo >= guard->bound; })) {
+					discard();
+					continue;
+				}
+			}
 			for (size_t side = 0; side < 2; ++side) {
 				if (!ExcludesLocal(mask->Arg(side), inst.Arg(2))) continue;
 				if (!loop_phis) loop_phis = LoopPhis(program);
