@@ -1669,6 +1669,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdEndRendering(VkCommandBuffer cb) {
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query,
                                              VkQueryControlFlags flags) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1679,6 +1680,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool poo
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1693,6 +1695,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQue
                                                        VkBuffer buffer, VkDeviceSize offset,
                                                        VkDeviceSize stride,
                                                        VkQueryResultFlags flags) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
