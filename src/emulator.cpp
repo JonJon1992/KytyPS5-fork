@@ -190,6 +190,9 @@ void Run(const RunOptions& options) {
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
+	// The renderer keys its caches by this file when the game has no param.json (Init creates
+	// the pipeline cache before /app0 is mounted).
+	Loader::SystemContentSetExecutablePath(options.app0_dir / options.elf.filename());
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 

@@ -95,6 +95,7 @@ struct SystemContent {
 	std::filesystem::path playgo_path;
 	PlayGo                playgo;
 	std::filesystem::path icon_path;
+	std::filesystem::path executable_path;
 };
 
 Psf::~Psf() {
@@ -610,6 +611,26 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 	if (sc->playgo.IsValid()) {
 		sc->playgo.DbgPrint();
 	}
+}
+
+void SystemContentSetExecutablePath(const std::filesystem::path& host_path) {
+	Common::Singleton<SystemContent>::Instance()->executable_path = host_path;
+}
+
+bool SystemContentGetExecutablePath(std::filesystem::path* host_path) {
+	if (host_path == nullptr) {
+		return false;
+	}
+
+	const auto* sc = Common::Singleton<SystemContent>::Instance();
+
+	if (sc->executable_path.empty()) {
+		return false;
+	}
+
+	*host_path = sc->executable_path;
+
+	return true;
 }
 
 bool SystemContentParamSfoGetInt(const char* name, int32_t* value) {

@@ -4,7 +4,6 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
-#include "kernel/fileSystem.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
@@ -128,15 +127,22 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 }
 
 // A game without sce_sys/param.json (TITLE_ID and CONTENT_ID unknown) still gets both caches,
-// keyed by the content of its executable: "NOID-<XXH3-64 of /app0/eboot.bin>". Ghost of Yotei's
+// keyed by the content of its executable: "NOID-<XXH3-64 of the eboot.bin>". Ghost of Yotei's
 // extracted folder had no param file, so every boot translated every shader and compiled every
 // pipeline again. Only the caches use this key; the sandbox and save directories keep theirs.
 // Program records are matched on their full guest code, so the key only selects the file.
+// The executable is read through its host path: the pipeline cache is created before /app0 is
+// mounted.
 std::string ExecutableCacheId() {
 	static const std::string id = []() -> std::string {
-		const auto path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/eboot.bin");
-		std::FILE* file = path.empty() ? nullptr : std::fopen(path.string().c_str(), "rb");
+		std::filesystem::path path;
+		std::FILE*            file = Loader::SystemContentGetExecutablePath(&path)
+		                                 ? std::fopen(Common::PathToString(path).c_str(), "rb")
+		                                 : nullptr;
 		if (file == nullptr) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Pipeline caches: off (no TITLE_ID or CONTENT_ID, executable {} unreadable)\n",
+			    path.empty() ? std::string("unknown") : Common::PathToString(path)));
 			return {};
 		}
 		XXH3_state_t* state = XXH3_createState();
