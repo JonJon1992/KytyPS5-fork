@@ -200,6 +200,16 @@ bool IsCapture(VkCommandBuffer cb) noexcept {
 	return cb == g_capture_cb.load(std::memory_order_relaxed);
 }
 
+// The recording thread's composition of the guest command buffer (TakeComposition). Begin, every
+// hooked command and the timing ring's EndCommand run on the thread that owns the buffer.
+thread_local GpuCommandComposition t_composition;
+
+void NoteComposition(VkCommandBuffer cb) noexcept {
+	if (IsGuest(cb)) {
+		t_composition.Add(t_site != nullptr ? t_site->name : "(no site)");
+	}
+}
+
 void CountBarrier(uint64_t transitions) noexcept {
 	g_counters.barriers.fetch_add(1, std::memory_order_relaxed);
 	if (transitions != 0) {
@@ -1192,6 +1202,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBindPipeline(VkCommandBuffer cb, VkPipelineBin
 VKAPI_ATTR void VKAPI_CALL HookCmdDraw(VkCommandBuffer cb, uint32_t vertex_count,
                                        uint32_t instance_count, uint32_t first_vertex,
                                        uint32_t first_instance) {
+	NoteComposition(cb);
 	g_real.vkCmdDraw(cb, vertex_count, instance_count, first_vertex, first_instance);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::Draw, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1204,6 +1215,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDraw(VkCommandBuffer cb, uint32_t vertex_count
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexed(VkCommandBuffer cb, uint32_t index_count,
                                               uint32_t instance_count, uint32_t first_index,
                                               int32_t vertex_offset, uint32_t first_instance) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexed(cb, index_count, instance_count, first_index, vertex_offset,
 	                        first_instance);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1217,6 +1229,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexed(VkCommandBuffer cb, uint32_t index
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                VkDeviceSize offset, uint32_t draw_count,
                                                uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndirect(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndirect, KYTY_GPU_OP_CALLER,
@@ -1227,6 +1240,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buff
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                       VkDeviceSize offset, uint32_t draw_count,
                                                       uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexedIndirect(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndexedIndirect, KYTY_GPU_OP_CALLER,
@@ -1238,6 +1252,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer
                                                     VkDeviceSize offset, VkBuffer count_buffer,
                                                     VkDeviceSize count_offset,
                                                     uint32_t max_draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndirectCount(cb, buffer, offset, count_buffer, count_offset, max_draw_count,
 	                              stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1252,6 +1267,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
                                                            VkDeviceSize count_offset,
                                                            uint32_t     max_draw_count,
                                                            uint32_t     stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexedIndirectCount(cb, buffer, offset, count_buffer, count_offset,
 	                                     max_draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1262,6 +1278,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                                    uint32_t z) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksEXT(cb, x, y, z);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMesh, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1275,6 +1292,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t 
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, VkBuffer buffer,
                                                            VkDeviceSize offset,
                                                            uint32_t draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksIndirectEXT(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMeshIndirect, KYTY_GPU_OP_CALLER,
@@ -1285,6 +1303,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, V
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
     VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkBuffer count_buffer,
     VkDeviceSize count_offset, uint32_t max_draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksIndirectCountEXT(cb, buffer, offset, count_buffer, count_offset,
 	                                          max_draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1295,6 +1314,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                            uint32_t z) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1310,6 +1330,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint3
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                    VkDeviceSize offset) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1321,6 +1342,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer 
 
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
                                              uint32_t count, const VkBufferCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1343,6 +1365,7 @@ uint64_t Texels(const VkExtent3D& extent, uint32_t layers) {
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1360,6 +1383,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkI
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
                                                     VkImageLayout layout, uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1378,6 +1402,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
                                                     VkImageLayout layout, VkBuffer dst,
                                                     uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1395,6 +1420,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
 VKAPI_ATTR void VKAPI_CALL HookCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageBlit* regions, VkFilter filter) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1418,6 +1444,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdResolveImage(VkCommandBuffer cb, VkImage src,
                                                VkImageLayout src_layout, VkImage dst,
                                                VkImageLayout dst_layout, uint32_t count,
                                                const VkImageResolve* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1436,6 +1463,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
                                                   VkImageLayout layout,
                                                   const VkClearColorValue* color, uint32_t count,
                                                   const VkImageSubresourceRange* ranges) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1449,6 +1477,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
 VKAPI_ATTR void VKAPI_CALL HookCmdClearDepthStencilImage(
     VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value,
     uint32_t count, const VkImageSubresourceRange* ranges) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1462,6 +1491,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearDepthStencilImage(
 VKAPI_ATTR void VKAPI_CALL HookCmdClearAttachments(VkCommandBuffer cb, uint32_t attachment_count,
                                                    const VkClearAttachment* attachments,
                                                    uint32_t rect_count, const VkClearRect* rects) {
+	NoteComposition(cb);
 	g_real.vkCmdClearAttachments(cb, attachment_count, attachments, rect_count, rects);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::ClearAttachments, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1479,6 +1509,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearAttachments(VkCommandBuffer cb, uint32_t 
 VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                              VkDeviceSize offset, VkDeviceSize size,
                                              uint32_t data) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1494,6 +1525,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer
 VKAPI_ATTR void VKAPI_CALL HookCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                                VkDeviceSize offset, VkDeviceSize size,
                                                const void* data) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1511,6 +1543,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
     VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier* memory,
     uint32_t buffer_count, const VkBufferMemoryBarrier* buffers, uint32_t image_count,
     const VkImageMemoryBarrier* images) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1538,6 +1571,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
                                                    const VkDependencyInfo* dependency) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1574,6 +1608,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::None, true);
 	}
@@ -1977,6 +2012,12 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	std::fflush(stdout);
 }
 
+GpuCommandComposition TakeComposition() noexcept {
+	const auto composition = t_composition;
+	t_composition          = {};
+	return composition;
+}
+
 void OnBeginCommand(GraphicContext& graphics, vk::CommandBuffer buffer, uint64_t current_tick,
                     uint64_t known_gpu_tick) {
 	if (!Detail::g_active) {
@@ -1985,6 +2026,7 @@ void OnBeginCommand(GraphicContext& graphics, vk::CommandBuffer buffer, uint64_t
 	const auto cb = static_cast<VkCommandBuffer>(buffer);
 	g_guest_cb.store(cb, std::memory_order_relaxed);
 	g_counters.command_buffers.fetch_add(1, std::memory_order_relaxed);
+	t_composition = {};
 	if (!CaptureEnabled()) {
 		return;
 	}
