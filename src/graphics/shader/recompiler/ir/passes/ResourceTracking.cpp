@@ -427,7 +427,8 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset || a.bindless != b.bindless ||
+				    a.table_offset != b.table_offset || a.record_stride != b.record_stride ||
+				    a.bindless != b.bindless ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -640,6 +641,52 @@ private:
 				return false;
 			}
 			// These additions are shader U32 arithmetic, before the scalar memory offset.
+			offset += immediate;
+		}
+	}
+
+	// A bindless table offset `key * stride + immediate` (IMul32 by an immediate, or a shift):
+	// the T# sits at a fixed place in each fixed-size record. The bindless path translates the
+	// keys on the GPU, so the stride matters only to the host reading the records.
+	bool MatchStridedTableOffset(Value value, Value& key, uint32_t& offset,
+	                             uint32_t& stride) const {
+		offset = 0;
+		for (;;) {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst == nullptr || inst->NumArgs() != 2u) {
+				return false;
+			}
+			uint32_t immediate = 0;
+			if (inst->GetOpcode() == ValueOpcode::IMul32) {
+				if (ImmediateU32(inst->Arg(1), immediate)) {
+					key = inst->Arg(0).Resolve();
+				} else if (ImmediateU32(inst->Arg(0), immediate)) {
+					key = inst->Arg(1).Resolve();
+				} else {
+					return false;
+				}
+				stride = immediate;
+				return stride != 0u && key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), immediate) && immediate < 32u) {
+				key    = inst->Arg(0).Resolve();
+				stride = 1u << immediate;
+				return key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
+				return false;
+			}
+			if (ImmediateU32(inst->Arg(0), immediate)) {
+				value = inst->Arg(1);
+			} else if (ImmediateU32(inst->Arg(1), immediate)) {
+				value = inst->Arg(0);
+			} else {
+				return false;
+			}
+			if (offset > UINT32_MAX - immediate) {
+				return false;
+			}
 			offset += immediate;
 		}
 	}
@@ -1001,6 +1048,7 @@ private:
 		Value key;
 		uint32_t table_offset = 0;
 		uint32_t key_mask = UINT32_MAX;
+		uint32_t record_stride = 32u;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
@@ -1016,6 +1064,17 @@ private:
 			Value current_key;
 			uint32_t current_mask = UINT32_MAX;
 			uint32_t offset = 0;
+			uint32_t current_stride = 32u;
+			const auto matched = [&] {
+				if (MatchTableOffset(read->Arg(1), current_key, offset, 5u,
+				                     m_program.bindless_images ? &current_mask : nullptr)) {
+					return true;
+				}
+				// Bindless only: other strides (records holding the T#) need no host enumeration.
+				current_mask = UINT32_MAX;
+				return m_program.bindless_images &&
+				       MatchStridedTableOffset(read->Arg(1), current_key, offset, current_stride);
+			};
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1023,8 +1082,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, 5u, m_program.bindless_images ? &current_mask : nullptr) ||
-			    memory->offset > UINT32_MAX - offset) {
+			    !matched() || memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
 			offset += memory->offset;
@@ -1032,7 +1090,9 @@ private:
 				key = current_key;
 				key_mask = current_mask;
 				table_offset = offset;
+				record_stride = current_stride;
 			} else if (!EquivalentValue(m_program, key, current_key) || current_mask != key_mask ||
+			           current_stride != record_stride ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1054,7 +1114,15 @@ private:
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
         if (m_program.bindless_images && table_source.dword_count == 4u) {
+            // The record must hold all 8 T# dwords: the host reads key * stride + offset.
+            if (record_stride != 32u &&
+                (record_stride < 32u || (record_stride & 3u) != 0u || (table_offset & 3u) != 0u)) {
+                return false;
+            }
             indirect.bindless = true;
+            indirect.record_stride = record_stride;
+        } else if (record_stride != 32u) {
+            return false;
         } else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&

@@ -34,6 +34,7 @@ struct BindlessHeapUse {
 	uint32_t table_offset = 0;
 	uint32_t image = 0;
 	uint32_t mapping_offset = 0;
+	uint32_t record_stride = 32; // bytes between the T#s of consecutive keys
 	bool operator==(const BindlessHeapUse&) const = default;
 };
 

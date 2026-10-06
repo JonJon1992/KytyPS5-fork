@@ -1459,16 +1459,30 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     }
     for (const auto& use: snapshot.bindless_heaps) {
         prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
-        if (!GuestRange {use.base, use.size}.Valid() || use.table_offset >= use.size) continue;
-        const auto count64 = (use.size - use.table_offset) / 32u;
+        const uint64_t stride = use.record_stride;
+        if (!GuestRange {use.base, use.size}.Valid() || stride < 32u ||
+            uint64_t {use.table_offset} + 32u > use.size) continue;
+        // Every key whose 8-dword T# lies inside the table.
+        const auto count64 = (use.size - use.table_offset - 32u) / stride + 1u;
         if (count64 == 0 || count64 >= BindlessTable::TranslationEntries) continue;
         // ponytail: reread and resolve the bounded heap on every consumer; precise content
         // revisions can avoid this O(heap size) work without weakening first-use residency.
         std::vector<std::array<uint32_t, 8>> records(static_cast<size_t>(count64));
-        if (!read(use.base + use.table_offset, records.data(), count64 * 32u)) continue;
+        if (stride == 32u) {
+            if (!read(use.base + use.table_offset, records.data(), count64 * 32u)) continue;
+        } else {
+            // Records holding the T# (Ghost of Yotei: 440-byte materials): read the span once
+            // and keep each key's 8 dwords.
+            const auto span = (count64 - 1u) * stride + 32u;
+            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            if (!read(use.base + use.table_offset, words.data(), span)) continue;
+            for (uint64_t key = 0; key < count64; ++key) {
+                std::memcpy(records[key].data(), words.data() + key * stride / 4u, 32u);
+            }
+        }
         const auto& resource = runtime.program->info.images.at(use.image);
         const auto array = BindlessBindingFor(resource);
-        auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, array,
+        auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, use.record_stride, array,
                                             static_cast<uint32_t>(count64), resource);
         if (heap == nullptr) continue;
         prepared.bindless_patches.back() = {use.mapping_offset, heap->region,

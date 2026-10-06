@@ -747,6 +747,7 @@ public:
 				w.U32(image.selector_stride);
 				w.U32(image.selector_offset);
 				w.U32(image.table_offset);
+				w.U32(image.record_stride);
 				w.Bool(image.bindless);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}
@@ -972,6 +973,7 @@ public:
 				image.selector_stride = r.U32();
 				image.selector_offset = r.U32();
 				image.table_offset    = r.U32();
+				image.record_stride   = r.U32();
 				image.bindless = r.Bool();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}

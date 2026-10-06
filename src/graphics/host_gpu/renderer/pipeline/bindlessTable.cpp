@@ -419,7 +419,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 }
 
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
-    uint64_t base, uint32_t table_offset, uint32_t binding, uint32_t entries,
+    uint64_t base, uint32_t table_offset, uint32_t record_stride, uint32_t binding, uint32_t entries,
     const ShaderRecompiler::IR::ImageResource& resource) {
 	if (entries == 0) {
 		return nullptr;
@@ -427,7 +427,8 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	for (auto& heap: m_heaps) {
 		// Interpretations sharing a typed array still need independent translations (for
 		// example, local cube-coordinate lowering and ordinary 2D-array sampling).
-		if (heap.base == base && heap.table_offset == table_offset && heap.binding == binding &&
+		if (heap.base == base && heap.table_offset == table_offset &&
+		    heap.record_stride == record_stride && heap.binding == binding &&
 		    heap.resource == resource) {
 			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
 				return nullptr;
@@ -438,6 +439,7 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	auto& heap        = m_heaps.emplace_back();
 	heap.base         = base;
 	heap.table_offset = table_offset;
+	heap.record_stride = record_stride;
 	heap.binding      = binding;
 	heap.resource     = resource;
 	if (!AllocateRegion(heap, entries)) {

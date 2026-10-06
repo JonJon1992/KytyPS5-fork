@@ -523,6 +523,9 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		// Bytes between the T#s of consecutive keys. Bindless tables may embed the T# in larger
+		// records (Ghost of Yotei: 440-byte material records); the other kinds are 32-byte T# arrays.
+		uint32_t record_stride   = 32;
 		Value    key_count;
 		Value    selector_mask;
 		bool     bindless = false;

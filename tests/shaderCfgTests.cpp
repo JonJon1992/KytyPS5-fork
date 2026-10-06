@@ -8954,9 +8954,22 @@ int StructurizeFiles(std::span<char *const> paths) {
     // resource tracking), then the global address writes left for SPIR-V emission, which it
     // refuses, and, when every resource materializes from null memory, validated SPIR-V.
     if (std::getenv("KYTY_STRUCTURIZE_FILE_SPIRV") != nullptr) {
-      auto options = MakeCompileOptions(ShaderType::Compute);
-      options.input_info.compute = &compute;
+      // The stage comes from a "stage<N>_" file name prefix (cachecode dumps: 1 VS, 2 PS, 4 CS);
+      // KYTY_STRUCTURIZE_FILE_BINDLESS=1 tracks with bindless images and samplers.
+      const std::string name = std::filesystem::path(path).filename().string();
+      const auto stage = name.starts_with("stage1_")   ? ShaderType::Vertex
+                         : name.starts_with("stage2_") ? ShaderType::Pixel
+                                                       : ShaderType::Compute;
+      auto options = MakeCompileOptions(stage);
+      if (stage == ShaderType::Compute) options.input_info.compute = &compute;
+      options.bindless_images = options.bindless_samplers =
+          std::getenv("KYTY_STRUCTURIZE_FILE_BINDLESS") != nullptr;
       const auto translated = ShaderRecompiler::TranslateProgram(words, options);
+      uint32_t bindless = 0;
+      for (const auto &image : translated.program.info.images) bindless += image.bindless ? 1u : 0u;
+      std::printf("%s: %s, %zu images (%u bindless), skip_dispatch=%d\n", path,
+                  stage == ShaderType::Vertex ? "VS" : stage == ShaderType::Pixel ? "PS" : "CS",
+                  translated.program.info.images.size(), bindless, translated.skip_dispatch ? 1 : 0);
       uint32_t global_writes = 0;
       for (const auto *block : translated.program.blocks) {
         for (const auto &inst : *block) {
@@ -8999,6 +9012,34 @@ int StructurizeFiles(std::span<char *const> paths) {
 // they also translate to never runs (guest memory ends far below 0x70000000 << 32) and must not
 // reach SPIR-V emission, which refuses writable global addresses. A high dword that can be small
 // keeps its global store.
+void TestGlobalWideLoadsPreserveWidth() {
+  using namespace ShaderRecompiler;
+  for (uint32_t count : {2u, 3u, 4u}) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 2, 256 + 0),
+        EncodeVop1(0x01, 3, 128),
+        EncodeFlat0(count == 2 ? 0x0d : count == 3 ? 0x0f : 0x0e, 2),
+        EncodeFlat1(8, 0x7d, 0, 2),
+        EncodeExp0(0x00, (1u << count) - 1u), EncodeExp1(8, 9, 10, 11),
+        EncodeSopp(0x01),
+    };
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    uint32_t reads = 0;
+    for (const auto* block : result.program.blocks) {
+      for (const auto& inst : *block) {
+        if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::Read) continue;
+        const auto& mem = result.program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+        if (mem.kind != IR::ResourceKind::Global) continue;
+        ++reads;
+        Check(mem.data_dwords == count,
+              "GLOBAL wide load lost its operation width before SPIR-V emission");
+      }
+    }
+    Check(reads == 1, "GLOBAL wide load emitted separate address reads per component");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestFlatStoreAboveAddressSpaceDropsGlobalPath() {
   const auto global_writes = [](std::span<const uint32_t> shader) {
     const auto translated =
@@ -15281,6 +15322,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::string_view(argv[1]) == "--flat-address-space-only") {
+    TestGlobalWideLoadsPreserveWidth();
     TestFlatStoreAboveAddressSpaceDropsGlobalPath();
     return 0;
   }

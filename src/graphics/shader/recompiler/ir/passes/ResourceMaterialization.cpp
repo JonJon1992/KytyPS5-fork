@@ -1320,7 +1320,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                         if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
                             !DecodeBufferDescriptor(table, heap)) return false;
                         snapshot.bindless_heaps.push_back({heap.Base48(), heap.GetSize(),
-                                                          indirect.table_offset, i, offset});
+                                                          indirect.table_offset, i, offset,
+                                                          indirect.record_stride});
                     }
                     continue;
                 }
