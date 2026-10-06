@@ -1119,6 +1119,13 @@ void AppendUserShaderData(const ShaderRecompiler::IR::CompiledShaderInfo& progra
 	}
 }
 
+void WriteBufferStrides(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                        const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                        std::vector<uint32_t>&                          shader_data) {
+	ShaderRecompiler::IR::WriteBufferStrides(program.bindings, program.info.buffers, snapshot.buffers,
+	                                         shader_data);
+}
+
 bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                          std::vector<uint32_t>&                          shader_data) {
@@ -1785,6 +1792,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			static thread_local std::vector<uint32_t> serial;
 			serial.assign(prepared.shader_data.begin(), prepared.shader_data.end());
 			std::fill(serial.begin() + program.bindings.memory_offset_dword, serial.end(), 0);
+			WriteBufferStrides(program, snapshot, serial);
 			const bool active = WriteMipStatsFields(program, snapshot, serial);
 			DrawPrep::CountBindingVerifyCheck();
 			if (serial != plan->shader_data || active != plan->mip_stats_active) {
@@ -1919,17 +1927,10 @@ WriteRangeScratch& ThreadWriteRangeScratch() {
 }
 
 // The descriptor's stride/swizzle/ADD_TID bits normalized exactly as the resource
-// specialization that selected the compiled program (BuildResourceSpecialization).
-uint32_t SpecializedPackedStride(const ShaderBufferResource& descriptor) {
-	auto       packed  = descriptor.PackedStride();
-	const auto stride  = packed & 0x3fffu;
-	const bool swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
-	if (stride == 0u) {
-		packed &= ~((1u << 14u) | (3u << 16u));
-	} else if (!swizzle) {
-		packed &= ~(3u << 16u);
-	}
-	return packed;
+// specialization that selected the compiled program (BuildResourceSpecialization), with the
+// stride itself left out when the program reads it at runtime.
+uint32_t SpecializedPackedStride(const ShaderBufferResource& descriptor, bool runtime_stride) {
+	return ShaderRecompiler::IR::SpecializedPackedStride(descriptor.PackedStride(), runtime_stride);
 }
 
 } // namespace
@@ -1951,13 +1952,17 @@ static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&       
 	const auto* entry  = program.write_ranges.Find(index);
 	bool        proven = false;
 	const char* result = "unprovable";
+	const bool  runtime_stride =
+	    entry != nullptr && (entry->packed_stride & ShaderRecompiler::IR::PackedStrideRuntime) != 0u;
+	const auto descriptor = index < snapshot.buffers.size()
+	                            ? DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[index])
+	                            : ShaderBufferResource {};
 	if (!PreciseWriteRangesEnabled()) {
 		result = "disabled";
 	} else if (entry == nullptr || !entry->bounded) {
 		result = "unprovable";
 	} else if (index >= snapshot.buffers.size() ||
-	           SpecializedPackedStride(DecodeNativeDescriptor<ShaderBufferResource>(
-	               snapshot.buffers[index])) != entry->packed_stride) {
+	           SpecializedPackedStride(descriptor, runtime_stride) != entry->packed_stride) {
 		result = "stride-mismatch";
 	} else {
 		if (!evaluated) {
@@ -1970,7 +1975,8 @@ static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&       
 			scratch.evaluator.Evaluate(program.write_ranges, inputs);
 			evaluated = true;
 		}
-		proven = scratch.evaluator.Spans(program.write_ranges, index, source.size, scratch.spans);
+		proven = scratch.evaluator.Spans(program.write_ranges, index, source.size, scratch.spans,
+		                                 SpecializedPackedStride(descriptor, false));
 		result = proven ? "narrowed" : "unbounded";
 	}
 	uint64_t written_bytes = source.size;
@@ -2065,6 +2071,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		pack_memory_offset(i, buffer_offset);
 	}
 	prepared.mip_stats_canary = false;
+	if (!plan_shader_data) {
+		WriteBufferStrides(program, snapshot, prepared.shader_data);
+	}
 	prepared.mip_stats_active = plan_shader_data
 	                                ? prepared.plan->mip_stats_active
 	                                : WriteMipStatsFields(program, snapshot, prepared.shader_data);

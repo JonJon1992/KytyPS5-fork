@@ -106,6 +106,7 @@ bool PlanShaderData(const CompiledShaderInfo& program, const ResourceSnapshot& r
 	AppendUserShaderData(program, resources, shader_data);
 	shader_data.resize(dwords);
 	std::fill(shader_data.begin() + layout.memory_offset_dword, shader_data.end(), 0);
+	WriteBufferStrides(program, resources, shader_data);
 	mip_stats_active = WriteMipStatsFields(program, resources, shader_data);
 	return true;
 }

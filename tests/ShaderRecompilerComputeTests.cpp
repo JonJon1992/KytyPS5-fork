@@ -2369,6 +2369,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
   }
+  ShaderRecompiler::IR::WriteBufferStrides(result.program.bindings,
+                                           result.program.info.buffers,
+                                           resources.buffers, packed_user_data);
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
 }
@@ -2834,6 +2837,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::WriteBufferStrides(result.program.bindings,
+                                           result.program.info.buffers,
+                                           resources.buffers, packed_user_data);
   if (!result.spirv_plain.empty()) {
     ValidateSpirv(test.name, result.spirv_plain);
   }
@@ -38752,6 +38758,34 @@ TestCase BufferLoadDwordIdxenUsesDescriptorStride() {
   return test;
 }
 
+// A 48-byte stride (not a power of two, like Ghost of Yotei's records) read at runtime from the
+// shader data (KYTY_RUNTIME_BUFFER_STRIDE): index 1 loads dword 12.
+TestCase BufferLoadDwordIdxenUsesRuntimeStride48() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 1);
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordIdxenUsesRuntimeStride48";
+  test.code = code;
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u, 0x55555555u,
+                  0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u, 0xaaaaaaaau,
+                  0xbbbbbbbbu, 0xccccccccu, 0x5a5a5a5au};
+  test.expected = {0x5a5a5a5au, 0x22222222u, 0x33333333u, 0x44444444u, 0x55555555u,
+                   0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u, 0xaaaaaaaau,
+                   0xbbbbbbbbu, 0xccccccccu, 0x5a5a5a5au};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(48, 2);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferStoreDwordIdxenUsesDescriptorStride() {
   using O = ShaderOpcode;
 
@@ -52012,6 +52046,22 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-stride-only") == 0) {
+    // With KYTY_RUNTIME_BUFFER_STRIDE (default) the stride is not specialized: every stride
+    // keys the same program, and the shader reads the V#'s stride from its shader data.
+    using ShaderRecompiler::IR::SpecializedPackedStride;
+    Require("BufferStride", "specialization",
+            SpecializedPackedStride(16u, true) == SpecializedPackedStride(48u, true) &&
+                SpecializedPackedStride(16u, false) != SpecializedPackedStride(48u, false) &&
+                SpecializedPackedStride(0u, true) == 0u,
+            "runtime strides must share one specialization");
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadDwordIdxenUsesRuntimeStride48());
+    RunCase(&vulkan, BufferStoreDwordIdxenUsesDescriptorStride());
+    RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
+    std::printf("ShaderRecompilerComputeTests: buffer stride cases passed\n");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());

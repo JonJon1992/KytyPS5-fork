@@ -47,8 +47,11 @@ public:
 	// Written spans of `buffer` clipped to [0, size), sorted and merged (at most MaxSpans). Returns
 	// false when some store of the buffer is unbounded: the caller must treat [0, size) as written.
 	// An empty span list with true means no store can reach the binding.
+	// `runtime_packed_stride` is the bound descriptor's specialized PackedStride, used when the
+	// program reads the stride at runtime (IR::PackedStrideRuntime).
 	[[nodiscard]] bool Spans(const WriteRangeProgram& program, uint32_t buffer, uint64_t size,
-	                         std::vector<WriteRangeSpan>& spans) const;
+	                         std::vector<WriteRangeSpan>& spans,
+	                         uint32_t runtime_packed_stride = 0) const;
 
 	// Diagnostic description of a buffer's accesses with their evaluated address intervals.
 	[[nodiscard]] std::string Describe(const WriteRangeProgram& program, uint32_t buffer) const;
@@ -58,7 +61,7 @@ private:
 		uint64_t lo = 0;
 		uint64_t hi = UINT32_MAX;
 	};
-	[[nodiscard]] bool AccessSpan(const BufferWriteRange& buffer, const WriteRangeAccess& access,
+	[[nodiscard]] bool AccessSpan(uint32_t packed, const WriteRangeAccess& access,
 	                              WriteRangeSpan& span) const;
 
 	std::vector<Interval> m_values;

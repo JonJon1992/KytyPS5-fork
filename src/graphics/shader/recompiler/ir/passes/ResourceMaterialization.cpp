@@ -7,6 +7,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -583,14 +584,8 @@ static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& desc
 		descriptor_value.dwords.fill(0);
 		descriptor = {};
 	}
-	auto       packed_stride = descriptor.PackedStride();
-	const auto stride        = packed_stride & 0x3fffu;
-	const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-	if (stride == 0u) {
-		packed_stride &= ~((1u << 14u) | (3u << 16u));
-	} else if (!swizzle) {
-		packed_stride &= ~(3u << 16u);
-	}
+	const auto packed_stride = SpecializedPackedStride(descriptor.PackedStride(),
+	                                                   GetCodegenOptions().runtime_buffer_stride);
 	specialization.buffers.push_back({
 	    .packed_stride     = packed_stride,
 	    .descriptor_format = buffer.formatted
@@ -598,7 +593,8 @@ static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& desc
 	                             : Prospero::BufferFormat::kInvalid,
 	    .descriptor_swizzle =
 	        buffer.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
-	    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
+	    .zero_stride_oob = descriptor.OutOfBounds() == 0u && (packed_stride & 0x3fffu) == 0u &&
+	                       (packed_stride & PackedStrideRuntime) == 0u,
 	});
 	return true;
 }
@@ -1425,6 +1421,22 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	return MaterializeResources(program, runtime, ThreadEvaluationScratch(), snapshot,
 	                            specialization);
+}
+
+void WriteBufferStrides(const BindingLayout& layout, std::span<const BufferResource> buffers,
+                        std::span<const DescriptorValue> descriptors,
+                        std::span<uint32_t>              shader_data) {
+	const auto first = layout.MemoryStrideDword();
+	EXIT_IF(layout.memory_stride_count > buffers.size() ||
+	        first + (layout.memory_stride_count + 1u) / 2u > shader_data.size());
+	for (uint32_t index = 0; index < layout.memory_stride_count; index++) {
+		ShaderBufferResource descriptor;
+		if ((buffers[index].packed_stride & PackedStrideRuntime) == 0u ||
+		    index >= descriptors.size() || !DecodeBufferDescriptor(descriptors[index], descriptor)) {
+			continue;
+		}
+		shader_data[first + index / 2u] |= (descriptor.PackedStride() & 0x3fffu) << ((index % 2u) * 16u);
+	}
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

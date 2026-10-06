@@ -58,6 +58,17 @@ void EmitMemoryOffsets(EmitterState& state) {
 		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
 	}
+	const auto& layout = state.program.bindings;
+	for (uint32_t i = 0; i < layout.memory_stride_count; i++) {
+		if ((state.program.info.buffers[i].packed_stride & IR::PackedStrideRuntime) == 0u) {
+			continue;
+		}
+		const auto word = EmitShaderDataDwordLoad(state, layout.MemoryStrideDword() + i / 2u);
+		state.memory_strides[i] = EmitBinaryU32(
+		    state, spv::OpBitwiseAnd,
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, word, ConstantU32(state, (i % 2u) * 16u)),
+		    ConstantU32(state, 0x3fffu));
+	}
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {

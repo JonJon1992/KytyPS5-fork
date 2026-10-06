@@ -84,6 +84,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
 	b.U8(options.bindless_strided_compute ? 1u : 0u);
+	b.U8(options.runtime_buffer_stride ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
 	b.U8(options.movrel_switch ? 1u : 0u);

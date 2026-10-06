@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -13205,6 +13206,59 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+// Unswizzled structured buffers read their stride at runtime (KYTY_RUNTIME_BUFFER_STRIDE): V#s
+// with different strides compile to one SPIR-V module, so one pipeline (Ghost of Yotei bound
+// 8- and 48-byte strides to the same multi-second compute pipelines), and the shader data
+// carries the bound descriptor's stride.
+void TestRuntimeBufferStrideSharesProgram() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x1c, 0, true), // buffer_store_dword v0, v0, s[0:3] idxen
+      EncodeMubuf1(0, 0, 0),
+      0xbf810000u,
+  };
+  auto compile = [&](uint32_t stride) {
+    std::array<uint32_t, 12> user_data{};
+    user_data[0] = 0x1000u;
+    user_data[1] = stride << 16u;
+    user_data[2] = 64u;
+    user_data[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    return RecompileForTest(shader, options);
+  };
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  auto runtime = saved;
+  runtime.runtime_buffer_stride = true;
+  ShaderRecompiler::SetCodegenOptions(runtime);
+  const auto narrow = compile(16u);
+  const auto wide = compile(48u);
+  auto baked = saved;
+  baked.runtime_buffer_stride = false;
+  ShaderRecompiler::SetCodegenOptions(baked);
+  const auto baked_narrow = compile(16u);
+  const auto baked_wide = compile(48u);
+  ShaderRecompiler::SetCodegenOptions(saved);
+
+  Check(!narrow.spirv.empty() && narrow.spirv == wide.spirv,
+        "runtime buffer strides did not share one SPIR-V module");
+  Check(baked_narrow.spirv != baked_wide.spirv,
+        "specialized buffer strides unexpectedly produced the same SPIR-V");
+  const auto &program = wide.program;
+  Check(program.info.buffers.size() == 1u &&
+            (program.info.buffers[0].packed_stride &
+             ShaderRecompiler::IR::PackedStrideRuntime) != 0u &&
+            (program.info.buffers[0].packed_stride & 0x3fffu) == 0u &&
+            program.bindings.memory_stride_count == 1u,
+        "structured buffer did not take a runtime stride slot");
+  std::vector<uint32_t> shader_data(program.bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::WriteBufferStrides(program.bindings, program.info.buffers,
+                                           wide.resources.buffers, shader_data);
+  Check(program.bindings.MemoryStrideDword() < shader_data.size() &&
+            shader_data[program.bindings.MemoryStrideDword()] == 48u,
+        "shader data did not carry the descriptor's runtime stride");
+  CheckSpirvBinaryValidates(wide.spirv);
+}
+
 // Ghost of Yotei samples 8-bit signed integer textures.
 void TestSampledSignedByteTexture() {
   constexpr auto format = Prospero::BufferFormat::k8SInt;
@@ -15616,6 +15670,11 @@ int main(int argc, char **argv) {
 #endif
   }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--runtime-buffer-stride-only") {
+    TestRuntimeBufferStrideSharesProgram();
+    std::puts("ShaderCfgTests: runtime buffer stride passed");
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--typed-views-only") {
     TestTypedBitcastViews();
     std::puts("ShaderCfgTests: typed SSA views passed");
@@ -15870,6 +15929,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
   TestSampledSignedByteTexture();
+  TestRuntimeBufferStrideSharesProgram();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();

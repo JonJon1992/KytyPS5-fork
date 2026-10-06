@@ -687,6 +687,7 @@ void Write(CodecWriter& w, const BindingLayout& v) {
 	w.U32(v.push_data_start_dword);
 	w.U32(v.memory_offset_dword);
 	w.U32(v.memory_offset_count);
+	w.U32(v.memory_stride_count);
 	w.U32(v.mip_stats_count);
 	w.Words(v.user_data_registers);
 	WriteVector(w, v.descriptors);
@@ -696,6 +697,7 @@ void Read(CodecReader& r, BindingLayout& v) {
 	v.push_data_start_dword = r.U32();
 	v.memory_offset_dword   = r.U32();
 	v.memory_offset_count   = r.U32();
+	v.memory_stride_count   = r.U32();
 	v.mip_stats_count       = r.U32();
 	v.user_data_registers   = r.Words();
 	ReadVector(r, v.descriptors);

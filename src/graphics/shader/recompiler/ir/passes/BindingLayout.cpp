@@ -100,6 +100,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	const bool runtime_strides = std::ranges::any_of(program.info.buffers, [](const auto& buffer) {
+		return (buffer.packed_stride & PackedStrideRuntime) != 0u;
+	});
+	next.memory_stride_count = runtime_strides ? next.memory_offset_count : 0u;
 	const bool mip_stats     = UsesMipStats(program);
 	next.mip_stats_count     = mip_stats ? static_cast<uint32_t>(program.info.images.size()) : 0u;
 	next.push_data_start_dword =

@@ -133,6 +133,9 @@ struct CodegenOptions {
 	// of any stride. Off by default: in Ghost of Yotei the compute shaders it enabled produced
 	// command data the CP read as dispatch sizes (float bit patterns) and the GPU hung.
 	bool bindless_strided_compute = false;
+	// KYTY_RUNTIME_BUFFER_STRIDE (default on; 0 disables): unswizzled structured buffers read
+	// their stride from the shader data instead of specializing on it (IR::PackedStrideRuntime).
+	bool runtime_buffer_stride = true;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,

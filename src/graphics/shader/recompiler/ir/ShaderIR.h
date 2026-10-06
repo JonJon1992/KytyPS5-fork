@@ -100,6 +100,29 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// BufferResource::packed_stride bit of an unswizzled structured buffer whose stride is not part
+// of the specialization (KYTY_RUNTIME_BUFFER_STRIDE): bits 0-13 are zero and the shader reads the
+// descriptor's stride from its shader data (BindingLayout::MemoryStrideDword). One program then
+// serves every stride; Ghost of Yotei binds 8- and 48-byte strides to the same compute shaders,
+// each specialization a multi-second pipeline compile.
+inline constexpr uint32_t PackedStrideRuntime = 1u << 21u;
+
+// A descriptor's PackedStride (stride, swizzle, index stride, ADD_TID) as the resource
+// specialization keys it: the index stride only matters when swizzled, and both only for a
+// non-zero stride.
+[[nodiscard]] constexpr uint32_t SpecializedPackedStride(uint32_t packed, bool runtime_stride) {
+	const auto stride  = packed & 0x3fffu;
+	const bool swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		return packed & ~((1u << 14u) | (3u << 16u));
+	}
+	if (swizzle) {
+		return packed;
+	}
+	packed &= ~(3u << 16u);
+	return runtime_stride ? (packed & ~0x3fffu) | PackedStrideRuntime : packed;
+}
+
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 
@@ -461,6 +484,9 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	// 16-bit runtime strides of the buffers, two per dword after the memory offsets: one entry per
+	// buffer when some buffer has PackedStrideRuntime (zero for the others), otherwise none.
+	uint32_t                       memory_stride_count = 0;
 	// Per-draw GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField:
 	// counter id, base level, no-counter flag, counting threshold), after the memory offsets.
 	// Non-zero only for shaders instrumented for mip statistics.
@@ -468,8 +494,11 @@ struct BindingLayout {
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t MipStatsOffsetDword() const {
+	[[nodiscard]] uint32_t MemoryStrideDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t MipStatsOffsetDword() const {
+		return MemoryStrideDword() + (memory_stride_count + 1u) / 2u;
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return MipStatsOffsetDword() + mip_stats_count;

@@ -3,6 +3,8 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <span>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -56,6 +58,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Uses this thread's scratch.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
+// Writes the stride of every PackedStrideRuntime buffer, from its descriptor in `descriptors`
+// (the snapshot's), into the zeroed stride region of `shader_data` (BindingLayout).
+void WriteBufferStrides(const BindingLayout& layout, std::span<const BufferResource> buffers,
+                        std::span<const DescriptorValue> descriptors,
+                        std::span<uint32_t>              shader_data);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

@@ -1202,6 +1202,7 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME runtime_buffer_stride COMMAND $<TARGET_FILE:shader_cfg_tests> --runtime-buffer-stride-only)
 	add_test(NAME shader_frontend_optimization
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --frontend-optimization-only)
 	add_test(NAME wolverine_instructions_cpu
@@ -1414,6 +1415,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
+	add_test(NAME buffer_stride
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-stride-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	add_test(NAME tile_layout

@@ -478,13 +478,12 @@ void WriteRangeEvaluator::Evaluate(const WriteRangeProgram& program,
 	}
 }
 
-bool WriteRangeEvaluator::AccessSpan(const BufferWriteRange& buffer, const WriteRangeAccess& access,
+bool WriteRangeEvaluator::AccessSpan(uint32_t packed, const WriteRangeAccess& access,
                                      WriteRangeSpan& span) const {
 	const auto value_of = [&](uint32_t node) -> Range {
 		if (node >= m_values.size()) return Full();
 		return {m_values[node].lo, m_values[node].hi};
 	};
-	const uint32_t packed       = buffer.packed_stride;
 	const uint64_t stride       = packed & 0x3fffu;
 	const bool     swizzle      = stride != 0u && (packed & (1u << 14u)) != 0u;
 	const uint32_t index_stride = (packed >> 16u) & 3u;
@@ -533,16 +532,22 @@ bool WriteRangeEvaluator::AccessSpan(const BufferWriteRange& buffer, const Write
 }
 
 bool WriteRangeEvaluator::Spans(const WriteRangeProgram& program, uint32_t buffer, uint64_t size,
-                                std::vector<WriteRangeSpan>& spans) const {
+                                std::vector<WriteRangeSpan>& spans,
+                                uint32_t runtime_packed_stride) const {
 	spans.clear();
 	const auto* entry = program.Find(buffer);
 	if (entry == nullptr || !entry->bounded || m_program != &program ||
 	    m_values.size() != program.nodes.size()) {
 		return false;
 	}
+	const bool     runtime = (entry->packed_stride & PackedStrideRuntime) != 0u;
+	const uint32_t packed  = runtime ? runtime_packed_stride : entry->packed_stride;
+	if (runtime && (packed & 0x3fffu) == 0u) {
+		return false;
+	}
 	for (const auto& access: entry->accesses) {
 		WriteRangeSpan span;
-		if (!AccessSpan(*entry, access, span)) {
+		if (!AccessSpan(packed, access, span)) {
 			spans.clear();
 			return false;
 		}
@@ -628,7 +633,10 @@ std::string WriteRangeEvaluator::Describe(const WriteRangeProgram& program, uint
 		const auto     offset  = value_of(access.offset);
 		const auto     soffset = value_of(access.soffset);
 		WriteRangeSpan span;
-		const bool     bounded = m_program == &program && AccessSpan(*entry, access, span);
+		// A runtime stride is not known here: describe such accesses as unbounded.
+		const bool     bounded = m_program == &program &&
+		                     (entry->packed_stride & PackedStrideRuntime) == 0u &&
+		                     AccessSpan(entry->packed_stride, access, span);
 		const auto     unknown = origins({access.index, access.offset, access.soffset});
 		text += fmt::format(" [idx={:x}..{:x} off={:x}..{:x} soff={:x}..{:x} imm={} ext={} -> {}{}{}]",
 		                    index.lo, index.hi, offset.lo, offset.hi, soffset.lo, soffset.hi,

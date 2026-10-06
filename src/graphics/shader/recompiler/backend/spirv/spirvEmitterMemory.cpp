@@ -89,8 +89,10 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	const bool runtime = (packed & IR::PackedStrideRuntime) != 0u;
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              runtime ? state.memory_strides[mem.resource]
+	                                      : ConstantU32(state, stride),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;

@@ -136,6 +136,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    (program.bindings.memory_stride_count != 0u &&
+	     program.bindings.memory_stride_count != program.info.buffers.size()) ||
 	    program.bindings.mip_stats_count != (mip_stats ? program.info.images.size() : 0u) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),

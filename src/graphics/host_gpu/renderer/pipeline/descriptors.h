@@ -109,6 +109,11 @@ NativeSamplerDescriptor(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 void AppendUserShaderData(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                           const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                           std::vector<uint32_t>&                          shader_data);
+// The runtime buffer strides (IR::PackedStrideRuntime) of the snapshot's V#s, written into the
+// zeroed shader data like the mip-statistics fields.
+void WriteBufferStrides(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                        const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                        std::vector<uint32_t>&                          shader_data);
 // The GET_LOD_STATS field of every instrumented image (RebindBuffers), written into the
 // shader data; true when some image has a mip-statistics counter.
 bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program,
