@@ -43,7 +43,9 @@ for pair in "$@"; do
 	export "${pair?}"
 done
 
-# The emulator command line of kyty_run.sh (its first quoted line), with --game replaced.
+# The emulator command line of kyty_run.sh (its first quoted line), with --game replaced. The
+# --game-patch of kyty_run.sh belongs to the launcher's game, so a replaced game drops it (a
+# Crash Bandicoot 4 patch made a Ghost of Yotei run exit with "Failed to apply game cheat").
 mapfile -t command < <(python3 -c '
 import shlex, sys
 line = next(l for l in open(sys.argv[1]) if l.startswith("\x27"))
@@ -52,6 +54,11 @@ if sys.argv[2]:
     if "--game" not in args:
         sys.exit("kyty_run.sh has no --game argument")
     args[args.index("--game") + 1] = sys.argv[2]
+    if "--game-patch" in args:
+        index = args.index("--game-patch")
+        print(f"run-u59: dropped --game-patch {args[index + 1]} (patch of the launcher game)",
+              file=sys.stderr)
+        del args[index:index + 2]
 print("\n".join(args))
 ' "$dir/kyty_run.sh" "$game")
 game_index=-1
