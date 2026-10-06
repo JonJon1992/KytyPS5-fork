@@ -324,7 +324,8 @@ struct ValueEmitContext {
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
-	uint32_t              Ballot(IR::Value predicate);
+	// negate: ballots the predicate's complement (lanes that vote against it).
+	uint32_t              Ballot(IR::Value predicate, bool negate = false);
 	uint32_t              FirstLane(uint32_t ballot);
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);

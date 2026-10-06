@@ -153,20 +153,22 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
 		return ctx.Def(info.condition);
 	}
-	const auto ballot = ctx.Ballot(info.condition);
+	const auto kind = info.terminator.condition;
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero ||
+	                  kind == CFG::BranchCondition::SccZero;
+	// Host invocations that do not exist (a partial host subgroup) do not vote. A zero branch
+	// holds when no lane votes against it, not when every physical lane votes for it
+	// (fxpw/KytyPS5 37b35115).
+	const auto ballot = ctx.Ballot(info.condition, zero);
 	const auto low    = ctx.state.builder.AllocateId();
 	const auto high   = ctx.state.builder.AllocateId();
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const auto kind     = info.terminator.condition;
-	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
-	                      kind == CFG::BranchCondition::VccZero ||
-	                      kind == CFG::BranchCondition::SccZero;
-	const auto combined =
-	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
+	const auto combined = EmitBinaryU32(ctx.state, spv::OpBitwiseOr, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
+	                              result, combined, ConstantU32(ctx.state, 0u));
 	return result;
 }
 
@@ -793,13 +795,21 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
-uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+uint32_t ValueEmitContext::Ballot(IR::Value predicate, bool negate) {
+	const auto vote = [&](uint32_t value) {
+		if (!negate) {
+			return value;
+		}
+		const auto inverted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), inverted, value);
+		return inverted;
+	};
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	                          vote(other_half == nullptr || half == 0 ? Def(predicate)
+	                                                                  : other_half->Def(predicate)));
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -808,7 +818,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	                          vote(half == 1 ? Def(predicate) : other_half->Def(predicate)));
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
