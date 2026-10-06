@@ -1566,10 +1566,11 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	// A native image starts with undefined texels; give fallback reads a defined value.
+	// A native image starts with undefined texels; give fallback reads a defined value. A rejected
+	// clear is reported by ClearImage and only leaves the null image undefined.
 	vk::ClearValue clear {};
-	ClearImage(m_scheduler.Current(), id, format,
-	           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+	(void)ClearImage(m_scheduler.Current(), id, format,
+	                 {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear, "null-image");
 	m_null_images.emplace(format, id);
 	return id;
 }

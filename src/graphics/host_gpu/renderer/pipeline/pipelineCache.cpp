@@ -3380,7 +3380,7 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {};
 		auto& scratch = ThreadScratch();
 		ProgramKey key;
-		BuildKey(params, input_info, key);
+		if (!BuildKey(params, input_info, key, scratch)) return Outcome::Skipped;
 		// The journal's key must be what this build derives from the stored input info.
 		if (key.stage != static_cast<ShaderType>(source.stage) || key.static_state != source.static_state ||
 		    key.code_size != source.code_size) {

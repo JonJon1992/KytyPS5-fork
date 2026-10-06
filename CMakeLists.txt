@@ -338,9 +338,11 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/loader/*.h"
 )
 
-# Program cache preload catches thread-start failures while scanning cached records.
+# Program cache preload catches thread-start failures while scanning cached records, and the
+# shader precompile workers catch a failed replay.
 if(LINUX)
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp"
 		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
 endif()
 
