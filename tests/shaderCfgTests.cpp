@@ -8970,6 +8970,24 @@ int StructurizeFiles(std::span<char *const> paths) {
       }
       std::printf("%s: full translation, skip_dispatch=%d, global address writes %u\n", path,
                   translated.skip_dispatch ? 1 : 0, global_writes);
+      // KYTY_STRUCTURIZE_FILE_OPS=<n>: the n most frequent IR opcodes of that translation.
+      if (const char *top = std::getenv("KYTY_STRUCTURIZE_FILE_OPS"); top != nullptr) {
+        std::unordered_map<std::string_view, uint32_t> counts;
+        uint32_t total = 0;
+        for (const auto *block : translated.program.blocks) {
+          for (const auto &inst : *block) {
+            counts[ShaderRecompiler::IR::ValueOpcodeName(inst.GetOpcode())]++;
+            total++;
+          }
+        }
+        std::vector<std::pair<std::string_view, uint32_t>> sorted(counts.begin(), counts.end());
+        std::ranges::sort(sorted, [](const auto &a, const auto &b) { return a.second > b.second; });
+        std::printf("%s: %u IR instructions\n", path, total);
+        for (size_t i = 0; i < std::min<size_t>(sorted.size(), std::strtoul(top, nullptr, 10)); i++) {
+          std::printf("  %7u %.*s\n", sorted[i].second, static_cast<int>(sorted[i].first.size()),
+                      sorted[i].first.data());
+        }
+      }
       status |= global_writes != 0 ? 1 : 0;
     }
   }
@@ -13025,6 +13043,19 @@ void TestRenderTargetReverseExportMapping() {
   Check(standard_1555.format == vk::Format::eR5G5B5A1UnormPack16 &&
             standard_1555.export_mapping == Prospero::ColorMappingAbgr,
         "1:5:5:5 render target did not preserve its low one-bit component");
+  // Ghost of Yotei renders to 11:11:10 UNORM, which Vulkan lacks: it is stored like the packed
+  // float layout (same element size and channels).
+  const auto unorm_111110 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kUNorm,
+      Prospero::ChannelOrder::kStandard);
+  const auto float_111110 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
+      Prospero::ChannelOrder::kStandard);
+  Check(unorm_111110.format == vk::Format::eB10G11R11UfloatPack32 &&
+            unorm_111110.bytes_per_element == 4u &&
+            unorm_111110.format == float_111110.format &&
+            unorm_111110.export_mapping == float_111110.export_mapping,
+        "11:11:10 UNORM render target did not use the packed 11:11:10 storage");
 
   const auto argb = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
