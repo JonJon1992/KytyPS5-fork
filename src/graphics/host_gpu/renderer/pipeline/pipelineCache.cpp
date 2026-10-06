@@ -1585,6 +1585,11 @@ struct PipelineCache::ProgramCache {
 	                                      std::span<const uint32_t> static_state,
 	                                      ProgramCompileTimes&      times) {
 		const char* stage_name = ProgramStageName(options.stage);
+		// A requested shader whose emission exits (an unsupported construct) still leaves its
+		// guest code behind; the dump after a successful emission adds the decoded listing.
+		if (ShaderDumpRequested(options.shader_hash)) {
+			DumpShaderOriginal(stage_name, options.shader_hash, params.code, {});
+		}
 		const auto  emit_begin = CompileClockNs();
 		ShaderRecompiler::CompileResult result;
 		{
