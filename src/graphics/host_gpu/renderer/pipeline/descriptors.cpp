@@ -198,7 +198,21 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		// The shader indexes storage buffers in dwords; a base that is not dword aligned (RDNA
+		// allows any byte) has no binding here. Bind the null buffer, as for other unsupported
+		// resources: reads return zero, writes are dropped. Ghost of Yotei reached this once its
+		// bindless material shaders stopped being skipped.
+		static std::atomic_uint64_t unaligned {0};
+		const auto count = unaligned.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 8u || (count & 1023u) == 0u) {
+			std::printf("Warning: storage buffer (%s) at 0x%016" PRIx64 " size 0x%" PRIx64
+			            " is not dword aligned (adjustment %" PRIu64 ", alignment %" PRIu64
+			            ", stage %u, slot %u); bound as null (#%" PRIu64 ")\n",
+			            resource.written ? "writes dropped" : "reads zero", address,
+			            static_cast<uint64_t>(size), static_cast<uint64_t>(adjustment),
+			            static_cast<uint64_t>(alignment), static_cast<uint32_t>(stage), slot, count);
+		}
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	// OpArrayLength counts whole dwords. A 4-byte robustness alignment would round a partial
