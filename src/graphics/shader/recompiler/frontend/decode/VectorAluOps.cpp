@@ -545,13 +545,14 @@ struct Vop1SdwaRule {
 };
 
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
+    // The source field extract and the destination insert are independent (Translate.cpp), so a
+    // partial destination may combine with any source selector (Ghost of Yotei moves byte 0 of a
+    // register into its byte 1: v_mov_b32 v3.byte1, v3.byte0, preserve).
     {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
-     SdwaSelWords() | SdwaSelFull(), false},
+     SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
-    // The source field extract and the destination insert are independent (Translate.cpp), so a
-    // partial destination may combine with any source selector.
     {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_FFBL_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},

@@ -32803,6 +32803,53 @@ TestCase Vop1SdwaMovByteDestinations() {
   return test;
 }
 
+// Ghost of Yotei moves byte 0 of a register into its byte 1 (captured below). Every byte source
+// into every byte destination, with pad, sign extension and preserve (RDNA2 table 88).
+TestCase Vop1SdwaMovByteSourcesToByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 3, 30);
+  code.push_back(0x7e0602f9u);
+  code.push_back(0x00001103u); // Captured v_mov_b32 v3.byte1, v3.byte0, preserve.
+  AppendStoreVgpr(&code, 3, 0);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 2, 30);
+  AppendVMovLiteral(&code, 5, 0x01234567u);
+
+  constexpr u32 kOld = 0x01234567u;
+  constexpr u32 kSource = 0x8091a2b3u;
+  std::vector<u32> expected = {0xa1b2d4d4u, kSource};
+  for (u32 src_sel = 0; src_sel < 4; src_sel++) {
+    for (u32 dst_u = 0; dst_u < 3; dst_u++) {
+      for (u32 dst_sel = 0; dst_sel < 4; dst_sel++) {
+        code.push_back(EncodeVop1(0x01, 1, Vgpr(5)));
+        code.push_back(EncodeVop1(0x01, 1, 249));
+        code.push_back(EncodeVop1Sdwa(2, dst_sel, dst_u, src_sel));
+        AppendStoreVgpr(&code, 1, static_cast<u32>(expected.size()));
+        const u32 field = (kSource >> (src_sel * 8u)) & 0xffu;
+        const u32 shift = dst_sel * 8u;
+        const u32 sext = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(field)));
+        expected.push_back(dst_u == 0u   ? field << shift
+                           : dst_u == 1u ? sext << shift
+                                         : (kOld & ~(0xffu << shift)) | (field << shift));
+      }
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaMovByteSourcesToByteDestinations";
+  test.code = std::move(code);
+  test.initial = {0xa1b2c3d4u, kSource};
+  test.expected = std::move(expected);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitwiseOr"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcExactByte2Destination() {
   using O = ShaderOpcode;
 
@@ -45002,6 +45049,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
   AddCase(Vop1SdwaMovByteDestinations);
+  AddCase(Vop1SdwaMovByteSourcesToByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
@@ -51206,6 +51254,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteDestinations());
+    RunCase(&vulkan, Vop1SdwaMovByteSourcesToByteDestinations());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ffbh-only") == 0) {
