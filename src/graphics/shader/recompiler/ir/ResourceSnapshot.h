@@ -35,6 +35,7 @@ struct BindlessHeapUse {
 	uint32_t image = 0;
 	uint32_t mapping_offset = 0;
 	uint32_t record_stride = 32; // bytes between the T#s of consecutive keys
+	uint32_t record_dwords = 8;  // 4 for an r128 T# (DescriptorSource::IndirectImage::compact)
 	bool operator==(const BindlessHeapUse&) const = default;
 };
 
@@ -44,6 +45,7 @@ struct BindlessSamplerHeapUse {
 	uint32_t table_offset = 0;
 	uint32_t sampler = 0;
 	uint32_t mapping_offset = 0;
+	uint32_t record_stride = 16; // bytes between the S#s of consecutive keys
 	bool operator==(const BindlessSamplerHeapUse&) const = default;
 };
 

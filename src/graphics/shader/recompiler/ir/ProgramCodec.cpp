@@ -22,7 +22,7 @@ namespace {
 // ImageResource 20; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (IndirectImage
-// 8, BindlessSampler 1); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// 9, BindlessSampler 2); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 30;
 // ResourceSpecialization 3 (Buffer 3, Image 11, Sampler 2).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
@@ -42,7 +42,7 @@ static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: upd
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
 static_assert(sizeof(CompiledShaderInfo) == 344, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 216, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource) == 224, "IR::DescriptorSource changed: update ProgramCodec");
 static_assert(sizeof(DescriptorSource::IndirectImage) == 64,
               "IR::DescriptorSource::IndirectImage changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
@@ -749,10 +749,14 @@ public:
 				w.U32(image.table_offset);
 				w.U32(image.record_stride);
 				w.Bool(image.bindless);
+				w.Bool(image.compact);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}
 			w.Bool(source.bindless_sampler.has_value());
-			if (source.bindless_sampler) w.U32(source.bindless_sampler->table_offset);
+			if (source.bindless_sampler) {
+				w.U32(source.bindless_sampler->table_offset);
+				w.U32(source.bindless_sampler->record_stride);
+			}
 		}
 		w.U32(static_cast<uint32_t>(p.control_flow.size()));
 		for (const auto& block: p.control_flow) {
@@ -975,10 +979,15 @@ public:
 				image.table_offset    = r.U32();
 				image.record_stride   = r.U32();
 				image.bindless = r.Bool();
+				image.compact  = r.Bool();
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_mask)) return false;
 			}
 			source.bindless_sampler.reset();
-			if (r.Bool()) source.bindless_sampler = DescriptorSource::BindlessSampler {r.U32()};
+			if (r.Bool()) {
+				auto& sampler         = source.bindless_sampler.emplace();
+				sampler.table_offset  = r.U32();
+				sampler.record_stride = r.U32();
+			}
 			if (r.Failed()) return false;
 		}
 		const auto blocks = r.Count(1);

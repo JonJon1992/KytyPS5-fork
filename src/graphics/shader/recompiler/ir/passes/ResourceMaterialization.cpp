@@ -1321,7 +1321,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                             !DecodeBufferDescriptor(table, heap)) return false;
                         snapshot.bindless_heaps.push_back({heap.Base48(), heap.GetSize(),
                                                           indirect.table_offset, i, offset,
-                                                          indirect.record_stride});
+                                                          indirect.record_stride,
+                                                          indirect.compact ? 4u : 8u});
                     }
                     continue;
                 }
@@ -1367,7 +1368,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                     if (!clean.EvaluateDescriptor(source_index, table) ||
                         !DecodeBufferDescriptor(table, heap)) return false;
                     snapshot.bindless_sampler_heaps.push_back({heap.Base48(), heap.GetSize(),
-                        source->bindless_sampler->table_offset, i, offset});
+                        source->bindless_sampler->table_offset, i, offset,
+                        source->bindless_sampler->record_stride});
                 }
                 continue;
             }

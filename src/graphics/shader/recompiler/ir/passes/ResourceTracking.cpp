@@ -430,7 +430,7 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.table_offset != b.table_offset || a.record_stride != b.record_stride ||
-				    a.bindless != b.bindless ||
+				    a.bindless != b.bindless || a.compact != b.compact ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -1083,7 +1083,15 @@ private:
 		uint32_t table_offset = 0;
 		uint32_t key_mask = UINT32_MAX;
 		uint32_t record_stride = 32u;
-		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+		// An r128 T# leaves dwords 4..7 as zero immediates (Translator): only dwords 0..3 come from
+		// the record, and only the bindless path serves it.
+		bool compact = bindless_images;
+		for (uint32_t dword = 4u; compact && dword < 8u; ++dword) {
+			uint32_t value = 0;
+			compact = ImmediateU32(handle.Arg(dword), value) && value == 0u;
+		}
+		const uint32_t t_sharp_dwords = compact ? 4u : 8u;
+		for (uint32_t dword = 0; dword < t_sharp_dwords; ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
 				return false;
@@ -1151,14 +1159,17 @@ private:
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
         if (bindless_images && table_source.dword_count == 4u) {
-            // The record must hold all 8 T# dwords: the host reads key * stride + offset.
+            // The record must hold the whole T#: the host reads key * stride + offset.
+            const uint32_t t_sharp_bytes = t_sharp_dwords * 4u;
             if (record_stride != 32u &&
-                (record_stride < 32u || (record_stride & 3u) != 0u || (table_offset & 3u) != 0u)) {
+                (record_stride < t_sharp_bytes || (record_stride & 3u) != 0u ||
+                 (table_offset & 3u) != 0u)) {
                 return false;
             }
             indirect.bindless = true;
             indirect.record_stride = record_stride;
-        } else if (record_stride != 32u) {
+            indirect.compact = compact;
+        } else if (compact || record_stride != 32u) {
             return false;
         } else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
@@ -1277,7 +1288,21 @@ private:
 	bool TryMakeBindlessSampler(Inst& handle, uint32_t pc, BindlessSamplerPlan& plan) {
 		Inst*    table_handle = nullptr;
 		Value    key;
-		uint32_t table_offset = 0;
+		uint32_t table_offset  = 0;
+		uint32_t record_stride = 16u;
+		// An S# array (key << 4), or records that carry their own S# (key * stride + offset; Ghost
+		// of Yotei: next to the T# in 872-byte light records), with the image records' stage rule.
+		const auto match = [&](Value value, Value& current_key, uint32_t& offset,
+		                       uint32_t& current_stride) {
+			current_stride = 16u;
+			if (MatchTableOffset(value, current_key, offset, 4u)) {
+				return true;
+			}
+			return (m_program.stage != ShaderType::Compute ||
+			        GetCodegenOptions().bindless_strided_compute) &&
+			       MatchStridedTableOffset(value, current_key, offset, current_stride) &&
+			       current_stride >= 16u && (current_stride & 3u) == 0u;
+		};
 		for (uint32_t dword = 0; dword < 4u; ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
@@ -1292,20 +1317,23 @@ private:
 			}
 			auto*    current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value    current_key;
-			uint32_t offset = 0;
+			uint32_t offset         = 0;
+			uint32_t current_stride = 16u;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, 4u) ||
+			    !match(read->Arg(1), current_key, offset, current_stride) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
 			offset += memory->offset;
 			if (dword == 0u) {
-				key          = current_key;
-				table_offset = offset;
+				key           = current_key;
+				table_offset  = offset;
+				record_stride = current_stride;
 			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           current_stride != record_stride ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1329,7 +1357,11 @@ private:
 			source.dwords[dword]    = table_source.dwords[dword];
 			plan.table_roots[dword] = table_source.dwords[dword];
 		}
-		source.bindless_sampler = DescriptorSource::BindlessSampler {.table_offset = table_offset};
+		if (record_stride != 16u && (table_offset & 3u) != 0u) {
+			return false;
+		}
+		source.bindless_sampler = DescriptorSource::BindlessSampler {.table_offset  = table_offset,
+		                                                             .record_stride = record_stride};
 		plan.handle             = &handle;
 		plan.key                = key;
 		plan.source             = InternSource(source);

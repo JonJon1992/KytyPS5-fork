@@ -125,16 +125,19 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 
 BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base,
                                                                    uint32_t table_offset,
+                                                                   uint32_t record_stride,
                                                                    uint32_t flags) {
 	for (auto& heap: m_sampler_heaps) {
-		if (heap.base == base && heap.table_offset == table_offset && heap.flags == flags) {
+		if (heap.base == base && heap.table_offset == table_offset &&
+		    heap.record_stride == record_stride && heap.flags == flags) {
 			return &heap;
 		}
 	}
-	auto& heap        = m_sampler_heaps.emplace_back();
-	heap.base         = base;
-	heap.table_offset = table_offset;
-	heap.flags        = flags;
+	auto& heap         = m_sampler_heaps.emplace_back();
+	heap.base          = base;
+	heap.table_offset  = table_offset;
+	heap.record_stride = record_stride;
+	heap.flags         = flags;
 	return &heap;
 }
 

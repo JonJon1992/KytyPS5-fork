@@ -16,6 +16,44 @@ Classificações, como em `RAY-TRACING-VIABILIDADE-VULKAN.md`:
 - **Inferência:** conclusão técnica a partir das evidências.
 - **A validar:** precisa de teste, captura ou engenharia reversa.
 
+## 0 Estado em 6 de outubro de 2026
+
+As seções 1 a 7 descrevem o código de 5/10 e continuam valendo como análise. Desde então o caminho
+escolhido foi o **bindless com tradução na GPU** (parte da opção B), trazido do Wolverine, e não a
+enumeração na CPU da opção A.
+
+**Feito (Código):**
+- **Fase 0:** `KYTY_RUNTIME_DESCRIPTOR_REPORT=1` e `tools/descriptor_report.py` (`c55c8bae`,
+  `e4d0f0b7`). A primeira execução no Yōtei reportou 14 shaders descartados: 6 de imagem e 8 de
+  buffer (V# calculado no shader).
+- **Heap bindless** (opt-in, `KYTY_BINDLESS=1`; merge `365aa45b`): arrays de imagens por tipo de
+  view, tabela de tradução chave → slot preenchida pelo host, feedback de chaves não residentes e
+  samplers bindless (`KYTY_BINDLESS_SAMPLERS`, ligado por padrão quando há bindless). Usa descriptor
+  indexing, então a seção 2.3 ("nada de descriptor indexing") ficou desatualizada.
+- **Registros com stride** (`cbe04617`): T# em `chave × stride + imediato` (Yōtei: materiais de
+  440 bytes). Recuperou 3 VS, 4 PS e 3 CS, cerca de 295 mil draws.
+- **Compute com stride** só com `KYTY_BINDLESS_STRIDED_COMPUTE=1` (`589460f6`). Ligado, CSs do
+  Yōtei produziram tamanhos de dispatch lixo e a GPU travou; `KYTY_DISPATCH_GROUP_LIMIT` (`b7730dc0`)
+  só pula os dispatches gigantes.
+- **Amostragem com comparação** (`image_sample_c`, sombras) fica fora do bindless (`58e06b15`).
+- **HTile com mais de 32 camadas:** resolvido (`575cb979`). A seção 7 ainda cita o erro antigo.
+- **T# r128 e S# no mesmo registro** (CS `0x34be6ffcc212383c`, esta mudança): o T# de 4 dwords
+  (`IndirectImage::compact`, o host lê os dwords 4..7 como zero) e o S# em registro com stride
+  (`BindlessSampler::record_stride`). Teste `TestBindlessCompactRecordWithSampler`. **A validar no
+  jogo**: por ser compute, ainda depende de `KYTY_BINDLESS_STRIDED_COMPUTE=1`.
+
+**Falta:**
+1. **Causa dos dispatches lixo** com compute strided ligado. Sem isso o CS `0x34be…` e os outros
+   CSs com registros continuam desligados por padrão.
+2. **Comparação no bindless:** sombras (`image_sample_c`) seguem pelo caminho antigo ou são
+   descartadas.
+3. **`IMAGE_LOAD` e storage através de registro:** o PS `0x617c7166f3308810` continua descartado
+   (Fase 3).
+4. **V# calculado no shader** (8 dos 14 do relatório): o `IndirectBuffer` só cobre leituras raw
+   x2/x3/x4 e escalares; stores e acessos formatados não.
+5. **IndirectImage sem bindless:** continua com `OpSwitch` e teto de 64 imagens (Fase 1, item 4).
+6. **Perguntas da seção 6** ainda abertas: 1, 2, 3, 5 e 6.
+
 ## 1 O problema no Ghost of Yōtei
 
 **Medido.** Sem `KYTY_SRT_VARIANT_READS`, o jogo fecha no primeiro shader desse tipo
@@ -284,6 +322,9 @@ KYTY_SRT_VARIANT_READS=1 nice -n 15 ionice -c3 ./kyty_emulator <argumentos do la
 grep -c "computes a descriptor at runtime" yotei.log
 ```
 
-Sem `KYTY_SRT_VARIANT_READS=1` o emulador fecha no CS `0x34be6ffcc212383c`. Com ela, hoje fecha em
-`HTile clear tracking supports at most 32 slices`. O Yōtei pesa muito no sistema (page faults,
-compilação de shaders), por isso a prioridade baixa.
+Sem `KYTY_SRT_VARIANT_READS=1` o emulador fecha no CS `0x34be6ffcc212383c`. Com ela, em 5/10 fechava
+em `HTile clear tracking supports at most 32 slices`, resolvido em `575cb979`. O Yōtei pesa muito no
+sistema (page faults, compilação de shaders), por isso a prioridade baixa.
+
+Para o caminho bindless: `KYTY_BINDLESS=1`, e para os compute shaders com registros também
+`KYTY_BINDLESS_STRIDED_COMPUTE=1` (ver a seção 0, item 1 de "Falta").

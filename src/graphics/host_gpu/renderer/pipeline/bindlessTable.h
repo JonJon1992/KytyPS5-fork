@@ -115,13 +115,14 @@ public:
 	struct SamplerHeap {
 		uint64_t                             base          = 0;
 		uint32_t                             table_offset  = 0;
+		uint32_t                             record_stride = 16; // bytes between keys' S#s
 		uint32_t                             flags         = 0;
 		uint32_t                             region        = 0; // first slot; 0 = none yet
 		uint32_t                             capacity      = 0;
 		std::vector<std::array<uint32_t, 4>> records;           // mirrored S# records
 	};
 	[[nodiscard]] SamplerHeap* FindOrCreateSamplerHeap(uint64_t base, uint32_t table_offset,
-	                                                   uint32_t flags);
+	                                                   uint32_t record_stride, uint32_t flags);
 	// Mirrors the heap's records into its region. New records are appended in place (their slots
 	// were never used); a changed record, or more records than the region holds, moves the heap
 	// to a new region, because slots the GPU may be reading are never rewritten. False when the

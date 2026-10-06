@@ -1457,16 +1457,30 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     table.WriteDefaultSampler(m_context.GetSamplerCache().GetSampler(default_sampler, false));
     for (const auto& use: snapshot.bindless_sampler_heaps) {
         prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
-        if (!GuestRange {use.base, use.size}.Valid() || use.table_offset >= use.size) continue;
-        const auto count64 = (use.size - use.table_offset) / 16u;
+        const uint64_t stride = use.record_stride;
+        if (!GuestRange {use.base, use.size}.Valid() || stride < 16u ||
+            uint64_t {use.table_offset} + 16u > use.size) continue;
+        // Every key whose S# lies inside the table.
+        const auto count64 = (use.size - use.table_offset - 16u) / stride + 1u;
         if (count64 == 0 || count64 >= BindlessTable::MaxSamplers) continue;
         std::vector<std::array<uint32_t, 4>> records(static_cast<size_t>(count64));
-        if (!read(use.base + use.table_offset, records.data(), count64 * 16u)) continue;
+        if (stride == 16u) {
+            if (!read(use.base + use.table_offset, records.data(), count64 * 16u)) continue;
+        } else {
+            // Records carrying their own S# (Ghost of Yotei: 872-byte light records).
+            const auto span = (count64 - 1u) * stride + 16u;
+            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            if (!read(use.base + use.table_offset, words.data(), span)) continue;
+            for (uint64_t key = 0; key < count64; ++key) {
+                std::memcpy(records[key].data(), words.data() + key * stride / 4u, 16u);
+            }
+        }
         const auto& sampler = runtime.program->info.samplers.at(use.sampler);
         const uint32_t flags = (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
             (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
             (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
-        auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, flags);
+        auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, use.record_stride,
+                                                   flags);
         if (table.MirrorSamplerHeap(*heap, records, m_context.GetSamplerCache()))
             prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                                 static_cast<uint32_t>(count64)};
@@ -1474,24 +1488,27 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     for (const auto& use: snapshot.bindless_heaps) {
         prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
         const uint64_t stride = use.record_stride;
-        if (!GuestRange {use.base, use.size}.Valid() || stride < 32u ||
-            uint64_t {use.table_offset} + 32u > use.size) continue;
-        // Every key whose 8-dword T# lies inside the table.
-        const auto count64 = (use.size - use.table_offset - 32u) / stride + 1u;
+        // An r128 T# has 4 dwords in the record; its dwords 4..7 stay zero, as in the shader.
+        const uint64_t t_sharp_bytes = uint64_t {use.record_dwords} * 4u;
+        if (!GuestRange {use.base, use.size}.Valid() || stride < t_sharp_bytes ||
+            (t_sharp_bytes != 16u && t_sharp_bytes != 32u) ||
+            uint64_t {use.table_offset} + t_sharp_bytes > use.size) continue;
+        // Every key whose T# lies inside the table.
+        const auto count64 = (use.size - use.table_offset - t_sharp_bytes) / stride + 1u;
         if (count64 == 0 || count64 >= BindlessTable::TranslationEntries) continue;
         // ponytail: reread and resolve the bounded heap on every consumer; precise content
         // revisions can avoid this O(heap size) work without weakening first-use residency.
         std::vector<std::array<uint32_t, 8>> records(static_cast<size_t>(count64));
-        if (stride == 32u) {
+        if (stride == 32u && t_sharp_bytes == 32u) {
             if (!read(use.base + use.table_offset, records.data(), count64 * 32u)) continue;
         } else {
-            // Records holding the T# (Ghost of Yotei: 440-byte materials): read the span once
-            // and keep each key's 8 dwords.
-            const auto span = (count64 - 1u) * stride + 32u;
+            // Records holding the T# (Ghost of Yotei: 440-byte materials, 872-byte lights): read
+            // the span once and keep each key's T#.
+            const auto span = (count64 - 1u) * stride + t_sharp_bytes;
             std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
             if (!read(use.base + use.table_offset, words.data(), span)) continue;
             for (uint64_t key = 0; key < count64; ++key) {
-                std::memcpy(records[key].data(), words.data() + key * stride / 4u, 32u);
+                std::memcpy(records[key].data(), words.data() + key * stride / 4u, t_sharp_bytes);
             }
         }
         const auto& resource = runtime.program->info.images.at(use.image);

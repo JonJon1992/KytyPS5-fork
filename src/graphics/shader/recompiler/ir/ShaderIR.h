@@ -529,12 +529,18 @@ struct DescriptorSource {
 		Value    key_count;
 		Value    selector_mask;
 		bool     bindless = false;
+		// Bindless r128 images whose record holds only the 4-dword T#: the host reads dwords 4..7
+		// as zero, as the shader does (Ghost of Yotei cs 0x34be6ffcc212383c, 872-byte records).
+		bool     compact  = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
 	struct BindlessSampler {
-		uint32_t table_offset = 0;
+		uint32_t table_offset  = 0;
+		// Bytes between the S#s of consecutive keys: 16 for S# arrays, more when each record
+		// carries its own sampler next to its T#.
+		uint32_t record_stride = 16;
 		bool operator==(const BindlessSampler&) const = default;
 	};
 	std::array<Value, 8>         dwords {};

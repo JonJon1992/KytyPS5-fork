@@ -81,6 +81,79 @@ void TestBindlessStridedRecords() {
   Check(skipped.skip_dispatch, "strided record T# without bindless was not skipped");
 }
 
+// Ghost of Yotei cs 0x34be6ffcc212383c: each 872-byte light record carries its own S# (+136) and an
+// r128 T# (+152), read together by one S_BUFFER_LOAD_DWORDX8 at key * 872 + 136. The image is
+// tracked as a compact (4-dword) bindless T# and the sampler as a strided bindless S#.
+void TestBindlessCompactRecordWithSampler() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  const uint32_t code[] = {
+      EncodeVop1(0x02, 8, 256),             // GPU-selected key: first lane of v0
+      EncodeSop2(0x26, 9, 8, 255), 872u,    // s_mul_i32 s9, s8, 872
+      EncodeSmem0(0x0b, 32, 0), (9u << 25u) | 136u, // s[32:35] S#, s[36:39] T#
+      EncodeMimg0(0x20, 0xf) | (1u << 15u), // image_sample r128
+      EncodeMimg1(8, 9, 8, 1),              // T# s[36:39], S# s[32:35]
+      EncodeMubuf0(0x1c, 0), EncodeMubuf1(8, 3, 1),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> roots {};
+  roots[0] = 0x10000; roots[2] = 872u * 16u; // V# of 16 records
+  roots[12] = 0x30000; roots[14] = 64;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute {};
+  compute.threads_num[0]  = 64;
+  compute.threads_num[1]  = 1;
+  compute.threads_num[2]  = 1;
+  compute.thread_ids_num  = 1;
+  options.input_info.compute = &compute;
+  options.user_data = roots;
+  options.bindless_images = options.bindless_samplers = true;
+  const auto saved_options = GetCodegenOptions();
+  auto codegen = saved_options;
+  codegen.srt_variant_reads        = true;
+  codegen.bindless_strided_compute = true;
+  SetCodegenOptions(codegen);
+  auto translated = TranslateProgram(code, options);
+  SetCodegenOptions(saved_options);
+  const auto& info = translated.program.info;
+  Check(!translated.skip_dispatch && info.images.size() == 1 && info.images[0].bindless &&
+            info.samplers.size() == 1 && info.samplers[0].bindless,
+        "light record r128 T# and S# were not tracked as bindless");
+  const auto& image_source = translated.program.descriptor_sources.at(info.images[0].source);
+  Check(image_source.indirect_image && image_source.indirect_image->compact &&
+            image_source.indirect_image->record_stride == 872u &&
+            image_source.indirect_image->table_offset == 152u,
+        "r128 record T# lost its compact form, stride or offset");
+  const auto& sampler_source = translated.program.descriptor_sources.at(info.samplers[0].source);
+  Check(sampler_source.bindless_sampler && sampler_source.bindless_sampler->record_stride == 872u &&
+            sampler_source.bindless_sampler->table_offset == 136u,
+        "record S# lost its stride or offset");
+  auto plan = ExtractResourcePlan(translated.program);
+  std::vector<uint8_t> bytes;
+  ResourcePlan decoded;
+  Check(EncodeResourcePlan(plan, bytes) && DecodeResourcePlan(bytes, decoded),
+        "compact record bindless plan codec failed");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  uint32_t heap_reads = 0;
+  SrtRuntime runtime {.user_data = roots};
+  runtime.userdata                   = &heap_reads;
+  runtime.read_specialization_memory = [](void *reads, uint64_t, std::span<uint32_t>) {
+    ++*static_cast<uint32_t *>(reads);
+    return false;
+  };
+  Check(MaterializeResources(decoded, runtime, snapshot, specialization) && heap_reads == 0 &&
+            snapshot.bindless_heaps.size() == 1 &&
+            snapshot.bindless_heaps[0].record_stride == 872u &&
+            snapshot.bindless_heaps[0].record_dwords == 4u &&
+            snapshot.bindless_sampler_heaps.size() == 1 &&
+            snapshot.bindless_sampler_heaps[0].record_stride == 872u &&
+            snapshot.bindless_sampler_heaps[0].table_offset == 136u,
+        "compact record heap uses lost their layout");
+  auto result = CompileProgram(std::move(translated), options, specialization);
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 // A depth-comparison sample is not served by the bindless arrays: with bindless images on, the
 // handle keeps the CPU-enumerated path (or the shader is skipped) instead of becoming a bindless
 // image whose draws ResourceMaterialization would drop ("bindless requires a non-comparison ...").
@@ -190,5 +263,6 @@ void TestBindlessShaderContract() {
   Check(SpirvHasDecorationValue(result.spirv, 34u, 1u), "bindless set1 declaration missing");
   CheckSpirvBinaryValidates(result.spirv);
   TestBindlessStridedRecords();
+  TestBindlessCompactRecordWithSampler();
   TestBindlessCompareStaysOff();
 }
