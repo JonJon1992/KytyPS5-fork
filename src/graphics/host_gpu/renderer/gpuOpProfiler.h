@@ -160,8 +160,11 @@ private:
 [[nodiscard]] GpuCommandComposition TakeComposition() noexcept;
 
 // Environment-derived, evaluated once.
-[[nodiscard]] bool Enabled();        // counters or capture requested
+[[nodiscard]] bool Enabled();        // counters, capture or composition requested
 [[nodiscard]] bool CaptureEnabled(); // KYTY_GPU_OP_PROFILE > 0
+// KYTY_GPU_LONG_CB_MS > 0: the hooks of the commands TakeComposition counts are installed and the
+// CP recorder carries every command's site, without the sampled capture.
+[[nodiscard]] bool CompositionEnabled();
 
 // Directly after VULKAN_HPP_DEFAULT_DISPATCHER.init(device). No-op unless Enabled().
 void InstallHooks(GraphicContext& graphics);

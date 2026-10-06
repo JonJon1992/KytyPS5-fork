@@ -1943,9 +1943,17 @@ void CountEndRendering() noexcept {
 
 } // namespace Detail
 
+bool CompositionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GPU_LONG_CB_MS");
+		return value != nullptr && std::strtod(value, nullptr) > 0.0;
+	}();
+	return enabled;
+}
+
 bool Enabled() {
 	const auto& config = GetConfig();
-	return config.capture || config.counters;
+	return config.capture || config.counters || CompositionEnabled();
 }
 
 bool CaptureEnabled() {
@@ -1967,6 +1975,36 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier, &HookCmdPipelineBarrier);
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier2, &HookCmdPipelineBarrier2);
 	KYTY_GPU_OP_HOOK(vkCmdBeginRendering, &HookCmdBeginRendering);
+	if (!capture && CompositionEnabled()) {
+		// KYTY_GPU_LONG_CB_MS alone: the commands TakeComposition counts, without the capture's
+		// query pool, timestamps, pipeline, submission or image-view hooks.
+		KYTY_GPU_OP_HOOK(vkCmdDraw, &HookCmdDraw);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexed, &HookCmdDrawIndexed);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndirect, &HookCmdDrawIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexedIndirect, &HookCmdDrawIndexedIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndirectCount, &HookCmdDrawIndirectCount);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexedIndirectCount, &HookCmdDrawIndexedIndirectCount);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksEXT, &HookCmdDrawMeshTasksEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectEXT, &HookCmdDrawMeshTasksIndirectEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectCountEXT,
+		                 &HookCmdDrawMeshTasksIndirectCountEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDispatch, &HookCmdDispatch);
+		KYTY_GPU_OP_HOOK(vkCmdDispatchIndirect, &HookCmdDispatchIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdCopyBuffer, &HookCmdCopyBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdCopyImage, &HookCmdCopyImage);
+		KYTY_GPU_OP_HOOK(vkCmdCopyBufferToImage, &HookCmdCopyBufferToImage);
+		KYTY_GPU_OP_HOOK(vkCmdCopyImageToBuffer, &HookCmdCopyImageToBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdBlitImage, &HookCmdBlitImage);
+		KYTY_GPU_OP_HOOK(vkCmdResolveImage, &HookCmdResolveImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearColorImage, &HookCmdClearColorImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearDepthStencilImage, &HookCmdClearDepthStencilImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearAttachments, &HookCmdClearAttachments);
+		KYTY_GPU_OP_HOOK(vkCmdFillBuffer, &HookCmdFillBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdUpdateBuffer, &HookCmdUpdateBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdBeginQuery, &HookCmdBeginQuery);
+		KYTY_GPU_OP_HOOK(vkCmdEndQuery, &HookCmdEndQuery);
+		KYTY_GPU_OP_HOOK(vkCmdCopyQueryPoolResults, &HookCmdCopyQueryPoolResults);
+	}
 	if (capture) {
 		g_real.vkCmdWriteTimestamp2 = d.vkCmdWriteTimestamp2;
 		g_real.vkCmdWriteTimestamp  = d.vkCmdWriteTimestamp;
@@ -2009,8 +2047,10 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	LinkSite(g_unknown_site);
 	g_state.next_ns   = NowNs() + static_cast<uint64_t>(GetConfig().period_s * 1e9);
 	Detail::g_active = true;
-	std::printf("GPU op profiler: counters %s, sampled capture %s (period %.3f s, %u queries)\n",
+	std::printf("GPU op profiler: counters %s, sampled capture %s, command buffer composition %s "
+	            "(period %.3f s, %u queries)\n",
 	            GetConfig().counters ? "on" : "off", capture ? "on" : "off",
+	            CompositionEnabled() ? "on" : "off",
 	            GetConfig().period_s, GetConfig().queries);
 	std::fflush(stdout);
 }
