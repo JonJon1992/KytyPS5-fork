@@ -389,8 +389,8 @@ private:
 		if (inst == nullptr) {
 			Fail(use_pc, "invalid typed planning value");
 		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
-		if (cycle != m_visiting.end()) {
+		if (m_on_path.contains(inst)) {
+			const auto cycle        = std::ranges::find(m_visiting, inst);
 			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
 				return value->GetOpcode() == ValueOpcode::Phi;
 			});
@@ -400,15 +400,17 @@ private:
 			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
 			                         ValueOpcodeName(inst->GetOpcode())));
 		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
+		if (m_visited.contains(inst)) {
 			return;
 		}
 		m_visiting.push_back(inst);
+		m_on_path.insert(inst);
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
 			Collect(inst->Arg(index), use_pc);
 		}
 		m_visiting.pop_back();
-		m_visited.push_back(inst);
+		m_on_path.erase(inst);
+		m_visited.insert(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
@@ -483,8 +485,12 @@ private:
 	}
 
 	Program&           m_program;
-	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
+	// Collect's current path (in order, for cycle reports) and its members; the visited set.
+	// Sets, not vector scans: a shader of thousands of instructions made the scans quadratic
+	// (28% of Ghost of Yotei's 8800-instruction ray traversal shader's translation).
+	std::vector<Inst*>              m_visiting;
+	std::unordered_set<const Inst*> m_on_path;
+	std::unordered_set<const Inst*> m_visited;
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
