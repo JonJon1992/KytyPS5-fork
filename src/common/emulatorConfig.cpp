@@ -9,10 +9,17 @@ namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
 
+// The inline copies in the header (GraphicsDebugDumpEnabled, GetPrintfDirection).
+static void PublishInlineOptions() {
+	Detail::g_graphics_debug_dump_enabled = g_config->graphics_debug_dump_enabled;
+	Detail::g_printf_direction            = g_config->printf_direction;
+}
+
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
 
 	g_config = std::make_unique<ConfigOptions>();
+	PublishInlineOptions();
 }
 
 void Shutdown() {
@@ -26,6 +33,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 
 	*g_config = cfg;
+	PublishInlineOptions();
 }
 
 uint32_t GetScreenWidth() {
@@ -120,14 +128,6 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
 }
 
-bool GraphicsDebugDumpEnabled() {
-	return g_config->graphics_debug_dump_enabled;
-}
-
-LogDirection GetPrintfDirection() {
-	return g_config->printf_direction;
-}
-
 std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
@@ -154,6 +154,10 @@ bool ReadbackLinearImagesEnabled() {
 
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
+}
+
+bool PerfOverlayEnabled() {
+	return g_config->perf_overlay_enabled;
 }
 
 bool TrophyEnabled() {

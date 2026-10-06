@@ -1,3 +1,4 @@
+// Adapted from Senaxx/KytyPS5 Wolverine, commit 6b3fbc83d3bf39c89b3bb1adc68b6e50ce66732f (GPL-2.0).
 TestCase FlatStackApertures(u32 wave_size) {
   TestCase test;
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";

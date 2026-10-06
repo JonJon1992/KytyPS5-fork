@@ -20,7 +20,8 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 23 bools, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders, dispatcher_cap.
+// Members include bool switches, MadMode, PsLiveExec, loop_guard_budget, loop_guard_shaders and
+// dispatcher_cap. Every switch is serialized below, even when a new bool fits existing padding.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
 static_assert(sizeof(CodegenOptions) == 64, "CodegenOptions changed: update CodegenFingerprint");
@@ -82,6 +83,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 		b.U64(hash);
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
+	b.U8(options.bindless_strided_compute ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
 	b.U8(options.movrel_switch ? 1u : 0u);
@@ -93,6 +95,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U32(options.dispatcher_cap);
 	b.U8(options.ir_linear_uses ? 1u : 0u);
 	b.U8(options.fold_lane_masks ? 1u : 0u);
+	b.U8(options.spirv_optimize ? 1u : 0u);
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();
@@ -100,6 +103,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(float_controls.denorm_preserve_f16 ? 1u : 0u);
 	b.U8(float_controls.denorm_preserve_f64 ? 1u : 0u);
 	b.U8(Spirv::GetHostBufferRobustness().storage_dword_loads_return_zero ? 1u : 0u);
+	b.U8(Spirv::GetHostBufferRobustness().null_descriptor_for_short_ranges ? 1u : 0u);
 	const auto image_features = Spirv::GetHostImageFeatures();
 	b.U8(image_features.min_lod ? 1u : 0u);
 	b.U8(static_cast<uint8_t>(image_features.compute_derivatives));
@@ -112,6 +116,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(Common::RendererBatchEnabled() ? 1u : 0u);
 	b.U64(BufferCache::CACHING_PAGEBITS);
 	b.U64(BufferCache::CACHING_PAGESIZE);
+	b.U64(BufferCache::CACHING_NUMPAGES);
 
 	b.U32(static_cast<uint32_t>(kSwitchCount));
 	for (size_t i = 0; i < kSwitchCount; ++i) {

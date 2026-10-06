@@ -21,6 +21,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -245,6 +246,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
@@ -449,6 +451,19 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
+
+	const auto enabled_flag = [](bool value) {
+		return value ? QStringLiteral("1") : QStringLiteral("0");
+	};
+	auto environment = QProcessEnvironment::systemEnvironment();
+	environment.insert(QStringLiteral("KYTY_DCC_GPU"), enabled_flag(info.dcc_gpu_clear_enabled));
+	environment.insert(QStringLiteral("KYTY_PROGRAM_CACHE"),
+	                   enabled_flag(info.program_cache_enabled));
+	environment.insert(QStringLiteral("KYTY_PIPELINE_LIBRARY"),
+	                   enabled_flag(info.pipeline_library_enabled));
+	environment.insert(QStringLiteral("KYTY_GPU_FAULT_REPORT"),
+	                   enabled_flag(info.gpu_fault_report_enabled));
+	process->setProcessEnvironment(environment);
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

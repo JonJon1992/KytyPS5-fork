@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
@@ -129,6 +131,13 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 		const auto host_format = ResolveHostFormat(encoding.buffer_format, order);
 		const auto bytes       = Prospero::RenderTargetBytesPerElement(encoding.buffer_format);
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
+			if (static std::atomic_bool logged = false;
+			    encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm &&
+			    !logged.exchange(true)) {
+				Log::WriteToConsoleAndLog(
+				    "Render target 11_11_10 UNORM: approximated with A2B10G10R10 UNORM (Vulkan has "
+				    "no 11_11_10 UNORM format; 10-bit red and green)\n");
+			}
 			const auto order_mapping =
 			    kRenderTargetColorMappings[static_cast<size_t>(order)][encoding.components - 1u];
 			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping)};

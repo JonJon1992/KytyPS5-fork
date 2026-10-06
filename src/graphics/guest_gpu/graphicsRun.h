@@ -44,7 +44,8 @@ public:
 	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
 
-	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Inline: the caches ask it several times per draw binding from other translation units.
+	[[nodiscard]] static bool IsGpuThread() noexcept { return t_gpu_thread; }
 
 	// Like SendCommand, but returns false (dropping nothing: the caller keeps the command's
 	// work) once the GPU no longer accepts external commands (shutdown). Any thread.
@@ -71,6 +72,9 @@ private:
 		uint64_t size    = 0;
 		uint64_t tick    = 0;
 	};
+	// Set by ThreadRun for its own thread (IsGpuThread).
+	static inline thread_local bool t_gpu_thread = false;
+
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
@@ -130,9 +134,14 @@ private:
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
-	std::atomic_uint32_t                           m_pending_commands {0};
-	std::deque<DeferredLabel>                      m_deferred_labels; // m_queue_mutex
+	// Polled by the GPU thread at every packet or op (HasPendingCommands): alone on its cache line,
+	// so the fields admissions write under m_queue_mutex do not evict it.
+	alignas(64) std::atomic_uint32_t               m_pending_commands {0};
+	alignas(64) std::deque<DeferredLabel>          m_deferred_labels; // m_queue_mutex
 	std::atomic_uint32_t                           m_deferred_label_count {0};
+	// Compute submissions in m_queues (changed under m_queue_mutex; HasRunnableComputeWork fast
+	// path).
+	std::atomic_uint32_t                           m_compute_queued {0};
 	// Some queue front is marked blocked (set under m_queue_mutex; NotifyProgress fast path).
 	std::atomic_bool                               m_has_blocked {false};
 	// Bounded Done (KYTY_AGC_DONE_MODE): admission sequence numbers of submissions not yet

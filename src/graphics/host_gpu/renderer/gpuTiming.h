@@ -15,6 +15,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -49,6 +50,51 @@ void OnGuestFlip();
 
 } // namespace GpuTiming
 
+// What one guest command buffer recorded, by the innermost KYTY_GPU_OP_SITE of each command
+// (GpuOpProfiler's hooks, installed with KYTY_HANG_TRACE=1 or KYTY_GPU_OP_PROFILE; empty without
+// them). Diagnostic only: KYTY_GPU_LONG_CB_MS reports it for long command buffers.
+struct GpuCommandComposition {
+	static constexpr uint32_t MaxSites = 6;
+
+	std::array<const char*, MaxSites> sites {};
+	std::array<uint32_t, MaxSites>    counts {};
+	uint32_t                          other = 0; // commands of sites past MaxSites
+	// Guest compute shaders dispatched (hash 0: not registered), with their total thread groups
+	// (0 for an indirect dispatch).
+	static constexpr uint32_t         MaxDispatchShaders = 4;
+	std::array<uint64_t, MaxDispatchShaders> dispatch_hashes {};
+	std::array<uint64_t, MaxDispatchShaders> dispatch_groups {};
+	std::array<uint32_t, MaxDispatchShaders> dispatch_counts {};
+	uint32_t                                 dispatch_other = 0;
+
+	void AddDispatch(uint64_t hash, uint64_t groups) noexcept {
+		for (uint32_t index = 0; index < MaxDispatchShaders; index++) {
+			if (dispatch_counts[index] == 0 || dispatch_hashes[index] == hash) {
+				dispatch_hashes[index] = hash;
+				dispatch_groups[index] += groups;
+				dispatch_counts[index]++;
+				return;
+			}
+		}
+		dispatch_other++;
+	}
+
+	void Add(const char* site) noexcept {
+		for (uint32_t index = 0; index < MaxSites; index++) {
+			if (sites[index] == site) {
+				counts[index]++;
+				return;
+			}
+			if (sites[index] == nullptr) {
+				sites[index]  = site;
+				counts[index] = 1;
+				return;
+			}
+		}
+		other++;
+	}
+};
+
 // One collected command buffer: raw device ticks and steady_clock nanoseconds (GpuTiming::NowNs).
 struct GpuTimingSample {
 	uint64_t gpu_start   = 0;
@@ -57,6 +103,8 @@ struct GpuTimingSample {
 	uint64_t submit_ns   = 0; // CommandScheduler::Submit was entered
 	uint64_t dispatch_ns = 0; // native vkQueueSubmit containing it returned
 	uint64_t observed_ns = 0; // producer observed the tick complete and read the queries
+	uint64_t tick        = 0; // the scheduler tick this buffer signals
+	GpuCommandComposition composition;
 };
 
 // Fixed ring of timestamp-query pairs owned by one command scheduler.
@@ -104,6 +152,7 @@ private:
 		uint64_t  submit_ns   = 0;
 		uint64_t  dispatch_ns = 0;
 		SlotState state       = SlotState::Free;
+		GpuCommandComposition composition;
 	};
 
 	void CollectRun(uint32_t first, uint32_t count, uint64_t observed_ns);

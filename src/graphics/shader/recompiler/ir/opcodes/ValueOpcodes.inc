@@ -4,6 +4,8 @@ VALUE_OPCODE(Identity, Opaque, Opaque)
 VALUE_OPCODE(Void, Void)
 VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
+VALUE_OPCODE(ShaderTrap, Void, U32, U32)
+VALUE_OPCODE(BvhIntersect, U32x4, U32x4, ImageAddress, U1)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
@@ -219,7 +221,7 @@ VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
 VALUE_OPCODE(ReadLane, U32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)
-VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1, U32, U32)
 VALUE_OPCODE(PermuteU32, U32, U32, U32, U1)
 VALUE_OPCODE(BpermuteU32, U32, U32, U32, U1)
 
@@ -357,3 +359,8 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+
+// Keep a guest GLOBAL DWORDXn read together through lowering and BDA translation.
+VALUE_OPCODE(LoadAddressU32x2, U32x2, AddressResource, U32, U32, U1)
+VALUE_OPCODE(LoadAddressU32x3, U32x3, AddressResource, U32, U32, U1)
+VALUE_OPCODE(LoadAddressU32x4, U32x4, AddressResource, U32, U32, U1)

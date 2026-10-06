@@ -47,6 +47,19 @@ struct GuestBackingMappingCache {
 };
 static thread_local GuestBackingMappingCache t_backing_mapping_cache;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Post-mortem scan helper: a page can vanish between the working-set query and the read. No object with
+// a destructor may live in a function that uses __try, hence the scan by reference.
+static bool ScanBlockGuarded(PointerScan& scan, const uint64_t* words, size_t count, uint64_t address) {
+	__try {
+		scan.AddBlock(words, count, address);
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+#endif
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -185,6 +198,117 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+
+	// Post-mortem diagnostic (GPU fault report): where the guest's mappings hold 8-byte values whose low
+	// 48 bits lie in [low, high] (pointerScan.h). The guest writes through its own views of the backing and
+	// a page's working-set state is per view, so the guest views are scanned (the backing view is the
+	// fallback when the map lock is busy). Only pages with a valid page-table entry are read: looking
+	// commits nothing, and a page the write tracking made inaccessible is not valid, so no tracking fault
+	// is triggered. Stops after `budget`. The map lock is only tried: a thread stuck holding it must not
+	// hold the report.
+	[[nodiscard]] std::string ScanForAddressRange(uint64_t low, uint64_t high,
+	                                              std::chrono::milliseconds budget) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!IsAvailable()) {
+			return "guest direct memory is not available\n";
+		}
+		constexpr uint64_t kPage       = 4096;
+		constexpr size_t   kChunkPages = 1024;
+
+		struct Range {
+			uint64_t address;
+			uint64_t size;
+			uint64_t backing_offset;
+		};
+		std::vector<Range> ranges;
+		{
+			std::unique_lock lock(m_mutex, std::try_to_lock);
+			if (lock.owns_lock()) {
+				for (const auto& [vaddr, entry]: m_maps) {
+					ranges.push_back({entry.vaddr, entry.size, entry.backing_offset});
+				}
+			}
+		}
+		const bool from_maps = !ranges.empty();
+		if (!from_maps) {
+			ranges.push_back({GetBackingBase(), m_size, 0});
+		}
+
+		PointerScan                                   scan(low, high);
+		std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(kChunkPages);
+		const auto                                    start = std::chrono::steady_clock::now();
+		uint64_t                                      mapped_bytes   = 0;
+		uint64_t                                      faulted_blocks = 0;
+		bool                                          timed_out      = false;
+		bool                                          query_failed   = false;
+		for (const Range& range: ranges) {
+			if (timed_out || query_failed) {
+				break;
+			}
+			const uint64_t begin = range.address & ~(kPage - 1);
+			const uint64_t end   = (range.address + range.size + kPage - 1) & ~(kPage - 1);
+			mapped_bytes += end - begin;
+			for (uint64_t address = begin; address < end; address += kChunkPages * kPage) {
+				const auto pages = static_cast<size_t>(std::min<uint64_t>(kChunkPages, (end - address) / kPage));
+				for (size_t i = 0; i < pages; i++) {
+					info[i].VirtualAddress          = reinterpret_cast<void*>(address + i * kPage);
+					info[i].VirtualAttributes.Flags = 0;
+				}
+				if (K32QueryWorkingSetEx(GetCurrentProcess(), info.data(),
+				                         static_cast<DWORD>(pages * sizeof(info[0]))) == 0) {
+					query_failed = true;
+					break;
+				}
+				for (size_t i = 0; i < pages; i++) {
+					if (info[i].VirtualAttributes.Valid == 0) {
+						continue;
+					}
+					const uint64_t page = address + i * kPage;
+					if (ScanBlockGuarded(scan, reinterpret_cast<const uint64_t*>(page), kPage / sizeof(uint64_t), page)) {
+						scan.NoteScanned(kPage);
+					} else {
+						faulted_blocks++;
+					}
+				}
+				if (std::chrono::steady_clock::now() - start > budget) {
+					timed_out = true;
+					break;
+				}
+			}
+		}
+		const auto elapsed_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+		        .count();
+
+		auto describe = [&](uint64_t address) -> std::string {
+			for (const Range& range: ranges) {
+				if (address >= range.address && address < range.address + range.size) {
+					char text[64];
+					std::snprintf(text, sizeof(text), " (dmem 0x%" PRIx64 ")",
+					              range.backing_offset + (address - range.address));
+					return text;
+				}
+			}
+			return {};
+		};
+
+		char head[400];
+		std::snprintf(head, sizeof(head),
+		              "scanned %.2f of %.2f GiB of %s (pages with a valid page-table entry only) in %lld ms%s%s%s\n",
+		              static_cast<double>(scan.ScannedBytes()) / (1024.0 * 1024.0 * 1024.0),
+		              static_cast<double>(mapped_bytes) / (1024.0 * 1024.0 * 1024.0),
+		              from_maps ? "guest mappings" : "the backing view (the map lock was busy)",
+		              static_cast<long long>(elapsed_ms), timed_out ? ", stopped at the time budget" : "",
+		              query_failed ? ", working-set query failed" : "",
+		              faulted_blocks != 0 ? ", some pages faulted and were skipped" : "");
+		return std::string(head) + scan.Format(describe);
+#else
+		(void)low;
+		(void)high;
+		(void)budget;
+		return "guest memory scan is only implemented on Windows\n";
+#endif
+	}
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -686,8 +810,10 @@ private:
 
 	// Small reads only: the lock matters for descriptor-sized probes, and they go through a
 	// bounce buffer so a failed read never modifies the destination (as on the locked path).
+	// 512 covers the batched vertex-buffer descriptor read (shader.cpp, 2 * MaxBatchWords words),
+	// which otherwise takes the mutex and two tree searches.
 	// Reads only: a write through a mapping being removed concurrently could not be undone.
-	static constexpr uint64_t MAX_CACHED_MAPPING_READ = 256;
+	static constexpr uint64_t MAX_CACHED_MAPPING_READ = 512;
 
 	bool TryReadCachedMapping(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || size == 0 || size > MAX_CACHED_MAPPING_READ ||
@@ -1019,6 +1145,11 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+
+	[[nodiscard]] std::string ScanForAddressRange(uint64_t low, uint64_t high,
+	                                              std::chrono::milliseconds budget) {
+		return m_backing->ScanForAddressRange(low, high, budget);
+	}
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);
@@ -1585,6 +1716,12 @@ private:
 	void ReserveGuestRegions() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
+		// Other threads (the profiler, networking) allocate while this scan runs, and one of their
+		// allocations can land in a range VirtualQuery has just reported free. Such a range is
+		// queried again: the newcomer then shows up as occupied and is skipped like any other
+		// (IDXTRI/KytyPS5 5206955b).
+		constexpr int      MaxReserveRetries = 64;
+		int                reserve_retries   = 0;
 		const auto         process           = GetCurrentProcess();
 		const auto         guest_end         = HOST_USER_MAX + 1u;
 		auto               next_addr         = HOST_SYSTEM_MANAGED_MIN;
@@ -1608,6 +1745,9 @@ private:
 				    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 				    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 				if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+					if (ptr == nullptr && ++reserve_retries <= MaxReserveRetries) {
+						continue; // query next_addr again
+					}
 					EXIT("failed to reserve guest address space at 0x%016" PRIx64
 					     ", size 0x%016" PRIx64 "\n",
 					     reserve_start, reserve_end - reserve_start);

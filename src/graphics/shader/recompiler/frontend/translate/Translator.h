@@ -7,6 +7,20 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+// Whether a wave32 guest program may run in a 64-lane host subgroup: pixel and compute pipelines
+// require the guest's wave size, but drivers need not take a required size for vertex stages (the
+// RX 9070 XT reports requiredSubgroupSizeStages 0xf0 and runs vertex, LS and domain shaders as
+// wave64). Host lanes 32-63 are then a second guest wave: their EXEC, VCC and ballots are the host
+// ballot's upper word, MBCNT counts within their own 32 lanes, and lane reads stay in their half
+// (Spirv::Emitter::WaveHalvesInHostSubgroup). Correct for a 32-lane host subgroup too, whose lanes
+// are all in the low half. KYTY_DEBUG_WAVE_HALVES=0 translates as if the host subgroup matched the
+// guest wave (A/B). From BryanKAdams/KytyPS5 8f02ad19.
+[[nodiscard]] bool WaveHalvesInHostSubgroup(const IR::Program& program);
+// The guest wave's 32-lane mask from a host ballot, per WaveHalvesInHostSubgroup: the ballot's low
+// word, or in host lanes 32-63 of a split subgroup its high word.
+[[nodiscard]] IR::U32 GuestWaveMask(IR::IREmitter& ir, const IR::Program& program,
+                                    const IR::Value& ballot);
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
@@ -82,7 +96,7 @@ private:
 	IR::Value     ConstructU32x4(const Decoder::Operand& base, uint32_t count);
 	void          WriteImageComponents(const Decoder::Operand& dst, IR::Value value,
 	                                   const IR::MemoryInfo& memory, uint32_t component_limit);
-	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst, uint32_t source_offset);
+	BufferAddress ReadBufferAddress(const Decoder::Instruction& inst);
 	IR::U32       WidenSubdword(IR::Value value, uint32_t bits, bool sign);
 	IR::Value     NarrowSubdword(IR::U32 value, uint32_t bits);
 	void          S_LOAD(const Decoder::Instruction& inst, bool raw);
@@ -92,6 +106,7 @@ private:
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);

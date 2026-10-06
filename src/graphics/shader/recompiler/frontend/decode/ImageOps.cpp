@@ -189,12 +189,16 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
     {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
     {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
+    {0x4cu, Opcode::IMAGE_GATHER4_C_L, ImageSampleFlagCompare | ImageSampleFlagLod},
     {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x54u, Opcode::IMAGE_GATHER4_L_O, ImageSampleFlagLod | ImageSampleFlagOffset},
     {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
      ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x58u, Opcode::IMAGE_GATHER4_C_O,
      ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x5cu, Opcode::IMAGE_GATHER4_C_L_O,
+     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
@@ -241,6 +245,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -269,6 +274,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
+		case 0xe6u: return 11u;
 		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
@@ -391,6 +397,12 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
+	}
+
+	if (opcode == 0xe6u &&
+	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "BVH intersection requires eleven full-float ray DWORDs and R128/dmask:0xf");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

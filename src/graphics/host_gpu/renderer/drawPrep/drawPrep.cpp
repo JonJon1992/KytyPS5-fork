@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
@@ -448,6 +449,166 @@ static ValidateResult ValidateValues(const ReadSet& reads) {
 // Per-reason fallback counts for the periodic console line (PrintDrawPrepSummary).
 std::array<std::atomic<uint64_t>, static_cast<size_t>(Failure::Mismatch) + 1u> g_fallback_reasons;
 
+namespace {
+
+// KYTY_DRAW_PREP_CERT_DIAG=1 (live, default off; diagnostics): for every commit refused as
+// CertUnclean, the path that refused it, which exact predicate makes its first unclean range
+// unclean (Memory::GpuUncleanReasons), whether that range is a read or a digest, and how many
+// coherence generations separated preparation and commit (also for accepted commits). Summed in
+// the "DrawPrep 10s" line with the most frequent refused ranges. GPU thread only (Validate and
+// PrintDrawPrepSummary both run there), so plain counters.
+Live::Switch g_cert_diag("KYTY_DRAW_PREP_CERT_DIAG", Live::ParseDefaultOff);
+
+// KYTY_DRAW_PREP_RELEASE_OVERWRITTEN=1 (live, default off): a certificate whose only unclean
+// ranges are covered by GPU-modified images first lets the images a CPU write definitely
+// overwrote give up their bytes, as the serial path's SynchronizeGpuBackingForRead does before it
+// reads, and is accepted when every range is clean then. The preparation read those ranges from
+// the backing, which is what the serial path reads after the same release; a range still unclean
+// (an image the CPU did not overwrite, GPU-dirty bytes, a pending publication) falls back as before.
+// Crash Bandicoot 4 reuses the memory of small render targets (30x5x5 ...) for tables the CPU
+// rewrites, and its draws refused here took the serial path thousands of times a second.
+Live::Switch g_release_overwritten("KYTY_DRAW_PREP_RELEASE_OVERWRITTEN", Live::ParseDefaultOff);
+uint64_t     g_release_rescues = 0; // accepted after a release, since the last summary line
+
+// Releases the CPU-overwritten images behind the certificate's unclean ranges; false when a range
+// is unclean for another reason (nothing can be accepted then).
+bool ReleaseOverwrittenImages(const PreparedDraw& prepared) {
+	const auto release = [](std::span<const Coherence::Range> ranges) {
+		for (const auto& range: ranges) {
+			const auto size = range.end - range.begin;
+			if (LibKernel::Memory::IsGpuCleanForRead(range.begin, size)) {
+				continue;
+			}
+			if (LibKernel::Memory::GpuUncleanReasons(range.begin, size) !=
+			    LibKernel::Memory::GpuUncleanImage) {
+				return false;
+			}
+			(void)LibKernel::Memory::ReleaseCpuOverwrittenGpuImages(range.begin, size);
+		}
+		return true;
+	};
+	return release(prepared.reads.Ranges()) && release(prepared.reads.DigestRanges());
+}
+
+enum class CertPath : uint8_t { LogClean, LogConflict, Value, Count };
+
+struct CertDiag {
+	struct Top {
+		uint64_t begin = 0;
+		uint64_t size  = 0;
+		uint64_t count = 0;
+	};
+	std::array<uint64_t, static_cast<size_t>(CertPath::Count)> paths {};
+	std::array<uint64_t, 8>  reasons {}; // by GpuUnclean* bits; 0: clean again when inspected
+	uint64_t                 digest_ranges = 0;
+	uint64_t                 fail_count    = 0;
+	uint64_t                 fail_gens     = 0;
+	uint64_t                 ok_count      = 0;
+	uint64_t                 ok_gens       = 0;
+	uint64_t                 top_dropped   = 0;
+	std::array<Top, 64>      top {};
+};
+CertDiag g_cert_diag_state;
+
+void NoteCertTop(uint64_t begin, uint64_t size) {
+	auto&      top  = g_cert_diag_state.top;
+	const auto hash = (begin >> 6u) * 0x9E3779B97F4A7C15ull;
+	for (uint32_t probe = 0; probe < 8; probe++) {
+		auto& entry = top[(hash + probe) & (top.size() - 1u)];
+		if (entry.count == 0 || (entry.begin == begin && entry.size == size)) {
+			entry.begin = begin;
+			entry.size  = size;
+			entry.count++;
+			return;
+		}
+	}
+	g_cert_diag_state.top_dropped++;
+}
+
+void NoteCertUnclean(const PreparedDraw& prepared, CertPath path) {
+	if (!g_cert_diag.On()) {
+		return;
+	}
+	auto& diag = g_cert_diag_state;
+	diag.paths[static_cast<size_t>(path)]++;
+	diag.fail_count++;
+	diag.fail_gens += Coherence::Generation() - prepared.coherence_generation;
+	const auto inspect = [&](std::span<const Coherence::Range> ranges, bool digest) {
+		for (const auto& range: ranges) {
+			const auto size = range.end - range.begin;
+			if (LibKernel::Memory::IsGpuCleanForRead(range.begin, size)) {
+				continue;
+			}
+			const auto reasons = LibKernel::Memory::GpuUncleanReasons(range.begin, size);
+			diag.reasons[reasons & 7u]++;
+			diag.digest_ranges += digest ? 1u : 0u;
+			if ((reasons & LibKernel::Memory::GpuUncleanImage) != 0) {
+				// The images behind a range, once per range (the first 16 ranges).
+				static std::array<uint64_t, 16> described {};
+				static size_t                   described_count = 0;
+				const auto key = range.begin ^ (size << 48u);
+				if (described_count < described.size() &&
+				    std::find(described.begin(), described.begin() + described_count, key) ==
+				        described.begin() + described_count) {
+					described[described_count++] = key;
+					LibKernel::Memory::LogGpuUncleanImages(range.begin, size);
+				}
+			}
+			NoteCertTop(range.begin, size);
+			return true;
+		}
+		return false;
+	};
+	if (!inspect(prepared.reads.Ranges(), false) && !inspect(prepared.reads.DigestRanges(), true)) {
+		diag.reasons[0]++; // every range is clean again by now
+	}
+}
+
+void NoteCertAccepted(const PreparedDraw& prepared) {
+	if (g_cert_diag.On()) {
+		g_cert_diag_state.ok_count++;
+		g_cert_diag_state.ok_gens += Coherence::Generation() - prepared.coherence_generation;
+	}
+}
+
+// The diagnostics since the previous line, then reset; empty when nothing was noted.
+std::string TakeCertDiagText() {
+	auto& diag = g_cert_diag_state;
+	if (diag.fail_count == 0 && diag.ok_count == 0) {
+		return {};
+	}
+	const auto avg = [](uint64_t sum, uint64_t count) {
+		return count == 0 ? 0.0 : static_cast<double>(sum) / static_cast<double>(count);
+	};
+	char text[384];
+	std::snprintf(text, sizeof(text),
+	              " certdiag: path logclean=%" PRIu64 " logconflict=%" PRIu64 " value=%" PRIu64
+	              "; first unclean dirty=%" PRIu64 " publication=%" PRIu64 " image=%" PRIu64
+	              " mixed=%" PRIu64 " clean-again=%" PRIu64 " (digest %" PRIu64
+	              "); gens fail=%.1f ok=%.1f;",
+	              diag.paths[0], diag.paths[1], diag.paths[2], diag.reasons[1], diag.reasons[2],
+	              diag.reasons[4], diag.reasons[3] + diag.reasons[5] + diag.reasons[6] + diag.reasons[7],
+	              diag.reasons[0], diag.digest_ranges, avg(diag.fail_gens, diag.fail_count),
+	              avg(diag.ok_gens, diag.ok_count));
+	std::string line = text;
+	auto        top  = diag.top;
+	std::sort(top.begin(), top.end(),
+	          [](const CertDiag::Top& a, const CertDiag::Top& b) { return a.count > b.count; });
+	line += " top";
+	for (size_t i = 0; i < 6 && top[i].count != 0; i++) {
+		std::snprintf(text, sizeof(text), " 0x%" PRIx64 "+0x%" PRIx64 "(%" PRIu64 ")", top[i].begin,
+		              top[i].size, top[i].count);
+		line += text;
+	}
+	if (diag.top_dropped != 0) {
+		line += " (+" + std::to_string(diag.top_dropped) + " untracked)";
+	}
+	diag = {};
+	return line;
+}
+
+} // namespace
+
 bool Validate(PreparedDraw& prepared, bool pixel_active,
               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping) {
 	const auto fail = [&](Failure failure) {
@@ -480,7 +641,12 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogEntries, outcome.entries);
 		if (outcome.result == Coherence::CheckResult::Clean) {
 			if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
-				return fail(Failure::CertUnclean);
+				if (!g_release_overwritten.On() || !ReleaseOverwrittenImages(prepared) ||
+				    !prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
+					NoteCertUnclean(prepared, CertPath::LogClean);
+					return fail(Failure::CertUnclean);
+				}
+				g_release_rescues++;
 			}
 		} else {
 			// A logged transition touched a certified range, or the interval could not be read:
@@ -496,7 +662,9 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 				case ValidateResult::Ok:
 					Profiler::CountFrameEvent(E::DrawPrepLogValueRescues);
 					break;
-				case ValidateResult::Unclean: return fail(Failure::CertUnclean);
+				case ValidateResult::Unclean:
+					NoteCertUnclean(prepared, CertPath::LogConflict);
+					return fail(Failure::CertUnclean);
 				case ValidateResult::Changed: return fail(Failure::CertChanged);
 			}
 		}
@@ -518,10 +686,13 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		}
 		switch (result) {
 			case ValidateResult::Ok: break;
-			case ValidateResult::Unclean: return fail(Failure::CertUnclean);
+			case ValidateResult::Unclean:
+				NoteCertUnclean(prepared, CertPath::Value);
+				return fail(Failure::CertUnclean);
 			case ValidateResult::Changed: return fail(Failure::CertChanged);
 		}
 	}
+	NoteCertAccepted(prepared);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitted);
 	g_totals.committed.fetch_add(1, std::memory_order_relaxed);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRanges, ranges.size());
@@ -1044,8 +1215,16 @@ void Engine::SkipPublished(uint64_t count) {
 		auto& slot = window.HeadPayload();
 		if (!window.TryClaimHead()) {
 			// A worker prepares it (or has): its preparation is discarded once it is done.
-			while (!window.HeadDone()) {
+			const auto spin_start = NowNs();
+			for (uint32_t spins = 0; !window.HeadDone(); spins++) {
 				CpuRelax();
+				// The same last-resort deadlock guard as CommitHead's spin. The slots retired so
+				// far were speculative (never draws), so a command serviced here observes the
+				// window as CommitHead's guard does.
+				if ((spins & 1023u) == 1023u && m_service_commands &&
+				    NowNs() - spin_start > 2'000'000u) {
+					m_service_commands();
+				}
 			}
 		}
 		// Claimed or done (acquired): the slot is this thread's until it retires.
@@ -1059,20 +1238,11 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
 	        m_workers->window.Head() != position);
-	const std::function<void(Slot&)> patch = [submit_id, instance_count](Slot& slot) {
-		slot.submit_id = submit_id;
-		if (instance_count != UINT32_MAX) {
-			if (slot.kind == DrawKind::Index) {
-				slot.index_args.instance_count = instance_count;
-			} else {
-				slot.auto_args.instance_count = instance_count;
-			}
-		}
-	};
+	const HeadPatch patch {submit_id, instance_count};
 	CommitHead(&patch);
 }
 
-void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
+void Engine::CommitHead(const HeadPatch* patch) {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
 	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
@@ -1081,19 +1251,25 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	auto& slot = window.HeadPayload();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
+		const auto self_start = NowNs();
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+		g_totals.head_self.fetch_add(1, std::memory_order_relaxed);
+		g_totals.head_self_ns.fetch_add(NowNs() - self_start, std::memory_order_relaxed);
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+		g_totals.head_ready.fetch_add(1, std::memory_order_relaxed);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		g_totals.head_waits.fetch_add(1, std::memory_order_relaxed);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
 		HangWatchdog::Scope wait("draw-prep-head", reinterpret_cast<uint64_t>(&window),
 		                         HangWatchdog::Enabled() ? window.Head() : 0, occupancy);
 		if (window.Unclaimed() != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsUnclaimed);
+			g_totals.head_waits_unclaimed.fetch_add(1, std::memory_order_relaxed);
 		}
 		// A worker holds the head. KYTY_DRAW_PREP_STEAL: meanwhile this thread prepares the next
 		// unclaimed slots exactly as a worker does (AwaitHead, workerGate.h): same function, the
@@ -1125,6 +1301,12 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
+		g_totals.head_wait_ns.fetch_add(stats.spin_ns, std::memory_order_relaxed);
+		if (slot.after_stop != 0) {
+			g_totals.head_waits_after_stop.fetch_add(1, std::memory_order_relaxed);
+			g_totals.head_wait_after_stop_ns.fetch_add(stats.spin_ns, std::memory_order_relaxed);
+		}
+		g_totals.head_steals.fetch_add(stats.stolen, std::memory_order_relaxed);
 		// Actual idle CP wait on a shader miss, capped by the compiler call duration. Steals
 		// are accounted separately above. Whole-route flip intervals remain the hitch metric.
 		m_renderer.GetPipelineCache().NoteProgramPrefetchWait(
@@ -1153,7 +1335,14 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	}
 	if (patch != nullptr) {
 		// The preparation (and the preparing thread's reads of the slot) is complete.
-		(*patch)(slot);
+		slot.submit_id = patch->submit_id;
+		if (patch->instance_count != UINT32_MAX) {
+			if (slot.kind == DrawKind::Index) {
+				slot.index_args.instance_count = patch->instance_count;
+			} else {
+				slot.auto_args.instance_count = patch->instance_count;
+			}
+		}
 	}
 	Commit(slot);
 	window.Retire();
@@ -1174,14 +1363,46 @@ void Engine::Drain() {
 // preparation against draws that fell back to the serial path, and why. Fallbacks run the whole
 // program preparation on the command processor, so the ratio says how much of it is avoidable.
 namespace {
+struct Head {
+	uint64_t ready           = 0;
+	uint64_t self            = 0;
+	uint64_t self_ns         = 0;
+	uint64_t waits           = 0;
+	uint64_t waits_unclaimed = 0;
+	uint64_t wait_ns         = 0;
+	uint64_t steals          = 0;
+	uint64_t after_stop      = 0;
+	uint64_t after_stop_ns   = 0;
+	// KYTY_CP_SEQ_PREFETCH (P3c): speculative slots published, adopted and skipped.
+	uint64_t prefetch_published = 0;
+	uint64_t prefetch_adopted   = 0;
+	uint64_t prefetch_skipped   = 0;
+};
+
+Head ReadHead() {
+	return {g_totals.head_ready.load(std::memory_order_relaxed),
+	        g_totals.head_self.load(std::memory_order_relaxed),
+	        g_totals.head_self_ns.load(std::memory_order_relaxed),
+	        g_totals.head_waits.load(std::memory_order_relaxed),
+	        g_totals.head_waits_unclaimed.load(std::memory_order_relaxed),
+	        g_totals.head_wait_ns.load(std::memory_order_relaxed),
+	        g_totals.head_steals.load(std::memory_order_relaxed),
+	        g_totals.head_waits_after_stop.load(std::memory_order_relaxed),
+	        g_totals.head_wait_after_stop_ns.load(std::memory_order_relaxed),
+	        g_totals.prefetch_published.load(std::memory_order_relaxed),
+	        g_totals.prefetch_adopted.load(std::memory_order_relaxed),
+	        g_totals.prefetch_skipped.load(std::memory_order_relaxed)};
+}
+
 void PrintDrawPrepSummary() {
 	static uint64_t last_ns        = 0;
 	static uint64_t last_committed = 0;
 	static uint64_t last_fallbacks = 0;
+	static Head     last_head {};
 	static std::array<uint64_t, static_cast<size_t>(Failure::Mismatch) + 1u> last_reasons {};
-	// KYTY_CP_COMMIT=draws: the clock is read every 256th commit (the line is due every 10 s).
+	// The clock is read every 256th commit (the line is due every 10 s).
 	static uint32_t calls = 0;
-	if (CpCommit::Enabled(CpCommit::Part::Draws) && last_ns != 0 && (++calls & 255u) != 0) {
+	if (last_ns != 0 && (++calls & 255u) != 0) {
 		return;
 	}
 	const auto now = NowNs();
@@ -1206,13 +1427,48 @@ void PrintDrawPrepSummary() {
 			last_reasons[i] = value;
 		}
 	}
-	std::printf("DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
-	            " fell back to the serial path;%s\n",
-	            static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
-	            fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str());
+	// How the commits found their head slot (parallel mode): the command processor's idle spin on
+	// a head a worker held, and its own preparations of heads no worker had claimed.
+	const auto head = ReadHead();
+	char       line[512];
+	std::snprintf(line, sizeof(line),
+	              "DrawPrep %.0fs: %" PRIu64 " committed from a prepared slot, %" PRIu64
+	              " fell back to the serial path;%s; head ready=%" PRIu64 " self=%" PRIu64
+	              " (%.1f ms) waited=%" PRIu64 " (unclaimed behind %" PRIu64
+	              ", %.1f ms; after a CP stop %" PRIu64 ", %.1f ms) stolen=%" PRIu64 "\n",
+	              static_cast<double>(now - last_ns) * 1e-9, committed - last_committed,
+	              fallbacks - last_fallbacks, reasons.empty() ? " none" : reasons.c_str(),
+	              head.ready - last_head.ready, head.self - last_head.self,
+	              static_cast<double>(head.self_ns - last_head.self_ns) * 1e-6,
+	              head.waits - last_head.waits, head.waits_unclaimed - last_head.waits_unclaimed,
+	              static_cast<double>(head.wait_ns - last_head.wait_ns) * 1e-6,
+	              head.after_stop - last_head.after_stop,
+	              static_cast<double>(head.after_stop_ns - last_head.after_stop_ns) * 1e-6,
+	              head.steals - last_head.steals);
+	std::string text = line;
+	if (g_release_rescues != 0) {
+		text.pop_back();
+		text += " released-overwritten=" + std::to_string(g_release_rescues) + "\n";
+		g_release_rescues = 0;
+	}
+	if (const auto diag = TakeCertDiagText(); !diag.empty()) {
+		text.pop_back();
+		text += diag + "\n";
+	}
+	if (head.prefetch_published != last_head.prefetch_published) {
+		// The line ends with the newline above: the prefetch counters go before it.
+		text.pop_back();
+		text += " prefetch published=" +
+		        std::to_string(head.prefetch_published - last_head.prefetch_published) +
+		        " adopted=" + std::to_string(head.prefetch_adopted - last_head.prefetch_adopted) +
+		        " skipped=" + std::to_string(head.prefetch_skipped - last_head.prefetch_skipped) +
+		        "\n";
+	}
+	Log::WriteToConsoleAndLog(text);
 	last_ns        = now;
 	last_committed = committed;
 	last_fallbacks = fallbacks;
+	last_head      = head;
 }
 } // namespace
 

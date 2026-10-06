@@ -74,6 +74,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   perf_overlay_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -110,9 +111,20 @@ std::filesystem::path  GetShaderLogFolder();
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
-bool GraphicsDebugDumpEnabled();
+// Copies of graphics_debug_dump_enabled and printf_direction that Initialize and Load keep current:
+// the renderer asks for both several times per draw, so they are read inline.
+namespace Detail {
+inline bool         g_graphics_debug_dump_enabled = false;
+inline LogDirection g_printf_direction            = LogDirection::Silent;
+} // namespace Detail
 
-LogDirection          GetPrintfDirection();
+inline bool GraphicsDebugDumpEnabled() {
+	return Detail::g_graphics_debug_dump_enabled;
+}
+
+inline LogDirection GetPrintfDirection() {
+	return Detail::g_printf_direction;
+}
 std::filesystem::path GetPrintfOutputFile();
 
 bool ProfilerEnabled();
@@ -124,6 +136,7 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
+bool PerfOverlayEnabled();
 bool TrophyEnabled();
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

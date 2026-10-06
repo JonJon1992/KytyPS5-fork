@@ -200,6 +200,18 @@ bool IsCapture(VkCommandBuffer cb) noexcept {
 	return cb == g_capture_cb.load(std::memory_order_relaxed);
 }
 
+// The recording thread's composition of the guest command buffer (TakeComposition). Begin, every
+// hooked command and the timing ring's EndCommand run on the thread that owns the buffer.
+thread_local GpuCommandComposition t_composition;
+// The guest command buffer's bound compute pipeline on the recording thread (composition).
+thread_local uint64_t t_bound_compute = 0;
+
+void NoteComposition(VkCommandBuffer cb) noexcept {
+	if (IsGuest(cb)) {
+		t_composition.Add(t_site != nullptr ? t_site->name : "(no site)");
+	}
+}
+
 void CountBarrier(uint64_t transitions) noexcept {
 	g_counters.barriers.fetch_add(1, std::memory_order_relaxed);
 	if (transitions != 0) {
@@ -417,6 +429,24 @@ struct PipelineInfo {
 std::mutex                                 g_registry_mutex;
 std::unordered_map<uint64_t, ShaderInfo>   g_shaders;
 std::unordered_map<uint64_t, PipelineInfo> g_pipelines;
+
+// Composition: the guest compute shader of a dispatch into the guest command buffer, through the
+// bound pipeline's registered program (hash 0 when it was not registered).
+void NoteDispatchShader(VkCommandBuffer cb, uint64_t groups) noexcept {
+	if (!IsGuest(cb) || !CompositionEnabled()) {
+		return;
+	}
+	uint64_t hash = 0;
+	{
+		std::lock_guard lock(g_registry_mutex);
+		if (const auto pipeline = g_pipelines.find(t_bound_compute); pipeline != g_pipelines.end()) {
+			if (const auto shader = g_shaders.find(pipeline->second.compute); shader != g_shaders.end()) {
+				hash = shader->second.hash;
+			}
+		}
+	}
+	t_composition.AddDispatch(hash, groups);
+}
 
 std::mutex                             g_view_mutex;
 std::unordered_map<uint64_t, VkFormat> g_view_formats;
@@ -1179,6 +1209,9 @@ Writer& GetWriter() {
 VKAPI_ATTR void VKAPI_CALL HookCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point,
                                                VkPipeline pipeline) {
 	g_real.vkCmdBindPipeline(cb, point, pipeline);
+	if (point == VK_PIPELINE_BIND_POINT_COMPUTE && IsGuest(cb)) {
+		t_bound_compute = HandleBits(pipeline);
+	}
 	if (IsCapture(cb)) [[unlikely]] {
 		std::lock_guard lock(g_state.mutex);
 		if (point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -1192,6 +1225,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBindPipeline(VkCommandBuffer cb, VkPipelineBin
 VKAPI_ATTR void VKAPI_CALL HookCmdDraw(VkCommandBuffer cb, uint32_t vertex_count,
                                        uint32_t instance_count, uint32_t first_vertex,
                                        uint32_t first_instance) {
+	NoteComposition(cb);
 	g_real.vkCmdDraw(cb, vertex_count, instance_count, first_vertex, first_instance);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::Draw, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1204,6 +1238,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDraw(VkCommandBuffer cb, uint32_t vertex_count
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexed(VkCommandBuffer cb, uint32_t index_count,
                                               uint32_t instance_count, uint32_t first_index,
                                               int32_t vertex_offset, uint32_t first_instance) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexed(cb, index_count, instance_count, first_index, vertex_offset,
 	                        first_instance);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1217,6 +1252,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexed(VkCommandBuffer cb, uint32_t index
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                VkDeviceSize offset, uint32_t draw_count,
                                                uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndirect(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndirect, KYTY_GPU_OP_CALLER,
@@ -1227,6 +1263,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buff
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                       VkDeviceSize offset, uint32_t draw_count,
                                                       uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexedIndirect(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawIndexedIndirect, KYTY_GPU_OP_CALLER,
@@ -1238,6 +1275,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer
                                                     VkDeviceSize offset, VkBuffer count_buffer,
                                                     VkDeviceSize count_offset,
                                                     uint32_t max_draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndirectCount(cb, buffer, offset, count_buffer, count_offset, max_draw_count,
 	                              stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1252,6 +1290,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
                                                            VkDeviceSize count_offset,
                                                            uint32_t     max_draw_count,
                                                            uint32_t     stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawIndexedIndirectCount(cb, buffer, offset, count_buffer, count_offset,
 	                                     max_draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1262,6 +1301,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawIndexedIndirectCount(VkCommandBuffer cb, V
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                                    uint32_t z) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksEXT(cb, x, y, z);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMesh, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1275,6 +1315,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksEXT(VkCommandBuffer cb, uint32_t 
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, VkBuffer buffer,
                                                            VkDeviceSize offset,
                                                            uint32_t draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksIndirectEXT(cb, buffer, offset, draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DrawMeshIndirect, KYTY_GPU_OP_CALLER,
@@ -1285,6 +1326,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectEXT(VkCommandBuffer cb, V
 VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
     VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkBuffer count_buffer,
     VkDeviceSize count_offset, uint32_t max_draw_count, uint32_t stride) {
+	NoteComposition(cb);
 	g_real.vkCmdDrawMeshTasksIndirectCountEXT(cb, buffer, offset, count_buffer, count_offset,
 	                                          max_draw_count, stride);
 	if (IsCapture(cb)) [[unlikely]] {
@@ -1295,6 +1337,8 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                            uint32_t z) {
+	NoteComposition(cb);
+	NoteDispatchShader(cb, uint64_t {x} * y * z);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1310,6 +1354,8 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint3
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                    VkDeviceSize offset) {
+	NoteComposition(cb);
+	NoteDispatchShader(cb, 0);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, DispatchClass());
 	}
@@ -1321,6 +1367,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer 
 
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
                                              uint32_t count, const VkBufferCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1343,6 +1390,7 @@ uint64_t Texels(const VkExtent3D& extent, uint32_t layers) {
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1360,6 +1408,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkI
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
                                                     VkImageLayout layout, uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1378,6 +1427,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
                                                     VkImageLayout layout, VkBuffer dst,
                                                     uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1395,6 +1445,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
 VKAPI_ATTR void VKAPI_CALL HookCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageBlit* regions, VkFilter filter) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1418,6 +1469,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdResolveImage(VkCommandBuffer cb, VkImage src,
                                                VkImageLayout src_layout, VkImage dst,
                                                VkImageLayout dst_layout, uint32_t count,
                                                const VkImageResolve* regions) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1436,6 +1488,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
                                                   VkImageLayout layout,
                                                   const VkClearColorValue* color, uint32_t count,
                                                   const VkImageSubresourceRange* ranges) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1449,6 +1502,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
 VKAPI_ATTR void VKAPI_CALL HookCmdClearDepthStencilImage(
     VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value,
     uint32_t count, const VkImageSubresourceRange* ranges) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1462,6 +1516,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearDepthStencilImage(
 VKAPI_ATTR void VKAPI_CALL HookCmdClearAttachments(VkCommandBuffer cb, uint32_t attachment_count,
                                                    const VkClearAttachment* attachments,
                                                    uint32_t rect_count, const VkClearRect* rects) {
+	NoteComposition(cb);
 	g_real.vkCmdClearAttachments(cb, attachment_count, attachments, rect_count, rects);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::ClearAttachments, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1479,6 +1534,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearAttachments(VkCommandBuffer cb, uint32_t 
 VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                              VkDeviceSize offset, VkDeviceSize size,
                                              uint32_t data) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1494,6 +1550,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer
 VKAPI_ATTR void VKAPI_CALL HookCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                                VkDeviceSize offset, VkDeviceSize size,
                                                const void* data) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1511,6 +1568,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
     VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier* memory,
     uint32_t buffer_count, const VkBufferMemoryBarrier* buffers, uint32_t image_count,
     const VkImageMemoryBarrier* images) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1538,6 +1596,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
                                                    const VkDependencyInfo* dependency) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1574,6 +1633,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::None, true);
 	}
@@ -1634,6 +1694,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdEndRendering(VkCommandBuffer cb) {
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query,
                                              VkQueryControlFlags flags) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1644,6 +1705,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool poo
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1658,6 +1720,7 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQue
                                                        VkBuffer buffer, VkDeviceSize offset,
                                                        VkDeviceSize stride,
                                                        VkQueryResultFlags flags) {
+	NoteComposition(cb);
 	if (IsCapture(cb)) [[unlikely]] {
 		SegmentBoundary(cb, SegmentClass::Emulator);
 	}
@@ -1905,9 +1968,17 @@ void CountEndRendering() noexcept {
 
 } // namespace Detail
 
+bool CompositionEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GPU_LONG_CB_MS");
+		return value != nullptr && std::strtod(value, nullptr) > 0.0;
+	}();
+	return enabled;
+}
+
 bool Enabled() {
 	const auto& config = GetConfig();
-	return config.capture || config.counters;
+	return config.capture || config.counters || CompositionEnabled();
 }
 
 bool CaptureEnabled() {
@@ -1929,6 +2000,38 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier, &HookCmdPipelineBarrier);
 	KYTY_GPU_OP_HOOK(vkCmdPipelineBarrier2, &HookCmdPipelineBarrier2);
 	KYTY_GPU_OP_HOOK(vkCmdBeginRendering, &HookCmdBeginRendering);
+	if (!capture && CompositionEnabled()) {
+		// KYTY_GPU_LONG_CB_MS alone: the commands TakeComposition counts and the compute bind
+		// that names their shaders, without the capture's query pool, timestamps, submission or
+		// image-view hooks.
+		KYTY_GPU_OP_HOOK(vkCmdBindPipeline, &HookCmdBindPipeline);
+		KYTY_GPU_OP_HOOK(vkCmdDraw, &HookCmdDraw);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexed, &HookCmdDrawIndexed);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndirect, &HookCmdDrawIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexedIndirect, &HookCmdDrawIndexedIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndirectCount, &HookCmdDrawIndirectCount);
+		KYTY_GPU_OP_HOOK(vkCmdDrawIndexedIndirectCount, &HookCmdDrawIndexedIndirectCount);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksEXT, &HookCmdDrawMeshTasksEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectEXT, &HookCmdDrawMeshTasksIndirectEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDrawMeshTasksIndirectCountEXT,
+		                 &HookCmdDrawMeshTasksIndirectCountEXT);
+		KYTY_GPU_OP_HOOK(vkCmdDispatch, &HookCmdDispatch);
+		KYTY_GPU_OP_HOOK(vkCmdDispatchIndirect, &HookCmdDispatchIndirect);
+		KYTY_GPU_OP_HOOK(vkCmdCopyBuffer, &HookCmdCopyBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdCopyImage, &HookCmdCopyImage);
+		KYTY_GPU_OP_HOOK(vkCmdCopyBufferToImage, &HookCmdCopyBufferToImage);
+		KYTY_GPU_OP_HOOK(vkCmdCopyImageToBuffer, &HookCmdCopyImageToBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdBlitImage, &HookCmdBlitImage);
+		KYTY_GPU_OP_HOOK(vkCmdResolveImage, &HookCmdResolveImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearColorImage, &HookCmdClearColorImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearDepthStencilImage, &HookCmdClearDepthStencilImage);
+		KYTY_GPU_OP_HOOK(vkCmdClearAttachments, &HookCmdClearAttachments);
+		KYTY_GPU_OP_HOOK(vkCmdFillBuffer, &HookCmdFillBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdUpdateBuffer, &HookCmdUpdateBuffer);
+		KYTY_GPU_OP_HOOK(vkCmdBeginQuery, &HookCmdBeginQuery);
+		KYTY_GPU_OP_HOOK(vkCmdEndQuery, &HookCmdEndQuery);
+		KYTY_GPU_OP_HOOK(vkCmdCopyQueryPoolResults, &HookCmdCopyQueryPoolResults);
+	}
 	if (capture) {
 		g_real.vkCmdWriteTimestamp2 = d.vkCmdWriteTimestamp2;
 		g_real.vkCmdWriteTimestamp  = d.vkCmdWriteTimestamp;
@@ -1971,10 +2074,18 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 	LinkSite(g_unknown_site);
 	g_state.next_ns   = NowNs() + static_cast<uint64_t>(GetConfig().period_s * 1e9);
 	Detail::g_active = true;
-	std::printf("GPU op profiler: counters %s, sampled capture %s (period %.3f s, %u queries)\n",
+	std::printf("GPU op profiler: counters %s, sampled capture %s, command buffer composition %s "
+	            "(period %.3f s, %u queries)\n",
 	            GetConfig().counters ? "on" : "off", capture ? "on" : "off",
+	            CompositionEnabled() ? "on" : "off",
 	            GetConfig().period_s, GetConfig().queries);
 	std::fflush(stdout);
+}
+
+GpuCommandComposition TakeComposition() noexcept {
+	const auto composition = t_composition;
+	t_composition          = {};
+	return composition;
 }
 
 void OnBeginCommand(GraphicContext& graphics, vk::CommandBuffer buffer, uint64_t current_tick,
@@ -1985,6 +2096,7 @@ void OnBeginCommand(GraphicContext& graphics, vk::CommandBuffer buffer, uint64_t
 	const auto cb = static_cast<VkCommandBuffer>(buffer);
 	g_guest_cb.store(cb, std::memory_order_relaxed);
 	g_counters.command_buffers.fetch_add(1, std::memory_order_relaxed);
+	t_composition = {};
 	if (!CaptureEnabled()) {
 		return;
 	}
@@ -2102,7 +2214,7 @@ void OnGuestFlip() {
 }
 
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash) {
-	if (!CaptureEnabled()) {
+	if (!CaptureEnabled() && !CompositionEnabled()) {
 		return;
 	}
 	std::lock_guard lock(g_registry_mutex);
@@ -2111,7 +2223,7 @@ void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash)
 
 void RegisterGraphicsPipeline(vk::Pipeline pipeline, const uint64_t* vertex_program_ids,
                               uint32_t vertex_program_count, uint64_t pixel_program_id) {
-	if (!CaptureEnabled() || pipeline == nullptr) {
+	if ((!CaptureEnabled() && !CompositionEnabled()) || pipeline == nullptr) {
 		return;
 	}
 	PipelineInfo info;
@@ -2126,7 +2238,7 @@ void RegisterGraphicsPipeline(vk::Pipeline pipeline, const uint64_t* vertex_prog
 }
 
 void RegisterComputePipeline(vk::Pipeline pipeline, uint64_t compute_program_id) {
-	if (!CaptureEnabled() || pipeline == nullptr) {
+	if ((!CaptureEnabled() && !CompositionEnabled()) || pipeline == nullptr) {
 		return;
 	}
 	PipelineInfo info;

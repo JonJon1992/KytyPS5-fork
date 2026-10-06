@@ -31,9 +31,9 @@ enum class PsLiveExec : uint8_t {
 };
 
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
-// from its environment variable once (first use); tests may replace the whole set. Programs are
-// cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
-// switch between runs needs no cache invalidation.
+// from its environment variable once (first use); tests may replace the whole set. Each field is
+// part of CodegenFingerprint, so the persistent program cache rejects incompatible options.
+// The driver pipeline cache is keyed by the SPIR-V code.
 struct CodegenOptions {
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
@@ -129,6 +129,10 @@ struct CodegenOptions {
 	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
 	// evaluated before the dispatch keep their flat slots.
 	bool srt_variant_reads = false;
+	// KYTY_BINDLESS_STRIDED_COMPUTE=1: compute shaders also take bindless T#s embedded in records
+	// of any stride. Off by default: in Ghost of Yotei the compute shaders it enabled produced
+	// command data the CP read as dispatch sizes (float bit patterns) and the GPU hung.
+	bool bindless_strided_compute = false;
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
 	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
@@ -157,12 +161,13 @@ struct CodegenOptions {
 	// results instead of hanging the GPU until a device reset. Structured programs are unaffected.
 	uint32_t dispatcher_cap = 4096;
 	// KYTY_IR_LINEAR_USES=1 (default off; Senaxx 5145dc1f9): IR use-list bookkeeping without the
-	// quadratic searches (Inst::ReplaceUsesWith takes a use list over at once, AddUse searches for
-	// duplicates only in debug builds, RemoveUse searches from the end, RemoveIdentities drops the
-	// removed identities' entries in one pass, ~Program detaches without maintaining use lists) and
-	// RewriteToSsa seals a block as soon as every predecessor is filled. Translation time only: the
-	// same program, but early sealing can create a loop header's phis in another order, which
-	// renumbers the module's ids (same size and meaning; the driver compiles it as a new module).
+	// quadratic searches (RemoveUse searches from the end, RemoveIdentities drops the removed
+	// identities' entries in one pass, ~Program detaches without maintaining use lists) and
+	// RewriteToSsa seals a block as soon as every predecessor is filled. Inst::ReplaceUsesWith and
+	// AddUse are linear in every mode (ValidateProgram reports duplicated uses). Translation time
+	// only: the same program, but early sealing can create a loop header's phis in another order,
+	// which renumbers the module's ids (same size and meaning; the driver compiles it as a new
+	// module).
 	bool ir_linear_uses = false;
 	// KYTY_FOLD_LANE_MASKS=1 (default off; Senaxx 5189ea360): reads of the current lane's bit of a
 	// wave mask that is known per lane (a ballot of a predicate, an all-zero or all-one constant,
@@ -170,6 +175,10 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_SPIRV_OPT=0: bypass conservative SPIRV-Tools cleanup after emission. Enabled by default;
+	// interfaces, memory effects and precise float arithmetic are preserved, and a failed or
+	// invalid optimization keeps the original module. The persistent cache fingerprints this flag.
+	bool spirv_optimize = true;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

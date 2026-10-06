@@ -23,7 +23,7 @@ enum HostFloatControlBits : uint32_t {
 };
 
 std::atomic_uint32_t g_host_float_controls {0};
-std::atomic_bool     g_storage_dword_loads_return_zero {false};
+std::atomic_uint8_t  g_host_buffer_robustness {0};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
@@ -56,6 +56,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// Bindless images read the bindless table, not a native group (AllocateBindings).
+		if (program.info.images[i].bindless) {
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
@@ -99,8 +103,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
+		     return image.indirect_search_iterations != 0u || image.bindless;
+	     }) || std::ranges::any_of(program.info.samplers, &IR::SamplerResource::bindless);
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
@@ -295,6 +299,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot:
 				case IR::ValueOpcode::AnyLane: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::IsHelperInvocation:
@@ -390,13 +395,15 @@ HostFloatControls GetHostFloatControls() {
 }
 
 void SetHostBufferRobustness(const HostBufferRobustness& robustness) {
-	g_storage_dword_loads_return_zero.store(robustness.storage_dword_loads_return_zero,
-	                                        std::memory_order_relaxed);
+	const uint8_t bits = (robustness.storage_dword_loads_return_zero ? 1u : 0u) |
+	                     (robustness.null_descriptor_for_short_ranges ? 2u : 0u);
+	g_host_buffer_robustness.store(bits, std::memory_order_relaxed);
 }
 
 HostBufferRobustness GetHostBufferRobustness() {
-	return {.storage_dword_loads_return_zero =
-	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed)};
+	const auto bits = g_host_buffer_robustness.load(std::memory_order_relaxed);
+	return {.storage_dword_loads_return_zero = (bits & 1u) != 0u,
+	        .null_descriptor_for_short_ranges = (bits & 2u) != 0u};
 }
 
 void SetHostImageFeatures(const HostImageFeatures& features) {

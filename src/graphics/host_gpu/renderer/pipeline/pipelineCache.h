@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -104,7 +105,20 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	bool operator==(const PipelineVertexInputState& other) const {
+		if (binding_count != other.binding_count || attribute_count != other.attribute_count) {
+			return false;
+		}
+		// Only active entries are hashed and passed to Vulkan. In particular mesh pipelines
+		// have no vertex input; comparing their unused arrays adds work to every memo hit.
+		for (size_t i = 0; i < binding_count && i < bindings.size(); ++i) {
+			if (!(bindings[i] == other.bindings[i])) return false;
+		}
+		for (size_t i = 0; i < attribute_count && i < attributes.size(); ++i) {
+			if (!(attributes[i] == other.attributes[i])) return false;
+		}
+		return true;
+	}
 };
 
 struct ShaderProgram {
@@ -123,12 +137,23 @@ public:
 	// destroys the driver cache; later pipelines are created without one. Also writes the
 	// persistent program cache's pending records (it stays usable).
 	void Save();
+	// Emergency save (fatal error or unhandled exception, other threads still running): writes the
+	// program cache's pending records and the driver cache file without stopping any thread,
+	// destroying anything or taking m_mutex, so a thread that died holding a renderer lock cannot
+	// block it. Writes are serialized with the periodic and exit saves (the driver cache part
+	// gives up after 1 s). A failed read of the driver cache (e.g. after ErrorDeviceLost) only
+	// logs. The caller bounds the total time and keeps the cache alive meanwhile.
+	void SaveEmergency();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool uses_bindless = false;
+		// KYTY_ASYNC_PIPELINES: `pipeline` is still being compiled on a background thread (null
+		// until then). Guarded by PipelineCache::m_mutex.
+		bool                    pending               = false;
 	};
 
 	struct GraphicsPrograms {
@@ -200,6 +225,23 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
+	// KYTY_ASYNC_PIPELINES=1 (default off; not with KYTY_PIPELINE_LIBRARY): GetGraphicsPipeline,
+	// except that with may_defer a pipeline not created yet is compiled on a background thread and
+	// null is returned until it is ready; the caller then skips the draw. The draw that queues the
+	// compile first waits up to KYTY_ASYNC_PIPELINE_WAIT_MS (20) for it. Pipelines whose create
+	// info GraphicsPipelineSnapshot cannot copy (mesh, tessellation) are still created here.
+	// Without may_defer it waits for a pending compile of the same key. sync_reason: why the draw
+	// may not be deferred, recorded with a pipeline created here (hang trace compiles.csv).
+	[[nodiscard]] Pipeline* TryGetGraphicsPipeline(
+	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+	    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	    bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer,
+	    const char* sync_reason = nullptr);
+	[[nodiscard]] static bool AsyncPipelinesEnabled();
+	// KYTY_ASYNC_PIPELINES=2 (diagnostic): background compiles, but the draw waits for them
+	// instead of being skipped (checks that a background build renders like the inline one).
+	[[nodiscard]] static bool AsyncPipelinesWait();
 
 	// Draw-prep binding plans (KYTY_DRAW_PREP_BINDINGS, drawPrep/bindingPlan.h). Everything the
 	// graphics pipeline key takes from a draw's resolved colour and depth targets: the key is a
@@ -233,6 +275,7 @@ public:
 	struct PrefetchTotals {
 		uint64_t submitted = 0, used = 0, compile_ns = 0, wait_ns = 0, max_wait_ns = 0;
 		uint64_t programs = 0;
+		uint64_t retired = 0, saturated = 0;
 	};
 	[[nodiscard]] PrefetchTotals GetPrefetchTotals() const;
 	// KYTY_PIPELINE_FAST_FIRST counters (all zero when it is off); tests and diagnostics.
@@ -301,6 +344,7 @@ private:
 	struct PipelineDiagnostics;
 	struct DriverCacheSaver;
 	struct LibraryState;
+	struct AsyncState;
 	struct FastFirstState;
 
 	struct GraphicsPipelineKey {
@@ -377,6 +421,9 @@ private:
 	// Graphics pipeline libraries and the background compiles that replace linked pipelines
 	// (KYTY_PIPELINE_LIBRARY, pipelineLibrary.h); null when off or unsupported.
 	std::unique_ptr<LibraryState> m_library;
+	// Background compiles of new monolithic graphics pipelines (KYTY_ASYNC_PIPELINES); null when
+	// off or when pipeline libraries are on.
+	std::unique_ptr<AsyncState> m_async;
 	// Unoptimized-first pipeline creation and the background optimized compiles
 	// (KYTY_PIPELINE_FAST_FIRST, pipelineFastFirst.h); null when off.
 	std::unique_ptr<FastFirstState> m_fast_first;
@@ -400,6 +447,9 @@ private:
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs, bool fatal,
 	                              GraphicsPipelineKey& key) const;
+	// Shared by draw-prep lookup and prefetch so a miss builds the complete key only once.
+	PlanLookup FindGraphicsPipelineForPlan(const GraphicsPipelineKey& key,
+	                                      const Pipeline*& pipeline, uint64_t& generation);
 
 	void InitializeDriverCache();
 	void InitializeProgramDiskCache();
@@ -408,7 +458,18 @@ private:
 	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size
 	// written, 0 on failure, or UINT64_MAX for a periodic save skipped over the size cap.
 	uint64_t WriteDriverCache(bool periodic);
+	// WriteDriverCache with m_driver_cache_write held. kind names the save in the log; capped:
+	// skip a file over the size cap (keep the last one the loader accepts).
+	uint64_t WriteDriverCacheLocked(const char* kind, bool capped);
+	// Serializes writers of the driver cache file (its .tmp): the saver, Save() and SaveEmergency().
+	std::timed_mutex m_driver_cache_write;
 	void     NotePipelineCreated(uint64_t create_ns);
+	// A background compile finished: publishes `pipeline` in the pending entry `target` (key).
+	void PublishAsyncPipeline(const GraphicsPipelineKey* key, Pipeline* target,
+	                          vk::Pipeline pipeline, uint64_t create_ns);
+	// The draw that queued `target` waits for it (KYTY_ASYNC_PIPELINE_WAIT_MS); m_mutex held once,
+	// released while waiting. True when it was published in time.
+	[[nodiscard]] bool WaitForQueuedPipeline(const Pipeline& target);
 	// Background compile finished: swaps `optimized` in for the linked pipeline cached under `key`.
 	void ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
 	                           vk::Pipeline optimized);

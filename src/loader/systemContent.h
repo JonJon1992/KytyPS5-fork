@@ -11,6 +11,9 @@
 namespace Loader {
 
 void     SystemContentLoadParamSfo(const std::filesystem::path& file_name);
+// The host file the game executable (/app0/<elf>) is loaded from; known before /app0 is mounted.
+void     SystemContentSetExecutablePath(const std::filesystem::path& host_path);
+bool     SystemContentGetExecutablePath(std::filesystem::path* host_path);
 bool     SystemContentParamSfoGetInt(const char* name, int32_t* value);
 bool     SystemContentParamSfoGetString(const char* name, std::string* value);
 bool     SystemContentParamSfoGetString(const char* name, char* value, size_t value_size);

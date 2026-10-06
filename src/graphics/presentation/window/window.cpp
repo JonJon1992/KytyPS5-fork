@@ -5,10 +5,12 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/emergencySave.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/systemInfo.h"
+#include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "common/stringUtils.h"
@@ -16,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -153,7 +156,7 @@ struct EventController {
 
 namespace {
 
-std::unique_ptr<WindowContext> g_window;
+std::shared_ptr<WindowContext> g_window;
 
 } // namespace
 
@@ -520,6 +523,24 @@ void WindowContext::ProcessEvent(double time_s) {
 		}
 		return;
 	}
+	// Mac keyboards send brightness instead of F2 unless fn is held, so also accept Cmd+P there.
+	const bool performance_key =
+	    event->key.key == SDLK_F2
+#if defined(__APPLE__)
+	    || (event->key.key == SDLK_P && (event->key.mod & SDL_KMOD_GUI) != 0)
+#endif
+	    ;
+	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    performance_key) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
+			if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
+				TogglePerformanceOverlayDetails();
+			} else {
+				TogglePerformanceOverlay();
+			}
+		}
+		return;
+	}
 	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
@@ -859,7 +880,7 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EXIT_IF(g_window != nullptr);
 
-	auto window = std::make_unique<WindowContext>();
+	auto window = std::make_shared<WindowContext>();
 
 	window->graphic_ctx.screen_width  = width;
 	window->graphic_ctx.screen_height = height;
@@ -868,6 +889,9 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->CreateVulkan();
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
+	// Capture ownership, not the global pointer: a timed-out save must retain the renderer.
+	Common::Subsystems::SetEmergencySave(std::make_shared<Common::EmergencySave>(
+	    [context = g_window] { context->render_context->GetPipelineCache().SaveEmergency(); }));
 	return presenter;
 }
 
@@ -876,10 +900,12 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	Common::Subsystems::SetEmergencySave(nullptr);
 	g_window->render_context->GetPipelineCache().Save();
 }
 
 void WindowShutdown() {
+	Common::Subsystems::SetEmergencySave(nullptr);
 	if (g_window != nullptr) {
 		HostInputShutdown();
 		Controller::EmergencyShutdown();

@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/gpuReadDelegate.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/pointerScan.h"
 #include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -23,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <bitset>
 #include <cinttypes>
 #include <cstddef>
@@ -41,6 +43,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <psapi.h>   // K32QueryWorkingSetEx
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -1326,6 +1329,13 @@ static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t 
 	       recorder.reads->Record(vaddr, data, size);
 }
 
+std::string ScanGuestMemoryForAddressRange(uint64_t low, uint64_t high, uint32_t budget_ms) {
+	if (g_guest_address_space == nullptr) {
+		return "guest address space is not initialized\n";
+	}
+	return g_guest_address_space->ScanForAddressRange(low, high, std::chrono::milliseconds(budget_ms));
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (auto* recorder = Graphics::DrawPrep::ActiveRecorder(); recorder != nullptr) [[unlikely]] {
 		return TryReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER());
@@ -1398,6 +1408,39 @@ bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	return QueryGpuCleanVerdict(vaddr, size);
+}
+
+uint32_t GpuUncleanReasons(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return 0;
+	}
+	auto&    resources = GetGpuResources();
+	uint32_t reasons   = 0;
+	if (resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		reasons |= GpuUncleanDirtyBytes;
+	}
+	if (resources.GetBufferCache().HasPendingBackingPublication(vaddr, size)) {
+		reasons |= GpuUncleanPublication;
+	}
+	if (resources.GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		reasons |= GpuUncleanImage;
+	}
+	return reasons;
+}
+
+void LogGpuUncleanImages(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	    Graphics::GuestGpu::IsGpuThread()) {
+		std::fprintf(stderr, "GPU-unclean read 0x%016" PRIx64 "+0x%" PRIx64 ":\n", vaddr, size);
+		GetGpuResources().GetTextureCache().LogGpuModifiedImages(vaddr, size);
+	}
+}
+
+bool ReleaseCpuOverwrittenGpuImages(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetTextureCache().ReleaseCpuOverwrittenImages(vaddr, size);
 }
 
 bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
@@ -4787,6 +4830,32 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	}
 
 	return OK;
+}
+
+DebugStats GetDebugStats() {
+	DebugStats stats;
+	stats.direct_total       = PhysicalMemory::Size();
+	stats.flexible_total     = FlexibleMemory::Size();
+	stats.pool_committed     = g_memory_pool_committed.load(std::memory_order_relaxed);
+	stats.page_entries_total = PAGE_TABLE_POOL_ENTRIES;
+	if (g_physical_memory != nullptr) {
+		Common::LockGuard lock(g_physical_memory->GetMutex());
+		// Blocks record only whether a memory pool expansion made them.
+		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
+			(block.pool_expansion ? stats.pooled_allocated : stats.direct_allocated) += block.size;
+		}
+		for (const auto& mapping: g_physical_memory->GetMappings()) {
+			stats.direct_mapped += mapping.map_size;
+		}
+	}
+	if (g_flexible_memory != nullptr) {
+		stats.flexible_used = stats.flexible_total - g_flexible_memory->Available();
+	}
+	if (g_virtual_ranges != nullptr) {
+		stats.cpu_page_entries = g_virtual_ranges->CountPageTableEntries(false);
+		stats.gpu_page_entries = g_virtual_ranges->CountPageTableEntries(true);
+	}
+	return stats;
 }
 
 } // namespace Libs::LibKernel::Memory

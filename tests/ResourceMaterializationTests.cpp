@@ -621,6 +621,8 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+#include "BindlessMaterializationTests.inc"
+
 } // namespace
 
 namespace Common {
@@ -646,6 +648,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestBindlessSnapshots();
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();

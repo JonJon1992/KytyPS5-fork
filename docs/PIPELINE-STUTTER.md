@@ -21,9 +21,13 @@ The pool drains and joins before the driver cache, shader modules or layouts are
 Unused speculative pipelines and their layout references are released at shutdown. Worker
 compilation uses the normal monolithic create path and an internally synchronized Vulkan cache.
 This preserves the renderer's ordering of resource transitions, commands and guest-visible writes.
-Completed predictions that are never consumed retain a pending slot until shutdown. A workload
-with many mismatched predictions can fill the 128 slots and revert later misses to synchronous
-compilation; this bounds speculative memory, but limits how much stutter the pool can hide.
+When all 128 slots are occupied, a new request can reclaim the oldest completed, unused
+prediction (`KYTY_PIPELINE_PREFETCH_RECLAIM=1`, default). Running compiles and results reserved
+for a required draw are protected. The unused Vulkan pipeline and layout references are released;
+the driver cache still retains its compiled data according to the implementation's cache policy.
+With `KYTY_PIPELINE_PREFETCH_RECLAIM=0`, completed unused predictions retain slots until shutdown,
+reproducing the previous saturation behavior for A/B comparisons. Neither mode exceeds 128
+stored requests. Shutdown logs and `GetPrefetchTotals()` expose `retired` and `saturated` counts.
 
 This mechanism overlaps driver compilation with CPU preparation; it cannot hide a long compile
 when there is insufficient lead time. An entirely new shader still needs translation, emission
@@ -77,3 +81,9 @@ default off, and these intervals describe emulator flips rather than OS presenta
 Tests: `spirv_cache_salt`, `shader_code_snapshot`, `pipeline_compile_queue`, `pipeline_prefetch_rendering`, `pipeline_prefetch_programs` and
 `pipeline_prefetch_draw_run`. Rendering checks use GPU readbacks, blend accumulation, depth and
 texture sampling through the existing draw-prep and draw-run suites, with verification enabled.
+
+`pipeline_cold_cache` checks bounded reclamation, protection before a draw moves its future,
+and MIN/MAX blend-key equivalence without a GPU. `KYTY_PIPELINE_BLEND_MINMAX_NORMALIZE=1`
+(default, when `KYTY_PIPELINE_KEY_NORMALIZE` is enabled) removes unused factors from MIN/MAX
+blend states, avoiding extra pipeline variants. Set it to 0 for an isolated A/B.
+See [cold-cache analysis and validation](PIPELINE-COLD-CACHE-2026-10-05.md).

@@ -23,6 +23,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
 	{BufferFormat::k8SNorm, 0, 0, 1, false, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
+	{BufferFormat::k8SInt, 1, 0, 1, true, false, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16UInt, 2, 0, 2, true, true},
@@ -41,6 +42,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, false}, // stored as A2B10G10R10 UNORM
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UNorm, 4, 0, 4, true, false},

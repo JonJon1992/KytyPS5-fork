@@ -27,11 +27,19 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		bool                          bindless                   = false;
 		bool                          operator==(const Image&) const = default;
+	};
+
+	struct Sampler {
+		bool bindless = false;
+		uint32_t bindless_mapping_offset = 0;
+		bool operator==(const Sampler&) const = default;
 	};
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	std::vector<Sampler> samplers;
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

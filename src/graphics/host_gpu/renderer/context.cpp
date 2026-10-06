@@ -185,6 +185,37 @@ void CountOriginRequest(BarrierOrigin origin) {
 	    static_cast<uint32_t>(origin)));
 }
 
+using UploadSpanList = std::vector<std::pair<uint64_t, uint64_t>>;
+
+// Whether [begin, end) intersects a span of `spans` (sorted, disjoint [first, second) ranges).
+bool UploadSpansOverlap(const UploadSpanList& spans, uint64_t begin, uint64_t end) {
+	// The last span starting before `end` is the only one that can reach past `begin`.
+	const auto after = std::lower_bound(
+	    spans.begin(), spans.end(), end,
+	    [](const auto& span, uint64_t value) { return span.first < value; });
+	return after != spans.begin() && std::prev(after)->second > begin;
+}
+
+// Adds [begin, end) to `spans`, merging the spans it overlaps or touches.
+void AddUploadSpan(UploadSpanList& spans, uint64_t begin, uint64_t end) {
+	if (begin >= end) {
+		return;
+	}
+	// The first span ending at or after `begin`, and the first span starting after `end`.
+	const auto first = std::lower_bound(
+	    spans.begin(), spans.end(), begin,
+	    [](const auto& span, uint64_t value) { return span.second < value; });
+	const auto last = std::upper_bound(
+	    first, spans.end(), end, [](uint64_t value, const auto& span) { return value < span.first; });
+	if (first == last) {
+		spans.insert(first, {begin, end});
+		return;
+	}
+	first->first  = std::min(first->first, begin);
+	first->second = std::max(std::prev(last)->second, end);
+	spans.erase(first + 1, last);
+}
+
 } // namespace
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -382,23 +413,52 @@ void CommandBuffer::RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
 	}
 	// Copies recorded together are not ordered against each other: a rewrite of a queued
 	// destination range (a page re-dirtied between two uploads) goes into the next batch.
-	const bool overlaps = std::ranges::any_of(m_pending.uploads, [&](const PendingUpload& queued) {
-		if (queued.destination != destination) {
-			return false;
+	const auto find_spans = [this, destination]() -> PendingBarriers::UploadSpans* {
+		const auto count = m_pending.upload_span_count;
+		// Newest first: a pass queues the uploads of one buffer together.
+		if (count != 0 && m_pending.upload_spans[count - 1].destination == destination) {
+			return &m_pending.upload_spans[count - 1];
 		}
-		for (uint32_t index = 0; index < queued.region_count; index++) {
-			const auto& old = m_pending.upload_regions[queued.first_region + index];
-			for (const auto& region: regions) {
-				if (region.dstOffset < old.dstOffset + old.size &&
-				    old.dstOffset < region.dstOffset + region.size) {
-					return true;
-				}
+		if (!m_pending.upload_span_index.empty()) {
+			const auto it = m_pending.upload_span_index.find(static_cast<VkBuffer>(destination));
+			return it != m_pending.upload_span_index.end() ? &m_pending.upload_spans[it->second]
+			                                               : nullptr;
+		}
+		for (size_t index = count; index-- > 0;) {
+			if (m_pending.upload_spans[index].destination == destination) {
+				return &m_pending.upload_spans[index];
 			}
 		}
-		return false;
-	});
-	if (overlaps) {
+		return nullptr;
+	};
+	auto* spans = find_spans();
+	if (spans != nullptr && std::ranges::any_of(regions, [&](const vk::BufferCopy& region) {
+		    return UploadSpansOverlap(spans->spans, region.dstOffset,
+		                              region.dstOffset + region.size);
+	    })) {
 		FlushBarriers();
+		spans = nullptr; // the flush emptied the queue
+	}
+	if (spans == nullptr) {
+		auto& all = m_pending.upload_spans;
+		if (m_pending.upload_span_count == all.size()) {
+			all.emplace_back();
+		}
+		const auto index   = m_pending.upload_span_count++;
+		spans              = &all[index];
+		spans->destination = destination;
+		spans->spans.clear();
+		auto& span_index = m_pending.upload_span_index;
+		if (!span_index.empty()) {
+			span_index.emplace(static_cast<VkBuffer>(destination), static_cast<uint32_t>(index));
+		} else if (m_pending.upload_span_count > PendingBarriers::UploadSpanIndexMin) {
+			for (size_t i = 0; i < m_pending.upload_span_count; i++) {
+				span_index.emplace(static_cast<VkBuffer>(all[i].destination), static_cast<uint32_t>(i));
+			}
+		}
+	}
+	for (const auto& region: regions) {
+		AddUploadSpan(spans->spans, region.dstOffset, region.dstOffset + region.size);
 	}
 	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
 	if (!m_pending.Empty()) {
@@ -416,8 +476,15 @@ void CommandBuffer::RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
 void CommandBuffer::RecordPendingUploads() const {
 	const GpuOpProfiler::ScopedSite site(
 	    g_batch_sites[static_cast<size_t>(BarrierOrigin::Upload)]);
+	// Many destinations (a BDA synchronization pass) use one global dependency with the same
+	// scopes instead: it orders at least everything the buffer barriers order. Collecting stops
+	// at the first destination beyond the limit (the list is then unused).
+	constexpr size_t                      MaxBufferBarriers = 8;
 	std::vector<vk::BufferMemoryBarrier2> destinations;
 	for (const auto& upload: m_pending.uploads) {
+		if (destinations.size() > MaxBufferBarriers) {
+			break;
+		}
 		if (std::ranges::any_of(destinations, [&upload](const auto& barrier) {
 			    return barrier.buffer == upload.destination;
 		    })) {
@@ -440,9 +507,6 @@ void CommandBuffer::RecordPendingUploads() const {
 		barrier.size                = VK_WHOLE_SIZE;
 		destinations.push_back(barrier);
 	}
-	// Many destinations (a BDA synchronization pass) use one global dependency with the same
-	// scopes instead: it orders at least everything the buffer barriers order.
-	constexpr size_t   MaxBufferBarriers = 8;
 	const bool         global            = destinations.size() > MaxBufferBarriers;
 	vk::MemoryBarrier2 memory {};
 	memory.srcStageMask  = destinations.front().srcStageMask;
@@ -501,6 +565,7 @@ void CommandBuffer::RecordPendingUploads() const {
 	}
 	m_pending.uploads.clear();
 	m_pending.upload_regions.clear();
+	m_pending.ClearUploadSpans();
 }
 
 void CommandBuffer::FlushBarriers() const {

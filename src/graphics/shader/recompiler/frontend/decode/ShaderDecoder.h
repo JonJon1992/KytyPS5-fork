@@ -10,6 +10,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -453,7 +456,9 @@ enum class Opcode {
 	V_CMPX_LT_U16,
 	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
+	V_CMPX_LE_U16,
 	V_CMPX_NE_U16,
+	V_CMPX_GE_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -519,6 +524,24 @@ enum class Opcode {
 	BUFFER_STORE_DWORDX2,
 	BUFFER_STORE_DWORDX3,
 	BUFFER_STORE_DWORDX4,
+	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_XY,
+	BUFFER_LOAD_FORMAT_D16_XYZ,
+	BUFFER_LOAD_FORMAT_D16_XYZW,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
+	BUFFER_STORE_FORMAT_D16_X,
+	BUFFER_STORE_FORMAT_D16_XY,
+	BUFFER_STORE_FORMAT_D16_XYZ,
+	BUFFER_STORE_FORMAT_D16_XYZW,
+	BUFFER_STORE_FORMAT_D16_HI_X,
+	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
+	BUFFER_LOAD_SHORT_D16,
+	BUFFER_LOAD_SHORT_D16_HI,
+	BUFFER_STORE_BYTE_D16_HI,
+	BUFFER_STORE_SHORT_D16_HI,
 	TBUFFER_LOAD_FORMAT_X,
 	TBUFFER_LOAD_FORMAT_XY,
 	TBUFFER_LOAD_FORMAT_XYZ,
@@ -631,6 +654,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -657,6 +681,9 @@ enum class Opcode {
 	IMAGE_GATHER4_LZ,
 	IMAGE_GATHER4_C,
 	IMAGE_GATHER4_C_LZ,
+	IMAGE_GATHER4_C_L,
+	IMAGE_GATHER4_L_O,
+	IMAGE_GATHER4_C_L_O,
 	IMAGE_GATHER4_LZ_O,
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
@@ -705,6 +732,10 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	SharedLimit,
+	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 };
@@ -820,7 +851,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

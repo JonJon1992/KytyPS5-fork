@@ -13,6 +13,8 @@ struct MemoryOpcodeInfo {
 	bool     data_signed = false;
 	bool     typed       = false;
 	bool     formatted   = false;
+	// Formatted D16 accesses: components carried as 16-bit halves of data_dwords VGPRs.
+	uint32_t data_components = 0;
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -43,11 +45,21 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x0eu, Opcode::BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0fu, Opcode::BUFFER_LOAD_DWORDX3, 3, 32},
     {0x18u, Opcode::BUFFER_STORE_BYTE, 1, 8},
+    {0x19u, Opcode::BUFFER_STORE_BYTE_D16_HI, 1, 8},
     {0x1au, Opcode::BUFFER_STORE_SHORT, 1, 16},
+    {0x1bu, Opcode::BUFFER_STORE_SHORT_D16_HI, 1, 16},
     {0x1cu, Opcode::BUFFER_STORE_DWORD, 1, 32},
     {0x1du, Opcode::BUFFER_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
+    {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
+    {0x21u, Opcode::BUFFER_LOAD_UBYTE_D16_HI, 1, 8},
+    {0x22u, Opcode::BUFFER_LOAD_SBYTE_D16, 1, 8, true},
+    {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
+    {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
+    {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+    {0x26u, Opcode::BUFFER_LOAD_FORMAT_D16_HI_X, 1, 16, false, false, true, 1},
+    {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 16, false, false, true, 1},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
@@ -76,6 +88,14 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x5bu, Opcode::BUFFER_ATOMIC_XOR_X2, 2, 32},
     {0x71u, Opcode::BUFFER_GL0_INV, 0, 32},
     {0x72u, Opcode::BUFFER_GL1_INV, 0, 32},
+    {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true, 1},
+    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
+    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true, 1},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -161,6 +181,7 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 	inst.data_signed = info->data_signed;
 	inst.typed       = info->typed;
 	inst.formatted   = info->formatted;
+	inst.data_components = info->data_components;
 }
 
 bool IsDsWriteOpcode(Opcode opcode) {
@@ -320,6 +341,21 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
+	// D16 loads write one half of VDATA and keep the other (the partial destination
+	// representation of the DS D16 reads); D16_HI stores take their data from a high half.
+	switch (inst.opcode) {
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16: inst.dst.sdwa_sel = 4u; break;
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
+		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X: inst.dst.sdwa_sel = 5u; break;
+		case Opcode::BUFFER_STORE_BYTE_D16_HI: inst.dst.sdwa_sel = 2u; break;
+		default: break;
+	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
 	DecodeScalarSource(soffset, pc, inst.src2);

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <random>
 #include <thread>
 #include <vector>
@@ -278,11 +279,86 @@ struct LogExecutor {
 		     VerifyHash::Value(Op::WriteTimestamp2, Bits(p), q,
 		                       static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(st))));
 	}
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+		Push(Op::BeginConditionalRendering,
+		     VerifyHash::Value(Op::BeginConditionalRendering, Bits(info.buffer), info.offset,
+		                       static_cast<VkConditionalRenderingFlagsEXT>(info.flags)));
+	}
+	void endConditionalRenderingEXT() {
+		Push(Op::EndConditionalRendering, VerifyHash::Value(Op::EndConditionalRendering, 0));
+	}
 };
 
 // Discards everything (benchmark consumer).
 struct NullExecutor: LogExecutor {
 	NullExecutor() { record = false; }
+};
+
+// Counts replayed calls without hashing arguments (the driver does not hash them either).
+struct CountingExecutor {
+	uint64_t calls = 0;
+#define KYTY_COUNT_REPLAY(Method) \
+	template <typename... Args> void Method(Args&&...) { ++calls; }
+	KYTY_COUNT_REPLAY(Begin)
+	KYTY_COUNT_REPLAY(Submit)
+	KYTY_COUNT_REPLAY(DrainMarker)
+	KYTY_COUNT_REPLAY(EnterSite)
+	KYTY_COUNT_REPLAY(LeaveSite)
+	KYTY_COUNT_REPLAY(beginRendering)
+	KYTY_COUNT_REPLAY(endRendering)
+	KYTY_COUNT_REPLAY(pipelineBarrier2)
+	KYTY_COUNT_REPLAY(pipelineBarrier)
+	KYTY_COUNT_REPLAY(copyBuffer)
+	KYTY_COUNT_REPLAY(copyBufferToImage)
+	KYTY_COUNT_REPLAY(copyImageToBuffer)
+	KYTY_COUNT_REPLAY(copyImage)
+	KYTY_COUNT_REPLAY(fillBuffer)
+	KYTY_COUNT_REPLAY(bindPipeline)
+	KYTY_COUNT_REPLAY(bindDescriptorSets)
+	KYTY_COUNT_REPLAY(pushDescriptorSetKHR)
+	KYTY_COUNT_REPLAY(updateDescriptorSets)
+	KYTY_COUNT_REPLAY(pushConstants)
+	KYTY_COUNT_REPLAY(bindVertexBuffers2)
+	KYTY_COUNT_REPLAY(bindIndexBuffer)
+	KYTY_COUNT_REPLAY(setViewportWithCount)
+	KYTY_COUNT_REPLAY(setScissorWithCount)
+	KYTY_COUNT_REPLAY(setLineWidth)
+	KYTY_COUNT_REPLAY(setBlendConstants)
+	KYTY_COUNT_REPLAY(setDepthTestEnable)
+	KYTY_COUNT_REPLAY(setDepthWriteEnable)
+	KYTY_COUNT_REPLAY(setDepthCompareOp)
+	KYTY_COUNT_REPLAY(setDepthBiasEnable)
+	KYTY_COUNT_REPLAY(setDepthBias)
+	KYTY_COUNT_REPLAY(setStencilTestEnable)
+	KYTY_COUNT_REPLAY(setStencilOp)
+	KYTY_COUNT_REPLAY(setStencilCompareMask)
+	KYTY_COUNT_REPLAY(setStencilWriteMask)
+	KYTY_COUNT_REPLAY(setStencilReference)
+	KYTY_COUNT_REPLAY(setCullMode)
+	KYTY_COUNT_REPLAY(setFrontFace)
+	KYTY_COUNT_REPLAY(setDepthBoundsTestEnable)
+	KYTY_COUNT_REPLAY(setDepthBounds)
+	KYTY_COUNT_REPLAY(setColorWriteEnableEXT)
+	KYTY_COUNT_REPLAY(setAttachmentFeedbackLoopEnableEXT)
+	KYTY_COUNT_REPLAY(draw)
+	KYTY_COUNT_REPLAY(drawIndexed)
+	KYTY_COUNT_REPLAY(drawMeshTasksEXT)
+	KYTY_COUNT_REPLAY(drawMeshTasksIndirectEXT)
+	KYTY_COUNT_REPLAY(drawMeshTasksIndirectCountEXT)
+	KYTY_COUNT_REPLAY(drawIndirect)
+	KYTY_COUNT_REPLAY(drawIndexedIndirect)
+	KYTY_COUNT_REPLAY(drawIndirectCount)
+	KYTY_COUNT_REPLAY(drawIndexedIndirectCount)
+	KYTY_COUNT_REPLAY(dispatch)
+	KYTY_COUNT_REPLAY(dispatchIndirect)
+	KYTY_COUNT_REPLAY(resetQueryPool)
+	KYTY_COUNT_REPLAY(beginQuery)
+	KYTY_COUNT_REPLAY(endQuery)
+	KYTY_COUNT_REPLAY(copyQueryPoolResults)
+	KYTY_COUNT_REPLAY(writeTimestamp2)
+	KYTY_COUNT_REPLAY(beginConditionalRenderingEXT)
+	KYTY_COUNT_REPLAY(endConditionalRenderingEXT)
+#undef KYTY_COUNT_REPLAY
 };
 
 struct MismatchLog {
@@ -794,6 +870,23 @@ public:
 				                                   vk::PipelineStageFlags2(stage))))});
 				break;
 			}
+			case Op::BeginConditionalRendering: {
+				vk::ConditionalRenderingBeginInfoEXT info {};
+				info.buffer = H<vk::Buffer>();
+				info.offset = U64() & 0xfffc;
+				if ((U32() & 1u) != 0) {
+					info.flags = vk::ConditionalRenderingFlagBitsEXT::eInverted;
+				}
+				e.beginConditionalRenderingEXT(info);
+				expected.push_back(
+				    {op, VerifyHash::Value(op, LogExecutor::Bits(info.buffer), info.offset,
+				                           static_cast<VkConditionalRenderingFlagsEXT>(info.flags))});
+				break;
+			}
+			case Op::EndConditionalRendering:
+				e.endConditionalRenderingEXT();
+				expected.push_back({op, VerifyHash::Value(op, 0)});
+				break;
 			default: break;
 		}
 	}
@@ -1082,6 +1175,132 @@ void TestSites() {
 	Check(exec.sites == 1, "sites: only barrier packets carry the producer's site");
 }
 
+void TestVerificationHashWork() {
+#if defined(KYTY_COMMAND_STREAM_TEST_HASH_COUNTS)
+	for (bool verify: {false, true}) {
+		Ring ring(64u << 10u);
+		Encoder::Options options;
+		options.verify = verify;
+		Encoder encoder(ring, options);
+		vk::DescriptorBufferInfo buffer {MakeHandle<vk::Buffer>(0x100), 16, 32};
+		vk::WriteDescriptorSet write {};
+		write.descriptorType = vk::DescriptorType::eStorageBuffer;
+		write.descriptorCount = 1;
+		write.pBufferInfo = &buffer;
+		testing_hash_calls = 0;
+		encoder.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics,
+		                             MakeHandle<vk::PipelineLayout>(0x200), 0, 1, &write);
+		encoder.draw(3, 1, 0, 0);
+		// Each verified packet hashes its arguments and folds that hash into the CB digest.
+		Check(testing_hash_calls == (verify ? 4u : 0u), "encoder hashes only verified packets");
+		testing_hash_calls = 0;
+		CountingExecutor exec;
+		ReplayState state;
+		while (const auto* header = ring.Peek()) {
+			Replay(*header, exec, state, nullptr, nullptr);
+			ring.Advance(header->size);
+		}
+		Check(testing_hash_calls == (verify ? 4u : 0u), "replay hashes only verified packets");
+		Check(exec.calls == 2 && state.checks == (verify ? 2u : 0u) && state.mismatches == 0,
+		      "hash optimization preserves calls and active verification");
+	}
+#endif
+}
+
+void TestDrainWithoutMarker() {
+	for (bool verify: {false, true}) {
+		Ring ring(64u << 10u);
+		Encoder::Options options;
+		options.verify = verify;
+		options.policy.spin_ns = 0;
+		Encoder encoder(ring, options);
+		uint32_t data = 0x11223344;
+		encoder.pushConstants(MakeHandle<vk::PipelineLayout>(0x100), vk::ShaderStageFlagBits::eVertex,
+		                      0, sizeof(data), &data); // Not kicked: Drain must publish it.
+		const auto position = ring.WritePosition();
+		const auto packets = encoder.Packets();
+		std::atomic<bool> stop {false};
+		std::promise<void> published, release;
+		auto gate = release.get_future().share();
+		LogExecutor exec;
+		ReplayState state;
+		WaitPolicy policy {0};
+		WaitStats consumer_stats, drain_stats;
+		std::thread consumer([&] {
+			if (!ring.WaitPublished(stop, policy, consumer_stats)) return;
+			published.set_value();
+			gate.wait();
+			while (const auto* header = ring.Peek()) {
+				Replay(*header, exec, state, nullptr, nullptr);
+				ring.Advance(header->size);
+			}
+			ring.Release(consumer_stats);
+		});
+		auto drain = std::async(std::launch::async, [&] { encoder.Drain(policy, drain_stats); });
+		published.get_future().wait();
+		Check(drain.wait_for(std::chrono::seconds(0)) == std::future_status::timeout,
+		      "drain cannot return before the consumer executes pending calls");
+		release.set_value();
+		drain.get();
+		consumer.join();
+		Check(ring.Consumed() >= position && state.mismatches == 0, "drain retires original packets correctly");
+		Check(encoder.Packets() == packets && ring.WritePosition() == position && exec.calls.size() == 1,
+		      "drain adds no marker packet or ring bytes");
+	}
+}
+
+void BenchReplay() {
+	// CPU stream encode/replay only: no Vulkan driver, and no test hash instrumentation.
+	Ring ring(32u << 20u);
+	Encoder::Options options;
+	Encoder encoder(ring, options);
+	std::array<vk::WriteDescriptorSet, 20> writes {};
+	std::array<vk::DescriptorBufferInfo, 20> buffers {};
+	for (uint32_t i = 0; i < writes.size(); ++i) {
+		buffers[i] = {MakeHandle<vk::Buffer>(0x1000 + i), i * 256u, 256};
+		writes[i].dstBinding = i;
+		writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+		writes[i].descriptorCount = 1;
+		writes[i].pBufferInfo = &buffers[i];
+	}
+	std::array<uint32_t, 16> push {};
+	vk::Viewport viewport {0, 0, 3840, 2160, 0, 1};
+	vk::Rect2D scissor {{0, 0}, {3840, 2160}};
+	constexpr uint32_t Draws = 10000, Repetitions = 12;
+	CountingExecutor exec;
+	ReplayState state;
+	WaitStats stats;
+	double encode_ns = 0, replay_ns = 0;
+	for (uint32_t rep = 0; rep < Repetitions; ++rep) {
+		const auto encode_start = std::chrono::steady_clock::now();
+		for (uint32_t i = 0; i < Draws; ++i) {
+			push[0] = i;
+			buffers[0].offset = i;
+			encoder.pushConstants(MakeHandle<vk::PipelineLayout>(0x40), vk::ShaderStageFlagBits::eVertex,
+			                      0, sizeof(push), push.data());
+			encoder.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, MakeHandle<vk::PipelineLayout>(0x40),
+			                             0, static_cast<uint32_t>(writes.size()), writes.data());
+			encoder.bindPipeline(vk::PipelineBindPoint::eGraphics, MakeHandle<vk::Pipeline>(0x60 + i));
+			encoder.setViewportWithCount(1, &viewport);
+			encoder.setScissorWithCount(1, &scissor);
+			encoder.drawIndexed(300, 1, i, 0, 0);
+		}
+		encode_ns += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - encode_start).count();
+		ring.Publish();
+		const auto replay_start = std::chrono::steady_clock::now();
+		while (const auto* header = ring.Peek()) {
+			if (header->op != Op::Wrap) Replay(*header, exec, state, nullptr, nullptr);
+			ring.Advance(header->size);
+		}
+		replay_ns += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - replay_start).count();
+		ring.Release(stats);
+	}
+	const auto total = uint64_t {Draws} * Repetitions;
+	Check(exec.calls == total * 6 && encoder.Stats().spins == 0, "benchmark preserves call count without ring waits");
+	std::printf("replay-bench: encode=%.3f ns/draw replay=%.3f ns/draw calls=%" PRIu64 "\n",
+	            encode_ns / total, replay_ns / total, exec.calls);
+}
+
 void Bench(uint64_t publish_batch) {
 	// Producer cost of a typical Sky Garden draw (U52: ~8 packets, ~1 KB) with a consumer thread
 	// replaying into a null executor.
@@ -1168,12 +1387,18 @@ void Bench(uint64_t publish_batch) {
 } // namespace
 
 int main(int argc, char** argv) {
+	if (argc > 1 && std::strcmp(argv[1], "--bench-replay-only") == 0) {
+		BenchReplay();
+		return g_failures != 0;
+	}
 	TestRoundTrip(false);
 	TestRoundTrip(true);
 	TestWrapAndBackPressure();
 	TestThreadedStream();
 	TestVerifyDetectsCorruption();
 	TestSites();
+	TestVerificationHashWork();
+	TestDrainWithoutMarker();
 	if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
 		for (uint32_t round = 0; round < 3; round++) {
 			Bench(0);

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/occlusion.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
@@ -46,6 +47,7 @@ public:
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
+	BindlessTable& GetBindlessTable() { return m_bindless_table; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
@@ -104,6 +106,7 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
+	BindlessTable             m_bindless_table;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;

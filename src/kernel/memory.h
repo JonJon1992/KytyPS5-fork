@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -14,6 +16,22 @@ namespace Libs::LibKernel::Memory {
 
 void Initialize();
 void Shutdown();
+
+// Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
+// waits on the GPU; call it only while the memory subsystem is initialized.
+struct DebugStats {
+	uint64_t direct_total       = 0;
+	uint64_t direct_allocated   = 0; // Everything but pool expansions, extended memory included.
+	uint64_t pooled_allocated   = 0; // Memory pool expansions.
+	uint64_t direct_mapped      = 0;
+	uint64_t flexible_total     = 0;
+	uint64_t flexible_used      = 0;
+	uint64_t pool_committed     = 0;
+	uint64_t cpu_page_entries   = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries   = 0;
+	uint64_t page_entries_total = 0; // Per side.
+};
+[[nodiscard]] DebugStats GetDebugStats();
 
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
@@ -119,6 +137,11 @@ bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t
 // the guest unmaps the range it shows whatever that backing then holds. Any thread.
 [[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU fault report (post-mortem, any thread): text saying where the guest's mappings hold 8-byte values
+// whose low 48 bits lie in [low, high], that is, where a faulting address was loaded from
+// (kernel/pointerScan.h). Reads only pages that already have a valid page-table entry; stops after
+// budget_ms.
+std::string ScanGuestMemoryForAddressRange(uint64_t low, uint64_t high, uint32_t budget_ms);
 // TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
 // draw-prep preparation the read is certified by that digest instead of its bytes
 // (DrawPrep::ReadSet::RecordDigest): only for bytes the preparation merely hashes.
@@ -144,6 +167,19 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// Diagnostics (KYTY_DRAW_PREP_CERT_DIAG): which of the exact predicates behind IsGpuCleanForRead
+// refuse the range, as GpuUnclean* bits (0: clean, or not GPU memory). GPU thread only.
+inline constexpr uint32_t GpuUncleanDirtyBytes  = 1u; // BufferCache::HasGpuDirtyBytes
+inline constexpr uint32_t GpuUncleanPublication = 2u; // BufferCache::HasPendingBackingPublication
+inline constexpr uint32_t GpuUncleanImage       = 4u; // TextureCache::IsRegionGpuModified
+[[nodiscard]] uint32_t GpuUncleanReasons(uint64_t vaddr, uint64_t size);
+// Diagnostics: prints the GPU-modified images over the range (TextureCache::LogGpuModifiedImages,
+// to stderr, first 32 calls of the process). GPU thread only.
+void                   LogGpuUncleanImages(uint64_t vaddr, uint64_t size);
+// The first step of RenderContext::SynchronizeGpuBackingForRead: GPU-modified images over the
+// range that a CPU write definitely overwrote stop owning their bytes
+// (TextureCache::ReleaseCpuOverwrittenImages). Returns whether any did. GPU thread only.
+bool                   ReleaseCpuOverwrittenGpuImages(uint64_t vaddr, uint64_t size);
 // May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);

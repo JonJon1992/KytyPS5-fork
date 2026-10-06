@@ -527,6 +527,74 @@ void SetDeferMode(DeferMode mode) { PageManager::SetDeferModeForTests(mode); }
 
 // A release inside a scope changes the counts at once and the host only when the outermost scope
 // ends; outside a scope, and with the switch off, releases stay synchronous.
+// DeferProtectScope: write watches added inside the scope change their counts at once and their
+// host protection at the scope's end, one call per stretch of a region whose pages need it or
+// already have it (pages 2 and 4, watched before the scope, are bridged; unwatched pages 6 and 7
+// split the call). Off and Verify keep the watches synchronous.
+void TestDeferProtectScope(DeferMode mode) {
+  SetDeferMode(mode);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return memory + index * page_size; };
+  manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  manager.UpdatePageWatchers<true>(address + page_size * 4, page_size);
+  const auto before = PageManager::GetProtectBatchStats();
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  {
+    const PageManager::DeferProtectScope scope;
+    {
+      const PageManager::DeferProtectScope nested;
+      for (const uint64_t index : {1, 3, 5, 8, 9}) {
+        manager.UpdatePageWatchers<true>(address + page_size * index, page_size);
+      }
+    }
+    if (mode == DeferMode::On) {
+      Check(g_protection_calls == 0 && IsWritable(page(1)) && IsWritable(page(3)) &&
+                IsWritable(page(5)) && IsWritable(page(8)) && IsWritable(page(9)),
+            "a write watch inside the scope (or at a nested scope's end) made its host call");
+    } else {
+      Check(g_protection_calls == 5 && Protection(page(1)) == PAGE_READONLY,
+            "a write watch outside DeferMode::On was deferred");
+    }
+  }
+  for (const uint64_t index : {1, 2, 3, 4, 5, 8, 9}) {
+    Check(Protection(page(index)) == PAGE_READONLY, "a watched page is writable after the scope");
+  }
+  Check(IsWritable(page(0)) && IsWritable(page(6)) && IsWritable(page(7)) &&
+            IsWritable(page(10)),
+        "the scope protected a page nobody watches");
+  const auto after = PageManager::GetProtectBatchStats();
+  if (mode == DeferMode::On) {
+    Check(g_protection_calls == 2 && g_protection_ranges.size() == 2 &&
+              g_protection_ranges[0].address == address + page_size &&
+              g_protection_ranges[0].size == page_size * 5 &&
+              g_protection_ranges[1].address == address + page_size * 8 &&
+              g_protection_ranges[1].size == page_size * 2,
+          "the scope's end did not join the region's runs across already-watched pages");
+    Check(after.spans == before.spans + 5 && after.applies == before.applies + 1 &&
+              after.calls == before.calls + 2,
+          "protect batch statistics do not match the deferred watches");
+  } else {
+    Check(after.spans == before.spans, "a synchronous watch was counted as deferred");
+  }
+  for (const uint64_t index : {1, 2, 3, 4, 5, 8, 9}) {
+    manager.UpdatePageWatchers<false>(address + page_size * index, page_size);
+  }
+  {
+    // A watch released again inside the scope needs no host call at its end.
+    g_protection_calls = 0;
+    const PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address + page_size * 12, page_size);
+    manager.UpdatePageWatchers<false>(address + page_size * 12, page_size);
+  }
+  Check(IsWritable(page(12)), "a watch released inside the scope left its page protected");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  SetDeferMode(DeferMode::On);
+}
+
 void TestDeferredReleaseWaitsForScope(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
@@ -625,6 +693,91 @@ void TestDeferredReleaseRacingWatch(DeferMode mode) {
   Check(IsWritable(memory), "pending release scope changed a reconciled page");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// KernelMprotect can change the host protection without updating PageManager's `applied`.
+// Rewatch must tighten such pages even while an old release remains deferred.
+void TestReuseAfterExternalProtection() {
+  SetDeferMode(DeferMode::Verify);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  manager.UpdatePageWatchers<true>(address, 4 * page_size);
+  {
+    const PageManager::DeferUnprotectScope scope;
+    manager.UpdatePageWatchers<false>(address, 4 * page_size);
+    DWORD old_protection = 0;
+    Check(VirtualProtect(memory + page_size, page_size, PAGE_READWRITE,
+                         &old_protection) != 0,
+          "external protection change failed");
+    g_protection_calls = 0;
+    g_protection_ranges.clear();
+    manager.UpdatePageWatchers<true>(address, 4 * page_size);
+    for (uint64_t page = 0; page < 4; page++)
+      Check(Protection(memory + page * page_size) == PAGE_READONLY,
+            "protection reuse trusted stale applied state after an external change");
+    Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+              g_protection_ranges[0].address == address + page_size &&
+              g_protection_ranges[0].size == page_size,
+          "external change was not re-protected independently of its unchanged neighbours");
+
+    manager.UpdatePageWatchers<false>(address, 4 * page_size);
+    Check(VirtualProtect(memory, 4 * page_size, PAGE_READWRITE, &old_protection) != 0,
+          "second external protection change failed");
+    g_protection_calls = 0;
+    g_protection_ranges.clear();
+    manager.UpdatePageWatchers<true>(address, 4 * page_size);
+    Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+              g_protection_ranges[0].address == address &&
+              g_protection_ranges[0].size == 4 * page_size,
+          "host protection proof survived into the next watcher update");
+    for (uint64_t page = 0; page < 4; page++)
+      Check(Protection(memory + page * page_size) == PAGE_READONLY,
+            "external protection change left a watched page writable");
+  }
+  Check(g_protection_calls == 1, "a pending release undid externally restored protection");
+  manager.UpdatePageWatchers<false>(address, 4 * page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Rewatching before a deferred release reaches the host must reuse the read-only protection.
+// A newly watched neighbouring page still needs a real host call before this method returns.
+void TestReuseAppliedProtection() {
+  SetDeferMode(DeferMode::Verify);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  manager.UpdatePageWatchers<true>(address, page_size);
+  manager.UpdatePageWatchers<true>(address + 2 * page_size, page_size);
+  {
+    const PageManager::DeferUnprotectScope scope;
+    manager.UpdatePageWatchers<false>(address, page_size);
+    manager.UpdatePageWatchers<false>(address + 2 * page_size, page_size);
+    g_protection_calls = 0;
+    g_protection_ranges.clear();
+    manager.UpdatePageWatchers<true>(address, page_size);
+    Check(g_protection_calls == 0 && Protection(memory) == PAGE_READONLY,
+          "re-watching a pending release repeated an already applied host protection");
+    manager.UpdatePageWatchers<false>(address, page_size);
+    manager.UpdatePageWatchers<true>(address, 3 * page_size);
+    Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+              g_protection_ranges[0].address == address + page_size &&
+              g_protection_ranges[0].size == page_size,
+          "protection reuse either missed a new watch or re-protected unchanged neighbours");
+    Check(Protection(memory) == PAGE_READONLY &&
+              Protection(memory + page_size) == PAGE_READONLY &&
+              Protection(memory + 2 * page_size) == PAGE_READONLY,
+          "a watched page was left writable before returning from a reused protection");
+  }
+  Check(g_protection_calls == 1, "a stale deferred release undid protection reuse");
+  manager.UpdatePageWatchers<false>(address, 3 * page_size);
+  for (uint64_t page = 0; page < 3; page++)
+    Check(IsWritable(memory + page * page_size), "reuse left a released page protected");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+#endif
 
 // More pending spans than the batch holds: the extra ones apply at once, the rest at scope end.
 void TestDeferredBatchOverflow() {
@@ -850,6 +1003,13 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (const auto *reuse = std::getenv("KYTY_PAGE_PROTECT_REUSE");
+      reuse != nullptr && std::strcmp(reuse, "1") == 0) {
+    TestReuseAfterExternalProtection();
+    TestReuseAppliedProtection();
+  }
+#endif
   TestWatchAndUnwatch();
   TestSharedWatcherCounts();
   TestCrossRegionRange();
@@ -879,6 +1039,7 @@ int main(int argc, char **argv) {
     TestDeferredReleaseWaitsForScope(mode);
     TestDeferredReleaseRacingWatch(mode);
     TestDeferredReleaseStress(mode);
+    TestDeferProtectScope(mode);
   }
   TestDeferredBatchOverflow();
   TestParkingLock();

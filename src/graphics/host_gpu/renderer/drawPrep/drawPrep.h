@@ -129,6 +129,21 @@ struct Totals {
 	std::atomic<uint64_t> prefetch_published {0};
 	std::atomic<uint64_t> prefetch_adopted {0};
 	std::atomic<uint64_t> prefetch_skipped {0};
+	// Engine::CommitHead (parallel mode): heads a worker had already finished, heads no worker had
+	// claimed (prepared by the committing thread, and that time), heads it waited for while a worker held them
+	// (of those, with unclaimed slots behind the head), its idle spin on them, and the slots it
+	// prepared meanwhile (KYTY_DRAW_PREP_STEAL).
+	std::atomic<uint64_t> head_ready {0};
+	std::atomic<uint64_t> head_self {0};
+	std::atomic<uint64_t> head_self_ns {0};
+	std::atomic<uint64_t> head_waits {0};
+	std::atomic<uint64_t> head_waits_unclaimed {0};
+	std::atomic<uint64_t> head_wait_ns {0};
+	// Of the waited heads: the first draw published after a command-processor stop (a barrier or
+	// a submission start, Slot::after_stop), and their spin.
+	std::atomic<uint64_t> head_waits_after_stop {0};
+	std::atomic<uint64_t> head_wait_after_stop_ns {0};
+	std::atomic<uint64_t> head_steals {0};
 };
 [[nodiscard]] Totals& GetTotals();
 
@@ -286,9 +301,15 @@ public:
 private:
 	struct Workers;
 
+	// P3b: what the resolver learns of a published draw only at its commit.
+	struct HeadPatch {
+		uint64_t submit_id      = 0;
+		uint32_t instance_count = UINT32_MAX; // UINT32_MAX: the published one
+	};
+
 	void Commit(Slot& slot);
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
-	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	void CommitHead(const HeadPatch* patch = nullptr);
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

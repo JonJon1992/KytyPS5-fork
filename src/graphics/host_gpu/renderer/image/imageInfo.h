@@ -57,6 +57,8 @@ struct ImageInfo {
 	GuestRange                   data;
 	GuestRange                   stencil;
 	ImageMetadataInfo            metadata;
+	// Seeds the HTile clear state of every slice when the surface is first bound as a depth
+	// target (TextureCache::FindDepthTarget): 0 = no slice cleared, any other value = all cleared.
 	uint32_t                     htile_clear_mask = UINT32_MAX;
 	vk::Format                   pixel_format     = vk::Format::eUndefined;
 	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;

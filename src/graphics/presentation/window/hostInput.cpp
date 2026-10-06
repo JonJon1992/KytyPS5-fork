@@ -152,8 +152,14 @@ public:
 			}
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
-			if (binding.control == INVALID_CONTROL || reserved ||
+			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F11;
+			// Saved mappings can predate a key becoming reserved (F2 for the performance panel).
+			if (reserved && binding.control != INVALID_CONTROL) {
+				LOGF("Ignoring input mapping on reserved key: %s\n", value.c_str());
+				continue;
+			}
+			if (binding.control == INVALID_CONTROL ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
 			}
@@ -476,8 +482,12 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event) {
-	// -1 waits without a deadline.
-	int timeout = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
+	// Waits for the next event, bounded by the next held-key release, mouse poll and cursor
+	// auto-hide deadline (-1: none of them, wait for an event).
+	int        timeout  = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
+	const auto bound_by = [&timeout](int wait) {
+		timeout = timeout < 0 ? wait : std::min(timeout, wait);
+	};
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
@@ -486,17 +496,14 @@ bool HostInputWaitEvent(SDL_Event* event) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		const int mouse_wait = PollMouse(SDL_GetTicks());
-		timeout              = timeout < 0 ? mouse_wait : std::min(timeout, mouse_wait);
+		bound_by(PollMouse(SDL_GetTicks()));
 	}
 
 	if (g_cursor_hide_at != 0) {
 		const auto now_ms = SDL_GetTicks();
-		const int  cursor_timeout =
-		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
-		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
+		bound_by(now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0);
 	}
-	const bool has_event = SDL_WaitEventTimeout(event, timeout);
+	const bool has_event = timeout < 0 ? SDL_WaitEvent(event) : SDL_WaitEventTimeout(event, timeout);
 	if (!has_event && timeout < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}

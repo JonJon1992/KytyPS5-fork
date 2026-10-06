@@ -12,10 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
-# Loading/watchdog diagnostics handle filesystem and thread-start exceptions locally.
+# Loading/watchdog diagnostics and fatal watchdog startup handle exceptions locally.
 # Other sources retain the project's no-exceptions compilation policy.
 if(LINUX)
-	set_property(SOURCE profiler.cpp hangWatchdog.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+	set_property(SOURCE assert.cpp profiler.cpp hangWatchdog.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
 endif()
 
 target_include_directories(common
@@ -35,6 +35,10 @@ target_link_libraries(common
 		ZArchive::zarchive
 		nlohmann_json::nlohmann_json
 )
+if(APPLE)
+	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
+	target_link_libraries(common PUBLIC "-framework CoreFoundation" "-framework IOKit")
+endif()
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})

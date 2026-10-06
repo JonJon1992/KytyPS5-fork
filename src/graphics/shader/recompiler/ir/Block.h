@@ -15,7 +15,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // dependency.
 class Block {
 public:
-	using InstructionList = std::list<Inst>;
+	using InstructionList = std::list<Inst, IrAllocator<Inst>>;
 	using iterator        = InstructionList::iterator;
 	using const_iterator  = InstructionList::const_iterator;
 

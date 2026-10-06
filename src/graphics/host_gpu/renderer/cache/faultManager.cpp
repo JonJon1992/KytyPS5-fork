@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -18,18 +19,27 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
-constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t MaxPageFaults       = 1024;
+constexpr size_t PageFaultAreaSize   = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t PageFaultBitsetSize = BufferCache::CACHING_NUMPAGES / 8;
+
+size_t DownloadAreaSize(const GraphicContext& graphics) {
+	const auto& limits = graphics.physical_device_properties.limits;
+	const auto  alignment =
+	    std::max(limits.nonCoherentAtomSize, limits.minStorageBufferOffsetAlignment);
+	return (PageFaultAreaSize + sizeof(ShaderTrapRecord) + alignment - 1) & ~(alignment - 1);
+}
 
 } // namespace
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
+      m_download_area_size(DownloadAreaSize(graphics)),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     PageFaultBitsetSize + sizeof(ShaderTrapRecord)),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        MaxPendingFaults * m_download_area_size) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -75,34 +85,47 @@ FaultManager::~FaultManager() {
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }
 
+Buffer* FaultManager::GetFaultBuffer() noexcept {
+	// Construction happens before the scheduler is active. Initialize on the GPU
+	// thread at first binding, before any shader can read or claim the record.
+	if (!m_initialized) {
+		m_fault_buffer.Fill(0, m_fault_buffer.Size(), 0);
+		m_initialized = true;
+	}
+	return &m_fault_buffer;
+}
+
 void FaultManager::ProcessFaultBuffer() {
+	(void)GetFaultBuffer();
 	KYTY_GPU_OP_SITE("fault.process");
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
 
-	const auto offset = m_current_area * PageFaultAreaSize;
+	const auto offset = m_current_area * m_download_area_size;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	std::memset(mapped, 0, m_download_area_size);
+	m_download_buffer.Flush(offset, m_download_area_size);
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
-	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer;
+	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferRead;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
 	pre_barrier.offset        = 0;
 	pre_barrier.size           = m_fault_buffer.Size();
+	// Covers the parser's writes and the trap record clear (fill) below.
 	auto post_barrier         = pre_barrier;
-	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer;
+	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+	                             vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
+	    {m_fault_buffer.Handle(), 0, PageFaultBitsetSize},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -127,15 +150,55 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
-	dependency.pBufferMemoryBarriers = &post_barrier;
+	// Preserve the trap record in readback, then release it for the next attempt. The clear
+	// only has to wait for the copy's read (write-after-read): an execution dependency.
+	const vk::BufferCopy trap_copy {PageFaultBitsetSize, offset + PageFaultAreaSize,
+	                                sizeof(ShaderTrapRecord)};
+	command.copyBuffer(m_fault_buffer.Handle(), m_download_buffer.Handle(), trap_copy);
+	vk::BufferMemoryBarrier2 trap_barrier {};
+	trap_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	trap_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	trap_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	trap_barrier.buffer              = m_fault_buffer.Handle();
+	trap_barrier.offset              = PageFaultBitsetSize;
+	trap_barrier.size                = sizeof(ShaderTrapRecord);
+	dependency.pBufferMemoryBarriers = &trap_barrier;
+	command.pipelineBarrier2(dependency);
+	command.fillBuffer(m_fault_buffer.Handle(), PageFaultBitsetSize, sizeof(ShaderTrapRecord), 0);
+	m_fault_buffer.MarkContentWritten();
+	vk::BufferMemoryBarrier2 download_barrier {};
+	download_barrier.srcStageMask =
+	    vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer;
+	download_barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+	download_barrier.dstStageMask    = vk::PipelineStageFlagBits2::eHost;
+	download_barrier.dstAccessMask   = vk::AccessFlagBits2::eHostRead;
+	download_barrier.buffer          = m_download_buffer.Handle();
+	download_barrier.offset          = offset;
+	download_barrier.size            = m_download_area_size;
+	// One dependency publishes the fault buffer to later commands and the readback to the host.
+	const std::array post_barriers {post_barrier, download_barrier};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(post_barriers.size());
+	dependency.pBufferMemoryBarriers    = post_barriers.data();
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+		m_download_buffer.Invalidate(offset, m_download_area_size);
+		ShaderTrapRecord trap;
+		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
+		if (trap.claimed != 0) {
+			const auto hash = (uint64_t{trap.shader_hash_high} << 32) | trap.shader_hash_low;
+			EXIT("GPU shader trap: hash=0x%016" PRIx64 " pc=0x%08x code=0x%02x\n",
+			     hash, trap.pc, trap.code);
+		}
+
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
+		if (faults[0] > count) {
+			LOGF("GPU page-fault report truncated: %" PRIu64 " entries, %" PRIu64 " recorded\n", faults[0], count);
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);

@@ -33,6 +33,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
@@ -161,14 +162,18 @@ static uint32_t WriteRangeLogLimit() {
 	return limit;
 }
 
-// KYTY_WRITE_RANGE_STATS=0 skips the image lookup behind FrameEvent.WriteRangeImagesSpared.
+// KYTY_WRITE_RANGE_STATS=1 (default off) counts FrameEvent.WriteRangeImagesSpared: a texture-cache
+// lock and image lookup per narrowed written binding, only for that statistic.
 static bool WriteRangeImageStatsEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_WRITE_RANGE_STATS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }
+
+static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
+                                             std::span<const uint32_t> data);
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
@@ -197,16 +202,44 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		// The shader indexes storage buffers in dwords; a base that is not dword aligned (RDNA
+		// allows any byte) has no binding here. A small read-only buffer is copied to an upload
+		// that starts at its exact guest address (adjustment 0); a writable or atomic one has no
+		// copy to write back to.
+		constexpr uint64_t max_aligned_copy = 1u << 20u;
+		if (adjustment % sizeof(uint32_t) != 0 && resource.read && !resource.written &&
+		    !resource.atomic && size <= max_aligned_copy) {
+			std::vector<uint32_t> words(static_cast<size_t>((size + 3u) / 4u), 0u);
+			if (LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), size) ||
+			    (context.SynchronizeGpuBackingForRead(address, size) &&
+			     LibKernel::Memory::TryReadGpuCleanBacking(address, words.data(), size))) {
+				return NativeUpload(context, words);
+			}
+		}
+		// Otherwise bind the null buffer, as for other unsupported resources: reads return zero,
+		// writes are dropped. Ghost of Yotei reached this once its bindless material shaders
+		// stopped being skipped.
+		static std::atomic_uint64_t unaligned {0};
+		const auto count = unaligned.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 8u || (count & 1023u) == 0u) {
+			std::printf("Warning: storage buffer (%s) at 0x%016" PRIx64 " size 0x%" PRIx64
+			            " is not dword aligned (adjustment %" PRIu64 ", alignment %" PRIu64
+			            ", stage %u, slot %u); bound as null (#%" PRIu64 ")\n",
+			            resource.written ? "writes dropped" : "reads zero", address,
+			            static_cast<uint64_t>(size), static_cast<uint64_t>(adjustment),
+			            static_cast<uint64_t>(alignment), static_cast<uint32_t>(stage), slot, count);
+		}
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
-	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
-	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
-	// no-op for every shader-side check, and it makes the device check match them.
-	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
-	                                           : size + adjustment;
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
+	// OpArrayLength counts whole dwords. A 4-byte robustness alignment would round a partial
+	// last word UP, exposing bytes beyond that count, so always bind only complete words.
+	// For a range below one word, the AMD pilot requires nullDescriptor (range=0 is invalid).
+	const auto range = ShaderRecompiler::Spirv::StorageBufferDwordRange(
+	    size + adjustment, ShaderRecompiler::Spirv::GetHostBufferRobustness());
+	const vk::DescriptorBufferInfo result =
+	    range == 0u ? vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE}
+	                : vk::DescriptorBufferInfo {buffer->Handle(), aligned_offset, range};
 	if (narrowed) {
 		for (const auto& range: *written_ranges) {
 			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
@@ -220,10 +253,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	} else if (resource.written) {
 		access = "Write";
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, result.buffer,
-	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
+	if (result.buffer != nullptr) {
+		SetVulkanObjectNameF(
+		    graphics.device, result.buffer,
+		    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
+		    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
+	}
 	return result;
 }
 
@@ -695,6 +730,16 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+// KYTY_PLACED_IMAGE_VIEWS=0 binds an image whose address is not aligned to its standalone
+// allocation as null again (the behaviour before placed views were accepted).
+static bool PlacedImageViewsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PLACED_IMAGE_VIEWS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static TextureCache::ImageDesc BuildTextureDescription(
     const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
@@ -782,27 +827,31 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
+	// size.align is the alignment of a standalone allocation. An SRD address has 256-byte
+	// granularity, and a small surface may be placed inside a larger allocation at that
+	// granularity (Ghost of Yotei packs a 16x16 down to 2x2 RGBA16F Standard4KB mip chain into
+	// one 4 KB block and binds each level on its own). The detiler computes every tiled offset
+	// from the SRD address, so such a placed view keeps its exact guest range.
+	const bool misaligned = (address & (static_cast<uint64_t>(size.align) - 1u)) != 0;
 	if (size.size == 0 || size.align == 0 ||
-	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
-		if (storage) {
-			EXIT("Not implemented (storage texture with size=0x%x align=0x%x addr=0x%016" PRIx64
-			     ")\n",
-			     size.size, size.align, address);
-		}
-		// A sampled texture whose descriptor has no valid footprint (zero size, or a base address
-		// the tile layout cannot align to): bind a null texture like a null descriptor.
+	    (misaligned && ((address & 0xffu) != 0 || !PlacedImageViewsEnabled()))) {
+		// A descriptor with no valid footprint (zero size, or a base address the tile layout
+		// cannot align to): bind a null image like a null descriptor. A storage image's writes
+		// are dropped.
 		static std::atomic_uint32_t reported {0};
 		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-			std::printf("Warning: texture with invalid footprint bound as null: addr=0x%016" PRIx64
-			            " size=0x%x align=0x%x %ux%u format=%u type=%u tile=%u "
+			std::printf("Warning: %s with invalid footprint bound as null: addr=0x%016" PRIx64
+			            " size=0x%x align=0x%x %ux%ux%u levels=%u format=%u type=%u tile=%u "
 			            "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-			            address, size.size, size.align, width, height,
+			            storage ? "storage image (writes dropped)" : "texture", address,
+			            size.size, size.align, width, height, depth, physical_levels,
 			            static_cast<uint32_t>(format), static_cast<uint32_t>(type),
 			            static_cast<uint32_t>(tile), descriptor.fields[0], descriptor.fields[1],
 			            descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 			            descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 		}
-		return NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		return NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                         : TextureCache::BindingType::Texture);
 	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
@@ -1198,7 +1247,10 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
 				                          data.size_bytes());
-				return last.allocation;
+				// An earlier command's allocation: not fresh, so the push-descriptor shadow and the
+				// descriptor-set reuse lookup may match it (KYTY_PUSH_SHADOW_FRESH_SKIP,
+				// KYTY_SET_REUSE_FRESH).
+				return reused(last.allocation);
 			}
 			const auto allocation = NativeUpload(m_context, data);
 			last.words.assign(data.begin(), data.end());
@@ -1418,6 +1470,180 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 	return true;
 }
 
+static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& resource) {
+	using ShaderRecompiler::Decoder::ImageDimension;
+	if (resource.cube) {
+		return ShaderRecompiler::IR::BindlessImages2DArray;
+	}
+	if (resource.dimension == ImageDimension::Dim3D) {
+		return ShaderRecompiler::IR::BindlessImages3D;
+	}
+	if (resource.dimension == ImageDimension::Dim2DArray ||
+	    resource.dimension == ImageDimension::Dim2DMsaaArray) {
+		return ShaderRecompiler::IR::BindlessImages2DArray;
+	}
+	return ShaderRecompiler::IR::BindlessImages2D;
+}
+
+static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
+	if (descriptor.IsNull() ||
+	    Prospero::SampledTextureNumericClass(descriptor.Format()) !=
+	        Prospero::TextureNumericClass::Float) {
+		return false;
+	}
+	switch (descriptor.Type()) {
+		case Prospero::ImageType::kColor2D:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kColor2DArray:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
+		default: return false;
+	}
+}
+
+void RenderExecutor::BeginBindlessUpdate() {
+    auto& table = m_context.GetBindlessTable();
+    if (!table.Enabled()) return;
+    // ponytail: global producer drain; immutable translation regions can remove this stall.
+    if (table.Used()) {
+        m_context.GetCommandScheduler().FlushAndWait();
+        table.ClearUsed();
+    }
+    table.ApplyUnregistered();
+    m_run_prev_valid = false;
+    m_run_active = false;
+    m_run.valid = false;
+}
+
+void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
+                                        PreparedBindings& prepared) {
+    prepared.bindless_patches.clear();
+    prepared.bindless_textures.clear();
+    auto& table = m_context.GetBindlessTable();
+    const auto& snapshot = *runtime.resources;
+    const bool uses_bindless = std::ranges::any_of(runtime.program->info.images,
+        &ShaderRecompiler::IR::ImageResource::bindless) || std::ranges::any_of(runtime.program->info.samplers,
+        &ShaderRecompiler::IR::SamplerResource::bindless);
+    if (!uses_bindless) return;
+    EXIT_IF(!table.Enabled());
+    const auto read = [&](uint64_t address, void* data, uint64_t size) {
+        if (!GuestRange {address, size}.Valid()) return false;
+        return LibKernel::Memory::TryReadGpuCleanBacking(address, data, size) ||
+            (m_context.SynchronizeGpuBackingForRead(address, size) &&
+             LibKernel::Memory::TryReadGpuCleanBacking(address, data, size));
+    };
+    ShaderSamplerResource default_sampler;
+    std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
+    table.WriteDefaultSampler(m_context.GetSamplerCache().GetSampler(default_sampler, false));
+    for (const auto& use: snapshot.bindless_sampler_heaps) {
+        prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
+        const uint64_t stride = use.record_stride;
+        if (!GuestRange {use.base, use.size}.Valid() || stride < 16u ||
+            uint64_t {use.table_offset} + 16u > use.size) continue;
+        // Every key whose S# lies inside the table.
+        const auto count64 = (use.size - use.table_offset - 16u) / stride + 1u;
+        if (count64 == 0 || count64 >= BindlessTable::MaxSamplers) continue;
+        std::vector<std::array<uint32_t, 4>> records(static_cast<size_t>(count64));
+        if (stride == 16u) {
+            if (!read(use.base + use.table_offset, records.data(), count64 * 16u)) continue;
+        } else {
+            // Records carrying their own S# (Ghost of Yotei: 872-byte light records).
+            const auto span = (count64 - 1u) * stride + 16u;
+            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            if (!read(use.base + use.table_offset, words.data(), span)) continue;
+            for (uint64_t key = 0; key < count64; ++key) {
+                std::memcpy(records[key].data(), words.data() + key * stride / 4u, 16u);
+            }
+        }
+        const auto& sampler = runtime.program->info.samplers.at(use.sampler);
+        const uint32_t flags = (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
+            (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
+            (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
+        auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, use.record_stride,
+                                                   flags);
+        if (table.MirrorSamplerHeap(*heap, records, m_context.GetSamplerCache()))
+            prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
+                                                static_cast<uint32_t>(count64)};
+    }
+    for (const auto& use: snapshot.bindless_heaps) {
+        prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
+        const uint64_t stride = use.record_stride;
+        // An r128 T# has 4 dwords in the record; its dwords 4..7 stay zero, as in the shader.
+        const uint64_t t_sharp_bytes = uint64_t {use.record_dwords} * 4u;
+        if (!GuestRange {use.base, use.size}.Valid() || stride < t_sharp_bytes ||
+            (t_sharp_bytes != 16u && t_sharp_bytes != 32u) ||
+            uint64_t {use.table_offset} + t_sharp_bytes > use.size) continue;
+        // Every key whose T# lies inside the table.
+        const auto count64 = (use.size - use.table_offset - t_sharp_bytes) / stride + 1u;
+        if (count64 == 0 || count64 >= BindlessTable::TranslationEntries) continue;
+        // ponytail: reread and resolve the bounded heap on every consumer; precise content
+        // revisions can avoid this O(heap size) work without weakening first-use residency.
+        std::vector<std::array<uint32_t, 8>> records(static_cast<size_t>(count64));
+        if (stride == 32u && t_sharp_bytes == 32u) {
+            if (!read(use.base + use.table_offset, records.data(), count64 * 32u)) continue;
+        } else {
+            // Records holding the T# (Ghost of Yotei: 440-byte materials, 872-byte lights): read
+            // the span once and keep each key's T#.
+            const auto span = (count64 - 1u) * stride + t_sharp_bytes;
+            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            if (!read(use.base + use.table_offset, words.data(), span)) continue;
+            for (uint64_t key = 0; key < count64; ++key) {
+                std::memcpy(records[key].data(), words.data() + key * stride / 4u, t_sharp_bytes);
+            }
+        }
+        const auto& resource = runtime.program->info.images.at(use.image);
+        const auto array = BindlessBindingFor(resource);
+        auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, use.record_stride, array,
+                                            static_cast<uint32_t>(count64), resource);
+        if (heap == nullptr) continue;
+        prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
+                                            static_cast<uint32_t>(count64)};
+        for (uint32_t key = 0; key < count64; ++key) {
+            (void)table.ReleaseKey(*heap, key);
+            heap->settled[key] = 1;
+            heap->descriptors[key] = records[key];
+            table.SetTranslation(*heap, key, 0u);
+            ShaderRecompiler::IR::DescriptorValue value {.dwords = records[key], .dword_count = 8u};
+            const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+            if (!BindlessCompatible(descriptor, array) ||
+                (descriptor.Type() == Prospero::ImageType::kCube && !resource.cube) ||
+                TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
+                    Prospero::BufferFormat::kInvalid) continue;
+            auto binding = ResolveTexture(resource, value);
+            const auto expected_view = array == BindlessTable::Images3D ? vk::ImageViewType::e3D :
+                array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
+            if (binding.desc.view_info.type != expected_view) continue;
+            auto& cache = m_context.GetTextureCache();
+            auto* image = cache.m_slot_images.try_get(binding.image_id);
+            if (image == nullptr || !image->registered || image->info.data.Empty()) continue;
+            BindImage(binding.image_id, false);
+            binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
+            image = cache.m_slot_images.try_get(binding.image_id);
+            if (image == nullptr || !image->registered || !binding.image_view) continue;
+            // Resolution may retire an older view and recycle its raw handle. Cache calls have
+            // released their locks, and the producer phase has no pending table consumers.
+            table.ApplyUnregistered();
+            const auto old_slot = table.FindSlot(array, binding.image_view);
+            const auto slot = old_slot != 0 ? old_slot : table.AllocateSlot(array);
+            if (slot == 0) continue;
+            binding.layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
+            if (old_slot == 0) {
+                table.WriteSlot(array, slot, binding.image_view, binding.layout);
+                table.AddSlotOwner(binding.image_id, array, slot);
+            }
+            heap->slots[key] = slot;
+            heap->images[key] = binding.image_id;
+            table.AddImageReference(binding.image_id, *heap, key);
+            table.SetTranslation(*heap, key, slot);
+            prepared.bindless_textures.push_back({binding, resource, value, array, slot});
+        }
+    }
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared, DrawPrep::StagePlan* plan,
                                      bool keep_images) {
@@ -1571,6 +1797,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 		NoteGdsProgram(program, snapshot);
 	}
+	PrepareBindlessHeaps(runtime, prepared);
 }
 
 // The binding range is stride * NUM_RECORDS (NUM_RECORDS bytes without a stride) whatever the
@@ -1847,7 +2074,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		bool fresh             = false;
-		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site, &fresh);
+        auto words = std::span<const uint32_t>(snapshot.flattened_srt);
+        if (!prepared.bindless_patches.empty()) {
+            prepared.bindless_srt = snapshot.flattened_srt;
+            for (const auto& patch: prepared.bindless_patches) {
+                EXIT_IF(static_cast<size_t>(patch.offset) + 1u >= prepared.bindless_srt.size());
+                prepared.bindless_srt[patch.offset] = patch.region;
+                prepared.bindless_srt[patch.offset + 1u] = patch.entries;
+            }
+            words = prepared.bindless_srt;
+        }
+		prepared.flattened_srt = UploadShaderData(words, site, &fresh);
 		prepared.fresh_upload |= fresh;
 	}
 	if (ShaderRecompiler::IR::FindBinding(
@@ -2390,6 +2627,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
+        for (auto& texture: prepared->bindless_textures) {
+            auto& image = m_context.GetTextureCache().GetImage(texture.binding.image_id);
+            // The sampled arrays have read-only layouts. Reject attachment/storage overlap
+            // explicitly until a matching feedback/general-layout binding is implemented.
+            EXIT_IF(!image.registered || image.binding.is_target || image.binding.force_general ||
+                    image.binding.shader_write || image.binding.needs_rebind);
+            const auto& view = texture.binding.desc.view_info;
+            image.Transit(texture.binding.layout, vk::AccessFlagBits2::eShaderRead,
+                          ImageSubresourceRange {view.base_level, view.level_count, view.base_layer, view.layer_count},
+                          vk_buffer, true);
+            image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+            image.usage.texture = true;
+        }
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
 			if (partial && (binding.kind == BindingKind::Samplers ||
@@ -2414,7 +2664,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						for (const auto resource: binding.resources) {
 							const auto& view = descriptors.buffers.at(resource);
-							EXIT_IF(view.buffer == nullptr);
+							EXIT_IF(view.buffer == nullptr &&
+							        (!ShaderRecompiler::Spirv::GetHostBufferRobustness()
+							              .null_descriptor_for_short_ranges ||
+							         view.offset != 0 || view.range != VK_WHOLE_SIZE));
 							m_descriptor_buffers.push_back(view);
 						}
 						break;
@@ -2472,7 +2725,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    descriptors.images[i].mip_views.empty()
 			        ? 1u
 			        : static_cast<uint32_t>(descriptors.images[i].mip_views.size());
-			EXIT_IF(m_image_occurrences[i] != expected);
+			EXIT_IF(!program.info.images[i].bindless && m_image_occurrences[i] != expected);
 		}
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
@@ -2540,6 +2793,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			CommitDescriptorSet(buffer, pipeline_bind_point, pipeline, fresh);
 		}
 	}
+    if (pipeline.uses_bindless) {
+        const auto set = m_context.GetBindlessTable().Set();
+        EXIT_IF(!set);
+        buffer.StateHandle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+                                                1, 1, &set, 0, nullptr);
+        m_context.GetBindlessTable().MarkUsed();
+    }
 }
 
 // KYTY_SET_REUSE_FRESH (default on; 0 off; verify): a descriptor set whose writes refer to a

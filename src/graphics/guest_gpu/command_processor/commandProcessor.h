@@ -220,6 +220,9 @@ public:
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
 	                    const volatile void* address, uint32_t count_in_dwords);
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
+	// A predicated packet under a GPU predicate that conditional rendering cannot gate: takes the
+	// GPU's decision on the CPU (m_predicate_skip) and ends the GPU predicate. False: suspended.
+	[[nodiscard]] bool ResolveGpuPredicate();
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
@@ -231,6 +234,12 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
+	// KYTY_CP_SEQ_PREFETCH (P3c): the prefetch front parses ahead of a wait and may read register
+	// pairs the guest has not written yet (the hardware reads them after the wait). Invalid data
+	// there stops its speculative parse instead of exiting: the real parse reads the final bytes,
+	// and the slots published so far are adopted or skipped by their keys as usual. False (the
+	// caller exits as before) on every other front.
+	bool AbandonPrefetchOnInvalidData();
 	// A reference front (KYTY_CP_SEQ_VERIFY) and a speculative one (KYTY_CP_SEQ_PREFETCH) only
 	// parse: packet handlers skip their counters and diagnostics for them.
 	[[nodiscard]] bool IsReferenceFront() const noexcept {
@@ -476,6 +485,10 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	// KYTY_PREDICATION_MODE=gpu (gpuPredication.h): the active GPU predicate id (front state; 0:
+	// none), and the id the packet being handled passes to its draw (0: not gated on the GPU).
+	uint32_t  m_predicate_gpu               = 0;
+	uint32_t  m_packet_predicate            = 0;
 	uint32_t  m_deferred_eop_flushes        = 0;
 	uint32_t  m_packets_since_eop_request   = 0;
 	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
@@ -521,6 +534,9 @@ private:
 	// maybe not executed yet (range, op sequence).
 	bool     m_epoch_pending = false;
 	uint64_t m_barrier_epoch = 1;
+	// KYTY_CP_WAIT_STATS: the LockstepRead being submitted copies command bytes (CheckCommandBytes)
+	// rather than packet data (ReadGuestForFront).
+	bool m_lockstep_command_bytes = false;
 	struct PendingWrite {
 		uint64_t begin = 0;
 		uint64_t end   = 0;

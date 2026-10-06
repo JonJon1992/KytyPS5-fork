@@ -563,6 +563,10 @@ struct CommandRecorder::NativeExecutor {
 	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
 		command.writeTimestamp2(stage, pool, query);
 	}
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+		command.beginConditionalRenderingEXT(info);
+	}
+	void endConditionalRenderingEXT() { command.endConditionalRenderingEXT(); }
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -572,7 +576,7 @@ CommandStream::Encoder::Options MakeOptions(CommandRecorder::Mode mode, void* se
                                             void (*after_commit)(void*)) {
 	CommandStream::Encoder::Options options;
 	options.verify         = CommandRecorder::VerifyEnabled();
-	options.all_sites      = GpuOpProfiler::CaptureEnabled();
+	options.all_sites      = GpuOpProfiler::CaptureEnabled() || GpuOpProfiler::CompositionEnabled();
 	options.barrier_sites  = GpuOpProfiler::Enabled();
 	options.current_site   = &CurrentSites;
 	options.policy.spin_ns = EnvUnsigned("KYTY_CP_RECORDER_SPIN_US", 30, 1000000) * 1000u;
@@ -639,9 +643,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	if (idle) {
 		m_idle_drains++;
 	} else {
-		const auto end = m_encoder.DrainMarker(++m_drain_serial);
 		if (m_mode == Mode::Thread) {
-			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+			m_encoder.Drain(m_drain_policy, m_drain_stats);
 		}
 	}
 	const auto now = NowNs();
@@ -1020,6 +1023,8 @@ void CommandRecorder::InstallVerifyHooks() {
 		KYTY_RECORDER_HOOK(vkCmdCopyQueryPoolResults);
 		KYTY_RECORDER_HOOK(vkCmdWriteTimestamp);
 		KYTY_RECORDER_HOOK(vkCmdWriteTimestamp2);
+		KYTY_RECORDER_HOOK(vkCmdBeginConditionalRenderingEXT);
+		KYTY_RECORDER_HOOK(vkCmdEndConditionalRenderingEXT);
 #undef KYTY_RECORDER_HOOK
 		std::printf("Kyty CP recorder verify: ownership hooks installed\n");
 		std::fflush(stdout);

@@ -15,12 +15,16 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -40,6 +44,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <span>
@@ -213,8 +219,15 @@ TestCompileResult RecompileOnceForTest(
   Check(ShaderRecompiler::IR::MaterializeResources(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
+  // These emitter/CFG tests inspect exact instruction shapes, including dead branches. Test
+  // the raw emitter here; optimizer behavior and optimized readbacks have their own tests.
+  const auto saved_codegen = ShaderRecompiler::GetCodegenOptions();
+  auto raw_codegen = saved_codegen;
+  raw_codegen.spirv_optimize = false;
+  ShaderRecompiler::SetCodegenOptions(raw_codegen);
   auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization, push_data_start_dword);
+  ShaderRecompiler::SetCodegenOptions(saved_codegen);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -275,6 +288,16 @@ void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
     std::fprintf(stderr, "SPIR-V binary validation failed:\n%s\n",
                  messages.c_str());
     std::abort();
+  }
+  if (const auto *directory = std::getenv("KYTY_SPIRV_SNAPSHOT_DIR")) {
+    static size_t index = 0;
+    std::filesystem::create_directories(directory);
+    const auto path = std::filesystem::path(directory) /
+                      (std::to_string(index++) + ".spv");
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(binary.data()),
+                 static_cast<std::streamsize>(binary.size() * sizeof(uint32_t)));
+    Check(output.good(), "SPIR-V snapshot write failed");
   }
 }
 
@@ -1841,12 +1864,16 @@ void TestNggVertexEntryState() {
     options.input_info.vertex = &input;
     options.wave_size = input.wave_size;
     const auto result = RecompileForTest(params.code, options);
+    // A wave32 vertex shader may run in a 64-lane host subgroup (drivers need not take a
+    // required subgroup size for vertex stages), which then holds two guest waves: its NGG
+    // subgroup counts 64 vertices, so every host lane passes the launch-count test.
+    const uint32_t vertex_count = wave_size == 32u ? 64u : wave_size;
     bool live_vertex_range = false;
     for (const auto *block : result.program.blocks) {
       for (const auto &inst : *block) {
         if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
           const auto count = inst.Arg(0).Resolve();
-          live_vertex_range |= count.IsImmediate() && count.U32() == wave_size;
+          live_vertex_range |= count.IsImmediate() && count.U32() == vertex_count;
         }
       }
     }
@@ -5977,6 +6004,58 @@ void TestNewShaderRecompilerImageGatherVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerImageGatherLodVariants() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x4c, 0x1),
+      EncodeMimg1(60, 0, 2, 4), // image_gather4_c_l
+      EncodeMimg0(0x54, 0x2),
+      EncodeMimg1(64, 0, 2, 8), // image_gather4_l_o
+      EncodeMimg0(0x5c, 0x1),
+      EncodeMimg1(68, 0, 2, 12), // image_gather4_c_l_o
+      // Keep the gathers live: a dead image op leaves no resource behind.
+      EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(60, 4, 1), // buffer_store_dword v60
+      EncodeMubuf0(0x1c, 4),
+      EncodeMubuf1(64, 4, 1), // buffer_store_dword v64
+      EncodeMubuf0(0x1c, 8),
+      EncodeMubuf1(68, 4, 1), // buffer_store_dword v68
+      0xbf810000u,
+  };
+
+  // An eight-dword T# at s0 (reserved bits clear), the S# at s8 and a raw V# at s16.
+  auto user_data = ImageTestUserData();
+  user_data[2] &= ~0x70003000u;
+  user_data[6] &= ~0x00007b00u;
+  user_data[16] = 0x1000u;
+  user_data[17] = 0u;
+  user_data[18] = 64u;
+  user_data[19] = 0u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "explicit-LOD gather decoded as unsupported");
+  // Address order: offset, compare, x, y, lod.
+  Check(result.decoded_dump.find("sample_flags=lod|compare addr_components=4") !=
+            std::string::npos,
+        "IMAGE_GATHER4_C_L did not expose lod+compare sample metadata");
+  Check(result.decoded_dump.find("sample_flags=lod|offset addr_components=4") !=
+            std::string::npos,
+        "IMAGE_GATHER4_L_O did not expose lod+offset sample metadata");
+  Check(result.decoded_dump.find("sample_flags=lod|compare|offset addr_components=5") !=
+            std::string::npos,
+        "IMAGE_GATHER4_C_L_O did not expose lod+compare+offset sample metadata");
+  Check(CountSourceOccurrences(result.ir_dump, "ImageGatherRaw ") == 3u,
+        "explicit-LOD gathers did not lower to IR ImageGatherRaw");
+  Check(SpirvContainsOpcode(result.spirv, 96),
+        "SPIR-V binary does not contain OpImageGather");
+  Check(SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary does not contain OpImageDrefGather");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerImageLoadVariants() {
   const uint32_t shader[] = {
       EncodeMimg0(0x00, 0x3),
@@ -7072,6 +7151,75 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
          std::string::npos),
         "formatted half-float store did not convert F32 to F16");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+constexpr uint32_t EncodeMubufD16(uint32_t opcode, uint32_t offset = 0) {
+  return EncodeMubuf0(opcode, offset) | (((opcode >> 7u) & 1u) << 25u);
+}
+
+void TestNewShaderRecompilerMubufD16Translation() {
+  const uint32_t shader[] = {
+      EncodeMubufD16(0x80, 0),  EncodeMubuf1(20, 0, 1), // buffer_load_format_d16_x
+      EncodeMubufD16(0x81, 0),  EncodeMubuf1(21, 0, 1), // buffer_load_format_d16_xy
+      EncodeMubufD16(0x82, 0),  EncodeMubuf1(22, 0, 1), // buffer_load_format_d16_xyz
+      EncodeMubufD16(0x83, 0),  EncodeMubuf1(24, 0, 1), // buffer_load_format_d16_xyzw
+      EncodeMubufD16(0x26, 0),  EncodeMubuf1(26, 0, 1), // buffer_load_format_d16_hi_x
+      EncodeMubufD16(0x84, 0),  EncodeMubuf1(20, 0, 1), // buffer_store_format_d16_x
+      EncodeMubufD16(0x85, 0),  EncodeMubuf1(21, 0, 1), // buffer_store_format_d16_xy
+      EncodeMubufD16(0x86, 0),  EncodeMubuf1(22, 0, 1), // buffer_store_format_d16_xyz
+      EncodeMubufD16(0x87, 0),  EncodeMubuf1(24, 0, 1), // buffer_store_format_d16_xyzw
+      EncodeMubufD16(0x27, 0),  EncodeMubuf1(26, 0, 1), // buffer_store_format_d16_hi_x
+      EncodeMubufD16(0x20, 0),  EncodeMubuf1(40, 0, 1), // buffer_load_ubyte_d16
+      EncodeMubufD16(0x21, 1),  EncodeMubuf1(50, 0, 1), // buffer_load_ubyte_d16_hi
+      EncodeMubufD16(0x22, 2),  EncodeMubuf1(42, 0, 1), // buffer_load_sbyte_d16
+      EncodeMubufD16(0x23, 3),  EncodeMubuf1(43, 0, 1), // buffer_load_sbyte_d16_hi
+      EncodeMubufD16(0x24, 4),  EncodeMubuf1(44, 0, 1), // buffer_load_short_d16
+      EncodeMubufD16(0x25, 6),  EncodeMubuf1(51, 0, 1), // buffer_load_short_d16_hi
+      EncodeMubufD16(0x19, 8),  EncodeMubuf1(50, 0, 1), // buffer_store_byte_d16_hi
+      EncodeMubufD16(0x1b, 10), EncodeMubuf1(51, 0, 1), // buffer_store_short_d16_hi
+      0xbf810000u,
+  };
+
+  std::array<uint32_t, 64> user_data{};
+  user_data[1] = 8u << 16u;
+  user_data[2] = 64u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  for (const char* name :
+       {"BUFFER_LOAD_FORMAT_D16_X ", "BUFFER_LOAD_FORMAT_D16_XY ", "BUFFER_LOAD_FORMAT_D16_XYZ ",
+        "BUFFER_LOAD_FORMAT_D16_XYZW", "BUFFER_LOAD_FORMAT_D16_HI_X", "BUFFER_STORE_FORMAT_D16_X ",
+        "BUFFER_STORE_FORMAT_D16_XYZW", "BUFFER_STORE_FORMAT_D16_HI_X", "BUFFER_LOAD_UBYTE_D16 ",
+        "BUFFER_LOAD_SBYTE_D16_HI", "BUFFER_LOAD_SHORT_D16_HI", "BUFFER_STORE_BYTE_D16_HI",
+        "BUFFER_STORE_SHORT_D16_HI"}) {
+    Check(result.decoded_dump.find(name) != std::string::npos,
+          (std::string("new decoder did not decode ") + name).c_str());
+  }
+  Check(result.decoded_dump.find("unsupported") == std::string::npos,
+        "MUBUF D16 opcode decoded as unsupported");
+  // D16 formats load and store at full component width; the stores consume the loads.
+  Check(CountSourceOccurrences(result.ir_dump, "LoadBufferU32x4 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x4 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "LoadBufferU32x3 ") == 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x3 ") == 1u,
+        "MUBUF D16 format accesses did not keep their component width");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("PackHalf2x16") != std::string::npos,
+        "D16 half-float load did not convert components to F16");
+  Check(source.find("UnpackHalf2x16") != std::string::npos,
+        "D16 half-float store did not widen components from F16");
+
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16UInt) << 12u;
+  options.user_data = user_data;
+  result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(DisassembleSpirvBinary(result.spirv).find("UnpackHalf2x16") == std::string::npos,
+        "D16 integer store converted components through F16");
 }
 
 void TestNewShaderRecompilerTypedBufferTranslation() {
@@ -8255,6 +8403,117 @@ void TestNewShaderRecompilerCfgLoopExitSharedWithSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// x post-dominates b when every path from b to a return passes x. A block that
+// cannot reach a return keeps every block as a post-dominator.
+void CheckPostDominatorsMatchPaths(const ShaderRecompiler::CFG::Graph &graph,
+                                   const char *text) {
+  const auto count = static_cast<uint32_t>(graph.blocks.size());
+  for (uint32_t x = 0; x < count; x++) {
+    std::vector<bool> escapes(count, false);
+    std::vector<uint32_t> pending;
+    for (const auto &block : graph.blocks) {
+      if (block.id != x && block.successors.empty()) {
+        escapes[block.id] = true;
+        pending.push_back(block.id);
+      }
+    }
+    while (!pending.empty()) {
+      const auto id = pending.back();
+      pending.pop_back();
+      for (const auto predecessor : graph.FindBlock(id)->predecessors) {
+        if (predecessor != x && !escapes[predecessor]) {
+          escapes[predecessor] = true;
+          pending.push_back(predecessor);
+        }
+      }
+    }
+    for (const auto &block : graph.blocks) {
+      Check(graph.PostDominates(x, block.id) == (block.id == x || !escapes[block.id]),
+            text);
+    }
+  }
+}
+
+void TestNewShaderRecompilerCfgPostDominatorsMatchPaths() {
+  // Runs of diamonds around an early return and inside a loop, then a trap
+  // loop that never reaches a return.
+  std::vector<uint32_t> shader = {EncodeSMovB32(0, 128)};
+  const auto add_diamonds = [&shader](uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+      shader.push_back(EncodeSopc(0x06, 0, 1 + i % 6)); // s_cmp_eq_u32 s0, sN
+      shader.push_back(EncodeSopp(0x05, 2));            // skip the first arm
+      shader.push_back(EncodeSMovB32(7, 129));
+      shader.push_back(EncodeSopp(0x02, 1)); // join
+      shader.push_back(EncodeSMovB32(7, 130));
+    }
+  };
+  add_diamonds(6);
+  shader.push_back(EncodeSopc(0x06, 7, 8));
+  shader.push_back(EncodeSopp(0x04, 1)); // skip the early return
+  shader.push_back(0xbf810000u);
+  const auto loop_start = static_cast<uint32_t>(shader.size());
+  add_diamonds(6);
+  shader.push_back(EncodeSopc(0x0a, 0, 129)); // s_cmp_lt_u32 s0, 1
+  shader.push_back(EncodeSopp(0x04, 2));      // leave the loop
+  shader.push_back(EncodeSop2(0x00, 0, 0, 129));
+  shader.push_back(EncodeSopp(
+      0x02, static_cast<uint16_t>(loop_start - (shader.size() + 1)))); // backedge
+  shader.push_back(0xbf810000u);
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(graph.natural_loops.size() == 1u && graph.blocks.size() > 30u,
+        "post-dominator fixture has the wrong native CFG");
+  CheckPostDominatorsMatchPaths(graph, "native post-dominators do not match their paths");
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        "post-dominator fixture did not structurize");
+  CheckPostDominatorsMatchPaths(graph,
+                                "structured post-dominators do not match their paths");
+
+  const uint32_t trap[] = {
+      EncodeSopc(0x06, 0, 1),
+      EncodeSopp(0x05, 2),          // to the trap
+      EncodeSMovB32(1, 129),
+      0xbf810000u,
+      EncodeSMovB32(2, 129),        // trap
+      EncodeSopp(0x02, 0xfffeu),    // spin
+      0xbf810000u,                  // unreachable decoder terminator
+  };
+  decoded = {};
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{trap}, decoded);
+  graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  CheckPostDominatorsMatchPaths(graph, "a trap loop's post-dominators do not match its paths");
+
+  // Cross bitset word boundaries with both terminating chains and cycles without an exit.
+  for (const uint32_t count : {63u, 64u, 65u, 127u, 128u, 129u}) {
+    std::vector<uint32_t> chain(count, EncodeSopp(0x02));
+    chain.back() = EncodeSopp(0x01);
+    for (const bool cycle : {false, true}) {
+      if (cycle) {
+        chain.back() = EncodeSopp(0x02, static_cast<uint16_t>(-count));
+        chain.push_back(EncodeSopp(0x01)); // Unreachable decoder terminator.
+      }
+      decoded = {};
+      ShaderRecompiler::Decoder::DecodeProgram(std::span{chain}, decoded);
+      graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+      Check(graph.blocks.size() == count, "word-boundary CFG has the wrong block count");
+      CheckPostDominatorsMatchPaths(graph, "word-boundary post-dominators differ from paths");
+      for (const auto &block : graph.blocks) {
+        Check(block.dominators.size() == block.id + 1u &&
+                  block.dominators.front() == 0u && block.dominators.back() == block.id &&
+                  std::ranges::is_sorted(block.dominators),
+              "word-boundary dominators changed their ascending IDs");
+        Check(block.post_dominators.size() == (cycle ? count : count - block.id) &&
+                  block.post_dominators.front() == (cycle ? 0u : block.id) &&
+                  block.post_dominators.back() == count - 1u &&
+                  std::ranges::is_sorted(block.post_dominators),
+              "word-boundary post-dominators include padding or changed their ascending IDs");
+      }
+    }
+  }
+}
+
 void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
   const uint32_t shader[] = {
       EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
@@ -8720,6 +8979,324 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
             SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "nested early-exit SPIR-V has the wrong structured control flow");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// A skipped shared tail is reached again only after the loop backedge. That
+// reachability must not prevent routing the overlapping selection in this iteration.
+void TestCfgLoopSharedContinuation() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 13),       // header -> end
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 4),       // outer -> right arm
+      EncodeSopc(0x06, 2, 128),
+      EncodeSopp(0x04, 5),       // inner -> skip shared tail
+      EncodeSMovB32(3, 129),     // left arm
+      EncodeSopp(0x02, 1),       // left -> shared tail
+      EncodeSMovB32(4, 130),     // right arm -> shared tail
+      EncodeSMovB32(5, 131),     // shared tail
+      EncodeSopp(0x02, 0),       // shared tail -> skipped target
+      EncodeSMovB32(6, 132),     // skipped target
+      EncodeSopp(0x02, 0),
+      EncodeSop2(0x00, 7, 7, 129), // latch
+      EncodeSopp(0x02, 0xfff1u), // repeat -> header
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original = graph;
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.natural_loops.size() == 1u, "shared-continuation loop fixture");
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared-continuation routing duplicated or discarded guest instructions");
+
+  // Compare execution paths against the original guest CFG for every combination
+  // of the two decisions across three iterations. Routing state must be refreshed
+  // on each iteration, and neither arm may execute the shared tail twice.
+  const auto trace = [&](const ShaderRecompiler::CFG::Graph &cfg, uint32_t choices) {
+    std::vector<uint32_t> executed;
+    std::vector<bool> routes(cfg.blocks.size(), false);
+    uint32_t iteration = 0;
+    auto id = cfg.entry_block;
+    for (uint32_t steps = 0; steps < 256; ++steps) {
+      const auto *block = cfg.FindBlock(id);
+      Check(block != nullptr, "shared-continuation trace lost a target");
+      for (auto i = block->inst_begin; i < block->inst_end; ++i) executed.push_back(i);
+      const auto &term = block->terminator;
+      if (term.goto_value >= 0) routes.at(term.goto_variable) = term.goto_value != 0;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::Return) return executed;
+      bool take = false;
+      if (term.condition == ShaderRecompiler::CFG::BranchCondition::GotoVariable) {
+        take = routes.at(term.goto_variable);
+      } else if (term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+        if (block->start_pc == 0) {
+          take = iteration++ == 3;
+        } else {
+          const auto decision = block->start_pc == 8 ? 0u : 1u;
+          take = (choices & (1u << ((iteration - 1u) * 2u + decision))) != 0;
+        }
+      }
+      id = term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch && !take
+               ? term.false_block : term.true_block;
+    }
+    Check(false, "shared-continuation trace did not terminate");
+    return executed;
+  };
+  for (uint32_t choices = 0; choices < 64; ++choices) {
+    Check(trace(graph, choices) == trace(original, choices),
+          "shared-continuation routing changed a guest execution path");
+  }
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
+            !SpirvContainsOpcode(result.spirv, 251),
+        "shared-continuation loop did not emit native structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// The outer selection enters the nested selection's region through its shared tail, and a block
+// separates the two headers, so goto routing does not apply. The last structurization tier
+// copies the tail for the nested header instead of taking the dispatcher.
+void TestCfgClonesExternallyEnteredTail() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 6),       // outer -> shared tail
+      EncodeSMovB32(3, 129),     // between the headers
+      EncodeSopp(0x02, 0),
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 2),       // nested -> shared tail
+      EncodeSMovB32(4, 130),     // nested arm
+      EncodeSopp(0x02, 2),       // nested arm -> merge
+      EncodeSMovB32(5, 131),     // shared tail
+      EncodeSopp(0x02, 0),
+      EncodeSMovB32(6, 132),     // merge (not terminal: both headers join here)
+      EncodeSopp(0x02, 0),
+      EncodeSMovB32(7, 133),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original = graph;
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+
+  const auto tail_copies = std::ranges::count_if(graph.blocks, [](const auto &block) {
+    return block.inst_begin == 8u && block.inst_end == 10u;
+  });
+  Check(tail_copies == 2, "shared tail was not copied for the nested selection");
+  Check(std::ranges::none_of(graph.blocks,
+                             [](const auto &block) {
+                               return block.terminator.goto_variable != UINT32_MAX;
+                             }),
+        "tail cloning fixture was routed instead");
+
+  // Both decisions, original against structured: same guest instructions in the same order.
+  const auto trace = [&](const ShaderRecompiler::CFG::Graph &cfg, uint32_t choices) {
+    std::vector<uint32_t> executed;
+    auto id = cfg.entry_block;
+    for (uint32_t steps = 0; steps < 64; ++steps) {
+      const auto *block = cfg.FindBlock(id);
+      Check(block != nullptr, "tail cloning trace lost a target");
+      for (auto i = block->inst_begin; i < block->inst_end; ++i) executed.push_back(i);
+      const auto &term = block->terminator;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::Return) return executed;
+      bool take = false;
+      if (term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch) {
+        take = (choices & (block->start_pc == 0 ? 1u : 2u)) != 0;
+      }
+      id = term.kind == ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch && !take
+               ? term.false_block : term.true_block;
+    }
+    Check(false, "tail cloning trace did not terminate");
+    return executed;
+  };
+  for (uint32_t choices = 0; choices < 4; ++choices) {
+    Check(trace(graph, choices) == trace(original, choices),
+          "tail cloning changed a guest execution path");
+  }
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback && !SpirvContainsOpcode(result.spirv, 251),
+        "externally entered tail did not emit native structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// --structurize-file <guest.bin> [...]: builds and structurizes the CFG of dumped guest compute
+// shaders (KYTY_DUMP_SHADERS writes _Shaders/original/*.bin) and translates the structured ones.
+// Exit status 1 when any of them would take the dispatcher fallback.
+int StructurizeFiles(std::span<char *const> paths) {
+  int status = 0;
+  for (const char *path : paths) {
+    std::ifstream file(path, std::ios::binary);
+    const std::vector<char> bytes{std::istreambuf_iterator<char>(file), {}};
+    if (bytes.empty() || bytes.size() % 4u != 0u) {
+      std::printf("%s: not a guest shader binary (%zu bytes)\n", path, bytes.size());
+      status = 1;
+      continue;
+    }
+    std::vector<uint32_t> words(bytes.size() / 4u);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(words, decoded);
+    // KYTY_STRUCTURIZE_FILE_RDNA2=1: the decoded listing next to the binary (<guest.bin>.rdna2),
+    // for dumps taken before the emission that would have written it.
+    if (std::getenv("KYTY_STRUCTURIZE_FILE_RDNA2") != nullptr) {
+      std::ofstream(std::string(path) + ".rdna2") << ShaderRecompiler::Decoder::ProgramToString(decoded);
+    }
+    auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+    const auto blocks = graph.blocks.size();
+    const bool structured = !graph.irreducible && ShaderRecompiler::CFG::Structurize(graph);
+    uint32_t routes = 0;
+    for (const auto &block : graph.blocks) {
+      routes += block.terminator.goto_value >= 0 ? 1u : 0u;
+    }
+    std::printf("%s: %zu instructions, %zu blocks -> %zu, %zu loops, %u route sets: %s%s\n", path,
+                decoded.instructions.size(), blocks, graph.blocks.size(),
+                graph.natural_loops.size(), routes, structured ? "structured" : "dispatcher, ",
+                structured ? "" : graph.unsupported_reason.c_str());
+    if (!structured) {
+      status = 1;
+      continue;
+    }
+    // Scratch-backed FLAT accesses need a per-thread size; the dispatch's COMPUTE_TMPRING_SIZE
+    // is not in the dump, so any nonzero size stands in for it.
+    ShaderComputeInputInfo compute{};
+    compute.scratch_size_dwords = 1024;
+    ShaderRecompiler::Frontend::TranslateOptions translate_options{};
+    translate_options.stage = ShaderType::Compute;
+    translate_options.wave_size = 64u;
+    translate_options.input_info.compute = &compute;
+    const auto program = ShaderRecompiler::Frontend::TranslateProgram(decoded, graph, translate_options);
+    std::printf("%s: translated, %zu IR blocks, dispatcher_fallback=%d\n", path,
+                program.blocks.size(), program.dispatcher_fallback ? 1 : 0);
+    status |= program.dispatcher_fallback ? 1 : 0;
+    // KYTY_STRUCTURIZE_FILE_SPIRV=1: the recompiler's whole translation (every IR pass up to
+    // resource tracking), then the global address writes left for SPIR-V emission, which it
+    // refuses, and, when every resource materializes from null memory, validated SPIR-V.
+    if (std::getenv("KYTY_STRUCTURIZE_FILE_SPIRV") != nullptr) {
+      // The stage comes from a "stage<N>_" file name prefix (cachecode dumps: 1 VS, 2 PS, 4 CS);
+      // KYTY_STRUCTURIZE_FILE_BINDLESS=1 tracks with bindless images and samplers.
+      const std::string name = std::filesystem::path(path).filename().string();
+      const auto stage = name.starts_with("stage1_")   ? ShaderType::Vertex
+                         : name.starts_with("stage2_") ? ShaderType::Pixel
+                                                       : ShaderType::Compute;
+      auto options = MakeCompileOptions(stage);
+      if (stage == ShaderType::Compute) options.input_info.compute = &compute;
+      options.bindless_images = options.bindless_samplers =
+          std::getenv("KYTY_STRUCTURIZE_FILE_BINDLESS") != nullptr;
+      const auto translated = ShaderRecompiler::TranslateProgram(words, options);
+      uint32_t bindless = 0;
+      for (const auto &image : translated.program.info.images) bindless += image.bindless ? 1u : 0u;
+      std::printf("%s: %s, %zu images (%u bindless), skip_dispatch=%d\n", path,
+                  stage == ShaderType::Vertex ? "VS" : stage == ShaderType::Pixel ? "PS" : "CS",
+                  translated.program.info.images.size(), bindless, translated.skip_dispatch ? 1 : 0);
+      uint32_t global_writes = 0;
+      for (const auto *block : translated.program.blocks) {
+        for (const auto &inst : *block) {
+          const auto access = ShaderRecompiler::IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+          if (access != ShaderRecompiler::IR::AddressAccess::Write) continue;
+          const auto index = inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+          global_writes += index < translated.program.memory_info.size() &&
+                           translated.program.memory_info[index].kind !=
+                               ShaderRecompiler::IR::ResourceKind::Scratch;
+        }
+      }
+      std::printf("%s: full translation, skip_dispatch=%d, global address writes %u\n", path,
+                  translated.skip_dispatch ? 1 : 0, global_writes);
+      // KYTY_STRUCTURIZE_FILE_OPS=<n>: the n most frequent IR opcodes of that translation.
+      if (const char *top = std::getenv("KYTY_STRUCTURIZE_FILE_OPS"); top != nullptr) {
+        std::unordered_map<std::string_view, uint32_t> counts;
+        uint32_t total = 0;
+        for (const auto *block : translated.program.blocks) {
+          for (const auto &inst : *block) {
+            counts[ShaderRecompiler::IR::ValueOpcodeName(inst.GetOpcode())]++;
+            total++;
+          }
+        }
+        std::vector<std::pair<std::string_view, uint32_t>> sorted(counts.begin(), counts.end());
+        std::ranges::sort(sorted, [](const auto &a, const auto &b) { return a.second > b.second; });
+        std::printf("%s: %u IR instructions\n", path, total);
+        for (size_t i = 0; i < std::min<size_t>(sorted.size(), std::strtoul(top, nullptr, 10)); i++) {
+          std::printf("  %7u %.*s\n", sorted[i].second, static_cast<int>(sorted[i].first.size()),
+                      sorted[i].first.data());
+        }
+      }
+      status |= global_writes != 0 ? 1 : 0;
+    }
+  }
+  return status;
+}
+
+// Ghost of Yotei's ray traversal stack (cs 0x4f07b07b3d8c8406): FLAT stores whose high address
+// dword is med3(s_brev_b32 1 = 0x80000000, 0x70000000, x) are LDS or scratch; the global path
+// they also translate to never runs (guest memory ends far below 0x70000000 << 32) and must not
+// reach SPIR-V emission, which refuses writable global addresses. A high dword that can be small
+// keeps its global store.
+void TestGlobalWideLoadsPreserveWidth() {
+  using namespace ShaderRecompiler;
+  for (uint32_t count : {2u, 3u, 4u}) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 2, 256 + 0),
+        EncodeVop1(0x01, 3, 128),
+        EncodeFlat0(count == 2 ? 0x0d : count == 3 ? 0x0f : 0x0e, 2),
+        EncodeFlat1(8, 0x7d, 0, 2),
+        EncodeExp0(0x00, (1u << count) - 1u), EncodeExp1(8, 9, 10, 11),
+        EncodeSopp(0x01),
+    };
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    uint32_t reads = 0;
+    for (const auto* block : result.program.blocks) {
+      for (const auto& inst : *block) {
+        if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::Read) continue;
+        const auto& mem = result.program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+        if (mem.kind != IR::ResourceKind::Global) continue;
+        ++reads;
+        Check(mem.data_dwords == count,
+              "GLOBAL wide load lost its operation width before SPIR-V emission");
+      }
+    }
+    Check(reads == 1, "GLOBAL wide load emitted separate address reads per component");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestFlatStoreAboveAddressSpaceDropsGlobalPath() {
+  const auto global_writes = [](std::span<const uint32_t> shader) {
+    const auto translated =
+        ShaderRecompiler::TranslateProgram(shader, MakeCompileOptions(ShaderType::Compute));
+    uint32_t writes = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (ShaderRecompiler::IR::AddressOpcodeInfoOf(inst.GetOpcode()).access ==
+                ShaderRecompiler::IR::AddressAccess::Write &&
+            translated.program.memory_info[inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index]
+                    .kind == ShaderRecompiler::IR::ResourceKind::Global) {
+          writes++;
+        }
+      }
+    }
+    return writes;
+  };
+  const uint32_t stack[] = {
+      EncodeSop1(0x0b, 53, 129),                                     // s_brev_b32 s53, 1
+      EncodeSMovB32(2, 255), 0x70000000u,                            // s_mov_b32 s2, 0x70000000
+      EncodeVop3Word0(0x159, 12), EncodeVop3Word1(53, 2, 256 + 31), // v_med3_u32 v12, s53, s2, v31
+      EncodeVop1(0x01, 11, 256 + 0),                                 // v_mov_b32 v11, v0
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 5, 11),             // flat_store_dword v[11:12], v5
+      EncodeSopp(0x01),
+  };
+  Check(global_writes(stack) == 0,
+        "FLAT store above the guest address space kept its global path");
+  const uint32_t low[] = {
+      EncodeSMovB32(53, 128),                                        // s_mov_b32 s53, 0
+      EncodeSMovB32(2, 255), 0x00000010u,                            // s_mov_b32 s2, 0x10
+      EncodeVop3Word0(0x159, 12), EncodeVop3Word1(53, 2, 256 + 31), // v_med3_u32 v12, s53, s2, v31
+      EncodeVop1(0x01, 11, 256 + 0),
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 5, 11),
+      EncodeSopp(0x01),
+  };
+  Check(global_writes(low) == 1, "FLAT store that can reach guest memory lost its global path");
 }
 
 void TestNewShaderRecompilerCfgExecSccSharedArm() {
@@ -9674,42 +10251,64 @@ void TestComputeDispatchWaveSize() {
 }
 
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
-  const uint32_t shader[] = {
-      EncodeMubuf0(0x0c),
-      EncodeMubuf1(0, 0, 1), // buffer_load_dword
-                             // v0
-      EncodeMubuf0(0x1c, 0, false),
-      EncodeMubuf1(0, 12, 0),
-      EncodeSopp(0x01),
+  // buffer_load_dword v0, then a store of it. With live_exec a v_cmpx against user data first
+  // leaves EXEC unknown; otherwise EXEC is the full entry mask, the module's constant true, and
+  // its guard is folded.
+  // robust_loads (KYTY_ROBUST_BUFFER_LOADS, default on) issues the storage-buffer load at its own
+  // index and selects zero out of bounds; off, the load sits in a bounds branch.
+  const auto check = [](bool live_exec, bool robust_loads) {
+    std::vector<uint32_t> shader;
+    if (live_exec) {
+      shader.push_back(EncodeVopc(0xd4, 4, 0)); // v_cmpx_gt_u32 s4, v0
+    }
+    for (const uint32_t word : {
+             EncodeMubuf0(0x0c), EncodeMubuf1(0, 0, 1), // buffer_load_dword v0
+             EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 12, 0), EncodeSopp(0x01)}) {
+      shader.push_back(word);
+    }
+
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    const auto saved = ShaderRecompiler::GetCodegenOptions();
+    auto codegen = saved;
+    codegen.robust_buffer_loads = robust_loads;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    auto result = RecompileForTest(shader, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
+          "buffer load guard regression did not decode MUBUF load");
+    CheckSpirvBinaryValidates(result.spirv);
+
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    const auto first_branch = source.find("OpBranchConditional", 0);
+    const auto array_length = source.find("OpArrayLength", 0);
+    Check(array_length != std::string::npos,
+          "buffer load SPIR-V lacks storage buffer array-length bounds check");
+    const auto element_access =
+        source.find("OpAccessChain %_ptr_StorageBuffer_uint", array_length);
+    Check(element_access != std::string::npos,
+          "buffer load SPIR-V lacks storage element access");
+    if (live_exec) {
+      Check(first_branch < array_length,
+            "buffer load bounds check was emitted outside EXEC guard");
+    } else {
+      Check(first_branch > array_length,
+            "buffer load kept an EXEC guard for the full entry mask");
+    }
+    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    if (robust_loads) {
+      const auto select = source.find("OpSelect %uint", element_access);
+      Check(select != std::string::npos && select < bounds_branch,
+            "storage buffer load was not branch-free under robust buffer access");
+    } else {
+      Check(bounds_branch < element_access,
+            "buffer load storage element pointer was formed before bounds guard");
+    }
   };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("BUFFER_LOAD_DWORD") != std::string::npos),
-        "buffer load guard regression did not decode MUBUF load");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto exec_branch =
-      source.find("OpBranchConditional", 0);
-  const auto array_length =
-      source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
-  const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
-  Check(exec_branch != std::string::npos,
-        "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
-  Check(element_access != std::string::npos,
-        "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
-        "buffer load bounds check was emitted outside EXEC guard");
-  Check(bounds_branch < element_access,
-        "buffer load storage element pointer was formed before bounds guard");
+  check(false, true);
+  check(true, true);
+  check(false, false);
+  check(true, false);
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
@@ -12606,6 +13205,18 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+// Ghost of Yotei samples 8-bit signed integer textures.
+void TestSampledSignedByteTexture() {
+  constexpr auto format = Prospero::BufferFormat::k8SInt;
+  const auto surface = TextureGetSurfaceFormatInfo(format);
+  Check(Prospero::SampledTextureNumericClass(format) ==
+                Prospero::TextureNumericClass::Sint &&
+            Prospero::NumBytesPerElement(format) == 1u &&
+            surface.vk_format == vk::Format::eR8Sint &&
+            surface.conversion_format == Prospero::BufferFormat::kInvalid,
+        "8-bit signed integer texture is not sampled as R8_SINT");
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -12721,6 +13332,18 @@ void TestRenderTargetReverseExportMapping() {
   Check(standard_1555.format == vk::Format::eR5G5B5A1UnormPack16 &&
             standard_1555.export_mapping == Prospero::ColorMappingAbgr,
         "1:5:5:5 render target did not preserve its low one-bit component");
+  // Ghost of Yotei renders to 11:11:10 UNORM, which Vulkan lacks: it is stored as 10:10:10:2
+  // UNORM (same element size, fixed point that saturates at 1.0), its colors in the standard order.
+  const auto unorm_111110 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kUNorm,
+      Prospero::ChannelOrder::kStandard);
+  const auto float_111110 = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
+      Prospero::ChannelOrder::kStandard);
+  Check(unorm_111110.format == vk::Format::eA2B10G10R10UnormPack32 &&
+            unorm_111110.bytes_per_element == 4u &&
+            unorm_111110.export_mapping == float_111110.export_mapping,
+        "11:11:10 UNORM render target did not use 10:10:10:2 UNORM storage");
 
   const auto argb = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -14603,6 +15226,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 }
 
 #include "ShaderRayTracingTests.inc"
+#include "ShaderFrontendOptimizationTests.inc"
 
 void TestRdna2IsaAccuracyDecode() {
   namespace Decoder = ShaderRecompiler::Decoder;
@@ -14767,6 +15391,46 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
         "LDS waitcnt barrier did not emit OpMemoryBarrier");
   CheckSpirvBinaryValidates(exchange.spirv);
 
+  // The only producer before the wait is FLAT. Keep the cross-lane consumer
+  // live by storing its result after both waits; that later DS write cannot
+  // make the first wait look ordered. Exercise split wave64 and both consumers.
+  for (uint32_t subgroup : {32u, 64u}) {
+    compute.host_subgroup_size = subgroup;
+    for (const auto width : {std::array{0x18u, 0x08u, 0x3au},
+                             std::array{0x1au, 0x0au, 0x3cu},
+                             std::array{0x1cu, 0x0cu, 0x36u}}) {
+      for (bool flat_consumer : {false, true}) for (bool split_wait : {false, true}) {
+        const auto wait = split_wait ? EncodeSopk(0x1a, 125, 0)
+                                     : EncodeSopp(0x0c, WaitLgkm0);
+        std::vector<uint32_t> code{
+            EncodeSop1(0x04, 8, 235), // shared base
+            EncodeVop2(0x1a, 1, 130, 0), // v1 = lane * 4
+            EncodeVop1(0x01, 2, 9), // v2 = shared high tag
+            EncodeFlat0(width[0], 0), EncodeFlat1(0, 0x7d, 0, 1),
+            wait, wait, // The second zero-count wait must not duplicate publication.
+            EncodeVop2(0x1d, 3, 132, 1), // v3 = adjacent lane's address
+            EncodeVop1(0x01, 4, 9),
+        };
+        if (flat_consumer)
+          code.insert(code.end(), {EncodeFlat0(width[1], 0), EncodeFlat1(5, 0x7d, 0, 3)});
+        else
+          code.insert(code.end(), {EncodeDs0(width[2]), EncodeDs1(5, 0, 3)});
+        code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 5, 1), EncodeSopp(0x01)});
+        const auto flat_exchange = RecompileForTest(code, options);
+        Check(barriers(flat_exchange) == 1u,
+              "FLAT-only LDS producer did not publish at zero-count wait exactly once");
+        // Subword stores publish their CAS update once per host invocation;
+        // the wait adds one wave-wide LDS barrier, also for split wave64.
+        const auto subword_barriers = width[0] == 0x1cu ? 0u : 64u / subgroup;
+        Check(SpirvInstructionOpcodeCount(flat_exchange.spirv, spv::OpMemoryBarrier) ==
+                  1u + subword_barriers,
+              "FLAT LDS wait did not add one OpMemoryBarrier beyond the subword CAS barriers");
+        CheckSpirvBinaryValidates(flat_exchange.spirv);
+      }
+    }
+  }
+  compute.host_subgroup_size = 64;
+
   const auto nonzero_wait = compile({
       EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
       EncodeSopp(0x0c, WaitLgkm1),
@@ -14782,6 +15446,22 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
   });
   Check(barriers(read_only) == 0u,
         "S_WAITCNT without a preceding LDS write inserted an LDS barrier");
+  const auto flat_nonzero_wait = compile({
+      EncodeSop1(0x04, 8, 235), EncodeVop1(0x01, 2, 9),
+      EncodeFlat0(0x1c, 0), EncodeFlat1(0, 0x7d, 0, 1),
+      EncodeSopp(0x0c, WaitLgkm1), EncodeSopp(0x01),
+  });
+  Check(barriers(flat_nonzero_wait) == 0u,
+        "nonzero-count wait after a FLAT LDS write inserted a barrier");
+  CheckSpirvBinaryValidates(flat_nonzero_wait.spirv);
+  const auto flat_read_only = compile({
+      EncodeSop1(0x04, 8, 235), EncodeVop1(0x01, 2, 9),
+      EncodeFlat0(0x0c, 0), EncodeFlat1(5, 0x7d, 0, 1),
+      EncodeSopp(0x0c, WaitLgkm0), EncodeSopp(0x01),
+  });
+  Check(barriers(flat_read_only) == 0u,
+        "FLAT read without a prior write inserted an LDS barrier");
+  CheckSpirvBinaryValidates(flat_read_only.spirv);
   const auto split_wait = compile({
       EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
       EncodeSopk(0x1a, 125, 0), // s_waitcnt_lgkmcnt null, 0
@@ -14820,13 +15500,181 @@ void TestRdna2LdsWaitcntBarrierAndFloatControls() {
         "float controls were declared without device support");
 }
 
+void TestExecSelectAnalysisFixpoint() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto check_chain = [](uint32_t count, bool observed, bool frozen) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    for (uint32_t id = 0; id < 3; id++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    auto *entry = program.blocks[0];
+    auto *loop = program.blocks[1];
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    loop->AddBranch(program.blocks[2]);
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[2].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Return;
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+
+    std::vector<Inst *> conditions;
+    std::vector<Inst *> phis;
+    std::vector<Inst *> stores;
+    Inst *first_select = nullptr;
+    for (uint32_t i = 0; i < count; i++) {
+      auto &source = entry->AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      auto &condition = entry->AppendNewInst(
+          ValueOpcode::IEqual32, {Value(&source), Value(i + 1u)});
+      conditions.push_back(&condition);
+      auto &phi = loop->AppendNewInst(ValueOpcode::Phi);
+      phi.SetFlags(Type::U32);
+      phi.AddPhiOperand(entry, Value(0u));
+      phis.push_back(&phi);
+    }
+    program.block_info[1].condition = Value(conditions.front());
+    for (uint32_t i = 0; i < count; i++) {
+      // The previous select's back-edge phi feeds this false arm. Rejection of
+      // the last select therefore propagates backwards on subsequent passes.
+      auto &select = loop->AppendNewInst(
+          ValueOpcode::SelectU32,
+          {Value(conditions[i]), Value(i + 1u), Value(phis[i == 0 ? 0 : i - 1])});
+      phis[i]->AddPhiOperand(loop, Value(&select));
+      if (i == 0) first_select = &select;
+      const Value guard = observed && i + 1u == count
+                              ? Value(true)
+                              : Value(conditions[i]);
+      auto &store = loop->AppendNewInst(
+          ValueOpcode::WriteSharedU32,
+          {Value(i * 4u), Value(&select), guard});
+      store.SetFlags(MemoryFlags{.index = 0});
+      stores.push_back(&store);
+    }
+    if (frozen) program.dynamic_reads.push_back(Value(first_select));
+    ValidateProgram(program, true);
+    const auto stats = EliminateExecSelects(program, false);
+    ValidateProgram(program, true);
+    Check(stats.branch_known == 0u && stats.nested_folds == 0u,
+          "EXEC memo fixture unexpectedly folded branch or nested selects");
+    const bool eliminated = !observed && !frozen;
+    Check(stats.masked_uses == (eliminated ? count : 0u),
+          "EXEC masked-use fixpoint changed select elimination");
+    uint32_t remaining = 0;
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        remaining += inst.GetOpcode() == ValueOpcode::SelectU32;
+      }
+    }
+    Check(remaining == (eliminated ? 0u : count),
+          "EXEC masked-use fixpoint retained or removed the wrong selects");
+    for (uint32_t i = 0; i < count; i++) {
+      const auto value = stores[i]->Arg(1);
+      if (eliminated) {
+        Check(value.IsImmediate() && value.U32() == i + 1u,
+              "EXEC masked cycle did not retain the selected true value");
+      } else {
+        Check(value.TryInstruction() != nullptr &&
+                  value.Instruction()->GetOpcode() == ValueOpcode::SelectU32,
+              "EXEC observed or frozen select was rewritten");
+      }
+    }
+  };
+
+  check_chain(1, false, false); // A masked loop cycle can be eliminated.
+  check_chain(1, false, true);  // Frozen resource-plan values stay unchanged.
+  check_chain(1, true, false);  // An observed No verdict remains valid.
+  check_chain(2, true, false);  // Yes must be invalidated after assumed shrinks.
+  check_chain(10, true, false); // More than eight passes requires the safe fallback.
+}
+
+#include "BindlessShaderTests.inc"
+
+#include "ShaderTypedViewsTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  // The tests also validate the IR as translated (off in production).
+  if (std::getenv("KYTY_VALIDATE_IR") == nullptr) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_VALIDATE_IR", "1");
+#else
+    setenv("KYTY_VALIDATE_IR", "1", 1);
+#endif
+  }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--typed-views-only") {
+    TestTypedBitcastViews();
+    std::puts("ShaderCfgTests: typed SSA views passed");
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--loop-shared-continuation-only") {
+    TestCfgLoopSharedContinuation();
+    TestCfgClonesExternallyEnteredTail();
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--flat-address-space-only") {
+    TestGlobalWideLoadsPreserveWidth();
+    TestFlatStoreAboveAddressSpaceDropsGlobalPath();
+    return 0;
+  }
+  if (argc >= 3 && std::string_view(argv[1]) == "--structurize-file") {
+    return StructurizeFiles(std::span<char *const>(argv + 2, static_cast<size_t>(argc - 2)));
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--frontend-optimization-only") == 0) {
+    TestFrontendInstructionPrefixes();
+    TestFrontendBufferAddresses();
+    TestFrontendImageAddresses();
+    TestNewShaderDecoderArchitecture();
+    TestImageAddressOperands();
+    TestNewShaderRecompilerNativeWideBufferIr();
+    TestNewShaderRecompilerMubufFormatTranslation();
+    TestNewShaderRecompilerMubufD16Translation();
+    TestNewShaderRecompilerTypedBufferTranslation();
+    TestNewShaderRecompilerBufferLoadsGuardedByExec();
+    TestCapturedBufferAtomicsX2();
+    std::puts("ShaderCfgTests: frontend optimization cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-only") == 0) {
+    TestBindlessShaderContract();
+    std::puts("ShaderCfgTests: bindless CPU/SPIR-V cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-only") == 0) {
+    TestWolverineInstructions();
+    TestRdna2LdsWaitcntBarrierAndFloatControls();
+    std::puts("ShaderCfgTests: Wolverine instruction CPU/SPIR-V cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-waitcnt-only") == 0) {
+    TestRdna2LdsWaitcntBarrierAndFloatControls();
+    std::puts("ShaderCfgTests: LDS waitcnt cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--exec-select-analysis-only") == 0) {
+    TestExecSelectAnalysisFixpoint();
+    std::puts("ShaderCfgTests: EXEC-select analysis cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--post-dominators-only") == 0) {
+    TestNewShaderRecompilerCfgPostDominatorsMatchPaths();
+    std::puts("ShaderCfgTests: post-dominator cases passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--upsync2-only") == 0) {
     TestDisabledDebugBranches();
     TestWave32MaskProjection();
@@ -14835,6 +15683,10 @@ int main(int argc, char **argv) {
     TestValuePhiValidation();
     TestNewShaderRecompilerCfgConsecutiveNativePhis();
     TestDeferredSpirvPhiPatching();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gather-lod-only") == 0) {
+    TestNewShaderRecompilerImageGatherLodVariants();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--registered-shader-code-only") == 0) {
@@ -14869,7 +15721,12 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  TestTypedBitcastViews();
+  TestBindlessShaderContract();
   TestRayTracingDispatchDetection();
+  TestFrontendInstructionPrefixes();
+  TestFrontendBufferAddresses();
+  TestFrontendImageAddresses();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -14882,6 +15739,7 @@ int main(int argc, char **argv) {
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
+  TestExecSelectAnalysisFixpoint();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
   TestNggVertexEntryState();
@@ -14892,6 +15750,8 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerMubufD16Translation();
+  TestNewShaderRecompilerImageGatherLodVariants();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
@@ -14938,6 +15798,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
   TestNewShaderRecompilerCfgLoopExitSharedWithSelection();
+  TestNewShaderRecompilerCfgPostDominatorsMatchPaths();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
   TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
   TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
@@ -14951,6 +15812,9 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerCfgMultipleLoopLatches();
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
+  TestCfgLoopSharedContinuation();
+  TestCfgClonesExternallyEnteredTail();
+  TestFlatStoreAboveAddressSpaceDropsGlobalPath();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
@@ -15005,6 +15869,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
+  TestSampledSignedByteTexture();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();

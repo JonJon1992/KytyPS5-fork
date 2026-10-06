@@ -36,6 +36,7 @@ struct PipelineLayoutSignature {
 	uint32_t                             push_stages      = 0;
 	uint32_t                             push_size        = 0;
 	bool                                 push_descriptors = false;
+	VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
 
 	bool operator==(const PipelineLayoutSignature&) const = default;
 };
@@ -45,7 +46,7 @@ struct PipelineLayoutSignature {
 [[nodiscard]] PipelineLayoutSignature
 MakePipelineLayoutSignature(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                             vk::ShaderStageFlags push_stages, uint32_t push_size,
-                            uint32_t max_push_descriptors);
+                            uint32_t max_push_descriptors, vk::DescriptorSetLayout bindless_layout = nullptr);
 [[nodiscard]] uint64_t HashPipelineLayoutSignature(const PipelineLayoutSignature& signature);
 
 // The layouts for these bindings: interned (owned by the cache, destroyed by
@@ -53,7 +54,8 @@ MakePipelineLayoutSignature(std::span<const vk::DescriptorSetLayoutBinding> bind
 [[nodiscard]] PipelineLayoutHandles
 AcquirePipelineLayout(GraphicContext& graphics,
                       std::span<const vk::DescriptorSetLayoutBinding> bindings,
-                      vk::ShaderStageFlags push_stages, uint32_t push_size);
+                      vk::ShaderStageFlags push_stages, uint32_t push_size,
+                      vk::DescriptorSetLayout bindless_layout = nullptr);
 // Destroys a pipeline's layouts unless they are interned.
 void ReleasePipelineLayout(GraphicContext& graphics, vk::PipelineLayout pipeline_layout,
                            vk::DescriptorSetLayout set_layout);

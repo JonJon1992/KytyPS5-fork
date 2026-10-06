@@ -1,7 +1,10 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/bdaSyncDiagnostics.h"
+#include "graphics/host_gpu/renderer/cache/bdaHotRanges.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/hangTrace.h"
 #include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
@@ -30,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +54,46 @@ namespace {
 
 Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
 Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
+// Live A/B control: 0 restores the previous extra-submission rule for eager publication.
+Live::Switch g_eager_current_tick("KYTY_READBACK_EAGER_CURRENT_TICK", Live::ParseDefaultOn);
+
+Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
+
+Live::Switch g_bda_hot_ranges_merge("KYTY_BDA_HOT_RANGES_MERGE", Live::ParseDefaultOff);
+
+// KYTY_BDA_BATCH_PROTECT_OVERRIDE (live): 0 disables the pass's protection batch, 1 enables it;
+// unset (or unrecognized) inherits the cache's KYTY_BDA_BATCH_PROTECT startup option. A pass
+// completes its collection, protection and copying before the next flip can change this choice.
+Live::Switch g_bda_batch_protect_override("KYTY_BDA_BATCH_PROTECT_OVERRIDE",
+                                         [](const char* value) -> int64_t {
+	if (value != nullptr && std::strcmp(value, "0") == 0) return 0;
+	if (value != nullptr && std::strcmp(value, "1") == 0) return 1;
+	return -1;
+});
+
+template <typename Range>
+void MergeRecordedHotRanges(std::vector<Range>& ranges) {
+	const auto before = ranges.size();
+	if (MergeBdaHotRanges(ranges)) {
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsMerged,
+		                          before - ranges.size());
+	}
+}
+
+// Only join exact adjacency in both buffers. first_copy separates guest-memory
+// copies from host snapshots: UploadCopies chooses its input by that boundary.
+void AppendUploadCopy(std::vector<vk::BufferCopy>& copies, uint64_t source,
+                      uint64_t destination, uint64_t bytes, size_t first_copy = 0) {
+	if (g_upload_coalesce.On() && copies.size() > first_copy) {
+		auto& previous = copies.back();
+		if (source >= previous.srcOffset && source - previous.srcOffset == previous.size &&
+		    destination >= previous.dstOffset && destination - previous.dstOffset == previous.size) {
+			previous.size += bytes;
+			return;
+		}
+	}
+	copies.emplace_back(source, destination, bytes);
+}
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -225,6 +269,14 @@ uint64_t SideReadbackWindow() {
 	return kib * 1024;
 }
 
+// Saturates instead of wrapping (UINT64_MAX disables the skips that compare the epoch).
+void AdvanceEpoch(std::atomic_uint64_t& epoch) noexcept {
+	auto value = epoch.load(std::memory_order_relaxed);
+	while (value != UINT64_MAX && !epoch.compare_exchange_weak(value, value + 1,
+	                                                            std::memory_order_release,
+	                                                            std::memory_order_relaxed)) {}
+}
+
 uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
 	const auto* value = std::getenv(name);
 	if (value == nullptr) {
@@ -248,6 +300,10 @@ uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
 //                         4 KiB shadow each) are hot.
 //   KYTY_UPLOAD_COPY_OUTSIDE_LOCK  0 copies written uploads with their region locks held (the
 //                         previous behaviour) instead of MemoryTracker::ForEachWrittenUploadRange.
+//   KYTY_UPLOAD_DEFER_PROTECT  0 write-protects a read upload's pages under their region locks,
+//                         one host call per run (the previous behaviour), instead of after the
+//                         locks, once per region, before the copy (FaultPolicy::defer_upload_protect;
+//                         needs KYTY_DEFER_UNPROTECT on).
 MemoryTracker::FaultPolicy BufferFaultPolicy() {
 	MemoryTracker::FaultPolicy policy;
 	const auto ahead_kib = ParseEnvU64("KYTY_FAULT_AHEAD_KB", 32);
@@ -263,7 +319,8 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 			policy.hot_frames = 0;
 		}
 	}
-	policy.copy_outside_lock = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
+	policy.copy_outside_lock    = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
+	policy.defer_upload_protect = ParseEnvU64("KYTY_UPLOAD_DEFER_PROTECT", 1) != 0;
 	return policy;
 }
 
@@ -271,6 +328,56 @@ uint32_t HotPageQuietFrames() {
 	return static_cast<uint32_t>(
 	    std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_QUIET_FRAMES", 8), 1, 1000));
 }
+
+// KYTY_BDA_PROTECT_PROBE=1: the write-protect host calls of each BDA synchronization pass
+// (PageManager::BeginProtectProbe), summed into one console/log line every 10 s with the calls
+// the same ranges would take joined. Diagnostics only: the calls themselves are unchanged.
+class BdaProtectProbeScope final {
+public:
+	BdaProtectProbeScope() noexcept: m_active(Enabled()) {
+		if (m_active) {
+			PageManager::BeginProtectProbe();
+		}
+	}
+	~BdaProtectProbeScope() {
+		if (!m_active) {
+			return;
+		}
+		const auto probe = PageManager::EndProtectProbe();
+		static PageManager::ProtectProbe        totals;
+		static uint64_t                         passes = 0;
+		static std::chrono::steady_clock::time_point start;
+		const auto now = std::chrono::steady_clock::now();
+		if (passes == 0 && totals.calls == 0) {
+			start = now;
+		}
+		passes++;
+		totals.calls += probe.calls;
+		totals.pages += probe.pages;
+		totals.joined_calls += probe.joined_calls;
+		totals.gap8_calls += probe.gap8_calls;
+		if (now - start < std::chrono::seconds(10)) {
+			return;
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "BDA protect {:.0f}s: {} passes, {} protect calls ({} pages), {} if adjacent ranges "
+		    "were joined, {} with 8-page gaps bridged\n",
+		    std::chrono::duration<double>(now - start).count(), passes, totals.calls, totals.pages,
+		    totals.joined_calls, totals.gap8_calls));
+		totals = {};
+		passes = 0;
+		start  = now;
+	}
+	BdaProtectProbeScope(const BdaProtectProbeScope&)            = delete;
+	BdaProtectProbeScope& operator=(const BdaProtectProbeScope&) = delete;
+
+private:
+	static bool Enabled() {
+		static const bool enabled = ParseEnvU64("KYTY_BDA_PROTECT_PROBE", 0) != 0;
+		return enabled;
+	}
+	bool m_active;
+};
 
 // BufferCache::m_hot_check_limit (0 disables).
 uint32_t HotPageCheckLimit() {
@@ -445,6 +552,23 @@ uint32_t EagerFlushBudget() {
 	return static_cast<uint32_t>(
 	    std::min<uint64_t>(ParseEnvU64("KYTY_READBACK_EAGER_FLUSHES", 8), 100000));
 }
+
+// Optional diagnostic clocks only; no clock reads when HangTrace is disabled.
+class ReadbackPhase {
+public:
+	explicit ReadbackPhase(uint64_t* elapsed): m_elapsed(elapsed),
+	    m_start(elapsed != nullptr ? HangTrace::NowNs() : 0) {}
+	~ReadbackPhase() {
+		if (m_elapsed != nullptr) {
+			*m_elapsed += HangTrace::NowNs() - m_start;
+		}
+	}
+	ReadbackPhase(const ReadbackPhase&) = delete;
+	ReadbackPhase& operator=(const ReadbackPhase&) = delete;
+private:
+	uint64_t* m_elapsed;
+	uint64_t m_start;
+};
 
 // Reads larger than this are bulk readbacks (e.g. DCC metadata): their pages do not become hot.
 constexpr uint64_t EagerReadMaxBytes = 64 * 1024;
@@ -793,7 +917,20 @@ Buffer* BufferCache::GetBdaPageTableBuffer() {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	InvalidateBdaSynchronization();
+	BdaSyncDiagnostics::Record(insert ? BdaSyncDiagnostics::Event::Registers
+	                                  : BdaSyncDiagnostics::Event::Unregisters);
+	if (m_bda_new_buffer_sync) {
+		// The binding memo's guard still moves; the BDA pass only synchronizes the new buffer.
+		AdvanceEpoch(m_buffer_registry_epoch);
+		std::scoped_lock lock(m_bda_new_buffers_mutex);
+		if constexpr (insert) {
+			m_bda_new_buffers.push_back(id);
+		} else {
+			std::erase(m_bda_new_buffers, id);
+		}
+	} else {
+		InvalidateBdaSynchronization();
+	}
 	EnsureBdaPageTableInitialized();
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
@@ -811,6 +948,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              static_cast<int64_t>(buffer.Size()));
 		buffer.lru_id   = m_lru_cache.Insert(id, m_gc_tick);
 		buffer.lru_tick = m_gc_tick;
 		std::vector<vk::DeviceAddress> addresses;
@@ -831,6 +970,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		// own bytes and must not underflow.
 		EXIT_IF(buffer.Size() > m_total_used_memory && !m_graphics.CanReportMemoryUsage());
 		m_total_used_memory -= std::min(m_total_used_memory, buffer.Size());
+		Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::BufferCacheBytes,
+		                              -static_cast<int64_t>(buffer.Size()));
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -838,14 +979,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 }
 
-// KYTY_BUFFER_LRU_SKIP=1 (default off): draws touch the same buffers many times per GC tick. The
-// buffer mirrors its LRU item's tick (lru_tick, set by Insert and every Touch, the only writers of
-// the item's tick), so a touch in a tick the item already holds, which LeastRecentlyUsedCache::Touch
-// would return from at once, skips reading the scattered item. The LRU order is unchanged.
+// KYTY_BUFFER_LRU_SKIP (default on; =0 off): draws touch the same buffers many times per GC tick.
+// The buffer mirrors its LRU item's tick (lru_tick, set by Insert and every Touch, the only writers
+// of the item's tick), so a touch in a tick the item already holds, which
+// LeastRecentlyUsedCache::Touch would return from at once, skips reading the scattered item. The
+// LRU order is unchanged.
 static bool BufferLruSkipEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_BUFFER_LRU_SKIP");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }
@@ -906,6 +1048,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	// A download larger than the staging ring gets a buffer of its own, released after the
@@ -1102,6 +1245,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                              graphics.sparse_residency_buffer_enabled),
       m_bda_incremental_sync(IncrementalBdaSyncEnabled()),
       m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
+      m_bda_new_buffer_sync(ParseEnvU64("KYTY_BDA_NEW_BUFFER_SYNC", 0) != 0),
+      m_bda_batch_protect(ParseEnvU64("KYTY_BDA_BATCH_PROTECT", 0) != 0),
       m_memory_tracker(page_manager, m_bda_incremental_sync, BufferFaultPolicy()),
       m_hot_quiet_frames(HotPageQuietFrames()),
       m_hot_check_limit(HotPageCheckLimit()),
@@ -1125,6 +1270,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
 	// keeps only with incremental BDA synchronization.
 	m_bda_epoch_verify = m_bda_epoch_skip && m_bda_incremental_sync ? BdaEpochVerifyMode() : 0;
+	m_bda_hot_per_submission =
+	    SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_HOT_PER_SUBMISSION", 0) != 0;
+	m_hot_pressure_enabled = ParseEnvU64("KYTY_HOT_PAGE_PRESSURE", 0) != 0;
 	if (SyncEpoch::Enabled() && BindingEpochMemoEnabled()) {
 		const bool large      = CpCommit::Enabled(CpCommit::Part::BindSlots);
 		m_binding_memo_shift  = large ? 49u : 53u;
@@ -1132,6 +1280,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		                                                              : BindingMemoSlots);
 		m_binding_memo_verify = BindingEpochMemoVerifyMode();
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
+		m_binding_memo_buffer_guard = ParseEnvU64("KYTY_BINDING_MEMO_BUFFER_GUARD", 1) != 0;
 	}
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	m_written_sync_skip = WrittenSyncSkipEnabled();
@@ -1262,7 +1411,53 @@ void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
 	}
 	auto it = m_hot_shadows.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
 	while (it != m_hot_shadows.end() && it->first < vaddr + size) {
+		ReleaseHotShadow(std::move(it->second.data));
 		it = m_hot_shadows.erase(it);
+	}
+}
+
+void BufferCache::EraseHotShadowsForCopies(const Buffer& buffer,
+                                           std::span<const vk::BufferCopy> copies) {
+	// EraseHotShadows of every copy's destination range, in order. Copies arrive in ascending
+	// address order (page runs of an upload), so the cursor continues from the previous copy:
+	// every shadow below it was already erased (or lies below this copy's first page) and the
+	// tree is descended again only for a copy below the previous one or a long gap.
+	if (m_hot_shadows.empty() || copies.empty()) {
+		return;
+	}
+	auto     it       = m_hot_shadows.end();
+	uint64_t previous = 0;
+	bool     started  = false;
+	for (const auto& copy: copies) {
+		const auto vaddr = buffer.CpuAddress() + copy.dstOffset;
+		const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto end   = vaddr + copy.size;
+		if (!started || vaddr < previous) {
+			it = m_hot_shadows.lower_bound(first);
+		} else {
+			uint32_t steps = 0;
+			while (it != m_hot_shadows.end() && it->first < first && ++steps <= 8u) {
+				++it;
+			}
+			if (it != m_hot_shadows.end() && it->first < first) {
+				it = m_hot_shadows.lower_bound(first);
+			}
+		}
+		started  = true;
+		previous = vaddr;
+		while (it != m_hot_shadows.end() && it->first < end) {
+			ReleaseHotShadow(std::move(it->second.data));
+			it = m_hot_shadows.erase(it);
+		}
+		if (m_hot_shadows.empty()) {
+			return;
+		}
+	}
+}
+
+void BufferCache::ReleaseHotShadow(std::unique_ptr<uint8_t[]> data) {
+	if (data != nullptr && m_hot_shadow_free.size() < m_memory_tracker.HotMax()) {
+		m_hot_shadow_free.push_back(std::move(data));
 	}
 }
 
@@ -1270,7 +1465,33 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 	if (m_memory_tracker.HotPageCount() == 0) {
 		return;
 	}
-	for (const auto page: m_memory_tracker.SettleHotPages(vaddr, size)) {
+	CompareSettledHotPages(m_memory_tracker.SettleHotPages(vaddr, size));
+}
+
+void BufferCache::SettleHotPageList(std::span<const uint64_t> pages) {
+	if (pages.empty() || m_memory_tracker.HotPageCount() == 0) {
+		return;
+	}
+	// Reused (GPU thread; nothing below settles a list again).
+	auto& settled = m_settle_scratch;
+	settled.clear();
+	{
+		// Every page is settled with its write-protect deferred; the scope's end protects each
+		// region's pages in one host call, before any compare below (as SettleHotPages needs).
+		std::optional<PageManager::DeferProtectScope> defer_protect;
+		if (!PageManager::InDeferProtectScope() &&
+		    PageManager::GetDeferMode() == PageManager::DeferMode::On) {
+			defer_protect.emplace();
+		}
+		for (const auto page: pages) {
+			m_memory_tracker.SettleHotPages(page, TRACKER_PAGE_SIZE, settled);
+		}
+	}
+	CompareSettledHotPages(settled);
+}
+
+void BufferCache::CompareSettledHotPages(std::span<const uint64_t> pages) {
+	for (const auto page: pages) {
 		// The page is write-protected now: its contents can no longer change unobserved. If they
 		// differ from the last upload (or nothing was uploaded while hot), the CPU wrote since.
 		const auto shadow = m_hot_shadows.find(page);
@@ -1280,6 +1501,7 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 			m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
 		}
 		if (shadow != m_hot_shadows.end()) {
+			ReleaseHotShadow(std::move(shadow->second.data));
 			m_hot_shadows.erase(shadow);
 		}
 	}
@@ -1287,19 +1509,57 @@ void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::MaintainHotPages() {
 	const auto frame = m_memory_tracker.Frame();
-	if (frame - m_hot_sweep_frame < 8) {
+	// KYTY_HOT_PAGE_PRESSURE (bufferCache.h): pages were refused hot tracking since the last sweep.
+	const auto refused = m_memory_tracker.HotRefusedCount();
+	m_hot_pressure     = m_hot_pressure_enabled && refused != m_hot_sweep_refused;
+	if (frame - m_hot_sweep_frame < (m_hot_pressure ? 1u : 8u)) {
 		return;
 	}
-	m_hot_sweep_frame = frame;
-	m_memory_tracker.SweepHotPages(m_hot_quiet_frames);
-	std::erase_if(m_hot_shadows, [this, frame](const auto& entry) {
-		return frame - entry.second.last_use > m_hot_quiet_frames;
-	});
+	m_hot_sweep_frame   = frame;
+	m_hot_sweep_refused = refused;
+	m_memory_tracker.SweepHotPages(m_hot_pressure ? std::min(m_hot_quiet_frames, 2u)
+	                                              : m_hot_quiet_frames);
+	for (auto it = m_hot_shadows.begin(); it != m_hot_shadows.end();) {
+		if (frame - it->second.last_use > m_hot_quiet_frames) {
+			ReleaseHotShadow(std::move(it->second.data));
+			it = m_hot_shadows.erase(it);
+		} else {
+			++it;
+		}
+	}
+	LogHotPages();
+}
+
+// One console/log line every 10 s: the write faults of the buffer tracker, the hot pages
+// (KYTY_HOT_PAGES) and the pages refused hot tracking because KYTY_HOT_PAGE_MAX were hot. A
+// refused page keeps its fault/upload/reprotect cycle every frame.
+void BufferCache::LogHotPages() {
+	const auto now = std::chrono::steady_clock::now();
+	if (m_hot_log.time == std::chrono::steady_clock::time_point {}) {
+		m_hot_log.time    = now;
+		m_hot_log.faults  = m_memory_tracker.WriteFaultCount();
+		m_hot_log.refused = m_memory_tracker.HotRefusedCount();
+		m_hot_log.frame   = m_memory_tracker.Frame();
+		return;
+	}
+	if (now - m_hot_log.time < std::chrono::seconds(10)) {
+		return;
+	}
+	const auto faults  = m_memory_tracker.WriteFaultCount();
+	const auto refused = m_memory_tracker.HotRefusedCount();
+	const auto frame   = m_memory_tracker.Frame();
+	const auto seconds = std::chrono::duration<double>(now - m_hot_log.time).count();
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Hot pages {:.0f}s: {} frames, {} write faults, hot {}/{}, refused {}\n", seconds,
+	    frame - m_hot_log.frame, faults - m_hot_log.faults, m_memory_tracker.HotPageCount(),
+	    m_memory_tracker.HotMax(), refused - m_hot_log.refused));
+	m_hot_log = {now, faults, refused, frame};
 }
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
                                   std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
                                   std::vector<uint64_t>& demote, std::vector<uint64_t>& settle) {
+	const auto first_host_copy = copies.size();
 	uint64_t hot_bytes = 0;
 	for (const auto& range: hot_ranges) {
 		hot_bytes += range.size;
@@ -1308,7 +1568,11 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 		m_hot_scratch.resize(hot_bytes);
 	}
 	const auto frame     = m_memory_tracker.Frame();
-	const auto max_pages = m_memory_tracker.GetFaultPolicy().hot_max;
+	const auto max_pages = m_memory_tracker.HotMax();
+	// KYTY_HOT_PAGE_PRESSURE: while slots are short, unchanged pages give theirs back sooner.
+	const uint32_t check_limit =
+	    m_hot_pressure && m_hot_check_limit != 0 ? std::max(m_hot_check_limit / 4u, 1u)
+	                                             : m_hot_check_limit;
 	uint64_t   staged    = 0;
 	uint64_t   visited   = 0;
 	uint64_t   skipped   = 0;
@@ -1319,11 +1583,16 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 		// before it and keeps it valid).
 		auto next = m_hot_shadows.lower_bound(range.address);
 		for (auto page = range.address; page < range.End(); page += TRACKER_PAGE_SIZE) {
-			visited++;
 			auto shadow = m_hot_shadows.end();
 			if (next != m_hot_shadows.end() && next->first == page) {
 				shadow = next++;
 			}
+			if (m_hot_visit_pass != 0 && shadow != m_hot_shadows.end() &&
+			    shadow->second.visit_pass == m_hot_visit_pass) {
+				// Already compared (and uploaded if changed) by this BDA pass (m_hot_visit_pass).
+				continue;
+			}
+			visited++;
 			const auto unchanged = [&](const void* contents) {
 				return shadow != m_hot_shadows.end() &&
 				       std::memcmp(shadow->second.data.get(), contents, TRACKER_PAGE_SIZE) == 0;
@@ -1342,11 +1611,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			}
 			if (same) {
 				skipped++;
-				auto& state    = shadow->second;
-				state.last_use = frame;
+				auto& state      = shadow->second;
+				state.last_use   = frame;
+				state.visit_pass = m_hot_visit_pass;
 				if (frame - state.last_change > m_hot_quiet_frames) {
 					demote.push_back(page);
-				} else if (m_hot_check_limit != 0 && ++state.unchanged_checks >= m_hot_check_limit) {
+				} else if (check_limit != 0 && ++state.unchanged_checks >= check_limit) {
 					// Checked far more often than written: back to fault tracking, clean (the
 					// buffer holds exactly the shadow, which SettleHotPages compares again once the
 					// page is write-protected).
@@ -1360,7 +1630,8 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				// publication, and the buffer holds them: upload only the other bytes of the
 				// snapshot, and return the page to normal tracking (no shadow of mixed contents).
 				ForEachPublishedPart(page, TRACKER_PAGE_SIZE, [&](uint64_t part, uint64_t bytes) {
-					copies.emplace_back(total_size + (part - page), buffer.Offset(part), bytes);
+					AppendUploadCopy(copies, total_size + (part - page), buffer.Offset(part), bytes,
+					                 first_host_copy);
 				});
 				m_false_sharing_totals.upload_splits++;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingUploadSplits);
@@ -1372,7 +1643,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
-					shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
+					if (!m_hot_shadow_free.empty()) {
+						shadow->second.data = std::move(m_hot_shadow_free.back());
+						m_hot_shadow_free.pop_back();
+					} else {
+						shadow->second.data = std::make_unique<uint8_t[]>(TRACKER_PAGE_SIZE);
+					}
 				} else {
 					// No shadow to compare against: back to faulting on writes.
 					demote.push_back(page);
@@ -1383,8 +1659,9 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				shadow->second.last_change      = frame;
 				shadow->second.last_use         = frame;
 				shadow->second.unchanged_checks = 0;
+				shadow->second.visit_pass       = m_hot_visit_pass;
 			}
-			copies.emplace_back(total_size, buffer.Offset(page), TRACKER_PAGE_SIZE);
+			AppendUploadCopy(copies, total_size, buffer.Offset(page), TRACKER_PAGE_SIZE, first_host_copy);
 			total_size += TRACKER_PAGE_SIZE;
 			staged += TRACKER_PAGE_SIZE;
 		}
@@ -1410,6 +1687,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const auto      trace_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
 	ReadMemoryTrace trace;
+	auto* timing = trace_start != 0 ? &trace.timing : nullptr;
+	const auto issue = [&](std::shared_ptr<SideReadback>& issued) {
+		ReadbackPhase phase(timing != nullptr ? &timing->issue_ns : nullptr);
+		const auto result = TryIssueSideReadback(vaddr, size, issued);
+		if (timing != nullptr) {
+			constexpr const char* names[] = {"issued", "pending", "current-writer", "unbounded", "other"};
+			timing->side_result = names[static_cast<unsigned>(result)];
+		}
+		return result;
+	};
 	const auto      record = [&](std::optional<HangTrace::ReadbackKind> kind) {
 		if (!HangTrace::Enabled()) {
 			return;
@@ -1419,7 +1706,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			HangTrace::SetReadbackKind(*kind);
 		}
 		HangTrace::RecordReadback(vaddr, size, trace.begin, trace.size, trace.downloaded,
-		                          HangTrace::NowNs() - trace_start);
+		                          HangTrace::NowNs() - trace_start, trace.timing);
 		HangTrace::SetReadbackKind(previous);
 	};
 	auto&      gpu        = m_scheduler.Context().GetGpu();
@@ -1440,7 +1727,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint32_t eager = 0;
 		{
 			Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-			eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+			eager = CompleteSideReadbacks(page_begin, page_end - page_begin, timing);
 		}
 		if (eager != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackEagerWaits);
@@ -1465,7 +1752,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 	}
 	if (!side_path) {
+		const auto queued = timing != nullptr ? HangTrace::NowNs() : 0;
 		gpu.SendCommandSync([&, this, vaddr, size, is_write, gpu_thread] {
+			if (timing != nullptr) {
+				timing->cp_queue_ns += HangTrace::NowNs() - queued;
+			}
 			if (!is_write) {
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
@@ -1478,11 +1769,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (gpu_thread) {
 		NoteEagerRead(vaddr, size, true);
 		std::shared_ptr<SideReadback> issued;
-		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
+		const auto                    result = issue(issued);
 		if (result == SideIssueResult::Issued) {
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::GpuWaitSideCopy);
-				CompleteSideReadback(*issued);
+				CompleteSideReadback(*issued, timing);
 			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadSideCopies);
 			trace.begin      = issued->begin;
@@ -1508,9 +1799,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 	std::shared_ptr<SideReadback> issued;
 	auto                          result = SideIssueResult::Other;
+	const auto queued = timing != nullptr ? HangTrace::NowNs() : 0;
 	gpu.SendCommandSync([&, this, vaddr, size] {
+		if (timing != nullptr) {
+			timing->cp_queue_ns += HangTrace::NowNs() - queued;
+		}
 		NoteEagerRead(vaddr, size, false);
-		result = TryIssueSideReadback(vaddr, size, issued);
+		result = issue(issued);
 		if (result != SideIssueResult::Issued && result != SideIssueResult::Pending) {
 			ReadMemoryDrain(vaddr, size, false, trace);
 		}
@@ -1520,7 +1815,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// The GPU thread returned right after submitting; this guest thread waits.
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-				CompleteSideReadback(*issued);
+				CompleteSideReadback(*issued, timing);
 			}
 			trace.begin      = issued->begin;
 			trace.size       = issued->end - issued->begin;
@@ -1534,7 +1829,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			uint32_t eager = 0;
 			{
 				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
-				eager = CompleteSideReadbacks(page_begin, page_end - page_begin);
+				eager = CompleteSideReadbacks(page_begin, page_end - page_begin, timing);
 			}
 			Profiler::CountFrameEvent(eager != 0 ? Profiler::FrameEvent::ReadbackEagerWaits
 			                                     : Profiler::FrameEvent::ReadbackSideDuplicateWaits);
@@ -1576,12 +1871,24 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 
 	trace.begin = window_begin;
 	trace.size  = window_end - window_begin;
-	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+	auto* timing = HangTrace::Enabled() ? &trace.timing : nullptr;
+	bool downloaded;
+	{
+		ReadbackPhase phase(timing != nullptr ? &timing->issue_ns : nullptr);
+		downloaded = DownloadBufferMemory(buffer, window_begin, window_end - window_begin);
+	}
+	if (downloaded) {
 		trace.downloaded = true;
 		const auto                    tick = m_scheduler.CurrentTick();
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		{
+			ReadbackPhase phase(timing != nullptr ? &timing->drain_wait_ns : nullptr);
+			m_scheduler.Wait(tick);
+		}
+		{
+			ReadbackPhase phase(timing != nullptr ? &timing->completion_wait_ns : nullptr);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
@@ -1896,11 +2203,15 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	return SideIssueResult::Issued;
 }
 
-bool BufferCache::CompleteSideReadback(SideReadback& readback) {
+bool BufferCache::CompleteSideReadback(SideReadback& readback, HangTrace::ReadbackTiming* timing) {
 	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
 	                         0, readback.eager);
 	HangWatchdog::DebugDelay("readback", readback.begin);
-	std::scoped_lock lock(readback.mutex);
+	std::unique_lock lock(readback.mutex, std::defer_lock);
+	{
+		ReadbackPhase phase(timing != nullptr ? &timing->publication_lock_ns : nullptr);
+		lock.lock();
+	}
 	if (readback.done.load(std::memory_order_acquire)) {
 		return false;
 	}
@@ -1911,14 +2222,17 @@ bool BufferCache::CompleteSideReadback(SideReadback& readback) {
 		// The copy ends the recording of master tick `value`, behind all of its commands. A GPU
 		// thread (CP) reader waiting here waits for that recording, never the current one.
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitSideCopy);
+		ReadbackPhase phase(timing != nullptr ? &timing->side_gpu_wait_ns : nullptr);
 		m_scheduler.GetMasterSemaphore().Wait(readback.value);
 		staging      = side.eager_staging.get();
 		staging_base = uint64_t {readback.slot} * TRACKER_PAGE_SIZE;
 	} else {
+		ReadbackPhase phase(timing != nullptr ? &timing->side_gpu_wait_ns : nullptr);
 		side.Wait(readback.value);
 		staging      = side.staging.get();
 		staging_base = uint64_t {readback.slot} * side.window;
 	}
+	ReadbackPhase publish(timing != nullptr ? &timing->publish_ns : nullptr);
 	staging->Invalidate(staging_base, readback.end - readback.begin);
 	const auto* staged = staging->Mapped().data() + staging_base;
 	for (const auto& range: readback.ranges) {
@@ -1979,7 +2293,8 @@ bool BufferCache::OverlapsPendingSideReadback(uint64_t begin, uint64_t end) cons
 	                   });
 }
 
-uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size) {
+uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size,
+                                              HangTrace::ReadbackTiming* timing) {
 	if (m_side == nullptr || m_side->pending_count.load(std::memory_order_acquire) == 0 ||
 	    !GuestRange {vaddr, size}.Valid()) {
 		return 0;
@@ -1998,7 +2313,7 @@ uint32_t BufferCache::CompleteSideReadbacks(uint64_t vaddr, uint64_t size) {
 	// order.
 	uint32_t eager = 0;
 	for (const auto& entry: overlapping) {
-		CompleteSideReadback(*entry);
+		CompleteSideReadback(*entry, timing);
 		eager += entry->eager ? 1u : 0u;
 	}
 	return eager;
@@ -2119,11 +2434,11 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 	if (dirty.empty()) {
 		return Result::Drop;
 	}
-	// Only bytes whose writers are already submitted: a writer registered by this recording may
-	// record its shader command after this submission (a submit in the middle of a draw's
-	// preparation), so its bytes wait for the next submission. That is the side-readback rule;
-	// here the copy additionally follows the whole of this recording in queue order.
-	if (newest >= tick) {
+	// IssueEagerReadbacks runs at a packet/commit boundary: all registered canonical-buffer
+	// producers have been recorded, including this tick's writers. Unlike an on-demand side
+	// readback during draw preparation, this copy can follow its producer in the same recording.
+	// Waiting for another submission would also wait for unrelated work recorded in that batch.
+	if (newest > tick || (newest == tick && !g_eager_current_tick.Get())) {
 		return Result::Retry;
 	}
 	// Dirty bytes keep their tracker page GPU-owned (MemoryTracker validates the pairing).
@@ -2157,8 +2472,8 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 		                    range.size);
 	}
 
-	// Recorded last in this recording: the barrier's first scope covers every earlier command on
-	// the queue, including all writers of these bytes (checked above to be submitted already).
+	// The barrier's first scope covers all preceding canonical-buffer producers, including
+	// this recording's writers. Handle() also flushes pending uploads and drains the recorder.
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
@@ -2334,16 +2649,43 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+// The calling nesting level's SyncScratch, emptied (its vectors keep their capacity).
+class BufferCache::SyncScratchLease final {
+public:
+	explicit SyncScratchLease(BufferCache& cache): m_cache(cache) {
+		auto& pool = cache.m_sync_scratch;
+		if (pool.size() == cache.m_sync_scratch_depth) {
+			pool.push_back(std::make_unique<SyncScratch>());
+		}
+		m_scratch = pool[cache.m_sync_scratch_depth++].get();
+		m_scratch->copies.clear();
+		m_scratch->late_copies.clear();
+		m_scratch->hot_ranges.clear();
+		m_scratch->demote_hot.clear();
+		m_scratch->settle_hot.clear();
+		m_scratch->host_copies.clear();
+	}
+	~SyncScratchLease() { m_cache.m_sync_scratch_depth--; }
+	SyncScratchLease(const SyncScratchLease&)            = delete;
+	SyncScratchLease& operator=(const SyncScratchLease&) = delete;
+	SyncScratch*      operator->() const noexcept { return m_scratch; }
+
+private:
+	BufferCache& m_cache;
+	SyncScratch* m_scratch = nullptr;
+};
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
 	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
-	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
-	// GPU-written images; the BDA hot-pass verification scans in full.
-	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
+	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads still download
+	// GPU-written images, exactly as after an empty collection below; the BDA hot-pass
+	// verification scans in full.
+	if (!is_written && (stats == nullptr || stats->verify_fault_epoch == 0) &&
 	    RelaxedNothingToUpload(vaddr, size)) {
-		return false;
+		return is_texel_buffer ? SynchronizeBufferFromImage(buffer, vaddr, size) : false;
 	}
 	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
 	// READS do more than the tracker work below.)
@@ -2382,7 +2724,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			RunRangeMemoVerifyHook(vaddr, size);
 		}
 	}
-	std::vector<vk::BufferCopy> copies;
+	// KYTY_BDA_BATCH_PROTECT: inside a batched dirty-log pass a read upload is collected now and
+	// copied once the pass has protected every collected page (FinishBdaBatchedUpload).
+	if (m_bda_pending != nullptr && stats != nullptr && stats->verify_fault_epoch == 0 &&
+	    !is_written && !is_texel_buffer && !memo_verify) {
+		QueueBdaBatchedUpload(buffer, vaddr, size, stats, memo_applies, memo_signature);
+		return false;
+	}
+	const SyncScratchLease      scratch(*this);
+	auto&                       copies     = scratch->copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	// KYTY_FALSE_SHARING_WRITES: bytes an early release left to their publication are the GPU's
@@ -2394,13 +2744,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	const auto append_copy = [&](std::vector<vk::BufferCopy>& list, uint64_t& list_size,
 	                             uint64_t address, uint64_t bytes) noexcept {
 		if (!exclude_unpublished) {
-			list.emplace_back(list_size, buffer.Offset(address), bytes);
+			AppendUploadCopy(list, list_size, buffer.Offset(address), bytes);
 			list_size += bytes;
 			return;
 		}
 		uint64_t emitted = 0;
 		ForEachPublishedPart(address, bytes, [&](uint64_t part, uint64_t part_bytes) {
-			list.emplace_back(list_size, buffer.Offset(part), part_bytes);
+			AppendUploadCopy(list, list_size, buffer.Offset(part), part_bytes);
 			list_size += part_bytes;
 			emitted += part_bytes;
 		});
@@ -2412,8 +2762,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	uint8_t* reserved = nullptr;
 	uint64_t reserved_offset = 0;
 	uint64_t reserved_size = 0;
-	if (Common::RendererBatchEnabled() && is_written && size <= MiB &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// Only decides whether to reserve: a page this misses is still collected under the tracker
+	// locks below and copied by UploadCopies. On the GPU thread the lock-free mirrors give the
+	// locked answer (memoryTracker.h, QueryDirtyRelaxed); a missing region asks with the locks.
+	const auto may_have_cpu_dirty = [&] {
+		bool dirty = false;
+		if (m_relaxed_queries && GuestGpu::IsGpuThread() &&
+		    m_memory_tracker.QueryCpuDirtyRelaxed(vaddr, size, dirty)) {
+			return dirty;
+		}
+		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	};
+	if (Common::RendererBatchEnabled() && is_written && size <= MiB && may_have_cpu_dirty()) {
 		// Reserve before entering writable tracker locks. The dirty set is collected
 		// again under those locks, so a concurrent CPU write cannot be missed.
 		const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -2423,14 +2783,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	}
 	// Hot pages (MemoryTracker) stay CPU-dirty: they are reported separately and copied only when
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
-	std::vector<GuestRange> hot_ranges;
-	std::vector<uint64_t>   demote_hot;
-	std::vector<uint64_t>   settle_hot;
+	auto&                   hot_ranges = scratch->hot_ranges;
+	auto&                   demote_hot = scratch->demote_hot;
+	auto&                   settle_hot = scratch->settle_hot;
 	size_t                guest_copies = 0;
 	uint64_t              host_base    = 0;
 	// Written uploads with KYTY_UPLOAD_COPY_OUTSIDE_LOCK: pages re-dirtied by a racing guest write
 	// while the main copy ran unlocked, copied again under the tracker locks.
-	std::vector<vk::BufferCopy> late_copies;
+	auto&                       late_copies = scratch->late_copies;
 	uint64_t                    late_size = 0;
 	vk::Buffer                  late_source;
 	bool                        reserved_committed = false;
@@ -2455,12 +2815,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): a read upload large enough for the copy engine
 	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
 	// when upload() runs (ForEachUploadRange), as for the copy made here.
-	std::vector<UploadHostCopy> host_copies;
+	auto&      host_copies = scratch->host_copies;
 	const auto upload = [&]() noexcept {
 		// A normal upload replaces whatever a hot page shadow described.
-		for (const auto& copy: copies) {
-			EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
-		}
+		EraseHotShadowsForCopies(buffer, copies);
 		guest_copies = copies.size();
 		host_base    = total_size;
 		if (!hot_ranges.empty()) {
@@ -2546,9 +2904,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
 		EraseHotShadows(page, TRACKER_PAGE_SIZE);
 	}
-	for (const auto page: settle_hot) {
-		SettleHotPages(page, TRACKER_PAGE_SIZE);
-	}
+	SettleHotPageList(settle_hot);
 	if (reserved != nullptr && source && !reserved_committed) {
 		// Source copying and GPU ownership publication stayed consistent (under the tracker locks,
 		// or unlocked with the late pass). Flush and ring bookkeeping need no tracker lock and
@@ -2643,6 +2999,117 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+// The collection half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT): the same page runs,
+// hot ranges and false-sharing splits, with no copy yet.
+void BufferCache::QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        BdaSyncStats* stats, bool memo_applies,
+                                        uint64_t memo_signature) {
+	if (!m_early_released.empty()) {
+		PruneEarlyReleased();
+	}
+	const bool exclude_unpublished = !m_early_released.empty();
+	auto&      pool                = *m_bda_pending;
+	if (m_bda_pending_count == pool.size()) {
+		pool.emplace_back();
+	}
+	auto& pending = pool[m_bda_pending_count++];
+	pending.copies.clear();
+	pending.hot_ranges.clear();
+	pending.total_size             = 0;
+	pending.buffer                 = &buffer;
+	pending.vaddr                  = vaddr;
+	pending.size                   = size;
+	pending.stats                  = stats;
+	pending.memo_applies           = memo_applies;
+	pending.memo_signature         = memo_signature;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false,
+	    [&](uint64_t address, uint64_t bytes, bool hot) noexcept {
+		    if (hot) {
+			    pending.hot_ranges.push_back({address, bytes});
+			    if (stats->hot_ranges != nullptr) {
+				    stats->hot_ranges->push_back({stats->buffer_id, address, bytes});
+			    }
+			    return;
+		    }
+		    if (!exclude_unpublished) {
+			    AppendUploadCopy(pending.copies, pending.total_size, buffer.Offset(address), bytes);
+			    pending.total_size += bytes;
+			    return;
+		    }
+		    uint64_t emitted = 0;
+		    ForEachPublishedPart(address, bytes, [&](uint64_t part, uint64_t part_bytes) {
+			    AppendUploadCopy(pending.copies, pending.total_size, buffer.Offset(part), part_bytes);
+			    pending.total_size += part_bytes;
+			    emitted += part_bytes;
+		    });
+		    if (emitted != bytes) {
+			    m_false_sharing_totals.upload_splits++;
+			    Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingUploadSplits);
+		    }
+	    },
+	    []() noexcept {});
+	if (pending.copies.empty() && pending.hot_ranges.empty() && !memo_applies) {
+		m_bda_pending_count--;
+	}
+}
+
+// The copy half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT), after the pass's protection:
+// the same steps as its upload lambda and what follows it with UploadBatch on.
+void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
+	auto&                       buffer     = *pending.buffer;
+	auto&                       copies     = pending.copies;
+	uint64_t                    total_size = pending.total_size;
+	const SyncScratchLease      scratch(*this);
+	auto&                       demote_hot  = scratch->demote_hot;
+	auto&                       settle_hot  = scratch->settle_hot;
+	auto&                       host_copies = scratch->host_copies;
+	// A normal upload replaces whatever a hot page shadow described.
+	EraseHotShadowsForCopies(buffer, copies);
+	const size_t   guest_copies = copies.size();
+	const uint64_t host_base    = total_size;
+	if (!pending.hot_ranges.empty()) {
+		CollectHotPages(buffer, pending.hot_ranges, copies, total_size, demote_hot, settle_hot);
+	}
+	const bool defer_host = m_upload_dma != nullptr && UploadDmaHostCopyEnabled() &&
+	                        !UploadDmaVerify() && m_staging_buffer.IsCoherent() &&
+	                        total_size >= m_upload_dma->MinBytes();
+	auto source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
+	                           host_base, defer_host ? &host_copies : nullptr);
+	if (pending.memo_applies) {
+		const bool collected = !copies.empty() || !pending.hot_ranges.empty();
+		if (!collected && pending.memo_signature != 0 &&
+		    m_memory_tracker.RangeSignature(pending.vaddr, pending.size) == pending.memo_signature) {
+			RecordRangeFact(pending.vaddr, pending.size, pending.memo_signature, RangeFact::Clean);
+		}
+	}
+	for (const auto page: demote_hot) {
+		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
+		EraseHotShadows(page, TRACKER_PAGE_SIZE);
+	}
+	SettleHotPageList(settle_hot);
+	if (!source) {
+		return;
+	}
+	pending.stats->upload_bytes += total_size;
+	pending.stats->upload_copies += copies.size();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordTransfer(HangTrace::TransferKind::BufferUpload, "bda-sync", "",
+		                          copies.empty() ? pending.vaddr
+		                                         : buffer.CpuAddress() + copies.front().dstOffset,
+		                          0, static_cast<uint32_t>(copies.size()), 0, total_size,
+		                          pending.size);
+	}
+	auto& command = m_scheduler.Current();
+	source        = StageUploadDma(source, copies, &host_copies);
+	command.RequestUploadCopy(source, buffer.Handle(), copies);
+	buffer.MarkContentWritten();
+	if (m_upload_batch_depth == 0) {
+		command.FlushBarriers();
+	}
+}
+
 vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,
                                        std::vector<UploadHostCopy>* host_copies) {
 	// Staging bytes UploadCopies left to the DMA worker, written here when the copy is not
@@ -2715,6 +3182,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 	// The first guest_copies read guest memory at their destination; the rest read host_data
 	// at (srcOffset - host_base).
 	const auto source_of = [&](size_t index, const vk::BufferCopy& copy) -> const void* {
@@ -2726,13 +3194,30 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies the guest runs from their backing alias.
+		// When one mapping holds the whole span of the runs, one lookup (a lock and a tree search)
+		// serves them all: within a mapping the alias is linear in the address. Otherwise each run
+		// is looked up on its own, as it may lie in another mapping.
+		const uint8_t* span_alias = nullptr;
+		uint64_t       span_begin = 0;
+		if (deferred != nullptr && guest_copies > 1) {
+			span_begin        = UINT64_MAX;
+			uint64_t span_end = 0;
+			for (size_t index = 0; index < guest_copies; index++) {
+				span_begin = std::min(span_begin, copies[index].dstOffset);
+				span_end   = std::max(span_end, copies[index].dstOffset + copies[index].size);
+			}
+			span_alias = static_cast<const uint8_t*>(LibKernel::Memory::GuestBackingAlias(
+			    buffer.CpuAddress() + span_begin, span_end - span_begin));
+		}
 		for (size_t index = 0; index < copies.size(); index++) {
 			auto& copy = copies[index];
 			const void* alias = nullptr;
 			if (deferred != nullptr && index < guest_copies) {
-				// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies from the backing alias.
-				alias = LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
-				                                             copy.size);
+				alias = span_alias != nullptr
+				            ? span_alias + (copy.dstOffset - span_begin)
+				            : LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
+				                                                   copy.size);
 			}
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
@@ -2821,7 +3306,9 @@ bool BufferCache::RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
 
 bool BufferCache::QueryUploadSnapshot(const MemoryTracker& tracker, uint64_t vaddr, uint64_t size,
                                       MemoryTracker::DirtyState& state, bool& cpu_only) {
-	cpu_only = g_cpu_only_query.On();
+	// Both callers decide from state.cpu alone; only KYTY_TRACKER_RELAXED_VERIFY compares the GPU
+	// bit, so outside it the GPU mirror is never read (the same CPU bit and missing-region result).
+	cpu_only = g_cpu_only_query.On() || RelaxedVerifyMode() == 0;
 	if (!cpu_only) {
 		return tracker.QueryDirtyRelaxed(vaddr, size, state);
 	}
@@ -2927,16 +3414,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 		_mm_prefetch(reinterpret_cast<const char*>(&memo), _MM_HINT_T0);
 #endif
 	}
-	const auto epoch  = SyncEpoch::Current();
-	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
+	const auto epoch   = SyncEpoch::Current();
+	const auto before  = m_memory_tracker.RangeSignature(vaddr, size);
+	Buffer*    guarded = nullptr; // the cache buffer the guard looked up, when it did
 	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
 	    memo.kind == BindingMemoKind::Empty) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
 	} else if (memo.signature != before) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
 	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
-	           memo.guard != (stream ? m_scheduler.CurrentTick()
-	                                 : m_bda_structure_epoch.load(std::memory_order_acquire))) {
+	           !BindingMemoGuardHolds(memo, &guarded)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
 	} else {
 		bool cross = false;
@@ -2981,7 +3468,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			} else {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCachedHits);
 				m_binding_memo_totals.cached_hits++;
-				hit.first = &m_slot_buffers[memo.id];
+				hit.first = guarded != nullptr ? guarded : &m_slot_buffers[memo.id];
 				TouchBuffer(*hit.first);
 			}
 			if (m_binding_memo_verify != 0) {
@@ -2995,6 +3482,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	const auto result = ObtainBufferNow(vaddr, size, false, false, id, &obtained);
 	RecordBinding(vaddr, size, epoch, before, result, obtained);
 	return result;
+}
+
+bool BufferCache::BindingMemoGuardHolds(const BindingMemo& memo, Buffer** checked) {
+	if (memo.kind == BindingMemoKind::Stream) {
+		return memo.guard == m_scheduler.CurrentTick();
+	}
+	if (!m_binding_memo_buffer_guard) {
+		return memo.guard == m_buffer_registry_epoch.load(std::memory_order_acquire);
+	}
+	// KYTY_BINDING_MEMO_BUFFER_GUARD (bufferCache.h): the range is still in the same registered
+	// buffer at the same offset.
+	auto* buffer = m_slot_buffers.try_get(memo.id);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(memo.vaddr, memo.size) ||
+	    buffer->Offset(memo.vaddr) != memo.offset) {
+		return false;
+	}
+	if (checked != nullptr) {
+		*checked = buffer;
+	}
+	return true;
 }
 
 void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
@@ -3016,10 +3523,11 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 		entry.guard     = m_scheduler.CurrentTick();
 		entry.kind      = BindingMemoKind::Stream;
 	} else {
-		const auto structure = m_bda_structure_epoch.load(std::memory_order_acquire);
-		const auto after     = m_memory_tracker.RangeSignature(vaddr, size);
-		if (structure == UINT64_MAX || after == 0 || IsBufferInvalid(id) ||
-		    &m_slot_buffers[id] != result.first) {
+		const auto  structure = m_buffer_registry_epoch.load(std::memory_order_acquire);
+		const auto  after     = m_memory_tracker.RangeSignature(vaddr, size);
+		const auto* recorded  = m_slot_buffers.try_get(id);
+		if (structure == UINT64_MAX || after == 0 || recorded == nullptr || recorded->is_deleted ||
+		    recorded != result.first) {
 			return;
 		}
 		if (size <= CACHING_PAGESIZE) {
@@ -3199,13 +3707,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		}
 	}
 
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
-		id = FindBuffer(vaddr, size);
+	// One slot lookup for the caller's id (IsBufferInvalid is try_get == nullptr || is_deleted).
+	Buffer* found = m_slot_buffers.try_get(id);
+	if (found == nullptr || found->is_deleted || !found->IsInBounds(vaddr, size)) {
+		id    = FindBuffer(vaddr, size);
+		found = &m_slot_buffers[id];
 	}
 	if (obtained != nullptr) {
 		*obtained = id;
 	}
-	auto& buffer = m_slot_buffers[id];
+	auto& buffer = *found;
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -3241,10 +3752,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 			     range.address, range.size, vaddr, size);
 		}
 	}
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
-		id = FindBuffer(vaddr, size);
+	Buffer* found = m_slot_buffers.try_get(id);
+	if (found == nullptr || found->is_deleted || !found->IsInBounds(vaddr, size)) {
+		id    = FindBuffer(vaddr, size);
+		found = &m_slot_buffers[id];
 	}
-	auto& buffer = m_slot_buffers[id];
+	auto& buffer = *found;
 	TouchBuffer(buffer);
 	// Bytes the shader cannot write only need the upload a read binding gets. Each written range
 	// then uploads anything dirtied meanwhile and becomes GPU-owned under the same tracker locks,
@@ -3695,27 +4208,44 @@ void BufferCache::EndBackingPublication(uint64_t token) {
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);
 }
 
-bool BufferCache::HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const {
-	return PendingBackingPublicationTick(vaddr, size).has_value();
-}
-
-std::optional<uint64_t> BufferCache::PendingBackingPublicationTick(uint64_t vaddr,
-	                                                               uint64_t size) const {
+template <typename Visit>
+void BufferCache::ForEachPendingPublication(uint64_t vaddr, uint64_t size, Visit&& visit) const {
 	const GuestRange query {vaddr, size};
 	EXIT_IF(!query.Valid());
 	if (m_backing_publication_count.load(std::memory_order_acquire) == 0) {
-		return std::nullopt;
+		return;
 	}
 	std::lock_guard lock(m_backing_publication_mutex);
-	std::optional<uint64_t> latest;
 	for (const auto& entry: m_backing_publications) {
 		for (const auto& range: entry.ranges) {
 			if (range.address < query.End() && query.address < range.End()) {
-				latest = latest ? std::max(*latest, entry.tick) : entry.tick;
+				if (visit(entry)) {
+					return;
+				}
 				break;
 			}
 		}
 	}
+}
+
+bool BufferCache::HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const {
+	// PendingBackingPublicationTick(...).has_value(), stopping at the first overlapping range (it
+	// runs for every clean-read check, also on draw-prep workers, under the publications' mutex).
+	bool found = false;
+	ForEachPendingPublication(vaddr, size, [&found](const BackingPublication&) {
+		found = true;
+		return true;
+	});
+	return found;
+}
+
+std::optional<uint64_t> BufferCache::PendingBackingPublicationTick(uint64_t vaddr,
+	                                                               uint64_t size) const {
+	std::optional<uint64_t> latest;
+	ForEachPendingPublication(vaddr, size, [&latest](const BackingPublication& entry) {
+		latest = latest ? std::max(*latest, entry.tick) : entry.tick;
+		return false;
+	});
 	return latest;
 }
 
@@ -3843,6 +4373,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});
@@ -3984,27 +4515,66 @@ void BufferCache::ProcessFaultBuffer() {
 void BufferCache::InvalidateBdaSynchronization() noexcept {
 	// Also without incremental synchronization: KYTY_BDA_SYNC_EPOCH skips a pass only while the
 	// registered buffers and GPU mappings are the ones its last pass scanned.
-	auto epoch = m_bda_structure_epoch.load(std::memory_order_relaxed);
-	while (epoch != UINT64_MAX &&
-	       !m_bda_structure_epoch.compare_exchange_weak(epoch, epoch + 1,
-	                                                     std::memory_order_release,
-	                                                     std::memory_order_relaxed)) {}
+	AdvanceEpoch(m_buffer_registry_epoch);
+	AdvanceEpoch(m_bda_structure_epoch);
+}
+
+template <typename Collect>
+void BufferCache::RunBdaPass(Collect&& collect) {
+	// KYTY_BDA_BATCH_PROTECT: collect every read upload of the pass, protect, then copy. Every
+	// synchronization collect() makes carries a BdaSyncStats, so none copies inside the scope.
+	const auto batch_override = g_bda_batch_protect_override.Get();
+	const bool enabled = batch_override >= 0 ? batch_override != 0 : m_bda_batch_protect;
+	const bool batch = enabled && UploadBatchEnabled() && m_range_memo_verify == 0 &&
+	                   PageManager::GetDeferMode() == PageManager::DeferMode::On &&
+	                   m_bda_pending == nullptr && !PageManager::InDeferProtectScope();
+	if (!batch) {
+		collect();
+		return;
+	}
+	m_bda_pending_count = 0;
+	{
+		const PageManager::DeferProtectScope defer_protect;
+		m_bda_pending = &m_bda_pending_pool;
+		collect();
+		m_bda_pending = nullptr;
+	}
+	const auto count = std::exchange(m_bda_pending_count, 0);
+	for (size_t index = 0; index < count; index++) {
+		FinishBdaBatchedUpload(m_bda_pending_pool[index]);
+	}
 }
 
 void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
+	// Hot pages compared once per pass (HotShadow::visit_pass), new-buffer part included.
+	struct HotVisitPass {
+		explicit HotVisitPass(BufferCache& cache_): cache(cache_) {
+			cache.m_hot_visit_pass = ++cache.m_hot_pass_counter;
+		}
+		~HotVisitPass() { cache.m_hot_visit_pass = 0; }
+		BufferCache& cache;
+	} const hot_visit_pass(*this);
 	// KYTY_BDA_SYNC_EPOCH (syncEpoch.h): once per synchronization epoch. After a completed pass,
 	// memory the pass left clean can only need an upload again within the same epoch through a
 	// guest CPU write, which races the draws that follow (the first pass of the next epoch uploads
 	// it), or a change of the registered buffers or GPU mappings, which moves the BDA structure
 	// epoch. Everything the command processor orders before later draws (packets writing memory,
 	// waits, cache invalidations, service commands) advances the epoch first.
+	// KYTY_BDA_NEW_BUFFER_SYNC: buffers registered since the last pass, before any skip below.
+	const BdaProtectProbeScope protect_probe;
+	if (m_bda_new_buffer_sync) {
+		SynchronizeBdaNewBuffers(mapped_ranges);
+	}
 	const auto sync_epoch = SyncEpoch::Current();
 	const auto submission = SyncEpoch::CurrentSubmission();
 	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
+	const BdaSyncDiagnostics::SyncScope diagnostics(sync_epoch != m_bda_synced_epoch,
+	    submission != m_bda_synced_submission, structure != m_bda_synced_structure);
 	if (m_bda_epoch_skip && sync_epoch == m_bda_synced_epoch &&
 	    structure == m_bda_synced_structure) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
 		m_bda_epoch_totals.skips++;
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::EpochSkips);
 		if (m_bda_epoch_verify != 0) {
 			VerifyBdaEpochSkip(mapped_ranges);
 		}
@@ -4024,6 +4594,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	if (same_submission && per_submission == 1) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSubmissionSkips);
 		m_bda_epoch_totals.submission_skips++;
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::SubmissionSkips);
 		ReportBdaSubmissionGate();
 		return;
 	}
@@ -4031,6 +4602,7 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const auto uploaded_before = m_bda_pass_upload_bytes;
 	m_bda_count_uploads        = same_submission;
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::Passes);
 	m_bda_count_uploads = false;
 	m_bda_epoch_totals.passes++;
 	if (same_submission) {
@@ -4142,7 +4714,11 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	                             structure_epoch != UINT64_MAX &&
 	                             structure_epoch == m_bda_scanned_structure_epoch;
 	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
-		if (m_bda_hot_ranges.empty()) {
+		// KYTY_BDA_HOT_PER_SUBMISSION: the recorded hot runs were re-examined in this submission.
+		const bool hot_done = m_bda_hot_per_submission &&
+		                      SyncEpoch::CurrentSubmission() == m_bda_hot_synced_submission;
+		if (m_bda_hot_ranges.empty() || hot_done) {
+			BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::IncrementalSkips);
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
 			}
@@ -4151,6 +4727,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		}
 		BdaSyncStats stats;
 		if (SynchronizeBdaHotRanges(stats)) {
+			BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotPasses);
 			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			m_bda_pass_upload_bytes += stats.upload_bytes;
 			if (collect) {
@@ -4169,6 +4746,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		// A recorded buffer is gone although the structure epoch held: scan everything.
 	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
 	           SynchronizeBdaDirtied(mapped_ranges)) {
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::DirtyLogPasses);
 		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
@@ -4193,6 +4771,8 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		return;
 	}
 
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::FullScans);
+	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::FullScanNs);
 	BdaSyncStats stats;
 	if (m_bda_hot_sync) {
 		m_bda_hot_ranges.clear();
@@ -4202,9 +4782,23 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	{
 		// Only uploads are recorded while scanning: all of them share one barrier pair.
 		const UploadBatch upload_batch(*this);
-		mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
-			SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
-		});
+		const auto        scan = [this, keep_stats, &stats, &mapped_ranges] {
+			mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
+				SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
+			});
+		};
+		// Batched only with stats: a synchronization without them copies at once.
+		if (keep_stats) {
+			RunBdaPass(scan);
+		} else {
+			scan();
+		}
+	}
+	if (m_bda_hot_sync) {
+		m_bda_hot_synced_submission = SyncEpoch::CurrentSubmission();
+	}
+	if (m_bda_hot_sync && g_bda_hot_ranges_merge.On()) {
+		MergeRecordedHotRanges(m_bda_hot_ranges);
 	}
 	m_bda_pass_upload_bytes += stats.upload_bytes;
 	if (m_bda_incremental_sync) {
@@ -4236,36 +4830,66 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	}
 	// The logged ranges report the hot runs they turn up (new hot pages, which a write fault
 	// logged when it promoted them); the recorded runs are re-examined as in a hot pass.
-	std::vector<BdaHotRange> found;
-	BdaSyncStats             stats;
+	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::DirtyLogNs);
+	// KYTY_BDA_HOT_PER_SUBMISSION: the recorded runs once per submission.
+	const auto submission = SyncEpoch::CurrentSubmission();
+	const bool check_hot =
+	    !m_bda_hot_per_submission || submission != m_bda_hot_synced_submission;
+	if (check_hot) {
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsChecked,
+		                           m_bda_hot_ranges.size());
+	}
+	auto& found = m_bda_found;
+	found.clear();
+	BdaSyncStats stats;
 	stats.hot_ranges = &found;
 	uint64_t logged  = 0;
 	{
 		const UploadBatch upload_batch(*this);
-		m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
-			logged++;
-			mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
-				SynchronizeBuffersInRange(start, finish - start, &stats);
+		BdaSyncStats      hot_stats;
+		RunBdaPass([&] {
+			// The logged ranges ascend: each continues the buffer walk where the previous one stood.
+			auto cursor = m_buffers.end();
+			m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
+				logged++;
+				mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+					SynchronizeBuffersInRange(start, finish - start, &stats, &cursor);
+				});
 			});
+			if (check_hot) {
+				for (const auto& range: m_bda_hot_ranges) {
+					(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size,
+					                        false, false, &hot_stats);
+				}
+			}
 		});
-		BdaSyncStats hot_stats;
-		for (const auto& range: m_bda_hot_ranges) {
-			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
-			                        false, &hot_stats);
+		if (check_hot) {
+			m_bda_hot_synced_submission = submission;
 		}
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;
 	}
 	m_bda_pass_upload_bytes += stats.upload_bytes;
-	for (const auto& range: found) {
-		const bool known =
-		    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
-			    return other.id == range.id && other.address == range.address &&
-			           other.size == range.size;
-		    });
-		if (!known) {
-			m_bda_hot_ranges.push_back(range);
-		}
+	if (g_bda_hot_ranges_merge.On() && !found.empty()) {
+		// A logged subrange may overlap a run recorded by a prior full/logged pass. Keep
+		// the exact union per buffer generation, instead of rechecking overlapping runs
+		// on every subsequent pass. No holes or ownership boundaries are bridged.
+		m_bda_hot_ranges.insert(m_bda_hot_ranges.end(), found.begin(), found.end());
+		MergeRecordedHotRanges(m_bda_hot_ranges);
+	} else if (!found.empty()) {
+		// Exact duplicates dropped by one sort instead of a scan of every recorded run per found
+		// run; the order of the runs does not matter to the passes.
+		m_bda_hot_ranges.insert(m_bda_hot_ranges.end(), found.begin(), found.end());
+		const auto key = [](const BdaHotRange& range) {
+			return std::tuple(range.id.index, range.id.generation, range.address, range.size);
+		};
+		std::sort(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(),
+		          [&](const BdaHotRange& a, const BdaHotRange& b) { return key(a) < key(b); });
+		m_bda_hot_ranges.erase(std::unique(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(),
+		                                   [&](const BdaHotRange& a, const BdaHotRange& b) {
+			                                   return key(a) == key(b);
+		                                   }),
+		                       m_bda_hot_ranges.end());
 	}
 	m_bda_log_totals.passes++;
 	m_bda_log_totals.ranges += logged;
@@ -4325,19 +4949,47 @@ bool BufferCache::SynchronizeBdaHotRanges(BdaSyncStats& stats) {
 	}
 	// A hot run that is no longer hot is synchronized like any range: a demoted page (still
 	// CPU-dirty) is uploaded and protected, a settled or re-owned one is left alone.
+	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::HotPassNs);
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::HotRangeRunsChecked, m_bda_hot_ranges.size());
 	const UploadBatch upload_batch(*this);
-	for (const auto& range: m_bda_hot_ranges) {
-		(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false, false,
-		                        &stats);
-	}
+	RunBdaPass([&] {
+		for (const auto& range: m_bda_hot_ranges) {
+			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
+			                        false, &stats);
+		}
+	});
+	m_bda_hot_synced_submission = SyncEpoch::CurrentSubmission();
 	return true;
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats) {
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
+                                            BufferMap::iterator* cursor) {
 	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+	// The last buffer starting at or below vaddr (or the first buffer). A cursor left by the
+	// previous, lower range of an ascending walk is advanced a few entries instead of descending
+	// the tree again; the result is the same entry.
+	auto it = m_buffers.end();
+	if (cursor != nullptr && *cursor != m_buffers.end() && (*cursor)->first <= vaddr) {
+		it = *cursor;
+		for (uint32_t steps = 0; steps < 8u; steps++) {
+			const auto next = std::next(it);
+			if (next == m_buffers.end() || next->first > vaddr) {
+				break;
+			}
+			it = next;
+		}
+		if (const auto next = std::next(it); next != m_buffers.end() && next->first <= vaddr) {
+			it = m_buffers.end(); // too far: descend
+		}
+	}
+	if (it == m_buffers.end()) {
+		it = m_buffers.upper_bound(vaddr);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+	}
+	if (cursor != nullptr) {
+		*cursor = it;
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
 		auto&      buffer = m_slot_buffers[it->second];
@@ -4350,6 +5002,55 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSy
 			}
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false, stats);
 		}
+	}
+}
+
+void BufferCache::SynchronizeBdaNewBuffers(const RangeSet& mapped_ranges) {
+	// Hot runs of buffers deleted since they were recorded: a joined buffer's bytes now belong to
+	// its successor, which is registered (so in the queue below) and records its own runs; the
+	// bytes of a retired one belong to no buffer, which no BDA read reaches. Pruned at every pass,
+	// also with no new buffer: a buffer retired without a successor would otherwise make the next
+	// hot pass find it gone and fall back to a full scan.
+	if (!m_bda_hot_ranges.empty()) {
+		std::erase_if(m_bda_hot_ranges, [this](const BdaHotRange& range) {
+			const auto* buffer = m_slot_buffers.try_get(range.id);
+			return buffer == nullptr || buffer->is_deleted ||
+			       !buffer->IsInBounds(range.address, range.size);
+		});
+	}
+	std::vector<BufferId> ids;
+	{
+		std::scoped_lock lock(m_bda_new_buffers_mutex);
+		if (m_bda_new_buffers.empty()) {
+			return;
+		}
+		ids.swap(m_bda_new_buffers);
+	}
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::NewBufferPasses);
+	const BdaSyncDiagnostics::TimedPath path_time(BdaSyncDiagnostics::Event::NewBufferNs);
+	BdaSyncStats stats;
+	if (m_bda_hot_sync) {
+		stats.hot_ranges = &m_bda_hot_ranges;
+	}
+	{
+		const UploadBatch upload_batch(*this);
+		RunBdaPass([&] {
+			for (const auto id: ids) {
+				auto* buffer = m_slot_buffers.try_get(id);
+				if (buffer == nullptr || buffer->is_deleted) {
+					continue;
+				}
+				stats.buffer_id = id;
+				mapped_ranges.ForEachInRange(buffer->CpuAddress(), buffer->Size(),
+				                             [&](uint64_t begin, uint64_t end) {
+					                             (void)SynchronizeBuffer(*buffer, begin, end - begin,
+					                                                     false, false, &stats);
+				                             });
+			}
+		});
+	}
+	if (m_bda_hot_sync && g_bda_hot_ranges_merge.On()) {
+		MergeRecordedHotRanges(m_bda_hot_ranges);
 	}
 }
 

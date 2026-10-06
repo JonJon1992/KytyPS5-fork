@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/cache/htileSliceState.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -21,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -44,6 +46,7 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	std::function<void(ImageId)> on_bindless_unregister;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
@@ -190,6 +193,14 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Diagnostics: prints the GPU-modified images IsRegionGpuModified finds over the range (first 32
+	// calls), for a guest read the renderer cannot make ready.
+	void LogGpuModifiedImages(uint64_t address, uint64_t size);
+	// A guest read the renderer must make ready (SRT readiness, RenderContext::
+	// SynchronizeGpuBackingForRead): GPU-modified images over the range that a CPU write definitely
+	// overwrote stop owning their bytes (their native contents are no longer a source of guest
+	// bytes; the next use rebuilds them from guest memory). Returns whether any did.
+	bool ReleaseCpuOverwrittenImages(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// KYTY_META_CLEAR_MEMO=1 (default off; BryanKAdams/KytyPS5 c36bbff): the last answer is kept for
@@ -239,8 +250,8 @@ private:
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		Type            type;
+		HtileSliceState clear_slices {true};
 	};
 
 	struct OverlapResult {
@@ -342,6 +353,16 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// !FindImagesInRegion(address, size, page_overlap).empty(), stopping at the first image (no
+	// list, no query epoch). Caller holds m_lock.
+	[[nodiscard]] bool AnyImageInRegion(uint64_t address, uint64_t size, bool page_overlap) const;
+	// The first (or with `last`, the last) image FindImagesInRegion(data, false) returns that
+	// `accept(id, image)` takes, when `accept` requires image.info.data == data: such images are all
+	// owners of data's first ImagePageTable page (an image registers the pages of its live range,
+	// which starts at info.data.address), which FindImagesInRegion visits first, in the same order.
+	// Only that page is read. Caller holds m_lock.
+	template <typename Accept>
+	[[nodiscard]] ImageId FindOnFirstPage(const GuestRange& data, bool last, Accept&& accept) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
 	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
 	                                                     bool exact_format) const;
@@ -522,18 +543,25 @@ private:
 	};
 	uint64_t                                          m_surface_meta_inserts = 0;
 	std::array<MetaErase, 64>                         m_meta_erases {};
-	// KYTY_CP_COMMIT=targetalloc: FindRenderTarget's bounded-claim block list (m_lock held).
+	// FindRenderTarget's bounded-claim block list (m_lock held), reused.
 	RangeSet                                          m_claim_blocks;
+	// MaterializeCmaskClear's read of a guest-owned CMASK slice (GPU thread), reused.
+	std::vector<uint32_t>                             m_cmask_words;
 	// Bumped under m_lock after every change of m_surface_metas (an entry added or removed, a
-	// clear_mask changed): validates m_meta_clear_memo (IsMetaCleared).
+	// slice's clear state changed): validates m_meta_clear_memo (IsMetaCleared).
 	std::atomic<uint64_t> m_surface_meta_generation {0};
 	void                  NoteSurfaceMetaChange() noexcept {
 		m_surface_meta_generation.fetch_add(1, std::memory_order_release);
 	}
+	// IsMeta/ClearMeta for a caller holding m_lock (several lookups under one acquisition).
+	[[nodiscard]] bool IsMetaLocked(uint64_t address) const;
+	[[nodiscard]] bool ClearMetaLocked(uint64_t address);
+	// The 64-slice word of the last IsMetaCleared lookup (HtileSliceState::Word(word_index)).
 	struct MetaClearMemo {
 		uint64_t address    = 0;
 		uint64_t generation = 0;
-		uint32_t clear_mask = 0;
+		uint64_t word       = 0;
+		uint32_t word_index = 0;
 		bool     found      = false;
 		bool     valid      = false;
 	} m_meta_clear_memo;

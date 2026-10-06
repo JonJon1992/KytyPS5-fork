@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -270,6 +271,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -769,6 +771,9 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	if (HangTrace::Enabled()) {
 		HangTrace::ClearFaultContext();
 	}
+	if (handled) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+	}
 	return handled;
 }
 
@@ -809,6 +814,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -828,32 +834,46 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
+		std::string report = fmt::format("--- Guest fault context ---\nthread: {}\npc={:016x}\n",
+		                                 thread_name, info->exception_address);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		report += fmt::format("red_zone_protection={}\n", Config::RedZoneProtectionEnabled());
+#endif
+		report += fmt::format(
+		    "rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+		    "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+		    "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+		    "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+		    info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+		    info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+		    info->r14, info->r15);
+		if (info->exception_address >= 48 && IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+			report += "code (pc-48 .. pc+48, fault at byte 48):";
 			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+				report += fmt::format("{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
-			std::printf("\n");
+			report += "\n";
+		}
+		if (info->rsp >= 128 && IsReadableRange(info->rsp - 128, 128)) {
+			const auto* red_zone = reinterpret_cast<const uint64_t*>(info->rsp - 128);
+			report += "stack below rsp (guest red zone):";
+			for (int i = 0; i < 16; i++) {
+				report += fmt::format("{} {:016x}", (i % 4 == 0) ? "\n " : "", red_zone[i]);
+			}
+			report += "\n";
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
+			report += "stack:";
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				report += fmt::format("{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
-			std::printf("\n");
+			report += "\n";
 		}
-		std::fflush(stdout);
+		// Persist the context in file logging mode as well as the console. A launcher
+		// often closes the console after the error dialog, losing printf-only diagnostics.
+		Log::WriteFatal(report);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

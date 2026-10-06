@@ -5,14 +5,17 @@
 
 // KYTY_CP_COMMIT: cheaper per-draw commit work on the command processor (Astro Bot's Sky Garden
 // start commits ~4,900 draws per flip at ~5.4 us each). Default 0 (off: every part below behaves
-// as before); 1 or "all" enables every part; otherwise a comma list of part names. Each part is
-// exact: it only removes work that provably changes nothing, or reorders none.
+// as before, except what is noted as always on); 1 or "all" enables every part; otherwise a comma
+// list of part names. Each part is exact: it only removes work that provably changes nothing, or
+// reorders none. Always on whatever the switch says (no longer separable by an A/B run): the
+// former targetalloc work, and the draw-prep console line's clock read every 256 commits.
 //  - dccguest: a render-target lookup whose DCC metadata the GPU never wrote (its fast-clear key
 //    bytes are guest memory) becomes a provable draw-sequence repeat: the repeat re-reads each
 //    slice's first key byte and checks that the metadata is still not GPU-written, which is all
 //    MaterializeDccClear's decision reads when no key is a clear code (TextureCache::MetadataNoop).
-//  - targetalloc: no heap allocation per target acquisition (the bounded-claim block set is a
-//    reused member; the HTile surface entry is inserted with try_emplace).
+//  - targetalloc: accepted for compatibility; target acquisition now always runs without a heap
+//    allocation (the bounded-claim block set is a reused member; the HTile surface entry is
+//    inserted with try_emplace).
 //  - streamread: a small read binding's stream copy reads the guest bytes through the per-thread
 //    mapping record for any size (LibKernel::Memory::TryReadBackingDirect), without the backing
 //    store's mapping lock and tree lookup; a racing map change redoes it under the lock.
@@ -20,7 +23,7 @@
 //    Common::g_slot_vector_dense) instead of the slot's tail behind the value in its deque node.
 //  - draws: per-draw bookkeeping without dead copies: AcquireVertexBuffers writes into the draw's
 //    vertex bindings and builds its vertex range plan only when it has none from the binding
-//    plan; the periodic draw-prep console line reads the clock every 256 commits.
+//    plan. (Its former clock throttle of the periodic draw-prep console line is always on.)
 //  - texdcc: a sampled texture with DCC metadata is memoized like any other (TextureBindingMemo),
 //    with the certificate of its FindImage's DCC decision (TextureCache::MetadataNoop: the
 //    dccguest keys, a recorded fill, or the description alone). A hit re-checks it as

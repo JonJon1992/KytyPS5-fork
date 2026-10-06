@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/occlusion.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/alignment.h"
 #include "common/profiler.h"
 #include "common/liveSwitch.h"
@@ -18,11 +19,28 @@
 #include <cstring>
 
 namespace Libs::Graphics {
+
 namespace {
+
+// KYTY_OCCLUSION_DIRECT=1 (default off, live): the reductions record natively behind a recorder
+// drain (CommandBuffer::Handle), as before they went through the command sink. For A/B runs.
+Live::Switch g_occlusion_direct("KYTY_OCCLUSION_DIRECT", Live::ParseDefaultOff);
+
 // Reset a bounded unused query prefix at once. Each query still begins and ends at exactly the
 // old points, and every copy/reduction/publication is unchanged. Safe to switch per preparation.
 Live::Switch g_reset_batch("KYTY_OCCLUSION_RESET_BATCH", Live::ParseDefaultOff);
+
+// The sink the reductions record through. With KYTY_OCCLUSION_DIRECT, Handle() first opens a
+// direct window, so the sink's calls record natively there.
+CommandSink ReductionSink(CommandBuffer& command) {
+	if (g_occlusion_direct.On()) {
+		(void)command.Handle();
+	}
+	return command.Sink();
 }
+
+} // namespace
+
 bool OcclusionCounter::Enabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_GPU_OCCLUSION");
@@ -424,9 +442,11 @@ void OcclusionCounter::FlushPending() {
 	KYTY_GPU_OP_SITE("occlusion.flush");
 	EXIT_IF(m_active || m_prepared);
 	if (!m_pending) return;
-	auto native = m_context.GetCommandScheduler().Current().Handle();
-	native.copyQueryPoolResults(m_pool, 0, m_pending, m_result->Handle(), 0, 8,
-	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+	// Through the sink: with KYTY_CP_RECORDER these commands are encoded in order, not recorded
+	// natively after a recorder drain (most of the CP's drain waits in Crash Bandicoot 4).
+	const auto sink = ReductionSink(m_context.GetCommandScheduler().Current());
+	sink.copyQueryPoolResults(m_pool, 0, m_pending, m_result->Handle(), 0, 8,
+	                          vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	Dispatch(0, m_counter->Handle(), 0, m_counter->Size());
 	m_pending = 0;
 	m_reset_window.Reduced();
@@ -436,7 +456,7 @@ void OcclusionCounter::FlushPending() {
 void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offset, uint64_t range) {
 	KYTY_GPU_OP_SITE("occlusion.reduce");
 	auto& command = m_context.GetCommandScheduler().Current();
-	auto native = command.Handle();
+	const auto sink = ReductionSink(command);
 	const auto alignment = m_context.GetGraphics().StorageMinAlignment();
 	const auto aligned = Common::AlignDown(offset, alignment);
 	EXIT_IF(offset - aligned > UINT32_MAX || range > UINT32_MAX);
@@ -452,18 +472,18 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
-	                       {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
+	                     {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	command.BindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.PushDescriptors(vk::PipelineBindPoint::eCompute, m_layout, 0,
 	                        static_cast<uint32_t>(writes.size()), writes.data());
 	const uint32_t push[] {mode, static_cast<uint32_t>(offset - aligned), m_pending};
-	native.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
-	native.dispatch(1, 1, 1);
+	sink.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+	sink.dispatch(1, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands,
-	                       {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	sink.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eAllCommands,
+	                     {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 // Astro Bot reads a visibility proxy's result right after the label that follows its end dump.

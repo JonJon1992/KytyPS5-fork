@@ -5,6 +5,7 @@
 #include "common/condWaitUntil.h"
 #include "common/cpuPlacement.h"
 #include "common/dateTime.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
@@ -3317,6 +3318,7 @@ static void CleanupThread(void* arg) {
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestThreadsExited);
 
 	thread->almost_done = true;
 }
@@ -3337,6 +3339,7 @@ static void* RunThread(void* arg) {
 	void* ret    = nullptr;
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestThreadsCreated);
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
@@ -3348,6 +3351,12 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	// Name the host thread so profilers and the performance panel show guest thread names.
+#if defined(__APPLE__)
+	pthread_setname_np(thread->name.c_str());
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Apply the guest's priority to this thread directly. The attribute carries it as well, but

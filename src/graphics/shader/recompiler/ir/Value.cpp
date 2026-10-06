@@ -1,12 +1,12 @@
 #include "graphics/shader/recompiler/ir/Value.h"
 
-#include "common/config.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -198,7 +198,7 @@ Block* Inst::Parent() const {
 	return parent;
 }
 
-const std::vector<Use>& Inst::Uses() const {
+const UseList& Inst::Uses() const {
 	return uses;
 }
 
@@ -232,33 +232,14 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	if (GetCodegenOptions().ir_linear_uses) {
-		// KYTY_IR_LINEAR_USES (Senaxx 5145dc1f9): every use goes, so the list is taken over at
-		// once, rewriting each user's slot and appending it to the replacement's uses in the same
-		// order as SetArg would, without searching and erasing this instruction's list once per use
-		// (quadratic for widely used values; the SSA rewrite and identity removal spent most of a
-		// big shader's IR passes there). The argument lists are left first, while this list is
-		// intact (a phi can use itself; Invalidate below then finds nothing to remove): when the
-		// replacement is one of this instruction's own arguments, as for every identity, removing
-		// this instruction from its list before the moved uses are appended shifts only the older
-		// entries, and the list ends up in the same order.
-		ClearArgs();
-		auto  old_uses         = std::move(uses);
-		auto* replacement_inst = replacement.TryInstruction();
-		uses.clear();
-		for (const auto& use: old_uses) {
-			EXIT_IF(use.operand >= use.user->args.size() ||
-			        use.user->args[use.operand].TryInstruction() != this);
-			use.user->args[use.operand] = replacement;
-			if (replacement_inst != nullptr) {
-				// That slot held this instruction until now, so the replacement cannot list it yet.
-				replacement_inst->uses.push_back({use.user, use.operand});
-			}
-		}
-	} else {
-		const auto old_uses = uses;
-		for (const auto& use: old_uses) {
-			use.user->SetArg(use.operand, replacement);
+	// Every use moves to the replacement in order, as SetArg on each would leave it, without
+	// searching this use list once per use.
+	auto* const target   = replacement.TryInstruction();
+	const auto  old_uses = std::exchange(uses, {});
+	for (const auto& use: old_uses) {
+		use.user->args[use.operand] = replacement;
+		if (target != nullptr) {
+			target->uses.push_back(use);
 		}
 	}
 	Invalidate();
@@ -284,13 +265,8 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	// The duplicate search is linear in the use count, so quadratic for widely used values: with
-	// KYTY_IR_LINEAR_USES only debug builds run it.
-	if (KYTY_BUILD == KYTY_BUILD_DEBUG || !GetCodegenOptions().ir_linear_uses) {
-		const auto found = std::ranges::find_if(
-		    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-		EXIT_IF(found != used->uses.end());
-	}
+	// Each argument slot adds one use and removes it before it changes, so no duplicate check
+	// here: it searched the whole list on every add. ValidateProgram reports duplicated uses.
 	used->uses.push_back({this, operand});
 }
 

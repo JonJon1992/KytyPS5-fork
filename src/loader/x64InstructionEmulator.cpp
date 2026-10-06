@@ -752,7 +752,7 @@ static uint32_t ReciprocalSquareRoot(uint32_t bits) {
 
 // GetReciprocalSqrtStats. Astro Bot traps here ~2.5 million times a second from a dozen guest
 // threads, so each thread counts in its own cache line (one relaxed add); the emulation time is
-// measured only with KYTY_AMD_CPU_TIMING=1 (read once when the patch is applied).
+// measured only with KYTY_AMD_CPU_TIMING=1 (read once at startup).
 struct alignas(64) TrapSlot {
 	std::atomic<uint64_t> traps {0};
 	std::atomic<uint64_t> ns {0};
@@ -760,7 +760,10 @@ struct alignas(64) TrapSlot {
 static constexpr uint32_t    TrapSlotCount = 32;
 static TrapSlot              g_rsqrt_slots[TrapSlotCount];
 static std::atomic<uint32_t> g_rsqrt_next_slot {0};
-static std::atomic<bool>     g_rsqrt_timing {false};
+static std::atomic<bool>     g_rsqrt_timing {[] {
+	const char* timing = std::getenv("KYTY_AMD_CPU_TIMING");
+	return timing != nullptr && std::strcmp(timing, "1") == 0;
+}()};
 static thread_local uint32_t t_rsqrt_slot = 0; // 1 + slot index; 0: none yet
 
 static TrapSlot& ThisThreadTrapSlot() {

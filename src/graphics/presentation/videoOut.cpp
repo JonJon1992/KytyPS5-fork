@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
@@ -20,6 +21,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/eventQueueFilters.h"
@@ -849,6 +851,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	KYTY_PROFILER_THREAD("Thread_Present");
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
 	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
 	Common::RaiseServiceThreadPriority();
@@ -924,6 +927,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		if (total_wait < 0) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
+		}
 	}
 }
 
@@ -953,6 +959,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		m_done_cond_var.SignalAll();
 	}
 	if (cfg.flip_status.flipPendingNum >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRejected);
 		return false;
 	}
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
@@ -980,6 +987,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1260,6 +1268,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
+		Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
 	}
 
 	m_mutex.Lock();

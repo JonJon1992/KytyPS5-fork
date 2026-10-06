@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
@@ -22,6 +23,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
@@ -708,20 +710,61 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 		vk_buffer.setStencilTestEnable(stencil_test_enable);
 	}
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
+		// Operations, compare mask, write mask and reference are separate dynamic states: only the
+		// ones that changed are recorded (games mostly change the reference alone), for both faces
+		// in one command when they get the same value (VK_STENCIL_FACE_FRONT_AND_BACK).
+		const bool  known = recorder.Reuse() && shadow.stencil_valid;
+		const auto& front = depth.stencil_front;
+		const auto& back  = depth.stencil_back;
+		const auto  update = [&](auto differs, auto record) {
+			const bool front_changed = !known || differs(shadow.stencil_front, front);
+			const bool back_changed  = !known || differs(shadow.stencil_back, back);
+			if (front_changed && back_changed && !differs(front, back)) {
+				record(vk::StencilFaceFlagBits::eFrontAndBack, front);
+				recorder.Emitted(1);
+				return;
+			}
+			if (front_changed) {
+				record(vk::StencilFaceFlagBits::eFront, front);
+			}
+			if (back_changed) {
+				record(vk::StencilFaceFlagBits::eBack, back);
+			}
+			recorder.Emitted(static_cast<uint64_t>(front_changed) + back_changed);
+			recorder.Avoided(static_cast<uint64_t>(!front_changed) + !back_changed);
 		};
-		// Each face is recorded as its group of four commands.
-		const bool valid = shadow.stencil_valid;
-		if (recorder.Update(shadow.stencil_front, depth.stencil_front, valid)) {
-			set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		}
-		if (recorder.Update(shadow.stencil_back, depth.stencil_back, valid)) {
-			set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
-		}
+		update(
+		    [](const vk::StencilOpState& a, const vk::StencilOpState& b) {
+			    return a.failOp != b.failOp || a.passOp != b.passOp ||
+			           a.depthFailOp != b.depthFailOp || a.compareOp != b.compareOp;
+		    },
+		    [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+			    vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp,
+			                           state.compareOp);
+		    });
+		update(
+		    [](const vk::StencilOpState& a, const vk::StencilOpState& b) {
+			    return a.compareMask != b.compareMask;
+		    },
+		    [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+			    vk_buffer.setStencilCompareMask(face, state.compareMask);
+		    });
+		update(
+		    [](const vk::StencilOpState& a, const vk::StencilOpState& b) {
+			    return a.writeMask != b.writeMask;
+		    },
+		    [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+			    vk_buffer.setStencilWriteMask(face, state.writeMask);
+		    });
+		update(
+		    [](const vk::StencilOpState& a, const vk::StencilOpState& b) {
+			    return a.reference != b.reference;
+		    },
+		    [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+			    vk_buffer.setStencilReference(face, state.reference);
+		    });
+		shadow.stencil_front = front;
+		shadow.stencil_back  = back;
 		shadow.stencil_valid = true;
 	}
 
@@ -863,9 +906,35 @@ struct DrawRenderState {
 };
 
 RenderExecutor::RenderExecutor(RenderContext& context)
-    : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()) {}
+    : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()),
+      m_predicates(std::make_unique<GpuPredication::Predicates>(context)) {}
 
 RenderExecutor::~RenderExecutor() = default;
+
+uint32_t RenderExecutor::RecordGpuPredicate(CommandBuffer& buffer, uint64_t address,
+                                            uint32_t condition) {
+	if (!m_predicates->Supported() || buffer.IsInvalid() ||
+	    !m_context.IsMapped(address, sizeof(uint64_t)) ||
+	    m_context.GetTextureCache().IsRegionGpuModified(address, sizeof(uint64_t))) {
+		return 0;
+	}
+	const auto [source, offset] =
+	    m_context.GetBufferCache().ObtainBuffer(address, sizeof(uint64_t), false);
+	if (source == nullptr) {
+		return 0;
+	}
+	return m_predicates->Record(buffer, *source, offset, condition);
+}
+
+bool RenderExecutor::ResolveGpuPredicate(uint32_t id) {
+	const bool     trace = HangTrace::Enabled();
+	const uint64_t begin = trace ? HangTrace::NowNs() : 0;
+	const bool     draw  = m_predicates->Resolve(id);
+	if (trace) {
+		HangTrace::RecordPredicationFlushWait(HangTrace::NowNs() - begin);
+	}
+	return draw;
+}
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -1224,6 +1293,9 @@ struct DrawEmitInfo {
 	// (meshIndirect.h) with these inputs.
 	bool                 mesh_indirect = false;
 	MeshIndirect::Inputs mesh_inputs;
+	// Nonzero: the draw commands are recorded inside a conditional-rendering scope on this GPU
+	// predicate (gpuPredication.h).
+	uint32_t predicate = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1263,6 +1335,54 @@ static bool MayRunTargetOperation(const HW::Context& hw) {
 
 static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
 	return MayRunTargetOperation(buffer.GetRegisters());
+}
+
+bool RenderExecutor::DrawNeedsCpuPredicate(const CommandBuffer& buffer) {
+	// Target operations record copies, resolves and clears; DB_RENDER_CONTROL clears run as
+	// rendering load operations and set HTILE clear state on the CPU. Conditional rendering
+	// gates none of these.
+	const auto& rc = buffer.GetRegisters().GetRenderControl();
+	return DrawMayRunTargetOperation(buffer) || rc.depth_clear_enable || rc.stencil_clear_enable;
+}
+
+// KYTY_ASYNC_PIPELINES: a program whose draw must run even while its pipeline compiles, because
+// later work may read what it writes to memory (buffers, images, addresses, GDS). Atomics count
+// as writes. Mip-statistics feedback (LodStatsCounter) is the caller's decision: it records only
+// while a counter is active.
+static bool ProgramMayWriteMemory(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	if (program.has_address_writes) {
+		return true;
+	}
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.written || buffer.atomic) return true;
+	}
+	for (const auto& image: program.info.images) {
+		if (image.written || image.atomic) return true;
+	}
+	for (const auto& descriptor: program.bindings.descriptors) {
+		if (descriptor.kind == ShaderRecompiler::IR::DescriptorBindingKind::Gds) return true;
+	}
+	return false;
+}
+
+bool RenderExecutor::DrawTargetsHoldGpuContent(const RenderColorInfo* colors, uint32_t color_count,
+                                               const RenderDepthInfo& depth) {
+	auto& cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (!colors[i].image_id || !cache.GetImage(colors[i].image_id).IsGpuModified()) {
+			return false;
+		}
+	}
+	return !depth.image_id || cache.GetImage(depth.image_id).IsGpuModified();
+}
+
+bool RenderExecutor::TakeDrawPredicate(const CommandBuffer& buffer, uint32_t& predicate) {
+	if (predicate == 0 || !DrawNeedsCpuPredicate(buffer)) {
+		return true;
+	}
+	const bool draw = ResolveGpuPredicate(predicate);
+	predicate       = 0;
+	return draw;
 }
 
 // ResolvePrimitiveRestart without its index scan. nullopt when only a scan of CPU-visible
@@ -1871,18 +1991,23 @@ static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVerte
 static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::StagePrep& b) noexcept {
 	auto& [a_resources, a_specialization, a_permutation] = a;
 	auto& [b_resources, b_specialization, b_permutation] = b;
-	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill] = a_resources;
-	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill] = b_resources;
-	auto& [a_spec_buffers, a_spec_images] = a_specialization;
-	auto& [b_spec_buffers, b_spec_images] = b_specialization;
+	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_heaps, a_sampler_heaps, a_fill] =
+	    a_resources;
+	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_heaps, b_sampler_heaps, b_fill] =
+	    b_resources;
+	auto& [a_spec_buffers, a_spec_images, a_spec_samplers] = a_specialization;
+	auto& [b_spec_buffers, b_spec_images, b_spec_samplers] = b_specialization;
 	a_buffers.swap(b_buffers);
 	a_images.swap(b_images);
 	a_samplers.swap(b_samplers);
 	a_srt.swap(b_srt);
 	a_user_data.swap(b_user_data);
+	a_heaps.swap(b_heaps);
+	a_sampler_heaps.swap(b_sampler_heaps);
 	std::swap(a_fill, b_fill);
 	a_spec_buffers.swap(b_spec_buffers);
 	a_spec_images.swap(b_spec_images);
+	a_spec_samplers.swap(b_spec_samplers);
 	std::swap(a_permutation, b_permutation);
 }
 
@@ -1891,6 +2016,8 @@ static bool SameStagePrep(const PipelineCache::StagePrep& a, const PipelineCache
 	const auto& y = b.resources;
 	return x.buffers == y.buffers && x.images == y.images && x.samplers == y.samplers &&
 	       x.flattened_srt == y.flattened_srt && x.user_data == y.user_data &&
+	       x.bindless_heaps == y.bindless_heaps &&
+	       x.bindless_sampler_heaps == y.bindless_sampler_heaps &&
 	       x.uniform_fill == y.uniform_fill && a.specialization == b.specialization &&
 	       a.permutation == b.permutation;
 }
@@ -2239,7 +2366,12 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
                                            bool log_change) const {
 	auto&            cache = m_context.GetTextureCache();
 	std::scoped_lock lock {cache.m_lock};
-	const auto&      images = cache.m_slot_images;
+	return DrawRunImagesChangeLocked(compare_serials, attachments_only, log_change);
+}
+
+uint32_t RenderExecutor::DrawRunImagesChangeLocked(bool compare_serials, bool attachments_only,
+                                                 bool log_change) const {
+	const auto& images = m_context.GetTextureCache().m_slot_images;
 	for (uint32_t index = 0; index < m_run.images.size(); index++) {
 		const auto& mark = m_run.images[index];
 		if (attachments_only && mark.texture) {
@@ -2399,29 +2531,28 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 		return false;
 	}
 	// No texture of the draw is an attachment or lies over one (AcquireRenderTargets would detect a
-	// feedback loop or choose other layouts; an alias is synchronized from the attachment).
-	{
-		auto&            cache = m_context.GetTextureCache();
-		std::scoped_lock lock {cache.m_lock};
-		for (const auto* stage: stages) {
-			for (const auto& binding: stage->images) {
-				const auto* image = cache.m_slot_images.try_get(binding.image_id);
-				if (image == nullptr) {
-					return false;
-				}
-				for (const auto& mark: run.images) {
-					if (!mark.texture && mark.id == binding.image_id) {
-						return false;
-					}
-				}
-				if (DrawRunOverAttachment(run.images, image->info.data.address,
-				                          image->info.data.size)) {
+	// feedback loop or choose other layouts; an alias is synchronized from the attachment). The
+	// attachments' state is then checked under the same lock hold.
+	auto&            cache = m_context.GetTextureCache();
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			const auto* image = cache.m_slot_images.try_get(binding.image_id);
+			if (image == nullptr) {
+				return false;
+			}
+			for (const auto& mark: run.images) {
+				if (!mark.texture && mark.id == binding.image_id) {
 					return false;
 				}
 			}
+			if (DrawRunOverAttachment(run.images, image->info.data.address,
+			                          image->info.data.size)) {
+				return false;
+			}
 		}
 	}
-	return DrawRunImagesUnchanged(true, true);
+	return DrawRunImagesChangeLocked(true, true, false) == 0;
 }
 
 bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,
@@ -3015,6 +3146,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	KYTY_GPU_OP_SITE("draw.execute");
+	BeginBindlessUpdate();
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
@@ -3281,9 +3413,54 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (planned_pipeline != nullptr && !plan_verify) {
 		pipeline_cache.NotePlannedPipeline(state.depth_info, ps_input);
 	} else {
-		pipeline_object = &pipeline_cache.GetGraphicsPipeline(
+		// KYTY_ASYNC_PIPELINES: a draw whose new pipeline compiles in the background is skipped
+		// (its colour and depth writes appear a few frames late). Not when it writes memory, clears
+		// depth/stencil through load operations (DrawNeedsCpuPredicate also covers target
+		// operations), counts occlusion, or draws mesh shaders (created here anyway).
+		const char* sync_reason = nullptr;
+		if (!PipelineCache::AsyncPipelinesEnabled()) {
+			sync_reason = "off";
+		} else if (mesh_active) {
+			sync_reason = "mesh";
+		} else if (!DrawTargetsHoldGpuContent(state.color_info, state.color_count,
+		                                      state.depth_info)) {
+			// A skipped first write would leave the target undefined (possibly NaN), and temporal
+			// effects (exposure, TAA history) that read it never recover. A target a draw already
+			// wrote only stays a few frames stale.
+			sync_reason = "first-write";
+		} else if (DrawNeedsCpuPredicate(buffer)) {
+			sync_reason = "target-op-or-clear";
+		} else if (m_context.GetOcclusionCounter().WouldCount(
+		               buffer.GetRegisters().GetDepthCountControl())) {
+			sync_reason = "occlusion";
+		} else {
+			for (uint32_t i = 0; sync_reason == nullptr && i < vertex_stages.size(); i++) {
+				if (ProgramMayWriteMemory(*vertex_stages[i].stage.program)) {
+					sync_reason = "writes-vertex";
+				}
+			}
+			if (sync_reason == nullptr && state.ps_active &&
+			    ProgramMayWriteMemory(*state.ps_input_info.stage.program)) {
+				sync_reason = "writes-pixel";
+			}
+			// The guest reads mip statistics (GET_LOD_STATS) only from an active counter.
+			if (sync_reason == nullptr && state.ps_active && bindings.pixel.has_value() &&
+			    bindings.pixel->mip_stats_active) {
+				sync_reason = "mip-stats";
+			}
+		}
+		pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
 		    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
-		    primitive_restart_enable, *programs);
+		    primitive_restart_enable, *programs, sync_reason == nullptr, sync_reason);
+		if (pipeline_object == nullptr && PipelineCache::AsyncPipelinesWait()) {
+			pipeline_object = pipeline_cache.TryGetGraphicsPipeline(
+			    colors_span, state.depth_info, vertex_stages, buffer, ps_input, topology,
+			    primitive_restart_enable, *programs, false, "wait");
+		}
+		if (pipeline_object == nullptr) {
+			// Nothing of the draw is recorded yet: its targets are acquired below.
+			return;
+		}
 		if (planned_pipeline != nullptr) {
 			DrawPrep::CountBindingVerifyCheck();
 			// A pipeline replaced after the certificate check is a race, not a difference.
@@ -3513,6 +3690,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
+	// A GPU predicate gates only the draw commands: the scope begins and ends inside this
+	// rendering instance (VK_EXT_conditional_rendering), and state commands stay unconditional.
+	if (emit.predicate != 0) {
+		vk_buffer.beginConditionalRenderingEXT(m_predicates->Use(emit.predicate));
+	}
 	// Mesh programs with split_groups read a seventh draw dword (MeshFirstGroupDword).
 	const uint32_t mesh_draw_dwords =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
@@ -3572,6 +3754,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	if (emit.predicate != 0) {
+		vk_buffer.endConditionalRenderingEXT();
 	}
 	static const bool occlusion_draw_rows = [] {
 		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
@@ -3714,6 +3901,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
+	// Resolving a GPU predicate waits for the GPU: before the renderer lock.
+	uint32_t predicate = args.predicate;
+	if (!TakeDrawPredicate(buffer, predicate)) {
+		return;
+	}
+
 	// Self time here includes renderer-lock acquisition and setup outside the
 	// separately timed preparation/execution phases.
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
@@ -3787,19 +3980,28 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source,
-	    MeshRestartEnabled() && state.vertex_info[0].stage.program->stage == ShaderType::Mesh);
+	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool primitive_restart =
+	    ResolvePrimitiveRestart(buffer, index_source, MeshRestartEnabled() && mesh_active);
 
-	std::vector<uint16_t> expanded_indices;
-	if (index_source.guest_element_size == 1) {
+	// 8-bit indices: bound as VK_INDEX_TYPE_UINT8 (restart index 0xFF, as on the guest) through
+	// the buffer cache like the wider types; widened to 16 bits on the host only without the
+	// feature. Mesh shaders read the guest indices by address and bind no index buffer.
+	// Reused per thread (draws run on the GPU thread under the render mutex).
+	static thread_local std::vector<uint16_t> expanded_indices;
+	if (index_source.guest_element_size == 1 && !mesh_active) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
-		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
-		for (uint32_t i = 0; i < args.index_count; i++) {
-			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+		if (m_context.GetGraphics().index_type_uint8_enabled) {
+			index_source.type = vk::IndexType::eUint8;
+		} else {
+			const auto* src = static_cast<const uint8_t*>(args.index_addr);
+			expanded_indices.resize(args.index_count);
+			for (uint32_t i = 0; i < args.index_count; i++) {
+				expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+			}
+			index_source.host_data = expanded_indices.data();
+			index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 		}
-		index_source.host_data = expanded_indices.data();
-		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
@@ -3813,9 +4015,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.predicate      = predicate;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
+	// The draw copied the widened indices into the stream buffer: a rare huge draw does not keep
+	// its capacity for the rest of the thread's life.
+	constexpr size_t MaxKeptExpandedIndices = 64 * 1024;
+	if (expanded_indices.capacity() > MaxKeptExpandedIndices) {
+		expanded_indices = {};
+	}
 	ResetBindings();
 }
 
@@ -3837,6 +4046,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
+
+	// Resolving a GPU predicate waits for the GPU: before the renderer lock.
+	uint32_t predicate = args.predicate;
+	if (!TakeDrawPredicate(buffer, predicate)) {
+		return;
+	}
 
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	Common::LockGuard lock(m_context.GetMutex());
@@ -3912,6 +4127,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	emit.predicate      = predicate;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

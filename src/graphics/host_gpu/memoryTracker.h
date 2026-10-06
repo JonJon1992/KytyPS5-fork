@@ -11,6 +11,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -98,7 +99,7 @@ public:
 	}
 	// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow). Once enabled, every transition
 	// FaultMutationEpoch() covers also records the range it can make CPU-dirty (a write fault's
-	// whole fault-ahead window, a whole new region, a demoted or swept region's hot pages, ...),
+	// newly dirtied pages including fault-ahead, a whole new region, demoted hot pages, ...),
 	// under the same log lock as its epoch advance. Needs the tracker's CPU-mutation tracking.
 	void EnableDirtiedLog() noexcept { m_dirtied_log.store(true, std::memory_order_release); }
 	[[nodiscard]] bool DirtiedLogEnabled() const noexcept {
@@ -148,6 +149,7 @@ private:
 		CheckNotInUploadCallback();
 		// KYTY_FAULT_AHEAD_ADAPT (SetFaultAheadOverride): a larger window for write faults.
 		FaultPolicy policy = m_fault_policy;
+		policy.hot_max     = HotMax();
 		if (const auto ahead = s_ahead_override.load(std::memory_order_relaxed);
 		    write_fault && ahead > policy.ahead_pages) {
 			policy.ahead_pages = ahead;
@@ -168,15 +170,13 @@ private:
 					return true;
 				}
 				if (write_fault) {
-					const auto [begin, end] = FaultWindow(offset, bytes, policy.ahead_pages);
-					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
+					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
+					                                Frame(), m_hot_count, on_ahead,
+					                                [this](uint64_t base, const RegionBits& dirty) noexcept {
+						                                NotifyCpuMutation(base, dirty);
+					                                });
 				} else {
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
-				}
-				if (write_fault) {
-					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes, policy,
-					                                Frame(), m_hot_count, on_ahead);
-				} else {
 					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 					                                             bytes);
 				}
@@ -190,12 +190,22 @@ private:
 			}
 			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
 			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
+			if (write_fault) {
+				m_write_faults.fetch_add(1, std::memory_order_relaxed);
+				if (fault.refused != 0) {
+					m_hot_refused.fetch_add(fault.refused, std::memory_order_relaxed);
+				}
+			}
 		});
 	}
 
 public:
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
+	// The hot page limit in effect: KYTY_HOT_PAGE_MAX_LIVE when a live change set it (1..65536),
+	// otherwise FaultPolicy::hot_max. Pages already hot above a lowered limit stay hot until they
+	// are demoted as usual.
+	[[nodiscard]] uint32_t HotMax() const noexcept;
 	// KYTY_FAULT_AHEAD_ADAPT (BufferCache): write faults use a fault-ahead window of at least this
 	// many pages (a power of two dividing TRACKER_REGION_PAGES; 0 or anything smaller than the
 	// policy's: the policy's). Any thread; a fault takes the value current when it starts.
@@ -219,6 +229,14 @@ public:
 	[[nodiscard]] uint32_t HotPageCount() const noexcept {
 		return m_hot_count.load(std::memory_order_relaxed);
 	}
+	// Totals since start: guest write faults handled by this tracker, and pages that qualified
+	// for hot tracking while FaultPolicy::hot_max pages were already hot.
+	[[nodiscard]] uint64_t WriteFaultCount() const noexcept {
+		return m_write_faults.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t HotRefusedCount() const noexcept {
+		return m_hot_refused.load(std::memory_order_relaxed);
+	}
 	[[nodiscard]] bool IsRegionHot(uint64_t vaddr, uint64_t size);
 	// Returns hot pages of the range to normal tracking (they stay CPU-dirty until uploaded).
 	void DemoteHotPages(uint64_t vaddr, uint64_t size);
@@ -228,6 +246,8 @@ public:
 	// tracking as clean, write-protected pages (RegionManager::SettleHot) and lists them. The
 	// caller must mark each one whose contents changed since its last upload CPU-dirty again.
 	[[nodiscard]] std::vector<uint64_t> SettleHotPages(uint64_t vaddr, uint64_t size);
+	// The same, appending the settled pages to `pages`.
+	void SettleHotPages(uint64_t vaddr, uint64_t size, std::vector<uint64_t>& pages);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -275,21 +295,35 @@ public:
 		const bool  keep_hot              = hot_aware && !is_written;
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			manager->lock.lock();
-			demoted += manager->CollectUpload(
-			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
-			    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
-				    if constexpr (hot_aware) {
-					    range_func(address, range_bytes, hot);
-				    } else {
-					    range_func(address, range_bytes);
-				    }
-			    });
-			if (!is_written) {
-				manager->lock.unlock();
+		{
+			// FaultPolicy::defer_upload_protect: a read upload write-protects its collected pages
+			// after the region locks below are released (guest write faults on those regions no
+			// longer wait for the host calls) and in one call per region, and copies after that,
+			// as a batched BDA pass does. A page written meanwhile does not fault, but it is still
+			// clean only once protected, and the copy below sees the write. Not inside another
+			// scope: its host calls would then come after the copy.
+			std::optional<PageManager::DeferProtectScope> defer_protect;
+			if (!is_written && m_fault_policy.defer_upload_protect &&
+			    !PageManager::InDeferProtectScope() &&
+			    PageManager::GetDeferMode() == PageManager::DeferMode::On) {
+				defer_protect.emplace();
 			}
-		});
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				manager->lock.lock();
+				demoted += manager->CollectUpload(
+				    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
+				    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
+					    if constexpr (hot_aware) {
+						    range_func(address, range_bytes, hot);
+					    } else {
+						    range_func(address, range_bytes);
+					    }
+				    });
+				if (!is_written) {
+					manager->lock.unlock();
+				}
+			});
+		}
 		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
@@ -426,11 +460,9 @@ private:
 	// CPU-dirty, and records the range in the dirtied log when that is enabled (both under the log
 	// lock, so a take sees the range together with the epoch it produced).
 	void           NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept;
+	// One fault's exact transition mask, published under one log lock with one epoch advance.
+	void           NotifyCpuMutation(uint64_t base, const RegionBits& dirty) noexcept;
 	void           AdvanceCpuMutationEpoch() noexcept;
-	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
-	// (RegionManager::MarkWriteFault's fault-ahead window of `ahead` pages).
-	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
-	                                                               uint64_t ahead) noexcept;
 	inline static std::atomic_uint32_t s_ahead_override {0};
 	inline static thread_local bool   t_fault_found_dirty = false;
 
@@ -443,6 +475,8 @@ private:
 	const FaultPolicy                              m_fault_policy;
 	std::atomic_uint32_t                           m_frame {1};
 	std::atomic_uint32_t                           m_hot_count {0};
+	std::atomic_uint64_t                           m_write_faults {0};
+	std::atomic_uint64_t                           m_hot_refused {0};
 	// Dirtied-range log (EnableDirtiedLog). A set of disjoint ranges; past DirtiedLogMaxRanges it
 	// is dropped and the next take reports the loss.
 	static constexpr size_t DirtiedLogMaxRanges = 4096;

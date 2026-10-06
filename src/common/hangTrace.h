@@ -198,8 +198,22 @@ void SetFaultContext(uint64_t pc, std::string_view thread_name);
 void ClearFaultContext();
 void SetReadbackKind(ReadbackKind kind);
 [[nodiscard]] ReadbackKind GetReadbackKind();
+// Exclusive wall-time phases of ReadMemory. drain_wait includes scheduler submission/recorder
+// work in Wait(), not just GPU execution. issue includes copy preparation and native submission.
+// Zero phases on EagerPublish/other callers mean not instrumented, not zero GPU latency.
+struct ReadbackTiming {
+	uint64_t cp_queue_ns         = 0;
+	uint64_t issue_ns            = 0;
+	uint64_t side_gpu_wait_ns    = 0;
+	uint64_t publication_lock_ns = 0;
+	uint64_t publish_ns          = 0;
+	uint64_t drain_wait_ns       = 0;
+	uint64_t completion_wait_ns  = 0;
+	const char* side_result      = "not-attempted";
+};
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
-                    bool downloaded, uint64_t duration_ns);
+                    bool downloaded, uint64_t duration_ns,
+                    const ReadbackTiming& timing = {});
 
 // occlusion.csv (KYTY_GPU_OCCLUSION=1): "dump" rows for each ZPASS_DONE dump (scopes counted since
 // the previous dump, plus the latest scope's target size, colour count, depth format and depth
@@ -525,6 +539,11 @@ enum class MemoryCounter : uint8_t {
 	Count
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);
+
+// A memory predication packet (op 3, wait) submitted all recorded GPU work and blocked the command
+// processor until it finished (CommandProcessor::ExecPredication); `ns` is the time spent blocked.
+// Summed per second into summary.csv pred_flush_waits and pred_flush_wait_us, appended last.
+void RecordPredicationFlushWait(uint64_t ns);
 
 } // namespace HangTrace
 

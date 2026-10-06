@@ -1,9 +1,11 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/deviceLostReport.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
@@ -11,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -329,6 +332,7 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		if (!swapchain.IsMinimized()) {
 			frames.SetFormat(swapchain.Format());
@@ -684,7 +688,11 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		default:
+			if (result == vk::Result::eErrorDeviceLost) {
+				DeviceLostReport::RunOnce();
+			}
+			EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
@@ -1307,7 +1315,8 @@ void Presenter::Impl::Present() {
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			    (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			    swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
 			const auto tick = swapchain.Submit(present_scheduler);
@@ -1334,6 +1343,7 @@ void Presenter::Impl::Present() {
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

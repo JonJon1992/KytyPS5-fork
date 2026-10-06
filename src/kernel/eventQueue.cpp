@@ -337,10 +337,15 @@ void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 		}
 	}
 	// Expired timers become pending in deadline order, the order their callouts would have fired.
+	// A periodic timer (interval_ns != 0) counts every period that expired in its data and moves
+	// its deadline past now; it stays pending (and keeps its place) until it is consumed.
 	for (;;) {
 		KernelEqueueEvent* earliest = nullptr;
 		for (auto& event: m_events) {
-			if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns &&
+			const bool periodic =
+			    event.interval_ns != 0 && event.event.filter == KERNEL_EVFILT_TIMER;
+			if ((!event.triggered || periodic) && event.deadline_ns != 0 &&
+			    event.deadline_ns <= now_ns &&
 			    (earliest == nullptr || event.deadline_ns < earliest->deadline_ns)) {
 				earliest = &event;
 			}

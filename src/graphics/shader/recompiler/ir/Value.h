@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/IrAllocator.h"
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
@@ -110,6 +111,8 @@ struct Use {
 	bool operator==(const Use&) const = default;
 };
 
+using UseList = std::vector<Use, IrAllocator<Use>>;
+
 class Inst {
 public:
 	explicit Inst(ValueOpcode opcode, uint64_t flags = 0);
@@ -130,7 +133,7 @@ public:
 	[[nodiscard]] Value                   Arg(size_t index) const;
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
-	[[nodiscard]] const std::vector<Use>& Uses() const;
+	[[nodiscard]] const UseList&          Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
 	// Lazy assignment is for plan construction and unsealed, single-threaded programs.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
@@ -191,9 +194,9 @@ private:
 	ValueOpcode         opcode;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	std::vector<Value>  args;
-	std::vector<Block*> phi_blocks;
-	std::vector<Use>    uses;
+	std::vector<Value, IrAllocator<Value>>   args;
+	std::vector<Block*, IrAllocator<Block*>> phi_blocks;
+	UseList                                  uses;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 

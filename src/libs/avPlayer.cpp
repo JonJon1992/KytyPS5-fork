@@ -4,6 +4,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
+#include "libs/avPlayerSync.h"
 #include "libs/libs.h"
 
 #include <algorithm>
@@ -453,9 +454,13 @@ public:
 		available.notify_all();
 	}
 	void Notify() { available.notify_all(); }
+	size_t Count() const {
+		std::lock_guard lock(mutex);
+		return queue.size();
+	}
 
 private:
-	std::mutex              mutex;
+	mutable std::mutex      mutex;
 	std::condition_variable available;
 	std::deque<DemuxPacket> queue;
 	size_t                  bytes    = 0;
@@ -555,6 +560,10 @@ public:
 		std::lock_guard lock(mutex);
 		return queue.empty();
 	}
+	size_t Count() const {
+		std::lock_guard lock(mutex);
+		return queue.size();
+	}
 	void Clear() {
 		std::lock_guard lock(mutex);
 		queue.clear();
@@ -576,7 +585,7 @@ struct ReadyFrame {
 
 class FileStreamer {
 public:
-	explicit FileStreamer(AvPlayerFileReplacement f): file(f) {}
+	FileStreamer(AvPlayerFileReplacement f, AvPlayerMemAllocator m): file(f), mem(m) {}
 	~FileStreamer() {
 		if (ctx != nullptr) {
 			av_freep(&ctx->buffer);
@@ -605,7 +614,16 @@ public:
 			return false;
 		}
 		constexpr int buffer_size = 64 * 1024;
-		auto*         buf         = static_cast<uint8_t*>(av_malloc(buffer_size));
+		// The game's read callback gets a buffer from the game's own allocator: it may read
+		// through AMPR, which only accepts guest memory (Astro Bot's intro video failed with
+		// EFAULT into FFmpeg's host buffer and the game asserted, DEBUGGING.md 2026-10-02).
+		if (opened && mem.allocate != nullptr && mem.deallocate != nullptr) {
+			guest_read = GuestBuffer(mem, 64, buffer_size, false);
+			if (!guest_read.Valid()) {
+				return false;
+			}
+		}
+		auto* buf = static_cast<uint8_t*>(av_malloc(buffer_size));
 		if (buf == nullptr) {
 			return false;
 		}
@@ -625,7 +643,14 @@ private:
 		}
 		len      = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
 		int read = 0;
-		if (s->opened) {
+		if (s->opened && s->guest_read.Valid()) {
+			len  = std::min<int>(len, static_cast<int>(s->guest_read.Size()));
+			read = s->file.read_offset(s->file.object_pointer, s->guest_read.Get(), s->pos,
+			                           static_cast<uint32_t>(len));
+			if (read > 0 && read <= len) {
+				std::memcpy(buf, s->guest_read.Get(), static_cast<size_t>(read));
+			}
+		} else if (s->opened) {
 			read = s->file.read_offset(s->file.object_pointer, buf, s->pos,
 			                           static_cast<uint32_t>(len));
 		} else {
@@ -666,6 +691,8 @@ private:
 		return static_cast<int64_t>(position);
 	}
 	AvPlayerFileReplacement file;
+	AvPlayerMemAllocator    mem;
+	GuestBuffer             guest_read;
 	Common::File            local_file;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
@@ -704,7 +731,7 @@ public:
 			return static_cast<Source*>(opaque)->interrupt_io.load() ? 1 : 0;
 		};
 		raw->interrupt_callback.opaque = this;
-		streamer                       = std::make_unique<FileStreamer>(file);
+		streamer                       = std::make_unique<FileStreamer>(file, mem);
 		if (!streamer->Init(path)) {
 			avformat_free_context(raw);
 			return AVPLAYER_ERROR_OPERATION_FAILED;
@@ -903,6 +930,7 @@ public:
 	}
 	bool Active() const {
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		return state == State::Ready ||
 		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
 	}
@@ -960,6 +988,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		if (state != State::Playing || !video_id) {
 			return false;
 		}
@@ -997,6 +1026,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
+		LogStallNoLock();
 		if (paused || state != State::Playing || !audio_id ||
 		    trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
 			return false;
@@ -1017,6 +1047,7 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
+		last_audio_ts = out->time_stamp; // stall report diagnostics
 		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
 		clock_start   = std::chrono::steady_clock::now();
 		paused_extra  = {};
@@ -1034,6 +1065,32 @@ public:
 
 private:
 	enum class State { Ready, Playing, Stopped };
+
+	// Report only playback that outlives the source duration. This separates a
+	// decoder/queue stall from a guest waiting elsewhere without logging each poll.
+	void LogStallNoLock() const {
+		if (state != State::Playing || paused || loop || fmt == nullptr || fmt->duration <= 0) {
+			return;
+		}
+		const auto time_ms = CurrentTimeNoLock();
+		const auto duration_ms = static_cast<uint64_t>(fmt->duration / 1000);
+		if (time_ms < duration_ms + 2000 || time_ms < next_stall_report_ms) {
+			return;
+		}
+		next_stall_report_ms = time_ms + 1000;
+		LOGF("AvPlayer end diagnostics: path=%s time_ms=%" PRIu64 " duration_ms=%" PRIu64
+		     " eof=%d video_done=%d audio_done=%d failed=%d stop=%d sync=%u"
+		     " last_video_ms=%" PRIu64 " last_audio_ms=%" PRIu64
+		     " video_packets=%zu audio_packets=%zu video_frames=%zu audio_frames=%zu"
+		     " video_buffers=%zu audio_buffers=%zu drained=%d\n",
+		     path.c_str(), time_ms, duration_ms, static_cast<int>(demux_eof.load()),
+		     static_cast<int>(video_done.load()), static_cast<int>(audio_done.load()),
+		     static_cast<int>(pipeline_failed.load()), static_cast<int>(worker_stop.load()),
+		     sync_mode, current_video ? current_video->info.time_stamp : uint64_t {0},
+		     last_audio_ts, video_packets.Count(), audio_packets.Count(), video_frames.Count(),
+		     audio_frames.Count(), video_buffers.Count(), audio_buffers.Count(),
+		     static_cast<int>(DrainedNoLock()));
+	}
 
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
@@ -1086,6 +1143,7 @@ private:
 		seek_video_frame_pending = false;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
+		next_stall_report_ms     = 0;
 	}
 	void AutoEnable() {
 		for (uint32_t i = 0; i < fmt->nb_streams; i++) {
@@ -1695,6 +1753,8 @@ private:
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
+	uint64_t                                 last_audio_ts = 0;
+	mutable uint64_t                         next_stall_report_ms = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};

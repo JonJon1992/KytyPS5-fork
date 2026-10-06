@@ -161,10 +161,44 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
+	const auto describe = [handle](const uint8_t* config, Atrac9CodecInfo* info) {
+		const int init_result = AjmAt9InitDecoder(handle, config);
+		return init_result == 0 ? Atrac9GetCodecInfo(handle, info) : init_result;
+	};
+	const auto*     config = static_cast<const uint8_t*>(config_data);
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
-	const int       info_result =
-	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
+	int             info_result = describe(config, &codec_info);
+	if (info_result != 0 && config[0] != 0xfeu) {
+		// The console also describes configurations whose first byte is not the 0xFE sync byte,
+		// and the game divides by the buffer size it computes from the description (an error left
+		// it 0: SIGFPE). Ghost of Yotei's multichannel streams carry 30 71 c0 fe (8 channels) and
+		// 30 72 c0 fe (12): the low nibble after the 48 kHz rate index follows the channel count,
+		// so the classic channel-configuration and validation fields do not apply. LibAtrac9 checks
+		// only the sync byte and the validation bit; with both set as it expects, the remaining
+		// fields describe the stream. Only the description is lenient: AjmAt9Decoder still refuses
+		// to decode such a stream, which stays silent.
+		uint8_t synced[ATRAC9_CONFIG_DATA_SIZE];
+		std::memcpy(synced, config, sizeof(synced));
+		synced[0] = 0xfeu;
+		synced[1] &= ~1u;
+		info_result = describe(synced, &codec_info);
+		if (info_result == 0) {
+			static std::mutex            mutex;
+			static std::vector<uint32_t> logged;
+			uint32_t                     word = 0;
+			std::memcpy(&word, config, sizeof(word));
+			std::scoped_lock lock(mutex);
+			if (logged.size() < 16u && std::ranges::find(logged, word) == logged.end()) {
+				logged.push_back(word);
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "AJM: ATRAC9 config {:02x} {:02x} {:02x} {:02x} has no 0xFE sync byte; described "
+				    "as {} channel(s), {} Hz, {}x{} samples per superframe (decoding it is not "
+				    "supported)\n",
+				    config[0], config[1], config[2], config[3], codec_info.channels,
+				    codec_info.samplingRate, codec_info.framesInSuperframe, codec_info.frameSamples));
+			}
+		}
+	}
 	Atrac9ReleaseHandle(handle);
 
 	if (info_result != 0 || codec_info.channels <= 0 || codec_info.samplingRate <= 0 ||

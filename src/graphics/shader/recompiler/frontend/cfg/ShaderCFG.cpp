@@ -3,12 +3,15 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stack>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -572,15 +575,6 @@ bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, u
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
 }
 
-std::vector<uint32_t> AllBlockIds(uint32_t count) {
-	std::vector<uint32_t> ids;
-	ids.reserve(count);
-	for (uint32_t i = 0; i < count; i++) {
-		ids.push_back(i);
-	}
-	return ids;
-}
-
 std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
                                       const std::vector<uint32_t>& b) {
 	std::vector<uint32_t> ret;
@@ -596,6 +590,11 @@ void SortUnique(std::vector<uint32_t>& values) {
 
 bool Contains(const std::vector<uint32_t>& values, uint32_t value) {
 	return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+// For vectors kept sorted (SortUnique), such as loop bodies.
+bool SortedContains(const std::vector<uint32_t>& values, uint32_t value) {
+	return std::binary_search(values.begin(), values.end(), value);
 }
 
 bool ReplaceValue(std::vector<uint32_t>& values, uint32_t old_value, uint32_t new_value) {
@@ -719,69 +718,80 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
-void ComputeDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
+// Rewrites keep block IDs dense. Intersect transient bitsets instead of sorted vectors, then
+// publish the same ascending IDs. Keep the original greatest fixpoint and traversal order:
+// forwards for dominators, backwards for post-dominators, including cycles without an exit.
+template<bool Post>
+void ComputeDominatorSets(Graph& graph) {
+	const auto count = graph.blocks.size();
+	const auto words = (count + 63u) / 64u;
+	if (words == 0) {
+		return;
 	}
-
+	const auto final_mask = count % 64u ? (uint64_t {1} << (count % 64u)) - 1u : UINT64_MAX;
+	std::vector<uint64_t> sets(count * words, UINT64_MAX);
+	std::vector<uint64_t> next(words);
+	for (const auto& block: graph.blocks) {
+		auto* row = sets.data() + block.id * words;
+		row[words - 1u] = final_mask;
+		if (Post ? block.successors.empty() : block.id == graph.entry_block) {
+			std::fill_n(row, words, uint64_t {0});
+			row[block.id / 64u] = uint64_t {1} << (block.id % 64u);
+		}
+	}
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
-			if (block.id == graph.entry_block) {
+		for (size_t index = 0; index < count; index++) {
+			const auto& block = graph.blocks[Post ? count - 1u - index : index];
+			if (!Post && block.id == graph.entry_block) {
 				continue;
 			}
-			std::vector<uint32_t> next;
-			if (block.predecessors.empty()) {
-				next = {block.id};
+			const auto& edges = Post ? block.successors : block.predecessors;
+			if (edges.empty()) {
+				std::fill(next.begin(), next.end(), uint64_t {0});
 			} else {
-				next = graph.blocks[block.predecessors.front()].dominators;
-				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
+				std::copy_n(sets.data() + edges.front() * words, words, next.data());
+				for (size_t edge = 1; edge < edges.size(); edge++) {
+					const auto* other = sets.data() + edges[edge] * words;
+					for (size_t word = 0; word < words; word++) {
+						next[word] &= other[word];
+					}
 				}
-				AddUnique(next, block.id);
-				SortUnique(next);
 			}
-			if (next != block.dominators) {
-				block.dominators = std::move(next);
-				changed          = true;
+			next[block.id / 64u] |= uint64_t {1} << (block.id % 64u);
+			auto* row = sets.data() + block.id * words;
+			if (!std::equal(next.begin(), next.end(), row)) {
+				std::copy(next.begin(), next.end(), row);
+				changed = true;
+			}
+		}
+	}
+	for (auto& block: graph.blocks) {
+		auto&       out = Post ? block.post_dominators : block.dominators;
+		const auto* row = sets.data() + block.id * words;
+		out.clear();
+		size_t elements = 0;
+		for (size_t word = 0; word < words; word++) {
+			elements += std::popcount(row[word]);
+		}
+		out.reserve(elements);
+		for (size_t word = 0; word < words; word++) {
+			auto bits = row[word];
+			while (bits != 0) {
+				out.push_back(static_cast<uint32_t>(word * 64u + std::countr_zero(bits)));
+				bits &= bits - 1u;
 			}
 		}
 	}
 }
 
+void ComputeDominators(Graph& graph) {
+	ComputeDominatorSets<false>(graph);
+}
+
 void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
-	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
-			}
-		}
-	}
+	ComputeDominatorSets<true>(graph);
 }
 
 void ComputeBackEdges(Graph& graph) {
@@ -801,8 +811,20 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 	std::vector<uint32_t> stack;
 	body.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
-	AddUnique(body, header);
-	AddUnique(body, latch);
+	// Membership of `body`: a bitmap instead of a search of the growing vector.
+	std::vector<uint8_t> in_body(graph.blocks.size(), 0u);
+	const auto           add_to_body = [&](uint32_t block_id) {
+		if (block_id < in_body.size() ? in_body[block_id] != 0u : Contains(body, block_id)) {
+			return false;
+		}
+		if (block_id < in_body.size()) {
+			in_body[block_id] = 1u;
+		}
+		body.push_back(block_id);
+		return true;
+	};
+	add_to_body(header);
+	add_to_body(latch);
 	if (latch != header) {
 		stack.push_back(latch);
 	}
@@ -821,8 +843,7 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 			if (!graph.Dominates(header, pred) && natural != nullptr) {
 				*natural = false;
 			}
-			if (!Contains(body, pred)) {
-				body.push_back(pred);
+			if (add_to_body(pred)) {
 				if (pred != header) {
 					stack.push_back(pred);
 				}
@@ -852,7 +873,7 @@ void ComputeNaturalLoops(Graph& graph) {
 				continue;
 			}
 			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
+				if (!SortedContains(loop.body_blocks, succ)) {
 					AddUnique(loop.exit_blocks, succ);
 				}
 			}
@@ -981,10 +1002,12 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 	graph.entry_block = RemapId(graph.entry_block, id_map);
 	for (auto& block: graph.blocks) {
 		block.id = RemapId(block.id, id_map);
-		RemapIds(block.predecessors, id_map);
+		// Every caller rebuilds predecessors and recomputes the analyses next (RebuildPredecessors,
+		// RecomputeAnalyses), which overwrite these without reading them.
+		block.predecessors.clear();
+		block.dominators.clear();
+		block.post_dominators.clear();
 		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -1026,12 +1049,15 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 	std::vector<uint32_t> stack = {header};
 	blocks.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
+	// Visited blocks: a bitmap instead of a search of the growing result.
+	std::vector<uint8_t> visited(graph.blocks.size(), 0u);
 
 	while (!stack.empty()) {
 		const auto block_id = stack.back();
 		stack.pop_back();
-		if (block_id == stop_block || Contains(blocks, block_id) ||
-		    !graph.Dominates(header, block_id)) {
+		const bool seen =
+		    block_id < visited.size() ? visited[block_id] != 0u : Contains(blocks, block_id);
+		if (block_id == stop_block || seen || !graph.Dominates(header, block_id)) {
 			continue;
 		}
 
@@ -1040,7 +1066,10 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 			continue;
 		}
 
-		AddUnique(blocks, block_id);
+		if (block_id < visited.size()) {
+			visited[block_id] = 1u;
+		}
+		blocks.push_back(block_id);
 		for (auto succ: block->successors) {
 			if (succ != stop_block && graph.Dominates(header, succ)) {
 				stack.push_back(succ);
@@ -1096,7 +1125,7 @@ bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
 const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
 	const NaturalLoop* innermost = nullptr;
 	for (const auto& loop: graph.natural_loops) {
-		if (Contains(loop.body_blocks, block_id) &&
+		if (SortedContains(loop.body_blocks, block_id) &&
 		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
 			innermost = &loop;
 		}
@@ -1252,8 +1281,8 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 		};
 		return is_repeat_target(true_target) && is_repeat_target(false_target);
 	}
-	const bool true_in_body  = Contains(loop->body_blocks, true_target);
-	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	const bool true_in_body  = SortedContains(loop->body_blocks, true_target);
+	const bool false_in_body = SortedContains(loop->body_blocks, false_target);
 	if (true_in_body != false_in_body) {
 		return true;
 	}
@@ -1316,8 +1345,8 @@ bool CanonicalizeNaturalLoops(Graph& graph) {
 			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
 			    is_loop_control_target(header->terminator.true_block) ||
 			    is_loop_control_target(header->terminator.false_block) ||
-			    !Contains(loop.body_blocks, header->terminator.true_block) ||
-			    !Contains(loop.body_blocks, header->terminator.false_block)) {
+			    !SortedContains(loop.body_blocks, header->terminator.true_block) ||
+			    !SortedContains(loop.body_blocks, header->terminator.false_block)) {
 				continue;
 			}
 
@@ -1443,11 +1472,16 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
                                       uint32_t merge) {
 	std::vector<uint32_t> region;
 	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
-	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
+	uint32_t              id_end  = 0;
+	for (const auto& block: graph.blocks) {
+		id_end = std::max(id_end, block.id + 1u);
+	}
+	std::vector<bool> visited(id_end, false);
+	const auto*       loop = FindInnermostContainingLoop(graph, header.id);
 	while (!pending.empty()) {
 		const auto block_id = pending.back();
 		pending.pop_back();
-		if (block_id == merge || Contains(region, block_id) ||
+		if (block_id == merge || (block_id < visited.size() && visited[block_id]) ||
 		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
 			continue;
 		}
@@ -1457,11 +1491,140 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 		}
 		// A return terminates its own block; a branch to a shared return still has to
 		// obey selection entry/exit rules, just like any other branch.
-		AddUnique(region, block_id);
-		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+		visited[block_id] = true;
+		region.push_back(block_id);
+		for (const auto successor: block->successors) {
+			if (successor >= visited.size() || !visited[successor]) {
+				pending.push_back(successor);
+			}
+		}
 	}
 	SortUnique(region);
 	return region;
+}
+
+// Tail cloning bounds: the selection construct being rewritten (not the whole module), the copied
+// guest instructions, and the clones per structurization attempt.
+constexpr size_t   MaxTailCloneRegionBlocks  = 32;
+constexpr uint32_t MaxTailCloneInstructions  = 16;
+constexpr uint32_t MaxTailClonesPerStructure = 4;
+
+// An enclosing selection's arm enters the region of a nested selection that shares its merge
+// through a short straight-line block that falls into that merge:
+//   A: c0 -> P | T;  P -> ... -> B;  B: c1 -> C | T;  C -> M;  T -> M
+// The nested header gets its own copy of T, so its region has no external entry and the shared
+// merge can be split as usual. Copying is exact only because T runs straight into the merge.
+bool CloneExternallyEnteredTail(Graph& graph, uint32_t header, uint32_t merge,
+                                const std::vector<uint32_t>& region) {
+	uint32_t shared = UINT32_MAX;
+	for (const auto member: region) {
+		if (!graph.Dominates(header, member)) {
+			if (shared != UINT32_MAX) {
+				return false;
+			}
+			shared = member;
+		}
+	}
+	const auto* source = graph.FindBlock(shared);
+	if (source == nullptr || source->inst_end - source->inst_begin > MaxTailCloneInstructions ||
+	    source->terminator.kind != TerminatorKind::Branch || source->successors.size() != 1u ||
+	    source->successors.front() != merge) {
+		return false;
+	}
+	std::vector<uint32_t> redirected;
+	for (const auto predecessor: source->predecessors) {
+		if (graph.Dominates(header, predecessor)) {
+			redirected.push_back(predecessor);
+		}
+	}
+	if (redirected.empty()) {
+		return false;
+	}
+
+	BasicBlock clone = *source;
+	clone.id         = static_cast<uint32_t>(graph.blocks.size());
+	clone.predecessors.clear();
+	clone.dominators.clear();
+	clone.post_dominators.clear();
+	const auto clone_id = clone.id;
+	graph.blocks.push_back(std::move(clone));
+	for (const auto predecessor: redirected) {
+		auto* block = graph.FindBlock(predecessor);
+		ReplaceValue(block->successors, shared, clone_id);
+		ReplaceTerminatorTarget(block->terminator, shared, clone_id);
+	}
+	// Same layout as a split merge: the copy sits right before the merge it falls into.
+	MoveBlockBefore(graph, clone_id, merge);
+	return true;
+}
+
+bool CloneOneSharedSelectionTail(Graph& graph) {
+	std::vector<uint32_t> loop_headers;
+	loop_headers.reserve(graph.natural_loops.size());
+	for (const auto& loop: graph.natural_loops) {
+		AddUnique(loop_headers, loop.header);
+	}
+	// Selection merges are computed once per pass; the enclosing-header test below only compares them.
+	std::vector<std::pair<uint32_t, uint32_t>> selections;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
+		    Contains(loop_headers, block.id) || IsInnermostLoopControlConditional(graph, block)) {
+			continue;
+		}
+		const auto merge = FindSelectionMerge(graph, block);
+		if (merge != UINT32_MAX && graph.FindBlock(merge) != nullptr) {
+			selections.emplace_back(block.id, merge);
+		}
+	}
+
+	struct Candidate {
+		uint32_t              cost   = 0;
+		uint32_t              depth  = 0;
+		uint32_t              header = UINT32_MAX;
+		uint32_t              merge  = UINT32_MAX;
+		std::vector<uint32_t> region;
+	};
+	std::vector<Candidate> candidates;
+	for (const auto& [header, merge]: selections) {
+		const auto* block  = graph.FindBlock(header);
+		auto        region = SelectionRegion(graph, *block, merge);
+		if (region.size() > MaxTailCloneRegionBlocks) {
+			continue;
+		}
+		const auto external = std::ranges::find_if(region, [&](uint32_t member) {
+			const auto* member_block = graph.FindBlock(member);
+			return member_block != nullptr &&
+			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != header && !SortedContains(region, predecessor);
+			       });
+		});
+		if (external == region.end()) {
+			continue;
+		}
+		const bool enclosed = std::ranges::any_of(selections, [&](const auto& other) {
+			return other.first != header && other.second == merge &&
+			       graph.Dominates(other.first, header);
+		});
+		const auto* external_block = graph.FindBlock(*external);
+		if (enclosed && external_block != nullptr) {
+			candidates.push_back({external_block->inst_end - external_block->inst_begin,
+			                      static_cast<uint32_t>(block->dominators.size()), header, merge,
+			                      std::move(region)});
+		}
+	}
+	// Smallest copy first, then the outermost header.
+	std::ranges::sort(candidates, [](const Candidate& lhs, const Candidate& rhs) {
+		if (lhs.cost != rhs.cost) {
+			return lhs.cost < rhs.cost;
+		}
+		return lhs.depth != rhs.depth ? lhs.depth < rhs.depth : lhs.header < rhs.header;
+	});
+	for (const auto& candidate: candidates) {
+		if (CloneExternallyEnteredTail(graph, candidate.header, candidate.merge, candidate.region)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool SplitOneSelectionMerge(Graph& graph) {
@@ -1504,7 +1667,8 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			const auto* member_block = graph.FindBlock(member);
 			return member_block != nullptr &&
 			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
-				       return predecessor != block_id && !Contains(region, predecessor);
+				       return predecessor != block_id &&
+				              !std::binary_search(region.begin(), region.end(), predecessor);
 			       });
 		});
 		if (external != region.end()) {
@@ -1524,9 +1688,15 @@ bool SplitOneSelectionMerge(Graph& graph) {
 	return false;
 }
 
-bool SplitSharedMergeBlocks(Graph& graph) {
+bool SplitSharedMergeBlocks(Graph& graph, bool clone_tails) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
+	for (uint32_t clones = 0;
+	     clone_tails && clones < MaxTailClonesPerStructure && CloneOneSharedSelectionTail(graph);
+	     clones++) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
 		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
 			return !graph.unsupported;
@@ -1594,12 +1764,15 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->dominators, dominator);
+	// Both sets are sorted: built by MeetSets, remapped through RemapIds.
+	return target != nullptr &&
+	       std::binary_search(target->dominators.begin(), target->dominators.end(), dominator);
 }
 
 bool Graph::PostDominates(uint32_t post_dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->post_dominators, post_dominator);
+	return target != nullptr && std::binary_search(target->post_dominators.begin(),
+	                                               target->post_dominators.end(), post_dominator);
 }
 
 uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const {
@@ -1800,8 +1973,14 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 
 			const auto continuation = graph.FindNearestCommonPostDominator(shared, body);
 			const auto* continuation_block = graph.FindBlock(continuation);
-			if (continuation_block == nullptr || continuation == other ||
-			    CanReachBefore(graph, other, continuation, UINT32_MAX)) {
+			// The exit must not lead into the continuation within this iteration. Inside a loop,
+			// reaching it again through the backedge is the next iteration's selection, so the
+			// search stops at the loop header (Ghost of Yotei's 0xe52e19c6923301d0 skips its
+			// shared tail this way in both of its loops).
+			const auto* loop          = FindInnermostContainingLoop(graph, outer_id);
+			const auto  iteration_end = loop != nullptr ? loop->header : UINT32_MAX;
+			if (continuation_block == nullptr || continuation == other || other == iteration_end ||
+			    CanReachBefore(graph, other, continuation, iteration_end)) {
 				continue;
 			}
 			std::vector<uint32_t> outer_predecessors;
@@ -2117,7 +2296,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 namespace {
 
-bool StructurizeImpl(Graph& graph) {
+bool StructurizeImpl(Graph& graph, bool clone_tails = false) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
 			graph.unsupported_reason = "unsupported CFG";
@@ -2128,7 +2307,7 @@ bool StructurizeImpl(Graph& graph) {
 	if (!CanonicalizeNaturalLoops(graph)) {
 		return false;
 	}
-	if (!SplitSharedMergeBlocks(graph)) {
+	if (!SplitSharedMergeBlocks(graph, clone_tails)) {
 		return false;
 	}
 	if (!IsolateSemanticLoopHeaders(graph)) {
@@ -2231,6 +2410,13 @@ bool Structurize(Graph& graph) {
 			graph = std::move(structured);
 			return true;
 		}
+	}
+	// Last tier before the dispatcher: copy short shared tails that a nested selection is entered
+	// through. Graphs that the tiers above structure keep their exact shape.
+	structured = graph;
+	if (StructurizeImpl(structured, true)) {
+		graph = std::move(structured);
+		return true;
 	}
 	SetFailure(graph, failure_kind, failure_block, failure_reason);
 	return false;

@@ -228,6 +228,8 @@ const char* OpName(Op op) noexcept {
 	    "CopyQueryPoolResults",
 	    "WriteTimestamp2",
 	    "UpdateDescriptorSets",
+	    "BeginConditionalRendering",
+	    "EndConditionalRendering",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -888,6 +890,12 @@ void Encoder::beginRendering(const vk::RenderingInfo& info) {
 	Close(w, m_options.verify ? VerifyHash::BeginRendering(info) : 0);
 }
 
+void Encoder::Drain(const WaitPolicy& policy, WaitStats& stats) {
+	// WaitConsumed publishes pending bytes. The released position follows their native calls,
+	// so a no-op marker adds no ordering and can needlessly block on ring capacity.
+	m_ring.WaitConsumed(m_ring.WritePosition(), policy, stats);
+}
+
 void Encoder::endRendering() {
 	auto w = Open(Op::EndRendering, 0, false);
 	Close(w, m_options.verify ? VerifyHash::EndRendering() : 0);
@@ -1341,6 +1349,21 @@ void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool,
 	Close(w, m_options.verify
 	             ? VerifyHash::Value(Op::WriteTimestamp2, HandleBits(pool), query, stage_bits)
 	             : 0);
+}
+
+void Encoder::beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT& info) {
+	EXIT_IF(info.pNext != nullptr);
+	const auto flags = static_cast<uint32_t>(static_cast<VkConditionalRenderingFlagsEXT>(info.flags));
+	auto       w     = Open(Op::BeginConditionalRendering, Sz<ConditionalRenderingPacket>(), false);
+	w.Put(ConditionalRenderingPacket {info.buffer, info.offset, flags, 0});
+	Close(w, m_options.verify ? VerifyHash::Value(Op::BeginConditionalRendering,
+	                                              HandleBits(info.buffer), info.offset, flags)
+	                          : 0);
+}
+
+void Encoder::endConditionalRenderingEXT() {
+	auto w = Open(Op::EndConditionalRendering, 0, false);
+	Close(w, m_options.verify ? VerifyHash::Value(Op::EndConditionalRendering, 0) : 0);
 }
 
 } // namespace Libs::Graphics::CommandStream

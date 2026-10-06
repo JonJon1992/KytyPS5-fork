@@ -1,4 +1,5 @@
 #include <SDL3/SDL.h>
+#include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
 #include <SDL3/SDL_vulkan.h>
 
 #include "common/assert.h"
@@ -11,10 +12,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/gpuPredication.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -616,15 +619,29 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext        = &supported_workgroup_layout;
 	}
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
-	supported_features12.pNext = supported_features2.pNext;
-	supported_features2.pNext  = &supported_features12;
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT supported_device_fault {};
+	if (device_fault_extension) {
+		supported_device_fault.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_device_fault;
+	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional_rendering {};
+	if (conditional_rendering_extension) {
+		supported_conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext             = &supported_conditional_rendering;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
 	if (image_atomic_int64_extension) {
-		image_atomic_int64.pNext = supported_features2.pNext;
+		image_atomic_int64.pNext  = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	supported_features12.pNext = supported_features2.pNext;
+	supported_features2.pNext  = &supported_features12;
 	const bool color_write_extension =
 	    HasExtension(device_extensions, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT supported_color_write {};
@@ -640,6 +657,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext  = &supported_depth_clip;
 	}
 	physical_device.getFeatures2(&supported_features2);
+    const auto* bindless_option = std::getenv("KYTY_BINDLESS");
+    graphics.bindless_supported = bindless_option != nullptr && bindless_option[0] == '1' &&
+        supported_features12.runtimeDescriptorArray &&
+        supported_features12.shaderSampledImageArrayNonUniformIndexing &&
+        supported_features12.descriptorBindingPartiallyBound &&
+        supported_features12.descriptorBindingSampledImageUpdateAfterBind &&
+        supported_features12.descriptorBindingUpdateUnusedWhilePending;
+    if (graphics.bindless_supported) {
+        features12.runtimeDescriptorArray = VK_TRUE;
+        features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+        features12.descriptorBindingPartiallyBound = VK_TRUE;
+        features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    }
+	graphics.shader_image_int64_atomics_enabled =
+	    image_atomic_int64_extension && image_atomic_int64.shaderImageInt64Atomics == VK_TRUE;
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension &&
+	    supported_conditional_rendering.conditionalRendering == VK_TRUE;
+	if (GpuPredication::ExtensionRequested()) {
+		LOGF("Vulkan conditional rendering (guest predication on the GPU): %s\n",
+		     graphics.conditional_rendering_enabled ? "true" : "false");
+	}
+	graphics.device_fault_enabled = device_fault_extension && supported_device_fault.deviceFault;
+	LOGF("Vulkan device fault reporting: %s\n", graphics.device_fault_enabled ? "enabled" : "disabled");
 	graphics.color_write_enable_enabled =
 	    color_write_extension && supported_color_write.colorWriteEnable == VK_TRUE;
 	graphics.depth_clip_enable_enabled =
@@ -659,7 +701,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan colorWriteEnable: %s, depthClipEnable: %s\n",
 	     graphics.color_write_enable_enabled ? "true" : "false (static colour-write masks)",
 	     graphics.depth_clip_enable_enabled ? "true" : "false (depth clamp only without Z clipping)");
-	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
@@ -753,23 +794,34 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		properties2.pNext            = &robustness2_properties;
 	}
 	physical_device.getProperties2(&properties2);
+    if (graphics.bindless_supported) {
+        const auto budget = CalculateBindlessBudget(properties12, properties2.properties.limits);
+        graphics.bindless_images_per_array = budget.images;
+        graphics.bindless_samplers_per_array = budget.samplers;
+        graphics.bindless_supported = budget.images >= 3u && budget.samplers != 0u;
+    }
 	ConfigureShaderFloatControls(properties12);
-	// robustBufferAccess2 (enabled below whenever supported) makes a storage-buffer load return 0
-	// when any byte lies past the descriptor range rounded up to this alignment; at 1 byte that is
-	// exactly the shaders' own dword bounds check, which they can then leave to the device.
+	// AMD's 4-byte robustness alignment is usable only with whole-dword descriptor ranges and
+	// nullDescriptor for ranges below one word. This pilot defaults off for controlled A/B tests.
 	{
-		ShaderRecompiler::Spirv::HostBufferRobustness robustness {};
-		robustness.storage_dword_loads_return_zero =
-		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE &&
-		    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+		const auto* amd_bounds_env = std::getenv("KYTY_AMD_BUFFER_BOUNDS");
+		const bool amd_bounds_requested = amd_bounds_env != nullptr && amd_bounds_env[0] == '1';
+		const bool robust2 =
+		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE;
+		const bool null_descriptor =
+		    robustness2_ext_enabled && supported_robustness2.nullDescriptor == VK_TRUE;
+		const auto robustness = ShaderRecompiler::Spirv::SelectHostBufferRobustness(
+		    properties2.properties.vendorID, robust2,
+		    robustness2_properties.robustStorageBufferAccessSizeAlignment,
+		    null_descriptor, amd_bounds_requested);
 		ShaderRecompiler::Spirv::SetHostBufferRobustness(robustness);
 		LOGF("Vulkan robustness: robustBufferAccess2=%s storage alignment=%" PRIu64
-		     " shader dword bounds checks=%s\n",
-		     robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE
-		         ? "true"
-		         : "false",
+		     " shader dword bounds checks=%s nullDescriptor=%s amdBounds=%s\n",
+		     robust2 ? "true" : "false",
 		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
-		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
+		     robustness.storage_dword_loads_return_zero ? "device" : "shader",
+		     null_descriptor ? "true" : "false",
+		     robustness.null_descriptor_for_short_ranges ? "enabled" : "disabled");
 	}
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
@@ -1079,6 +1131,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
 		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
 		create_info.pNext                        = &pipeline_library;
+	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                          = &conditional_rendering;
 	}
 	if (shader_clock.shaderDeviceClock == VK_TRUE || shader_clock.shaderSubgroupClock == VK_TRUE) {
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
@@ -1570,17 +1628,27 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 		}
-		if (DeviceFaultDiagnosticsEnabled()) {
-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
-			graphic_ctx.diagnostic_checkpoints_enabled = true;
-		}
-		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		// VK_EXT_device_fault only costs anything after a loss (the report is read then), so it has
+		// its own switch: KYTY_GPU_FAULT_REPORT=1 (launcher: "GPU fault report"). It used to need
+		// --graphics-debug-dump, which dumps every PM4 packet and slows the game to a crawl.
+		// KYTY_DEVICE_FAULT_DIAGNOSTICS also enables it, with the NV checkpoint extensions.
+		const char* fault_report_env = std::getenv("KYTY_GPU_FAULT_REPORT");
+		const bool  want_device_fault =
+		    Config::GraphicsDebugDumpEnabled() ||
+		    (fault_report_env != nullptr && fault_report_env[0] == '1') ||
+		    DeviceFaultDiagnosticsEnabled();
+		if (want_device_fault &&
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
-		}
+		if (DeviceFaultDiagnosticsEnabled()) {
+			if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+				graphic_ctx.diagnostic_checkpoints_enabled = true;
+			}
+			if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+			}
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
@@ -1634,6 +1702,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
+		// Guest predication on the GPU (KYTY_PREDICATION_MODE=gpu, the default,
+		// renderer/gpuPredication.h): not enabled for drain or precise.
+		if (GpuPredication::ExtensionRequested() &&
+		    HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1654,6 +1728,10 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// Whichever call first sees VK_ERROR_DEVICE_LOST prints the GPU fault report (deviceLostReport.h).
+	DeviceLostReport::Register(
+	    [](void* context) { ReportDeviceFault(*static_cast<const GraphicContext*>(context)); },
+	    &graphic_ctx);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.
@@ -1709,6 +1787,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		DeviceLostReport::Unregister(&graphic_ctx);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
@@ -570,16 +571,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+	// IMAGE_BVH_INTERSECT_RAY with an eleven-DWORD full-float ray is lowered (spirvEmitterBvh.cpp).
+	// The other BVH forms (BVH64, A16 rays, without R128 or dmask 0xf) decode as unsupported, and
+	// the CFG builder would end the emulator on them: as for games that compile ray-tracing
+	// shaders before the player can select a mode without ray tracing, the dispatch or draw is
+	// skipped in every stage instead.
+	const auto unsupported_bvh =
+	    std::ranges::find_if(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::UNSUPPORTED &&
+		           inst.family == Decoder::Family::MIMG &&
+		           (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u);
+	    });
+	if (unsupported_bvh != decoded.instructions.end()) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			const auto& bvh = decoded.instructions.back();
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    options.shader_hash, bvh.pc, bvh.opcode_id));
+			    "Warning: unsupported BVH intersection form; skipping dispatches and draws whose "
+			    "shaders contain it (stage={}, shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}: "
+			    "{}).\n",
+			    StageName(options.stage), options.shader_hash, unsupported_bvh->pc,
+			    unsupported_bvh->opcode_id, unsupported_bvh->unsupported_reason));
 		}
 		return {.skip_dispatch = true};
 	}
@@ -641,6 +652,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	ir.bindless_images = options.bindless_images;
+	ir.bindless_samplers = options.bindless_samplers;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -666,6 +679,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (IR::SimplifyLocalAddressStores(ir) != 0) {
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
@@ -735,8 +751,31 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	const auto optimize = [&](std::vector<uint32_t>& module, const char* variant) {
+		if (!GetCodegenOptions().spirv_optimize) {
+			return;
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		const auto words_before = module.size();
+		std::string diagnostic;
+		const bool success = Spirv::OptimizeProgram(module, diagnostic);
+		const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                            std::chrono::steady_clock::now() - begin).count();
+		LOGF("%s SPIR-V optimize: stage=%s hash=0x%016" PRIx64
+		     " variant=%s words=%" PRIu64 "->%" PRIu64 " elapsed_us=%" PRIu64 " success=%u\n",
+		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash, variant,
+		     static_cast<uint64_t>(words_before), static_cast<uint64_t>(module.size()),
+		     static_cast<uint64_t>(elapsed_us), success ? 1u : 0u);
+		if (!success) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: SPIR-V optimization failed (shader=0x{:016x}, variant={}); "
+			    "using the original module: {}\n", ir.shader_hash, variant, diagnostic));
+		}
+	};
+	optimize(spirv, "main");
 	if (options.plain_mip_stats_variant && IR::UsesMipStats(ir)) {
 		result.spirv_plain = Spirv::EmitProgram(ir, options.input_info, false);
+		optimize(result.spirv_plain, "plain");
 	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

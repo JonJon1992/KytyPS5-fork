@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/renderer/cache/bdaSyncDiagnostics.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
@@ -30,7 +31,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
       m_command_scheduler(*this, graphics, CommandScheduler::Role::Guest),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
+      m_bindless_table(graphics, m_command_scheduler), m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
@@ -52,6 +53,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		return 1;
 	});
 	FaultCost::RunStartupBenchmark();
+    m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+        m_bindless_table.QueueUnregistered(id);
+    };
 }
 
 RenderContext::~RenderContext() {
@@ -188,9 +192,28 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
-	if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
-	    !m_command_scheduler.Active() || m_command_scheduler.Current().IsInvalid() ||
-	    !IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+	const auto refused = [vaddr, size](const char* reason) {
+		// A failed SRT readiness retry otherwise reports only its caller's assert.
+		// Keep the rejected range and the first failing predicate without reading
+		// GPU-owned cache state from a thread that is not allowed to inspect it.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::fprintf(stderr, "GpuBackingRead: synchronization refused addr=0x%016" PRIx64
+			                     " size=0x%" PRIx64 " reason=%s\n", vaddr, size, reason);
+		}
+		return false;
+	};
+	if (!GuestGpu::IsGpuThread()) return refused("not-gpu-thread");
+	if (CommandScheduler::InDeferredOperation()) return refused("deferred-operation");
+	if (!m_command_scheduler.Active()) return refused("inactive-scheduler");
+	if (m_command_scheduler.Current().IsInvalid()) return refused("invalid-recording");
+	if (!IsMapped(vaddr, size)) return refused("unmapped-range");
+	// Old render targets whose memory the CPU rewrote (tables reusing it) give up their bytes:
+	// guest memory holds the current contents there.
+	(void)m_texture_cache.ReleaseCpuOverwrittenImages(vaddr, size);
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		refused("gpu-modified-image");
+		m_texture_cache.LogGpuModifiedImages(vaddr, size);
 		return false;
 	}
 
@@ -213,9 +236,15 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	}
 	// A publication may already have finished since the failed strict read. Such a range is
 	// ready too; callers still retry the actual read and bound their preparation retries.
-	return IsMapped(vaddr, size) && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
-	       !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
-	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
+	if (!IsMapped(vaddr, size)) return refused("unmapped-after-wait");
+	if (m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) return refused("gpu-dirty-after-wait");
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		refused("gpu-modified-image-after-wait");
+		m_texture_cache.LogGpuModifiedImages(vaddr, size);
+		return false;
+	}
+	if (m_buffer_cache.HasPendingBackingPublication(vaddr, size)) return refused("publication-pending-after-wait");
+	return true;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
@@ -224,6 +253,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	// generation in the guest address space).
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
 	m_mapped_ranges.Add(vaddr, size);
+	BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::Maps);
 	m_buffer_cache.InvalidateBdaSynchronization();
 	SyncEpoch::Advance();
 }
@@ -255,6 +285,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);
+		BdaSyncDiagnostics::Record(BdaSyncDiagnostics::Event::Unmaps);
 		m_buffer_cache.InvalidateBdaSynchronization();
 		SyncEpoch::Advance();
 	};
@@ -267,7 +298,62 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+namespace {
+// Opt-in CPU measurement, distinct from the GPU timestamp deltas. The clock has
+// the same origin as summary.csv. One CSV write per second, outside the measured
+// scope; no clock or file access when KYTY_BDA_CPU_TIMING_FILE is absent.
+class BdaCpuTimer {
+public:
+	BdaCpuTimer() {
+		if (OutputPath() != nullptr) m_start = HangTrace::NowNs();
+	}
+	~BdaCpuTimer() {
+		if (m_start == 0) return;
+		const auto end = HangTrace::NowNs();
+		thread_local Totals totals;
+		if (totals.calls == 0) totals.begin = m_start;
+		++totals.calls;
+		totals.ns += end - m_start;
+		totals.maximum = std::max(totals.maximum, end - m_start);
+		if (end - totals.begin >= 1'000'000'000) totals.Flush(end);
+	}
+
+private:
+	static const char* OutputPath() {
+		static const char* path = [] {
+			const auto* value = std::getenv("KYTY_BDA_CPU_TIMING_FILE");
+			return value != nullptr && value[0] != '\0' ? value : nullptr;
+		}();
+		return path;
+	}
+	struct Totals {
+		Totals(): file(std::fopen(OutputPath(), "w")) {
+			if (file != nullptr) std::fprintf(file, "begin_ms,end_ms,calls,total_ns,max_ns\n");
+			else std::fprintf(stderr, "BDA CPU timing: cannot open output file\n");
+		}
+		~Totals() {
+			Flush(HangTrace::NowNs());
+			if (file != nullptr) std::fclose(file);
+		}
+		void Flush(uint64_t end) {
+			if (file != nullptr && calls != 0) {
+				std::fprintf(file, "%.3f,%.3f,%llu,%llu,%llu\n", begin / 1.0e6, end / 1.0e6,
+				             static_cast<unsigned long long>(calls),
+				             static_cast<unsigned long long>(ns),
+				             static_cast<unsigned long long>(maximum));
+				std::fflush(file);
+			}
+			calls = ns = maximum = 0;
+		}
+		FILE* file;
+		uint64_t begin = 0, calls = 0, ns = 0, maximum = 0;
+	};
+	uint64_t m_start = 0;
+};
+} // namespace
+
 void RenderContext::PrepareBda() {
+	const BdaCpuTimer cpu_timer;
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;

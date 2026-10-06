@@ -5,14 +5,18 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <fmt/format.h>
+#include <string>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -177,6 +181,76 @@ bool CalibrationEnabled() {
 	return g_calibration_extension != nullptr;
 }
 
+// KYTY_GPU_LONG_CB_MS=<ms> (default off): every guest flip, the timed command buffers whose GPU
+// span exceeded <ms>, longest first (at most 8 per flip), with how long each waited between the
+// native submit and its first GPU timestamp, its tick and what it recorded (GpuCommandComposition).
+// Ghost of Yotei's loading showed GPU busy time in ~750 ms quanta while its own commands took
+// microseconds; this names the command buffers that hold the queue.
+static double LongCommandBufferMs() {
+	static const double ms = [] {
+		const auto* value = std::getenv("KYTY_GPU_LONG_CB_MS");
+		return value != nullptr ? std::strtod(value, nullptr) : 0.0;
+	}();
+	return ms;
+}
+
+template <typename ToSteady>
+static void ReportLongCommandBuffers(const std::vector<Span>& spans, double period_ns, bool calibrated,
+                              const ToSteady& to_steady) {
+	const auto threshold_ms = LongCommandBufferMs();
+	if (threshold_ms <= 0.0) {
+		return;
+	}
+	std::vector<const Span*> long_spans;
+	for (const auto& span: spans) {
+		if (static_cast<double>(span.end - span.start) * period_ns / 1e6 >= threshold_ms) {
+			long_spans.push_back(&span);
+		}
+	}
+	if (long_spans.empty()) {
+		return;
+	}
+	std::sort(long_spans.begin(), long_spans.end(), [](const Span* a, const Span* b) {
+		return a->end - a->start > b->end - b->start;
+	});
+	for (size_t index = 0; index < std::min<size_t>(long_spans.size(), 8u); index++) {
+		const auto& span   = *long_spans[index];
+		const auto& sample = *span.sample;
+		std::string sites;
+		for (uint32_t site = 0; site < GpuCommandComposition::MaxSites; site++) {
+			if (sample.composition.sites[site] == nullptr) {
+				break;
+			}
+			sites += fmt::format("{}{} x{}", sites.empty() ? "" : ", ",
+			                     sample.composition.sites[site], sample.composition.counts[site]);
+		}
+		if (sample.composition.other != 0) {
+			sites += fmt::format(", +{} other", sample.composition.other);
+		}
+		for (uint32_t shader = 0; shader < GpuCommandComposition::MaxDispatchShaders; shader++) {
+			if (sample.composition.dispatch_counts[shader] == 0) {
+				break;
+			}
+			sites += fmt::format("{} cs:0x{:016x} x{} ({} groups)", shader == 0 ? "; dispatched" : ",",
+			                     sample.composition.dispatch_hashes[shader],
+			                     sample.composition.dispatch_counts[shader],
+			                     sample.composition.dispatch_groups[shader]);
+		}
+		if (sample.composition.dispatch_other != 0) {
+			sites += fmt::format(", +{} other dispatches", sample.composition.dispatch_other);
+		}
+		const double wait_ms = calibrated && sample.dispatch_ns != 0
+		                           ? (to_steady(span.start) - static_cast<double>(sample.dispatch_ns)) / 1e6
+		                           : -1.0;
+		std::printf("GPU long command buffer: %.1f ms on the GPU, tick %" PRIu64
+		            ", submit->start %.1f ms, %zu of %zu long this flip; recorded: %s\n",
+		            static_cast<double>(span.end - span.start) * period_ns / 1e6, sample.tick,
+		            wait_ms, index + 1, long_spans.size(),
+		            sites.empty() ? "(no op hooks or no commands)" : sites.c_str());
+	}
+	std::fflush(stdout);
+}
+
 void OnGuestFlip() {
 	if (!Enabled()) {
 		return;
@@ -274,6 +348,8 @@ void OnGuestFlip() {
 		g_previous_end_raw  = (reference + static_cast<uint64_t>(cursor)) & info.mask;
 		g_have_previous_end = true;
 	}
+
+	ReportLongCommandBuffers(spans, info.period_ns, calibration.valid, to_steady);
 
 	HangTrace::GpuFrame frame;
 	frame.busy_ns              = ToUnsignedNs(static_cast<double>(busy) * info.period_ns);
@@ -423,7 +499,8 @@ void GpuTimestampRing::EndCommand(vk::CommandBuffer buffer) {
 	auto& slot = m_slots[m_recording];
 	EXIT_IF(slot.state != SlotState::Recording);
 	buffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_pool, m_recording * 2u + 1u);
-	slot.state = SlotState::Recorded;
+	slot.composition = GpuOpProfiler::TakeComposition();
+	slot.state       = SlotState::Recorded;
 }
 
 uint64_t* GpuTimestampRing::Submitted(uint64_t tick, uint64_t submit_ns) {
@@ -490,8 +567,9 @@ void GpuTimestampRing::CollectRun(uint32_t first, uint32_t count, uint64_t obser
 			auto& slot = m_slots[first + i];
 			EXIT_IF(slot.state != SlotState::Submitted);
 			if (read && results[i * 4 + 1] != 0 && results[i * 4 + 3] != 0) {
-				samples[valid++] = {results[i * 4], results[i * 4 + 2], slot.record_ns,
-				                    slot.submit_ns, slot.dispatch_ns, observed_ns};
+				samples[valid++] = {results[i * 4],  results[i * 4 + 2], slot.record_ns,
+				                    slot.submit_ns,  slot.dispatch_ns,   observed_ns,
+				                    slot.tick,       slot.composition};
 			}
 			slot.state = SlotState::Free;
 		}

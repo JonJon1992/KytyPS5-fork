@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/vramStats.h"
 
@@ -59,6 +60,11 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k16_16SInt, vk::Format::eR16G16Sint},
     {Prospero::BufferFormat::k16_16Float, vk::Format::eR16G16Sfloat},
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
+    // Vulkan has no 11_11_10 UNORM format. The 10:10:10:2 UNORM packing has the element size and
+    // keeps fixed point with saturation at 1.0 (one bit less for red and green; alpha unused). An
+    // unsigned float stand-in did not saturate: Ghost of Yotei's skin then glowed white. The bit
+    // layout in memory differs from the console's, which only CPU access to the target would see.
+    {Prospero::BufferFormat::k11_11_10UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2SNorm, vk::Format::eA2B10G10R10SnormPack32},
     {Prospero::BufferFormat::k10_10_10_2UScaled, vk::Format::eA2B10G10R10UscaledPack32},
@@ -132,6 +138,9 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			DeviceLostReport::RunOnce();
+		}
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}

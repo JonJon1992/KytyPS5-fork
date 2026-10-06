@@ -1,0 +1,65 @@
+{
+  "source": "/run/media/jonathanbraga/SSD/PS5/Ghost_of_Yotei_extraido/eboot.bin",
+  "sha256": "803466729b58db40882062edf38417855658f51c9a8c7c39992b5a97153bd299",
+  "embedded_title_id": "PPSA05512",
+  "app_version": null,
+  "validation": "Static analysis only; game not launched; no patch applied.",
+  "image_relative_addresses": {
+    "mode_name_table": "0x1fc1c10",
+    "mode_flags_table": "0x1a78580",
+    "current_mode": "0x53029bc",
+    "desired_mode": "0x53029b4",
+    "previous_mode": "0x53029c0",
+    "mode_range_predicate": "0x1377940",
+    "render_path_mode_gate": "0x137bca5"
+  },
+  "modes": [
+    {
+      "index": 0,
+      "name": "Quality",
+      "flags": "0x4",
+      "range_predicate_result": false
+    },
+    {
+      "index": 1,
+      "name": "Balanced",
+      "flags": "0x12",
+      "range_predicate_result": false
+    },
+    {
+      "index": 2,
+      "name": "Performance",
+      "flags": "0x1",
+      "range_predicate_result": false
+    },
+    {
+      "index": 3,
+      "name": "RayTracing",
+      "flags": "0xc",
+      "range_predicate_result": true
+    },
+    {
+      "index": 4,
+      "name": "RayTracingBalanced",
+      "flags": "0x1a",
+      "range_predicate_result": true
+    },
+    {
+      "index": 5,
+      "name": "RayTracingPro",
+      "flags": "0x29",
+      "range_predicate_result": true
+    },
+    {
+      "index": 6,
+      "name": "LowEnergy",
+      "flags": "0x44",
+      "range_predicate_result": false
+    }
+  ],
+  "predicate_bytes": "48630575b0f8034883c0fd4883f8030f92c0c3",
+  "predicate_semantics": "Returns (uint64_t(int64_t(current_mode)) - 3) < 3, using unsigned comparison. Performance (2) returns false; modes 3, 4, 5 return true.",
+  "render_gate": "At 0x137bca5: load current mode; add -6; unsigned compare against -3; jae 0x137bce0. Modes 3..5 enter that branch. Performance falls through, clears [rbx+0x4d1d], and returns via 0x137bcdf.",
+  "interpretation": "Strong static evidence that the RTGI-related path already excludes Performance. This does not prove absence of all ray-tracing GPU work or establish the current mode during emulation.",
+  "next_validation": "Read current_mode at relocated image base + 0x53029bc during a Performance session and correlate with RT/BVH GPU dispatches before designing any additional patch."
+}

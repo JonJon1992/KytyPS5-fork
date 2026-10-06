@@ -65,6 +65,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <atomic>
 #include <cstdint>
@@ -153,9 +154,17 @@ private:
 	bool  m_scope_owner = false;
 };
 
+// The calling thread's composition of the guest command buffer it is recording (innermost site of
+// each hooked command since OnBeginCommand), cleared by the call. GpuTimestampRing::EndCommand
+// stores it with the buffer's timing sample (KYTY_GPU_LONG_CB_MS). Empty while inactive.
+[[nodiscard]] GpuCommandComposition TakeComposition() noexcept;
+
 // Environment-derived, evaluated once.
-[[nodiscard]] bool Enabled();        // counters or capture requested
+[[nodiscard]] bool Enabled();        // counters, capture or composition requested
 [[nodiscard]] bool CaptureEnabled(); // KYTY_GPU_OP_PROFILE > 0
+// KYTY_GPU_LONG_CB_MS > 0: the hooks of the commands TakeComposition counts are installed and the
+// CP recorder carries every command's site, without the sampled capture.
+[[nodiscard]] bool CompositionEnabled();
 
 // Directly after VULKAN_HPP_DEFAULT_DISPATCHER.init(device). No-op unless Enabled().
 void InstallHooks(GraphicContext& graphics);

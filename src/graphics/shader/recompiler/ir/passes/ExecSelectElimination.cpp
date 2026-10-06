@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <memory_resource>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -370,6 +371,24 @@ public:
 				m_children[m_idom[block]].push_back(block);
 			}
 		}
+		// Entry/exit numbers of a dominator-tree walk answer Dominates in constant time; walking
+		// the idom chain cost the chain's depth, hundreds of blocks in long shaders.
+		m_enter.assign(count, 0);
+		m_exit.assign(count, 0);
+		uint32_t                               clock = 0;
+		std::vector<std::pair<size_t, size_t>> walk {{0, 0}};
+		m_enter[0] = clock++;
+		while (!walk.empty()) {
+			auto& [block, next] = walk.back();
+			if (next < m_children[block].size()) {
+				const auto child = m_children[block][next++];
+				m_enter[child]   = clock++;
+				walk.push_back({child, 0});
+				continue;
+			}
+			m_exit[block] = clock++;
+			walk.pop_back();
+		}
 	}
 
 	[[nodiscard]] size_t IndexOf(const Block* block) const {
@@ -389,13 +408,7 @@ public:
 		if (!Reachable(a) || !Reachable(b)) {
 			return false;
 		}
-		while (b != a) {
-			if (b == 0) {
-				return false;
-			}
-			b = m_idom[b];
-		}
-		return true;
+		return m_enter[a] <= m_enter[b] && m_exit[b] <= m_exit[a];
 	}
 
 	[[nodiscard]] bool Dominates(const Block* a, const Block* b) const {
@@ -408,9 +421,16 @@ private:
 	std::unordered_map<const Block*, size_t> m_index;
 	std::vector<size_t>                      m_idom;
 	std::vector<std::vector<size_t>>         m_children;
+	std::vector<uint32_t>                    m_enter;
+	std::vector<uint32_t>                    m_exit;
 };
 
 class MaskedUseAnalysis {
+	struct Frame {
+		const Inst* inst;
+		size_t      next_use;
+	};
+
 public:
 	// `assumed`: selects taken to be unobserved where their condition is false (the fixpoint
 	// candidate set), or nullptr to count every phi use as an observation.
@@ -418,17 +438,22 @@ public:
 	                  const std::unordered_set<const Inst*>* assumed)
 	    : m_program(program), m_dom(dom), m_assumed(assumed) {}
 
+	// Between fixpoint passes. `assumed` only shrinks, which can only turn masked phi uses into
+	// observations, so every No verdict still holds and the next pass stops at it; the Yes
+	// verdicts are recomputed.
+	void KeepObservedVerdicts() {
+		// Bounded by MaxFixpointPasses. Retain storage and invalidate Yes lazily on lookup.
+		++m_generation;
+	}
+
 	// Whether lanes where `condition` is false can never observe `root`'s value.
 	bool ObservedOnlyUnder(const Inst* root, const Inst* condition) {
 		auto& root_verdict = Lookup(root, condition);
 		if (root_verdict != Verdict::Unknown) {
 			return root_verdict == Verdict::Yes;
 		}
-		struct Frame {
-			const Inst* inst;
-			size_t      next_use;
-		};
-		std::vector<Frame> stack;
+		auto& stack = m_stack;
+		stack.clear();
 		root_verdict = Verdict::Pending;
 		stack.push_back({root, 0});
 		while (!stack.empty()) {
@@ -498,8 +523,20 @@ private:
 		}
 	};
 
+	struct MemoEntry {
+		Verdict  verdict    = Verdict::Unknown;
+		uint32_t generation = 0;
+	};
+
 	Verdict& Lookup(const Inst* inst, const Inst* condition) {
-		return m_memo[{inst, condition}];
+		auto& entry = m_memo[{inst, condition}];
+		if (entry.generation != m_generation) {
+			if (entry.verdict != Verdict::No) {
+				entry.verdict = Verdict::Unknown;
+			}
+			entry.generation = m_generation;
+		}
+		return entry.verdict;
 	}
 
 	[[nodiscard]] bool UsesImplicitDerivatives(const Inst& sample) const {
@@ -575,7 +612,11 @@ private:
 	const Program&                               m_program;
 	const DominatorTree&                         m_dom;
 	const std::unordered_set<const Inst*>*       m_assumed;
-	std::unordered_map<Key, Verdict, KeyHash>    m_memo;
+	std::vector<Frame>                          m_stack;
+	// Per-analysis storage, never shared between shader compilations. Destroy the map first.
+	std::pmr::unsynchronized_pool_resource          m_pool;
+	std::pmr::unordered_map<Key, MemoEntry, KeyHash> m_memo {&m_pool};
+	uint32_t                                       m_generation = 0;
 };
 
 class BranchFacts {
@@ -631,17 +672,18 @@ private:
 	}
 
 	[[nodiscard]] const Block* TargetBlock(uint32_t id) const {
-		for (size_t index = 0; index < m_program.block_info.size(); index++) {
-			if (m_program.block_info[index].id == id) {
-				return index < m_program.blocks.size() ? m_program.blocks[index] : nullptr;
-			}
-		}
-		return nullptr;
+		const auto found = m_block_by_id.find(id);
+		return found != m_block_by_id.end() ? found->second : nullptr;
 	}
 
 	void CollectEdgeFacts() {
 		const auto count = m_program.blocks.size();
 		m_edge_facts.assign(count, {});
+		// The first block with each id, as the former linear search found.
+		for (size_t index = 0; index < m_program.block_info.size(); index++) {
+			m_block_by_id.emplace(m_program.block_info[index].id,
+			                      index < count ? m_program.blocks[index] : nullptr);
+		}
 		for (size_t index = 0; index < count && index < m_program.block_info.size(); index++) {
 			const auto& info = m_program.block_info[index];
 			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
@@ -758,6 +800,7 @@ private:
 	const Program&                                          m_program;
 	const DominatorTree&                                    m_dom;
 	std::vector<std::vector<std::pair<const Inst*, bool>>> m_edge_facts;
+	std::unordered_map<uint32_t, const Block*>              m_block_by_id;
 	std::unordered_map<const Inst*, bool>                   m_facts;
 	std::vector<const Inst*>                                m_undo;
 };
@@ -884,12 +927,15 @@ ExecSelectStats EliminateExecSelects(Program& program, bool per_invocation_branc
 	for (const auto& [inst, condition]: candidates) {
 		assumed.insert(inst);
 	}
-	bool converged = false;
+	bool              converged = false;
+	MaskedUseAnalysis fixpoint(program, dom, &assumed);
 	for (uint32_t pass = 0; pass < MaxFixpointPasses && !converged; pass++) {
-		MaskedUseAnalysis analysis(program, dom, &assumed);
+		if (pass != 0) {
+			fixpoint.KeepObservedVerdicts();
+		}
 		converged = true;
 		for (const auto& [inst, condition]: candidates) {
-			if (assumed.contains(inst) && !analysis.ObservedOnlyUnder(inst, condition)) {
+			if (assumed.contains(inst) && !fixpoint.ObservedOnlyUnder(inst, condition)) {
 				assumed.erase(inst);
 				converged = false;
 			}

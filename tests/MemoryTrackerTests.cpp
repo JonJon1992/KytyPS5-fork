@@ -1377,6 +1377,246 @@ void TestDirtiedLog() {
   Release(memory);
 }
 
+// A fault logs transitions, not the whole fault-ahead window: GPU-owned holes and pages
+// already dirty must not invalidate the BDA epoch again. A partial upload rearms only its pages.
+void TestDirtiedFaultTransitions() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  UploadAll(tracker, address, 8 * page_size);
+  tracker.MarkRegionAsGpuModified(address + 3 * page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address + 6 * page_size, page_size);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  Check(WriteFault(tracker, address + page_size) == 0, "clean fault requested readback");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) &&
+            ranges.Contains(address, 3 * page_size) &&
+            ranges.Contains(address + 4 * page_size, 2 * page_size) &&
+            ranges.Contains(address + 7 * page_size, page_size) &&
+            !ranges.Intersects(address + 3 * page_size, page_size) &&
+            !ranges.Intersects(address + 6 * page_size, page_size),
+        "fault log includes GPU-owned or already CPU-dirty pages");
+  const auto first_epoch = epoch;
+  const auto signature = tracker.RangeSignature(address, 8 * page_size);
+  const auto dirtied = tracker.RangeDirtiedSignature(address, 8 * page_size);
+  ResetProtectionLog();
+  Check(WriteFault(tracker, address + 2 * page_size) == 0 &&
+            MemoryTracker::TakeFaultFoundDirty(), "duplicate fault was not recognized");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch == first_epoch &&
+            tracker.RangeSignature(address, 8 * page_size) == signature &&
+            tracker.RangeDirtiedSignature(address, 8 * page_size) == dirtied &&
+            g_protection_calls == 0 && tracker.HotPageCount() == 1,
+        "duplicate fault changed epochs, protection or hot-page history");
+
+  // A BDA consumer has taken the previous log and uploaded only page 4. A later fault
+  // on page 2 (still dirty, e.g. another watcher) must log and open page 4 again.
+  UploadAll(tracker, address + 4 * page_size, page_size);
+  Check(WriteFault(tracker, address + 2 * page_size) == 0, "partial rearm requested readback");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch != first_epoch && ranges.Size() == 1 &&
+            ranges.Contains(address + 4 * page_size, page_size) &&
+            !ranges.Intersects(address, 4 * page_size) &&
+            !ranges.Intersects(address + 5 * page_size, 3 * page_size) &&
+            tracker.IsRegionCpuModified(address + 4 * page_size, page_size) &&
+            tracker.IsRegionGpuModified(address + 3 * page_size, page_size) &&
+            Protection(memory + 3 * page_size) == PAGE_NOACCESS,
+        "partial rearm missed a dirty transition or disturbed GPU ownership");
+  tracker.UnmarkRegionAsGpuModified(address + 3 * page_size, page_size);
+  tracker.UntrackMemory(address, 8 * page_size);
+  Release(memory);
+}
+
+// Pause a fault at the existing ahead callback while a BDA-style consumer takes its log.
+// Taking the new epoch must make the new dirty mirror visible, or a lock-free clean fast
+// path could consume the notification without uploading its pages and never revisit them.
+void TestFaultLogPublishesDirtyMirror() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 2;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, 2 * TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  const auto before = epoch;
+  std::binary_semaphore published{0};
+  std::binary_semaphore resume{0};
+  std::thread writer([&] {
+    tracker.InvalidateRegionOnWriteFault(address, 1,
+        [] { Check(false, "publication test requested readback"); },
+        [&](uint64_t, uint64_t) noexcept {
+          published.release();
+          resume.acquire();
+        });
+  });
+  published.acquire();
+  const bool complete = tracker.TakeDirtiedRanges(ranges, epoch);
+  bool visible = complete && epoch != before && ranges.Contains(address, 2 * TRACKER_PAGE_SIZE);
+  for (uint64_t page = 0; page < 2; page++) {
+    bool dirty = false;
+    visible &= tracker.QueryCpuDirtyRelaxed(address + page * TRACKER_PAGE_SIZE,
+                                            TRACKER_PAGE_SIZE, dirty) && dirty;
+  }
+  const bool still_protected = !IsWritable(memory) && !IsWritable(memory + TRACKER_PAGE_SIZE);
+  resume.release();
+  writer.join();
+  Check(visible, "BDA consumed a new fault epoch with an old clean mirror");
+  Check(still_protected, "fault log was published after pages became writable");
+  tracker.UntrackMemory(address, 2 * TRACKER_PAGE_SIZE);
+  Release(memory);
+}
+
+void TestDuplicateFaultDeferredProtection() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  auto &pages = harness.page_manager;
+  tracker.EnableDirtiedLog();
+  auto *memory = Allocate(pages, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, 4 * TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  {
+    const PageManager::DeferUnprotectScope deferred;
+    WriteFault(tracker, address);
+    (void)tracker.TakeDirtiedRanges(ranges, epoch);
+    const auto first_epoch = epoch;
+    Check(!IsWritable(memory), "deferred fault protection was applied too soon");
+    WriteFault(tracker, address);
+    Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch == first_epoch,
+          "an in-flight duplicate invalidated the BDA log");
+    // RenderContext's nested-fault path must still open the faulting page before retrying.
+    pages.Reconcile(address, TRACKER_PAGE_SIZE, true);
+    Check(IsWritable(memory), "duplicate fault reconciliation left the page protected");
+    memory[0] = 0x7b;
+  }
+  Check(IsWritable(memory + 3 * TRACKER_PAGE_SIZE), "deferred fault lost its remaining releases");
+  tracker.UntrackMemory(address, 4 * TRACKER_PAGE_SIZE);
+  Release(memory);
+}
+
+void TestDirtiedFaultAcrossRegions() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 256;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto size = 2 * TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(size, Libs::Graphics::TRACKER_REGION_SIZE - TRACKER_PAGE_SIZE);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, size);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  // All the other pages start CPU-dirty and are unmapped. Neither the log nor the
+  // protection calls may widen the two real transitions to the two 1 MiB windows.
+  tracker.InvalidateRegionOnWriteFault(address, size,
+      [] { Check(false, "cross-region CPU fault requested readback"); },
+      [](uint64_t, uint64_t) noexcept { Check(false, "cross-region fault opened extra pages"); });
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Size() == 1 &&
+            ranges.Contains(address, size) && !ranges.Intersects(address - 1, 1) &&
+            !ranges.Intersects(address + size, 1) &&
+            IsWritable(memory) && IsWritable(memory + TRACKER_PAGE_SIZE),
+        "cross-region fault did not coalesce exactly its changed pages");
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+void TestDirtiedFaultLogOverflow() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto size = (16 + 4095 * 2) * TRACKER_PAGE_SIZE;
+  auto *memory = AllocateFixedGuestRange(size, 0);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.MarkRegionAsCpuModified(address, size); // create every region before collecting the log
+  UploadAll(tracker, address, 8 * TRACKER_PAGE_SIZE);
+  tracker.MarkRegionAsGpuModified(address + 3 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  tracker.MarkRegionAsGpuModified(address + 6 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  for (uint64_t i = 0; i < 4095; i++) {
+    tracker.MarkRegionAsCpuModified(address + (16 + i * 2) * TRACKER_PAGE_SIZE,
+                                    TRACKER_PAGE_SIZE);
+  }
+  const auto before = tracker.FaultMutationEpoch();
+  // The three disjoint transitions exceed the cap mid-mask. No partial log may be accepted.
+  WriteFault(tracker, address);
+  Check(!tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() && epoch != before,
+        "fragmented fault overflow was accepted as a complete BDA log");
+  UploadAll(tracker, address + 4 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+  WriteFault(tracker, address);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Size() == 1 &&
+            ranges.Contains(address + 4 * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE),
+        "fault log did not recover after overflow fallback");
+  tracker.UnmarkRegionAsGpuModified(address, 8 * TRACKER_PAGE_SIZE);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+// Synthetic handler work, not OS faults or game frames. No timing assertion: compare the same
+// executable/workload before and after. Each take models a BDA consumer between notifications.
+void BenchmarkDirtiedFaults() {
+  constexpr uint64_t pages = 256;
+  constexpr uint64_t iterations = 20000;
+  std::puts("case,notifications,ns_per_notification,logged_bytes,epoch_changes,protect_calls");
+  for (const bool rearm : {false, true}) {
+    MemoryTracker::FaultPolicy policy;
+    policy.ahead_pages = pages;
+    PolicyHarness harness(policy, true);
+    auto &tracker = harness.tracker;
+    tracker.EnableDirtiedLog();
+    const auto size = pages * TRACKER_PAGE_SIZE;
+    auto *memory = AllocateFixedGuestRange(size, 0);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    UploadAll(tracker, address, size);
+    const auto fault = [&] {
+      tracker.InvalidateRegionOnWriteFault(address, 1,
+          [] { Check(false, "benchmark unexpectedly requested readback"); },
+          [](uint64_t, uint64_t) noexcept {});
+    };
+    fault();
+    RangeSet ranges;
+    uint64_t epoch = 0;
+    (void)tracker.TakeDirtiedRanges(ranges, epoch);
+    const auto first_epoch = epoch;
+    uint64_t logged = 0;
+    ResetProtectionLog();
+    const auto start = std::chrono::steady_clock::now();
+    for (uint64_t i = 0; i < iterations; i++) {
+      if (rearm) UploadAll(tracker, address, TRACKER_PAGE_SIZE);
+      fault();
+      Check(tracker.TakeDirtiedRanges(ranges, epoch), "benchmark log overflowed");
+      ranges.ForEach([&](uint64_t begin, uint64_t end) { logged += end - begin; });
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::printf("%s,%llu,%.2f,%llu,%llu,%llu\n", rearm ? "one-page-rearm" : "duplicate",
+                static_cast<unsigned long long>(iterations), double(ns) / iterations,
+                static_cast<unsigned long long>(logged),
+                static_cast<unsigned long long>(epoch - first_epoch),
+                static_cast<unsigned long long>(g_protection_calls));
+    tracker.UntrackMemory(address, size);
+    Release(memory);
+  }
+}
+
 // KYTY_FAULT_AHEAD_ADAPT's classification of the PC (FaultCost::SlowLevelTracker): five slow
 // periods in a row raise the level, a fast period resets the streak, a slow startup benchmark
 // seeds it, and the level never falls (the larger window makes the calls cheaper again).
@@ -1665,10 +1905,12 @@ bool FaultStressHandler(const Common::HostException::ExceptionInfo &info) {
 // Writer threads store to tracked pages (real faults, resolved as HandleFault does) while an
 // uploader keeps taking the pages back. After the last upload the uploaded copy must equal memory:
 // a write that landed on a page the tracker considered clean would be missing from it.
-void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
+void TestFaultStressNoLostWrites(PageManager::DeferMode mode,
+                                 bool defer_upload_protect = false) {
   PageManager::SetDeferModeForTests(mode);
   MemoryTracker::FaultPolicy policy;
   policy.ahead_pages = 4;
+  policy.defer_upload_protect = defer_upload_protect;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
@@ -1746,11 +1988,12 @@ void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
         "a write was not uploaded: it landed on a page the tracker considered clean");
   Check(stats.verify_mismatches == stats_before.verify_mismatches,
         "verify mode found protection mismatches under the fault stress");
-  std::printf("  fault stress (%s): %llu faults in %.0f ms (writers %.0f ms CPU, %.1f us CPU "
+  std::printf("  fault stress (%s%s): %llu faults in %.0f ms (writers %.0f ms CPU, %.1f us CPU "
               "per fault), %llu uploads, %llu deferred spans, %llu settled, %llu verify checks\n",
               mode == PageManager::DeferMode::Off   ? "deferral off"
               : mode == PageManager::DeferMode::On ? "deferred"
                                                    : "verify",
+              defer_upload_protect ? ", upload protect deferred" : "",
               static_cast<unsigned long long>(faults), wall_ms,
               static_cast<double>(writer_cpu_100ns.load()) / 1e4,
               faults != 0 ? static_cast<double>(writer_cpu_100ns.load()) / 10.0 /
@@ -1859,6 +2102,112 @@ void FaultBench() {
   }
 }
 #endif
+
+// FaultPolicy::defer_upload_protect: a read upload write-protects its pages after the region
+// locks, before upload_func copies them. Inside another DeferProtectScope it does not open its own:
+// the outer scope's end protects them (its caller copies after that, as a batched BDA pass does).
+void TestDeferredUploadProtect() {
+  PageManager::SetDeferModeForTests(PageManager::DeferMode::On);
+  MemoryTracker::FaultPolicy policy;
+  policy.defer_upload_protect = true;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 8);
+  Check(!IsWritable(memory) && !IsWritable(memory + page_size * 7),
+        "deferred upload left pages writable");
+  WriteFault(tracker, address + page_size);
+  WriteFault(tracker, address + page_size * 5);
+  bool writable_while_collecting = false;
+  bool protected_at_copy = false;
+  uint64_t collected = 0;
+  tracker.ForEachUploadRange(
+      address, page_size * 8, false,
+      [&](uint64_t range, uint64_t bytes) noexcept {
+        collected += bytes / page_size;
+        writable_while_collecting =
+            writable_while_collecting || IsWritable(reinterpret_cast<const void *>(range));
+      },
+      [&]() noexcept {
+        protected_at_copy = !IsWritable(memory + page_size) && !IsWritable(memory + page_size * 5);
+      });
+  Check(collected == 2 && writable_while_collecting && protected_at_copy &&
+            !tracker.IsRegionCpuModified(address, page_size * 8),
+        "a deferred read upload was not protected after collecting and before copying");
+
+  // A written upload keeps protecting under its locks (it copies under them).
+  WriteFault(tracker, address + page_size * 2);
+  bool written_protected = false;
+  tracker.ForEachUploadRange(
+      address + page_size * 2, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      [&]() noexcept { written_protected = !IsWritable(memory + page_size * 2); });
+  Check(written_protected, "a written upload copied before its pages were protected");
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 2, page_size);
+
+  // Nested in an outer scope: protected when that scope ends, not before.
+  WriteFault(tracker, address + page_size * 3);
+  bool writable_at_nested_copy = false;
+  {
+    const PageManager::DeferProtectScope outer;
+    tracker.ForEachUploadRange(
+        address, page_size * 8, false, [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept { writable_at_nested_copy = IsWritable(memory + page_size * 3); });
+  }
+  Check(writable_at_nested_copy && !IsWritable(memory + page_size * 3),
+        "a nested upload ended its own scope instead of leaving it to the outer one");
+
+  tracker.UntrackMemory(address, page_size * 8);
+  Release(memory);
+}
+
+// MemoryTracker::SweepHotPages logs (KYTY_BDA_DIRTY_LOG) and publishes exactly the hot pages it
+// demotes: a region whose hot pages all stay hot changes nothing.
+void TestSweepLogsDemotedPagesOnly() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+
+  UploadAll(tracker, address, page_size * 8);
+  WriteFault(tracker, address);
+  WriteFault(tracker, address + page_size * 4);
+  Check(tracker.HotPageCount() == 2, "pages were not promoted for the sweep log");
+  for (int frame = 0; frame < 5; frame++) {
+    tracker.AdvanceFrame();
+  }
+  // Page 0 is visited (recently used); page 4 is idle.
+  (void)UploadHotAware(tracker, address, page_size);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  const auto before = tracker.FaultMutationEpoch();
+  tracker.SweepHotPages(3);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && tracker.HotPageCount() == 1 &&
+            tracker.FaultMutationEpoch() != before &&
+            ranges.Contains(address + page_size * 4, page_size) &&
+            !ranges.Intersects(address, page_size * 4) &&
+            !ranges.Intersects(address + page_size * 5, page_size * 3),
+        "a sweep did not log exactly the page it demoted");
+
+  // Nothing idle: no log entry, no epoch move.
+  (void)UploadHotAware(tracker, address, page_size);
+  const auto quiet = tracker.FaultMutationEpoch();
+  tracker.SweepHotPages(3);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() &&
+            tracker.HotPageCount() == 1 && tracker.FaultMutationEpoch() == quiet,
+        "a sweep that demoted nothing logged a range or moved the epoch");
+
+  tracker.UntrackMemory(address, page_size * 8);
+  Release(memory);
+}
 
 void TestHotPageSettle() {
   MemoryTracker::FaultPolicy policy;
@@ -2881,6 +3230,10 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-dirtied-faults") == 0) {
+    BenchmarkDirtiedFaults();
+    return 0;
+  }
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
@@ -2912,12 +3265,18 @@ int main(int argc, char **argv) {
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
   TestDirtiedLog();
+  TestDirtiedFaultTransitions();
+  TestFaultLogPublishesDirtyMirror();
+  TestDuplicateFaultDeferredProtection();
+  TestDirtiedFaultAcrossRegions();
+  TestDirtiedFaultLogOverflow();
   TestFaultAheadOverride();
   TestSlowLevelTracker();
   TestFaultFoundDirty();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();
+  TestSweepLogsDemotedPagesOnly();
   TestRangeSignature();
   TestRangeDirtiedSignature();
   TestRangeSignatureAcrossRegions();
@@ -2931,6 +3290,7 @@ int main(int argc, char **argv) {
   // Everything above ran with deferred write-unprotect (the default). The fault and upload cases
   // again with it off (the previous synchronous releases) and in verify mode.
   TestDeferredFaultUnprotect();
+  TestDeferredUploadProtect();
   for (const auto mode : {PageManager::DeferMode::Off, PageManager::DeferMode::Verify}) {
     PageManager::SetDeferModeForTests(mode);
     TestRangeInvalidation();
@@ -2948,6 +3308,8 @@ int main(int argc, char **argv) {
                           PageManager::DeferMode::Verify}) {
     TestFaultStressNoLostWrites(mode);
   }
+  // FaultPolicy::defer_upload_protect: uploads racing the writers' faults lose no write either.
+  TestFaultStressNoLostWrites(PageManager::DeferMode::On, true);
 #endif
   Check(PageManager::GetDeferStats().verify_mismatches == 0,
         "verify mode found protection mismatches");

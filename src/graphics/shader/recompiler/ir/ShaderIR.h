@@ -23,6 +23,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+inline constexpr uint32_t SharedApertureHigh = 0x80000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -69,6 +72,9 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// Formatted D16 buffer access (MUBUF *_FORMAT_D16_*): each component travels as 16 bits in
+	// the low half of its dword, a half float for float/normalized/scaled formats.
+	bool d16 = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
@@ -136,6 +142,7 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -153,6 +160,8 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	bool     bindless              = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -514,15 +523,30 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		// Bytes between the T#s of consecutive keys. Bindless tables may embed the T# in larger
+		// records (Ghost of Yotei: 440-byte material records); the other kinds are 32-byte T# arrays.
+		uint32_t record_stride   = 32;
 		Value    key_count;
 		Value    selector_mask;
+		bool     bindless = false;
+		// Bindless r128 images whose record holds only the 4-dword T#: the host reads dwords 4..7
+		// as zero, as the shader does (Ghost of Yotei cs 0x34be6ffcc212383c, 872-byte records).
+		bool     compact  = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
+	struct BindlessSampler {
+		uint32_t table_offset  = 0;
+		// Bytes between the S#s of consecutive keys: 16 for S# arrays, more when each record
+		// carries its own sampler next to its T#.
+		uint32_t record_stride = 16;
+		bool operator==(const BindlessSampler&) const = default;
+	};
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectImage> indirect_image;
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -705,7 +729,7 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>                     value_storage;
+	std::list<Inst, IrAllocator<Inst>> value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
@@ -731,6 +755,8 @@ struct ResourcePlan {
 	bool                                has_address_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	bool                                bindless_images = false;
+	bool                                bindless_samplers = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// Dense memo slot count. Unsealed programs still grow it lazily while evaluating;

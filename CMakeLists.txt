@@ -21,6 +21,13 @@ foreach(lang IN ITEMS C CXX)
         if(SCCACHE_PROGRAM)
             set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
             message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM AND (CMAKE_${lang}_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR
+                                   CMAKE_${lang}_COMPILER_ID STREQUAL "MSVC"))
+            # ccache with clang-cl (or cl) and Ninja hands Ninja no header dependencies
+            # (`ninja -t deps` shows "#deps 0"): editing a header then rebuilds nothing that
+            # includes it, and a changed class layout links old and new objects together.
+            message(STATUS "ccache not used for ${lang}: it breaks header dependencies with an "
+                           "MSVC-style compiler (set CMAKE_${lang}_COMPILER_LAUNCHER to force it)")
         elseif(CCACHE_PROGRAM)
             set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
             message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
@@ -331,6 +338,12 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/loader/*.h"
 )
 
+# Program cache preload catches thread-start failures while scanning cached records.
+if(LINUX)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
 set(gpu_tiler_shader_dir "${KYTY_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
@@ -481,6 +494,23 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Guest SET_PREDICATION on the GPU (renderer/gpuPredication.h): 64-bit guest predicate -> the
+# 32-bit word VK_EXT_conditional_rendering reads.
+set(gpu_predicate_source "${gpu_tiler_shader_dir}/gpu_predicate.comp")
+set(gpu_predicate_spv "${gpu_mesh_generated_dir}/gpu_predicate.spv")
+set(gpu_predicate_header "${gpu_mesh_generated_dir}/gpu_predicate_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_predicate_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_predicate_spv}" "${gpu_predicate_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_predicate_spv} -DOUTPUT=${gpu_predicate_header}
+	        -DSYMBOL=GPU_PREDICATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_predicate_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_predicate_header}")
+
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
 # a program produces. src/codegen_version.cmake fails the build when one of them includes a
@@ -592,6 +622,18 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+file(GLOB shader_function_decode_sources CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp")
+add_executable(shader_function_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderFunctionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+	${shader_function_decode_sources})
+target_link_libraries(shader_function_tests common fmt::fmt xxhash)
+target_include_directories(shader_function_tests PRIVATE ${inc_headers})
+
+add_executable(buffer_robustness_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BufferRobustnessTests.cpp")
+target_include_directories(buffer_robustness_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
@@ -678,6 +720,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(htile_slice_state_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HtileSliceStateTests.cpp"
+)
+target_include_directories(htile_slice_state_tests PRIVATE ${inc_headers})
+
 # KYTY_FUNCTION_ARRAY_SHRINK: the SPIR-V pass that shrinks Function-storage arrays to their proven
 # index bound (graphics/host_gpu/spirvLocalArrays.h).
 add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
@@ -691,9 +738,32 @@ add_executable(spirv_cache_salt_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SpirvC
 target_link_libraries(spirv_cache_salt_tests spirv-tools)
 target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 
+add_executable(spirv_optimizer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvOptimizerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvOptimizer.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
+)
+target_link_libraries(spirv_optimizer_tests spirv-tools-opt spirv-tools)
+target_include_directories(spirv_optimizer_tests PRIVATE ${inc_headers})
+
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+add_executable(pipeline_lookup_memo_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineLookupMemoTests.cpp")
+target_include_directories(pipeline_lookup_memo_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(pipeline_vertex_input_state_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineVertexInputStateTests.cpp")
+target_include_directories(pipeline_vertex_input_state_tests PRIVATE ${inc_headers})
+target_link_libraries(pipeline_vertex_input_state_tests PRIVATE Vulkan::Headers)
+
+add_executable(pipeline_cold_cache_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineColdCacheTests.cpp")
+target_include_directories(pipeline_cold_cache_tests PRIVATE ${inc_headers})
+target_link_libraries(pipeline_cold_cache_tests PRIVATE Vulkan::Headers)
+
+# CPU-only mechanism benchmark; excluded from the test suite and the normal build.
+add_executable(pipeline_lookup_benchmark EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_pipeline_lookup.cpp")
+target_include_directories(pipeline_lookup_benchmark PRIVATE ${inc_headers} "${KYTY_THIRD_PARTY_DIR}/xxHash")
+target_link_libraries(pipeline_lookup_benchmark PRIVATE Vulkan::Headers xxhash)
 # Shader precompile (KYTY_SHADER_PRECOMPILE): the journal file and the replay driver.
 add_executable(shader_precompile_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderPrecompileTests.cpp"
@@ -713,6 +783,10 @@ target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
 # KYTY_VRAM_GC_BUDGET: the budget-relative collection marks (graphics/host_gpu/vramBudget.h).
 add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
 target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(bda_hot_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaHotRangesTests.cpp")
+target_link_libraries(bda_hot_ranges_tests common)
+target_include_directories(bda_hot_ranges_tests PRIVATE ${inc_headers})
 
 # Device-capability choices for AMD, Intel and older NVIDIA GPUs (graphics/host_gpu/deviceCompat.h).
 add_executable(device_compat_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceCompatTests.cpp")
@@ -830,6 +904,9 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+# sceAjm: ATRAC9 config descriptions (Ghost of Yotei 12-channel streams).
+add_kyty_full_emulator_test(ajm_tests "${KYTY_TESTS_DIR}/AjmTests.cpp")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -919,6 +996,43 @@ add_executable(binding_path_tests EXCLUDE_FROM_ALL
 target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
 target_include_directories(binding_path_tests PRIVATE ${inc_headers})
 
+# Tile addressing (guest_gpu/tile.cpp) against maps and mip fetches measured on PS5 hardware.
+add_executable(tile_hardware_reference_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileHardwareReferenceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+)
+target_link_libraries(tile_hardware_reference_tests common fmt::fmt)
+target_include_directories(tile_hardware_reference_tests PRIVATE ${inc_headers})
+
+add_executable(tile_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileSizeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp")
+target_link_libraries(tile_size_tests PRIVATE common fmt::fmt)
+target_include_directories(tile_size_tests PRIVATE ${inc_headers})
+
+add_library(tile_size_counted_format OBJECT "${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp")
+set_target_properties(tile_size_counted_format PROPERTIES EXCLUDE_FROM_ALL TRUE)
+target_link_libraries(tile_size_counted_format PRIVATE common fmt::fmt)
+target_include_directories(tile_size_counted_format PRIVATE ${inc_headers})
+target_compile_definitions(tile_size_counted_format PRIVATE NumBytesPerElement=TileSizeUncachedNumBytesPerElement)
+add_executable(tile_size_reuse_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileSizeReuseTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	$<TARGET_OBJECTS:tile_size_counted_format>)
+target_link_libraries(tile_size_reuse_tests PRIVATE common fmt::fmt)
+target_include_directories(tile_size_reuse_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(tile_size_reuse_tests PRIVATE Threads::Threads)
+endif()
+
+add_executable(pm4_dump_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Pm4DumpTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/pm4.cpp")
+target_link_libraries(pm4_dump_tests PRIVATE common fmt::fmt)
+target_include_directories(pm4_dump_tests PRIVATE ${inc_headers})
+
 # CP recorder command stream (renderer/commandStream.h): ring, encoder, replay and verify mode,
 # without a Vulkan device (KYTY_CP_RECORDER).
 add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
@@ -927,8 +1041,20 @@ add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(cp_recorder_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(cp_recorder_tests PRIVATE ${inc_headers})
+target_compile_definitions(cp_recorder_tests PRIVATE KYTY_COMMAND_STREAM_TEST_HASH_COUNTS=1)
+
+# Uses the production stream flags, without the unit-test hash counter.
+add_executable(cp_recorder_benchmark EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpRecorderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp")
+target_link_libraries(cp_recorder_benchmark PRIVATE common fmt::fmt Vulkan::Headers)
+target_include_directories(cp_recorder_benchmark PRIVATE ${inc_headers})
+
+add_executable(command_pool_reuse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommandPoolReuseTests.cpp")
+target_include_directories(command_pool_reuse_tests PRIVATE "${KYTY_SOURCE_DIR}")
 if(LINUX)
 	target_link_libraries(cp_recorder_tests Threads::Threads)
+	target_link_libraries(cp_recorder_benchmark PRIVATE Threads::Threads)
 endif()
 
 # P3 op stream (command_processor/cpOps.h): every op kind through the op ring, wrap-around and a
@@ -969,18 +1095,86 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(repeat_trace_tests "${KYTY_TESTS_DIR}/RepeatTraceTests.cpp")
+add_kyty_full_emulator_test(http_wait_request_tests "${KYTY_TESTS_DIR}/HttpWaitRequestTests.cpp")
+add_executable(av_player_sync_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerSyncTests.cpp")
+target_include_directories(av_player_sync_tests PRIVATE "${KYTY_SOURCE_DIR}")
+# APR host file handle pool (libs/aprHostFilePool.h): bookkeeping, content under concurrency, and
+# (with --bench) the cost of an open per read against a pooled handle.
+add_executable(apr_host_file_pool_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AprHostFilePoolTests.cpp")
+target_link_libraries(apr_host_file_pool_tests common)
+target_include_directories(apr_host_file_pool_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(apr_host_file_pool_tests Threads::Threads)
+endif()
+# Once-only GPU loss report (graphics/host_gpu/deviceLostReport.h): header-only, no Vulkan.
+add_executable(device_lost_report_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceLostReportTests.cpp")
+target_include_directories(device_lost_report_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX)
+	target_link_libraries(device_lost_report_tests Threads::Threads)
+endif()
+# Search for a faulting GPU address in memory (kernel/pointerScan.h): header-only, no OS types.
+add_executable(pointer_scan_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PointerScanTests.cpp")
+target_include_directories(pointer_scan_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+# Bounded, once-only emergency cache save; no Vulkan device or game needed.
+add_executable(emergency_save_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EmergencySaveTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/subsystems.cpp")
+target_include_directories(emergency_save_tests PRIVATE "${KYTY_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(LINUX)
+	target_link_libraries(emergency_save_tests Threads::Threads)
+endif()
+
+add_executable(program_cache_emergency_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramCacheEmergencyTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp")
+target_link_libraries(program_cache_emergency_tests common xxhash)
+target_include_directories(program_cache_emergency_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(program_cache_emergency_tests Threads::Threads)
+endif()
+
+add_executable(program_cache_preload_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramCachePreloadTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp")
+target_link_libraries(program_cache_preload_tests common xxhash)
+target_include_directories(program_cache_preload_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(program_cache_preload_tests Threads::Threads)
+endif()
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests pipeline_compile_queue_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME http_wait_request COMMAND $<TARGET_FILE:http_wait_request_tests>)
+	add_test(NAME av_player_sync COMMAND $<TARGET_FILE:av_player_sync_tests>)
+	add_test(NAME apr_host_file_pool COMMAND $<TARGET_FILE:apr_host_file_pool_tests>)
+	add_test(NAME device_lost_report COMMAND $<TARGET_FILE:device_lost_report_tests>)
+	add_test(NAME pointer_scan COMMAND $<TARGET_FILE:pointer_scan_tests>)
+	add_test(NAME emergency_save COMMAND $<TARGET_FILE:emergency_save_tests>)
+	set_tests_properties(emergency_save PROPERTIES TIMEOUT 10)
+	add_test(NAME program_cache_emergency COMMAND $<TARGET_FILE:program_cache_emergency_tests>)
+	set_tests_properties(program_cache_emergency PROPERTIES TIMEOUT 15)
+	add_test(NAME program_cache_preload COMMAND $<TARGET_FILE:program_cache_preload_tests>)
+	add_test(NAME buffer_robustness COMMAND $<TARGET_FILE:buffer_robustness_tests>)
+	add_test(NAME amd_buffer_bounds
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --robust-buffer-loads-only)
+	set_tests_properties(amd_buffer_bounds PROPERTIES
+		ENVIRONMENT "KYTY_AMD_BUFFER_BOUNDS=1;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_LIBRARY=0"
+		SKIP_REGULAR_EXPRESSION "AMD bounds pilot unavailable or disabled")
+	add_test(NAME amd_buffer_bounds_regressions
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --amd-buffer-bounds-regressions-only)
+	set_tests_properties(amd_buffer_bounds_regressions PROPERTIES
+		ENVIRONMENT "KYTY_AMD_BUFFER_BOUNDS=1;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_LIBRARY=0")
+	set_tests_properties(program_cache_preload PROPERTIES TIMEOUT 30)
+	set_tests_properties(http_wait_request PROPERTIES TIMEOUT 10)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -1006,6 +1200,18 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_frontend_optimization
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --frontend-optimization-only)
+	add_test(NAME wolverine_instructions_cpu
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --wolverine-instructions-only)
+	add_test(NAME wolverine_bindless_cpu
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --bindless-only)
+	add_test(NAME wolverine_instruction_fixtures_cpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-instructions-codegen-only)
+	add_test(NAME shader_functions COMMAND $<TARGET_FILE:shader_function_tests>)
+	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
+	add_test(NAME shader_cfg_post_dominators
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --post-dominators-only)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_on PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
@@ -1022,8 +1228,16 @@ if(BUILD_TESTING)
 	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
+	add_test(NAME tile_hardware_reference COMMAND $<TARGET_FILE:tile_hardware_reference_tests>)
+	add_test(NAME tile_size COMMAND $<TARGET_FILE:tile_size_tests>)
+	add_test(NAME tile_size_reuse COMMAND $<TARGET_FILE:tile_size_reuse_tests>)
+	set_tests_properties(tile_size_reuse PROPERTIES TIMEOUT 30)
+	add_test(NAME pm4_dump COMMAND $<TARGET_FILE:pm4_dump_tests>)
+	set_tests_properties(tile_size pm4_dump PROPERTIES TIMEOUT 30)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
+	add_test(NAME command_pool_reuse COMMAND $<TARGET_FILE:command_pool_reuse_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
+	set_tests_properties(cp_recorder command_pool_reuse cp_sequencer PROPERTIES TIMEOUT 30)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
@@ -1032,6 +1246,10 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME page_manager_protect_reuse COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME memory_tracker_protect_reuse COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	set_tests_properties(page_manager_protect_reuse memory_tracker_protect_reuse PROPERTIES
+		ENVIRONMENT "KYTY_PAGE_PROTECT_REUSE=1" TIMEOUT 60)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -1058,9 +1276,22 @@ if(BUILD_TESTING)
 	add_test(NAME dispatcher_cap
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME htile_slice_state COMMAND $<TARGET_FILE:htile_slice_state_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
+	add_test(NAME spirv_optimizer COMMAND $<TARGET_FILE:spirv_optimizer_tests>)
+	add_test(NAME spirv_optimizer_default COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-enabled)
+	set_tests_properties(spirv_optimizer_default PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=")
+	add_test(NAME spirv_optimizer_off COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-disabled)
+	set_tests_properties(spirv_optimizer_off PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=0")
+	add_test(NAME spirv_optimizer_on COMMAND $<TARGET_FILE:spirv_optimizer_tests> --expect-enabled)
+	set_tests_properties(spirv_optimizer_on PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=1")
+	add_test(NAME spirv_optimizer_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --spirv-optimization-only)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME pipeline_cold_cache COMMAND $<TARGET_FILE:pipeline_cold_cache_tests>)
+	add_test(NAME pipeline_lookup_memo COMMAND $<TARGET_FILE:pipeline_lookup_memo_tests>)
+	add_test(NAME pipeline_vertex_input_state COMMAND $<TARGET_FILE:pipeline_vertex_input_state_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
 	add_test(NAME shader_precompile COMMAND $<TARGET_FILE:shader_precompile_tests>)
 	set_tests_properties(shader_precompile PROPERTIES TIMEOUT 60)
@@ -1088,6 +1319,7 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=128"
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
+	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
 	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -1107,6 +1339,7 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME ajm COMMAND $<TARGET_FILE:ajm_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -1160,6 +1393,9 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	# SRT readiness over a render target the CPU overwrote (Crash 4, KYTY_DCC_GPU=1 EXIT).
+	add_test(NAME cpu_overwritten_image
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-overwritten-image-only)
 	# KYTY_OCCLUSION_BATCH: the batch reduction shader against the per-dump reduction, and the
 	# scheduler's pre-submit hook it flushes from.
 	add_test(NAME occlusion_batch
@@ -1189,10 +1425,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
+	add_test(NAME texture_cache_null_image_init
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --null-image-init-only)
+	add_test(NAME fragment_subgroup_size
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fragment-subgroup-only)
+	set_tests_properties(fragment_subgroup_size PROPERTIES TIMEOUT 30)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
+	add_test(NAME texture_cache_htile_high_slices
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-slices-only)
 	add_test(NAME cpu_copy_page_skip_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	add_test(NAME cpu_copy_page_skip_alias_bytes
@@ -1210,6 +1453,19 @@ if(BUILD_TESTING)
 	set_tests_properties(draw_prep_code_cert_bytes PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP_CODE_DIGEST=0")
 	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
+	set(buffer_upload_test_env "KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_HOT_PAGES=1;KYTY_HOT_PAGE_FRAMES=2;KYTY_HOT_PAGE_CHECK_LIMIT=0;KYTY_HOT_PAGE_QUIET_FRAMES=1000;KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
+	foreach(upload_batch IN ITEMS 0 1)
+		add_test(NAME buffer_upload_coalesce_batch${upload_batch}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)
+		set_tests_properties(buffer_upload_coalesce_batch${upload_batch} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "${buffer_upload_test_env};KYTY_UPLOAD_BATCH=${upload_batch}")
+	endforeach()
+	foreach(merge_hot IN ITEMS 0 1)
+		add_test(NAME bda_hot_ranges_gpu_merge${merge_hot}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)
+		set_tests_properties(bda_hot_ranges_gpu_merge${merge_hot} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "${buffer_upload_test_env};KYTY_UPLOAD_BATCH=1;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_HOT_RANGES_MERGE=${merge_hot};KYTY_BDA_HOT_SYNC_VERIFY=exit;KYTY_BDA_DIRTY_LOG_VERIFY=exit;KYTY_PAGE_PROTECT_REUSE=1")
+	endforeach()
 	add_test(NAME buffer_range_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	add_test(NAME buffer_range_memo_verify
@@ -1235,6 +1491,79 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_locked_queries PROPERTIES
 		ENVIRONMENT "KYTY_TRACKER_RELAXED_QUERIES=0")
+	# Real PM4 ordering points and RELEASE_MEM/WAIT_REG_MEM64, including the threaded resolver.
+	foreach(lane IN ITEMS direct inline threaded completion)
+		set(guest_sync_seq off)
+		set(guest_sync_recorder 0)
+		set(guest_sync_submission sync)
+		set(guest_sync_label record)
+		if(lane STREQUAL inline)
+			set(guest_sync_seq inline)
+		elseif(lane STREQUAL threaded OR lane STREQUAL completion)
+			set(guest_sync_seq 1)
+			set(guest_sync_recorder 1)
+			set(guest_sync_submission queued)
+		endif()
+		if(lane STREQUAL completion)
+			set(guest_sync_label completion)
+		endif()
+		add_test(NAME guest_sync_${lane}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-sync-only)
+		set_tests_properties(guest_sync_${lane} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "KYTY_SYNC_EPOCH=1;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_SYNC_EPOCH=1;KYTY_BDA_SYNC_EPOCH_VERIFY=0;KYTY_CP_SEQ_VERIFY=0;KYTY_LABEL_MODE=${guest_sync_label};KYTY_CP_RECORDER=${guest_sync_recorder};KYTY_CP_SEQ=${guest_sync_seq};KYTY_SUBMISSION_MODE=${guest_sync_submission}")
+	endforeach()
+
+	# BDA passes after buffers registered between them (new buffer, grown/joined buffer): contents
+	# only, so it holds for any pass strategy. Default and as the product runs (incremental).
+	add_test(NAME bda_new_buffer
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	add_test(NAME bda_new_buffer_incremental
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_incremental PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	# KYTY_BDA_NEW_BUFFER_SYNC: new buffers synchronized alone, no full scan; the verify run follows
+	# every dirty-log pass with the full scan it replaced and exits on a page it missed.
+	add_test(NAME bda_new_buffer_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_sync PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1")
+	add_test(NAME bda_new_buffer_sync_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_sync_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+	# KYTY_BDA_BATCH_PROTECT: the dirty-log pass collects, protects once, then copies. Contents
+	# checked on the GPU; the verify run also follows each dirty-log pass with a full scan.
+	add_test(NAME bda_new_buffer_batch_protect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_batch_protect PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_BATCH_PROTECT=1")
+	add_test(NAME bda_new_buffer_batch_protect_sync_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+	set_tests_properties(bda_new_buffer_batch_protect_sync_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+	# The live override alternates off/on/inherit on one cache and checks real protection
+	# batches and GPU bytes; clearing the override restores either per-instance startup option.
+	foreach(batch_protect_startup IN ITEMS 0 1)
+		add_test(NAME bda_new_buffer_batch_protect_live${batch_protect_startup}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+		set_tests_properties(bda_new_buffer_batch_protect_live${batch_protect_startup} PROPERTIES
+			TIMEOUT 60
+			ENVIRONMENT "KYTY_TEST_BDA_BATCH_PROTECT_LIVE=1;KYTY_BDA_BATCH_PROTECT=${batch_protect_startup};KYTY_BDA_BATCH_PROTECT_OVERRIDE=;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0")
+	endforeach()
+	# Exercise the new-buffer upload before an otherwise valid epoch/submission skip, and mapping
+	# invalidation while a native buffer survives. The fixture checks real GPU contents.
+	foreach(bda_case same_epoch same_submission remap)
+		add_test(NAME bda_new_buffer_${bda_case}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-new-buffer-only)
+		set(bda_case_env "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_NEW_BUFFER_SYNC=1;KYTY_TEST_BDA_SAME_EPOCH=1")
+		if(bda_case STREQUAL same_submission)
+			list(APPEND bda_case_env "KYTY_BDA_SYNC_EPOCH=0" "KYTY_BDA_SYNC_PER_SUBMISSION=1")
+		elseif(bda_case STREQUAL remap)
+			list(APPEND bda_case_env "KYTY_TEST_BDA_REMAP=1" "KYTY_BDA_DIRTY_LOG_VERIFY=exit")
+		endif()
+		set_tests_properties(bda_new_buffer_${bda_case} PROPERTIES
+			TIMEOUT 60 ENVIRONMENT "${bda_case_env}")
+	endforeach()
 	# KYTY_BDA_SYNC_EPOCH: default, with incremental synchronization (as the product runs), verify
 	# mode (it needs the fault epoch of incremental synchronization), off.
 	add_test(NAME bda_sync_epoch
@@ -1385,6 +1714,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
 	add_test(NAME wave_reductions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	# Wave32 vertex/LS/domain shaders in 64-lane host subgroups run as two guest waves
+	# (KYTY_DEBUG_WAVE_HALVES), and V_READLANE/V_PERMLANE(X)16 read unlaunched lanes as the highest
+	# launched lane below (BryanKAdams/KytyPS5 8f02ad19, 067e8826); VulkanHarness(false).
+	add_test(NAME wave_halves
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-halves-only)
 	# KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): the row reductions with the fold off and on (the
 	# S_ORN2_SAVEEXEC work-list shape among them), and wave64 mask logic folded without growing.
 	add_test(NAME fold_lane_masks_codegen
@@ -1884,6 +2218,22 @@ if(BUILD_TESTING)
 	# stay in the build directory, so later runs start warm).
 	add_test(NAME program_cache
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	add_test(NAME async_pipeline
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=20;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_memo_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_memo_off PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_PIPELINE_MEMO=0;KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=20;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_wait_publication
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_wait_publication PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=1000;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=1;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
+	add_test(NAME async_pipeline_wait_zero
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-pipeline-only)
+	set_tests_properties(async_pipeline_wait_zero PROPERTIES TIMEOUT 90
+		ENVIRONMENT "KYTY_ASYNC_PIPELINES=1;KYTY_ASYNC_PIPELINE_WAIT_MS=0;KYTY_TEST_ASYNC_PIPELINE_PUBLISH_DURING_WAIT=0;KYTY_PIPELINE_LIBRARY=0;KYTY_PROGRAM_CACHE=0;KYTY_PIPELINE_CACHE_SAVE=0;KYTY_DRAW_PREP=off")
 	add_test(NAME program_cache_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
 	add_test(NAME program_cache_gpu_verify
@@ -2036,9 +2386,25 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		tile_size_tests pm4_dump_tests
+		tile_size_reuse_tests
+		command_pool_reuse_tests
+		pipeline_cold_cache_tests
+		pipeline_lookup_memo_tests
+		pipeline_vertex_input_state_tests
+		buffer_robustness_tests
+		http_wait_request_tests
+		av_player_sync_tests
+		apr_host_file_pool_tests
+		device_lost_report_tests
+		pointer_scan_tests
+		emergency_save_tests
+		program_cache_emergency_tests
+		program_cache_preload_tests
 		hang_watchdog_tests
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_function_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		image_clear_range_tests
@@ -2050,9 +2416,12 @@ if(BUILD_TESTING)
 		lod_stats_report_tests
 		game_patch_filter_tests
 		lru_cache_tests
+		htile_slice_state_tests
 		spirv_local_arrays_tests
+		spirv_optimizer_tests
 		pipeline_fast_first_tests
 		vram_budget_tests
+		bda_hot_ranges_tests
 		device_compat_tests
 		shader_precompile_tests
 		shader_vertex_metadata_tests

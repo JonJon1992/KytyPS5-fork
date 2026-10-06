@@ -46,6 +46,12 @@ RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
 
 struct GraphicContext {
+    bool bindless_supported = false;
+    bool bindless_enabled = false;
+    uint32_t bindless_images_per_array = 0;
+    uint32_t bindless_samplers_per_array = 0;
+    vk::DescriptorSetLayout bindless_layout = nullptr;
+    vk::DescriptorSet bindless_set = nullptr;
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
@@ -90,6 +96,9 @@ struct GraphicContext {
 	// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_creation_cache_control_enabled = false;
+	// VK_EXT_conditional_rendering, enabled only for KYTY_PREDICATION_MODE=gpu
+	// (renderer/gpuPredication.h).
+	bool                               conditional_rendering_enabled         = false;
 	// KYTY_BDA_PAGETABLE_SPARSE=1: sparseBinding + sparseResidencyBuffer enabled, unbound buffer
 	// ranges read as zero (residencyNonResidentStrict) and queue_family can bind sparse memory.
 	bool                               sparse_residency_buffer_enabled       = false;
@@ -202,6 +211,16 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+
+	struct HeapUsage {
+		uint64_t usage            = 0; // Whole process, as reported by VK_EXT_memory_budget.
+		uint64_t budget           = 0;
+		uint64_t size             = 0;
+		uint64_t allocation_bytes = 0; // Allocated through VMA.
+		uint32_t allocations      = 0;
+		bool     device_local     = false;
+	};
+	[[nodiscard]] std::vector<HeapUsage> GetHeapUsage() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 	// KYTY_VRAM_STATS report lines (vramStats.h): VMA heaps, allocation kinds, native image pool.
