@@ -7,9 +7,18 @@
 # diagnostic switch cannot reach a launcher run; a plain ./kyty_run.sh keeps the switch but skips
 # the preset (no program cache, no pipeline prefetch, the slow default renderer paths).
 #
-# Usage: tools/run-u59.sh [KYTY_X=value ...] 2>&1 | tee run.log
+# Usage: tools/run-u59.sh [--game <eboot.bin>] [KYTY_X=value ...] 2>&1 | tee run.log
+#   The emulator arguments come from kyty_run.sh, which the launcher rewrites for the last game it
+#   started; --game replaces the game so the run does not depend on that.
 #   KYTY_RUN_DIR selects the install directory (default: _Build/linux-clang/install).
 set -euo pipefail
+
+game=
+if [[ ${1:-} == --game ]]; then
+	game=${2:?--game needs a path}
+	[[ -f $game ]] || { echo "no such game file: $game" >&2; exit 1; }
+	shift 2
+fi
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
 dir=${KYTY_RUN_DIR:-$repo/_Build/linux-clang/install}
@@ -34,6 +43,21 @@ for pair in "$@"; do
 	export "${pair?}"
 done
 
-echo "run-u59: $(env | grep -c '^KYTY_') KYTY_ variables; build $(strings "$dir/kyty_emulator" | grep -m1 -E '^[0-9a-f]{8}$' || echo unknown)" >&2
+# The emulator command line of kyty_run.sh (its first quoted line), with --game replaced.
+mapfile -t command < <(python3 -c '
+import shlex, sys
+line = next(l for l in open(sys.argv[1]) if l.startswith("\x27"))
+args = shlex.split(line)
+if sys.argv[2]:
+    if "--game" not in args:
+        sys.exit("kyty_run.sh has no --game argument")
+    args[args.index("--game") + 1] = sys.argv[2]
+print("\n".join(args))
+' "$dir/kyty_run.sh" "$game")
+game_index=-1
+for index in "${!command[@]}"; do
+	[[ ${command[$index]} == --game ]] && game_index=$((index + 1))
+done
+echo "run-u59: $(env | grep -c '^KYTY_') KYTY_ variables; build $(strings "$dir/kyty_emulator" | grep -m1 -E '^[0-9a-f]{8}$' || echo unknown); game ${command[$game_index]:-?}" >&2
 cd "$dir"
-exec ./kyty_run.sh
+exec "${command[@]}"
