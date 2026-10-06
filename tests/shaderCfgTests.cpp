@@ -13084,19 +13084,18 @@ void TestRenderTargetReverseExportMapping() {
   Check(standard_1555.format == vk::Format::eR5G5B5A1UnormPack16 &&
             standard_1555.export_mapping == Prospero::ColorMappingAbgr,
         "1:5:5:5 render target did not preserve its low one-bit component");
-  // Ghost of Yotei renders to 11:11:10 UNORM, which Vulkan lacks: it is stored like the packed
-  // float layout (same element size and channels).
+  // Ghost of Yotei renders to 11:11:10 UNORM, which Vulkan lacks: it is stored as 10:10:10:2
+  // UNORM (same element size, fixed point that saturates at 1.0), its colors in the standard order.
   const auto unorm_111110 = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kUNorm,
       Prospero::ChannelOrder::kStandard);
   const auto float_111110 = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
       Prospero::ChannelOrder::kStandard);
-  Check(unorm_111110.format == vk::Format::eB10G11R11UfloatPack32 &&
+  Check(unorm_111110.format == vk::Format::eA2B10G10R10UnormPack32 &&
             unorm_111110.bytes_per_element == 4u &&
-            unorm_111110.format == float_111110.format &&
             unorm_111110.export_mapping == float_111110.export_mapping,
-        "11:11:10 UNORM render target did not use the packed 11:11:10 storage");
+        "11:11:10 UNORM render target did not use 10:10:10:2 UNORM storage");
 
   const auto argb = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,

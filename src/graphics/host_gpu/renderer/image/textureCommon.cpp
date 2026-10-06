@@ -135,8 +135,8 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 			    encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm &&
 			    !logged.exchange(true)) {
 				Log::WriteToConsoleAndLog(
-				    "Render target 11_11_10 UNORM: approximated with B10G11R11 UFLOAT (Vulkan has "
-				    "no 11_11_10 UNORM format; colors are stored as floats, not fixed point)\n");
+				    "Render target 11_11_10 UNORM: approximated with A2B10G10R10 UNORM (Vulkan has "
+				    "no 11_11_10 UNORM format; 10-bit red and green)\n");
 			}
 			const auto order_mapping =
 			    kRenderTargetColorMappings[static_cast<size_t>(order)][encoding.components - 1u];
