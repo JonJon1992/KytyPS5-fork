@@ -2152,6 +2152,9 @@ struct PipelineCache::ProgramCache {
 		     .plain_mip_stats_variant = options.plain_mip_stats_variant,
              .bindless_images = options.bindless_images,
              .bindless_samplers = options.bindless_samplers,
+		     .bindless_strided_compute =
+		         key.stage == ShaderType::Compute && options.bindless_images &&
+		         ShaderRecompiler::BindlessStridedComputeApplies(key.hash),
 		     .code                    = code_words,
 		     .back_code               = back_code_words},
 		    disk_key);

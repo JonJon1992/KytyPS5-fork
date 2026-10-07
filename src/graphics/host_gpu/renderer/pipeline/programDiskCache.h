@@ -84,6 +84,10 @@ public:
 		bool                      plain_mip_stats_variant = false;
 		bool bindless_images = false;
 		bool bindless_samplers = false;
+		// Records in T# tables of any stride for this compute shader
+		// (ShaderRecompiler::BindlessStridedComputeApplies): per shader, so changing the list
+		// only invalidates the shaders it moves.
+		bool bindless_strided_compute = false;
 		std::span<const uint32_t> code;
 		std::span<const uint32_t> back_code;
 	};

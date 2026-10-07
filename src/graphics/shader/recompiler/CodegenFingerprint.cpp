@@ -83,11 +83,8 @@ std::vector<uint8_t> CodegenFingerprint() {
 		b.U64(hash);
 	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
-	b.U8(options.bindless_strided_compute ? 1u : 0u);
-	b.U32(static_cast<uint32_t>(options.bindless_strided_compute_shaders.size()));
-	for (const auto hash: options.bindless_strided_compute_shaders) {
-		b.U64(hash);
-	}
+	// bindless_strided_compute(_shaders) is keyed per compute shader by the program disk cache's
+	// source key instead (ProgramDiskCache::SourceKeyInputs::bindless_strided_compute).
 	b.U8(options.runtime_buffer_stride ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
