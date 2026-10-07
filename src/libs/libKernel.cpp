@@ -2561,17 +2561,21 @@ static uint64_t FiberGuestStackBelow() {
 	return below;
 }
 
-// The stacks fibers run on, by fiber object: one initialized again without sceFiberFinalize gives
-// its old stack back first.
+// The stacks fibers run on, by fiber object: one initialized again without sceFiberFinalize keeps
+// its stack when the size is the same and gives it back first otherwise.
 static std::mutex                                                             g_fiber_stack_mutex;
 static std::unordered_map<const FiberObject*, std::pair<uint64_t, uint64_t>> g_fiber_stacks;
 
-static void FiberUnmapStack(const FiberObject* fiber) {
+// Gives back the stack of `fiber`; with `only_stack`, only if it is still that one (the object may
+// have been initialized again with a new stack meanwhile).
+static void FiberUnmapStack(const FiberObject* fiber, uint64_t only_stack = 0) {
 	std::pair<uint64_t, uint64_t> stack {};
 	{
 		std::lock_guard lock(g_fiber_stack_mutex);
-		if (auto node = g_fiber_stacks.extract(fiber)) {
-			stack = node.mapped();
+		const auto      found = g_fiber_stacks.find(fiber);
+		if (found != g_fiber_stacks.end() && (only_stack == 0 || found->second.first == only_stack)) {
+			stack = found->second;
+			g_fiber_stacks.erase(found);
 		}
 	}
 	if (stack.first != 0) {
@@ -2580,6 +2584,13 @@ static void FiberUnmapStack(const FiberObject* fiber) {
 }
 
 static uint64_t FiberMapStack(const FiberObject* fiber, uint64_t size) {
+	{
+		std::lock_guard lock(g_fiber_stack_mutex);
+		if (const auto found = g_fiber_stacks.find(fiber);
+		    found != g_fiber_stacks.end() && found->second.second == size) {
+			return found->second.first;
+		}
+	}
 	FiberUnmapStack(fiber);
 	const auto stack = LibKernel::MapGuestStack(size);
 	if (stack != 0) {
@@ -2734,11 +2745,17 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 
 	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;
-	const auto return_code =
-	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
+	const bool terminated   = FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED;
+	const auto return_code  = terminated ? FIBER_ERROR_STATE : OK;
+	const auto stack_low    = reinterpret_cast<uint64_t>(returned_fiber->context_start);
 	// Copy results before another thread can acquire and resume the fiber.
 	FiberCompleteSwitch(nullptr);
 	FiberSetThreadContext(nullptr);
+	// A fiber whose entry returned never runs again and sceFiberFinalize refuses it, so the guest
+	// stack it ran on goes back here, now that this thread has left it.
+	if (terminated && stack_low != 0) {
+		FiberUnmapStack(returned_fiber, stack_low);
+	}
 
 	if (arg_on_return != nullptr) {
 		*arg_on_return = return_value;
