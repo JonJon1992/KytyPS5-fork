@@ -861,6 +861,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmitCommandBuffers);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics, tick);

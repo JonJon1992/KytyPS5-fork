@@ -15,7 +15,8 @@ enum class Counter {
 	DrawInstances,
 	IndirectDraws,
 	Dispatches,
-	QueueSubmits,
+	QueueSubmits,             // vkQueueSubmit calls, every path (broker, CP recorder, direct).
+	QueueSubmitCommandBuffers, // Command buffers those calls submitted.
 	GpuWaits,     // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
 	GpuFaults,    // Guest writes to GPU-tracked memory.

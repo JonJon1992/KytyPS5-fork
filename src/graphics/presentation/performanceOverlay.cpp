@@ -422,7 +422,11 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Indirect draws", Fmt("%.0f/s", Rate(shown, Counter::IndirectDraws)));
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                           Rate(shown, Counter::Dispatches)));
-		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
+		const auto submits = Rate(shown, Counter::QueueSubmits);
+		Row("Queue submits",
+		    Fmt("%.1f/frame  %.0f/s  (%.1f cmd buffers, %.0f draws per submit)", submits / fps,
+		        submits, Rate(shown, Counter::QueueSubmitCommandBuffers) / std::max(submits, 1.0),
+		        draws / std::max(submits, 1.0)));
 		// Include GPU-dependent publications too: replacing a native wait with a callback
 		// dependency must not make the CPU's blocked wall time disappear from the panel.
 		Row("CPU waiting on GPU", Fmt("%.0f ms/s  (%.0f waits/s)",

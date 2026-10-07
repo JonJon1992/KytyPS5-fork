@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/queueSubmission.h"
 
+#include "common/debugCounters.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
 #include "common/hangTrace.h"
@@ -444,6 +445,8 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 		result = m_graphics->queue.submit(static_cast<uint32_t>(native_count), submits.data(), nullptr);
 	}
 	++m_driver_calls;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmitCommandBuffers, count);
 	m_native_submits += native_count;
 	m_coalesced_boundaries += count - native_count;
 	m_protected_boundaries += protected_count;

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include "common/debugCounters.h"
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
@@ -347,6 +348,8 @@ struct CommandRecorder::NativeExecutor {
 				NoteWatchdogSubmit(graphics.queue, submit_info, p.tick);
 				result = graphics.queue.submit(1, &submit_info, nullptr);
 			}
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmitCommandBuffers);
 			if (result == vk::Result::eErrorDeviceLost) DumpDeviceLossDiagnostics(graphics, p.tick);
 			if (result != vk::Result::eSuccess) {
 				std::printf("vkQueueSubmit (CP recorder) failed: %s (%d), tick=%" PRIu64
