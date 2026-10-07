@@ -660,6 +660,9 @@ struct TextureCacheTestAccess {
   }
   static uint64_t DccGpuRecords(const TextureCache &cache) { return cache.m_gpu_dcc_records; }
   static uint64_t DccCpuFallbacks(const TextureCache &cache) { return cache.m_gpu_dcc_fallbacks; }
+  static void MaterializeDcc(TextureCache &cache, ImageId id, const TextureCache::ImageDesc &desc) {
+    cache.MaterializeDccClear(id, desc, 0);
+  }
   // Under the lock every page's count equals its owner list's size.
   static bool CountsMatchOwners(TextureCache &cache, uint64_t address, uint64_t size) {
     std::lock_guard lock(cache.m_lock);
@@ -4193,6 +4196,43 @@ public:
   // KYTY_PRIORITY_WAIT_SPIN_US set, the runner wait spins first (PriorityWaitSpins).
   // Counters are read through the per-thread sink, switched on only around calls that submit
   // nothing (a scoped frame wait needs a running profiler).
+  void CheckSchedulerPriorityPublication() {
+    constexpr const char *name = "SchedulerPriorityPublication";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto *wrapper = &scheduler.Current();
+    const auto tick = scheduler.CurrentTick();
+    std::atomic<uint32_t> publications{0};
+    uint32_t retired = 0;
+    scheduler.DeferPriorityOperation([&] { publications.fetch_add(1); });
+    scheduler.DeferPriorityOperation([&] { publications.fetch_add(1); });
+    scheduler.DeferOperation([&] { ++retired; });
+    scheduler.FlushAndWaitPriorityPublication();
+    Require(name, "published bytes", publications.load() == 2 && scheduler.IsFree(tick),
+            "publication dependency returned before GPU retirement and both callbacks");
+    Require(name, "operation boundary", retired == 0 &&
+                scheduler.CurrentTick() == tick + 1 && &scheduler.Current() == wrapper &&
+                &wrapper->GetRegisters() == &registers &&
+                &wrapper->GetUserConfig() == &user_config &&
+                &wrapper->GetShaders() == &shaders,
+            "publication wait released normal resources or lost recording context");
+    scheduler.PopPendingOperations();
+    Require(name, "normal resource retirement", retired == 1,
+            "normal callback did not retire at the next operation boundary");
+    const auto empty_tick = scheduler.CurrentTick();
+    scheduler.FlushAndWaitPriorityPublication();
+    Require(name, "no-publication fallback", scheduler.IsFree(empty_tick) &&
+                scheduler.CurrentTick() == empty_tick + 1,
+            "an empty publication queue bypassed GPU completion");
+    scheduler.Shutdown();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerReadyOperations() {
     EnsureRuntimeContext();
     const auto *nowait_env = std::getenv("KYTY_PENDING_OPS_NOWAIT");
@@ -9500,7 +9540,12 @@ public:
       uint64_t fallbacks = 0;
     };
     const u32 push_limit = MaxPushDescriptors();
-    const auto run = [&](bool refresh, bool gpu_written_image) {
+    const auto run = [&](bool refresh, bool gpu_written_image,
+                         bool video_out = false, bool gpu_video_out = false,
+                         uint32_t metadata_word = 0x40404040u) {
+      Live::Testing::StageText(gpu_video_out ? "KYTY_DCC_VIDEOOUT_GPU=1\n"
+                                             : "KYTY_DCC_VIDEOOUT_GPU=0\n");
+      Live::OnCpFlip();
       for (uint64_t index = 0; index < allocation_size; index++) {
         memory[index] = static_cast<uint8_t>((index * 19 + index / 4096) & 0xffu);
       }
@@ -9532,41 +9577,58 @@ public:
         });
       };
       ImageDesc desc{};
-      desc.type = BindingType::RenderTarget;
-      desc.info.data = {base, color_size};
+      desc.type = video_out ? BindingType::VideoOut : BindingType::RenderTarget;
+      desc.info.data = {base, video_out ? color_size / 2 : color_size};
       desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
       desc.info.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
       desc.info.type = Prospero::ImageType::kColor2D;
       desc.info.extent = {128, 64, 1};
-      desc.info.resources = {1, 2};
+      desc.info.resources = {1, video_out ? 1u : 2u};
       desc.info.bytes_per_block = 8;
       desc.info.samples = 1;
-      desc.info.mip_layout[0] = {0, color_size, 128, 64};
+      desc.info.mip_layout[0] = {0, desc.info.data.size, 128, 64};
       desc.view_info.format = vk::Format::eR16G16B16A16Sfloat;
       desc.view_info.type = vk::ImageViewType::e2DArray;
       desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
-      desc.view_info.layer_count = 2;
+      desc.view_info.layer_count = video_out ? 1u : 2u;
       desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
       desc.info.pitch = TileGetRenderTargetPitch(128, 8);
       desc.info.mip_layout[0].pitch = desc.info.pitch;
       desc.info.metadata.kind = ImageMetadataKind::Dcc;
-      desc.info.metadata.range = {metadata_address, metadata_size};
+      desc.info.metadata.range = {metadata_address, video_out ? 0x1000u : metadata_size};
+      if (video_out) {
+        desc.info.metadata.compression = VideoOutCompression::Dcc256_64_64;
+      }
       desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       if (gpu_written_image) {
-        gpu_fill(base, color_size, 0x3c003c00u);
+        gpu_fill(base, desc.info.data.size, 0x3c003c00u);
       }
-      gpu_fill(metadata_address, 0x1000, 0x40404040u);
-      gpu_fill(metadata_address + 0x1000, 0x1000, 0x12121212u);
+      gpu_fill(metadata_address, 0x1000,
+               video_out && metadata_word == 0xffffffffu ? 0x40404040u : metadata_word);
+      if (!video_out) {
+        gpu_fill(metadata_address + 0x1000, 0x1000, 0x12121212u);
+      }
       const auto id = OnGpuThread(context, [&] { return cache.FindImage(desc); });
+      if (video_out) {
+        // Its DCC key survives the first inspection, so another binding must decide again.
+        // An FF-only video-out must already have current native image contents; start with
+        // a clear, then let the GPU replace its metadata with the observed no-clear code.
+        if (metadata_word == 0xffffffffu) {
+          gpu_fill(metadata_address, 0x1000, metadata_word);
+        }
+        OnGpuThread(context, [&] { TextureCacheTestAccess::MaterializeDcc(cache, id, desc); });
+      }
       Outcome outcome;
       outcome.helper = TextureCacheTestAccess::DccHelperAvailable(cache);
       outcome.layer0 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 0);
-      outcome.layer1 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 1);
-      buffers.ReadMemory(metadata_address, metadata_size, false);
-      outcome.metadata.resize(metadata_size);
+      if (!video_out) {
+        outcome.layer1 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 1);
+      }
+      buffers.ReadMemory(metadata_address, desc.info.metadata.range.size, false);
+      outcome.metadata.resize(desc.info.metadata.range.size);
       Require(name, "metadata backing",
               LibKernel::Memory::TryReadBacking(metadata_address, outcome.metadata.data(),
-                                               metadata_size),
+                                               outcome.metadata.size()),
               "the metadata backing could not be read");
       scheduler.Finish();
       const auto &totals = TextureCacheTestAccess::DccRefreshTotals(cache);
@@ -9611,6 +9673,27 @@ public:
       std::printf("[gpu]     %-32s ok (%s image, native inspection %s)\n", name, state,
                   native.helper ? "ran" : "unavailable");
     }
+    // Video-out DCC retains its clear key. A native inspection must make the same clear
+    // decision without consuming metadata, including when a second lookup sees that key.
+    for (const uint32_t key : {0x40404040u, 0xffffffffu}) {
+      const auto fallback = run(true, true, true, false, key);
+      const auto native = run(true, true, true, true, key);
+      Require(name, "video-out same texels",
+              native.layer0 == fallback.layer0 && native.layer1 == fallback.layer1,
+              "native video-out inspection changed the fallback's image result");
+      Require(name, "video-out key retained",
+              native.metadata == fallback.metadata &&
+                  std::all_of(native.metadata.begin(), native.metadata.end(),
+                              [key](uint8_t byte) { return byte == (key & 0xffu); }),
+              "native video-out inspection consumed or corrupted DCC metadata");
+      Require(name, "video-out native path",
+              !native.helper || (native.records == 2 && native.fallbacks == 0 &&
+                                 fallback.records == 0 &&
+                                 fallback.fallbacks == (key == 0xffffffffu ? 2u : 1u)),
+              "video-out metadata did not use the native inspection");
+    }
+    Live::Testing::StageText("KYTY_DCC_VIDEOOUT_GPU=\n");
+    Live::OnCpFlip();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "DCC refresh mapping release failed");
@@ -52170,6 +52253,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
     vulkan.CheckSchedulerReadyOperations();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scheduler-publication-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSchedulerPriorityPublication();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-only") == 0) {

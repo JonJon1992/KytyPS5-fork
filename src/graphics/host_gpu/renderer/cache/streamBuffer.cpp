@@ -408,6 +408,8 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 			return false;
 		}
 		{
+			KYTY_PROFILER_DETAIL_BLOCK("StreamBuffer::WaitPendingOperations (ring reuse)");
+			HangTrace::SyncResource resource(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(Handle())), Size());
 			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitStreamWrap);
 			Scheduler().Wait(watch.tick);
 		}

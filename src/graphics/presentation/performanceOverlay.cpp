@@ -423,9 +423,14 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Dispatches", Fmt("%.0f/frame  %.0f/s", Rate(shown, Counter::Dispatches) / fps,
 		                           Rate(shown, Counter::Dispatches)));
 		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
-		// Includes present pacing waits, so a high value alone is not a stall.
-		Row("CPU waiting on GPU", Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
-		                              Rate(shown, Counter::GpuWaits)));
+		// Include GPU-dependent publications too: replacing a native wait with a callback
+		// dependency must not make the CPU's blocked wall time disappear from the panel.
+		Row("CPU waiting on GPU", Fmt("%.0f ms/s  (%.0f waits/s)",
+		    (Rate(shown, Counter::GpuWaitNs) + Rate(shown, Counter::GpuPublicationWaitNs)) / 1e6,
+		    Rate(shown, Counter::GpuWaits)));
+		Row("Publication waits", Fmt("%.0f ms/s  (%.0f waits/s)",
+		    Rate(shown, Counter::GpuPublicationWaitNs) / 1e6,
+		    Rate(shown, Counter::GpuPublicationWaits)));
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
 		const auto shaders = Total(shown, Counter::ShadersCompiled);

@@ -11,6 +11,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Loader::GamePatch {
 
@@ -38,6 +41,7 @@ struct Plan {
 	std::string              title_id;
 	std::string              version;
 	std::string              process;
+	std::string              source_xxh3_64;
 	std::vector<Write>       writes;
 	std::vector<std::string> mod_names;
 	std::vector<uint64_t>    cave_pages;
@@ -79,6 +83,13 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 	plan->title_id = root["id"].get<std::string>();
 	plan->version  = root["version"].get<std::string>();
 	plan->process  = root["process"].get<std::string>();
+	plan->source_xxh3_64 = root.value("source_xxh3_64", std::string {});
+	if (!plan->source_xxh3_64.empty() &&
+	    (plan->source_xxh3_64.size() != 16 ||
+	     !std::all_of(plan->source_xxh3_64.begin(), plan->source_xxh3_64.end(),
+	                  [](unsigned char c) { return std::isxdigit(c) != 0; }))) {
+		return Fail(error, "invalid source_xxh3_64 fingerprint");
+	}
 
 	const auto* disable_env = std::getenv(kDisableEnv);
 	const auto  patterns    = ParseDisableList(disable_env != nullptr ? disable_env : "");
@@ -134,17 +145,55 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 	return true;
 }
 
+bool FingerprintFile(const std::filesystem::path& path, std::string* fingerprint) {
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		return false;
+	}
+	XXH3_state_t* state = XXH3_createState();
+	if (state == nullptr || XXH3_64bits_reset(state) != XXH_OK) {
+		XXH3_freeState(state);
+		return false;
+	}
+	std::array<char, 1 << 20> bytes {};
+	while (file) {
+		file.read(bytes.data(), bytes.size());
+		const auto count = file.gcount();
+		if (count > 0 && XXH3_64bits_update(state, bytes.data(),
+		                                    static_cast<size_t>(count)) != XXH_OK) {
+			XXH3_freeState(state);
+			return false;
+		}
+	}
+	if (file.bad()) {
+		XXH3_freeState(state);
+		return false;
+	}
+	*fingerprint = fmt::format("{:016x}", XXH3_64bits_digest(state));
+	XXH3_freeState(state);
+	return true;
+}
+
 bool ValidateGame(const Plan& plan, const Program* main_program, std::string* error) {
 	if (main_program == nullptr || main_program->base_vaddr == 0) {
 		return Fail(error, "main executable is not loaded");
 	}
 	std::string title_id;
 	std::string version;
-	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
-	    !SystemContentParamSfoGetString("APP_VER", &version) ||
-	    !Common::EqualNoCase(main_program->file_name.filename().string(), plan.process) ||
-	    !Common::EqualNoCase(title_id, plan.title_id) || version != plan.version) {
+	const bool has_title = SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	const bool has_version = SystemContentParamSfoGetString("APP_VER", &version);
+	if (!Common::EqualNoCase(main_program->file_name.filename().string(), plan.process) ||
+	    (has_title && !Common::EqualNoCase(title_id, plan.title_id)) ||
+	    (has_version && version != plan.version) ||
+	    ((!has_title || !has_version) && plan.source_xxh3_64.empty())) {
 		return Fail(error, "cheat file does not match the loaded game");
+	}
+	if (!plan.source_xxh3_64.empty()) {
+		std::string fingerprint;
+		if (!FingerprintFile(main_program->file_name, &fingerprint) ||
+		    !Common::EqualNoCase(fingerprint, plan.source_xxh3_64)) {
+			return Fail(error, "cheat file executable fingerprint does not match");
+		}
 	}
 	return true;
 }

@@ -10,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandPoolReuse.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -229,12 +230,16 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	HangTrace::SyncWait sync_wait("scheduler-finish", "flush-and-wait", reinterpret_cast<uint64_t>(this), CurrentTick());
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	const auto tick = Submit({}, true);
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	HangTrace::SyncWait sync_wait("scheduler-finish", "finish", reinterpret_cast<uint64_t>(this), CurrentTick());
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit({}, true);
@@ -244,19 +249,48 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
-void CommandScheduler::Wait(uint64_t tick) {
+void CommandScheduler::FlushAndWaitPriorityPublication(std::source_location caller) {
+	CheckActive();
+	EXIT_IF(g_deferred_callback_scheduler == this);
+	const auto tick = CurrentTick();
+	HangTrace::SyncWait dependency("publication-dependency", "readback-publication",
+	                               reinterpret_cast<uint64_t>(this), tick, caller);
+	bool has_publication;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		has_publication = (m_priority_active && m_priority_active_tick == tick) ||
+		                  (!m_priority_operations.empty() && m_priority_operations.back().tick == tick);
+	}
+	const auto submitted = Submit({}, true);
+	EXIT_IF(submitted != tick);
+	if (!has_publication) {
+		// This entry point is also safe for a recording with no priority callback.
+		m_master.Wait(tick, caller);
+	}
+	std::optional<Profiler::ScopedFrameWait> frame_wait;
+	if (has_publication && GuestGpu::IsGpuThread() && Profiler::AggregateEnabled()) {
+		frame_wait.emplace(Profiler::CurrentGpuWaitReason());
+	}
+	WaitPriorityOperations(tick, caller);
+	frame_wait.reset();
+	BeginNext();
+}
+
+void CommandScheduler::Wait(uint64_t tick, std::source_location caller) {
+	HangTrace::SyncWait scheduler_wait("scheduler", "resource-dependency", reinterpret_cast<uint64_t>(this), tick, caller);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
+		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit({}, true);
 		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
+		m_master.Wait(tick, caller);
 		BeginNext();
 	} else {
-		m_master.Wait(tick);
+		m_master.Wait(tick, caller);
 	}
 }
 
@@ -377,7 +411,8 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
-                                             PriorityOperationKind kind) {
+                                             PriorityOperationKind kind,
+                                             std::source_location caller) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -393,7 +428,8 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 			}
 		}
 		const bool was_empty = m_priority_operations.empty();
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		m_priority_operations.push({std::move(operation), CurrentTick(), caller, kind,
+		                            HangTrace::g_sync_resource.address, HangTrace::g_sync_resource.size});
 		lock.unlock();
 		if (!PriorityWakeupsBatched()) {
 			m_operation_available.notify_one();
@@ -430,6 +466,7 @@ void CommandScheduler::SetProgressHook(ProgressHook hook, void* context) {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GPU completion");
 	// It blocks on the operation queue and on the timeline semaphore; the CP waits for it
 	// (WaitPriorityOperations) and so does the guest (end-of-pipe interrupts, flips, readbacks).
 	Common::RaiseServiceThreadPriority();
@@ -474,7 +511,12 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			hook                   = m_progress_hook;
 			hook_context           = m_progress_hook_context;
 		}
-		m_master.Wait(operation.tick);
+		// The waiting runner is the consumer of a callback's completion dependency. Attribute
+		// its native wait to the operation's producer, not just to this common loop.
+		HangTrace::SyncResource resource(operation.trace_address, operation.trace_size);
+		m_master.Wait(operation.tick, operation.caller,
+		              operation.kind == PriorityOperationKind::EopInterrupt
+		                  ? "eop-interrupt" : "resource-publication");
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityOperationsRun);
@@ -530,12 +572,13 @@ static void PriorityWaitRelax() {
 #endif
 }
 
-void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+void CommandScheduler::WaitPriorityOperations(uint64_t tick, std::source_location caller) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	if (PriorityDoneLocked(tick)) {
 		return;
 	}
+	HangTrace::SyncWait priority_wait("priority-completion", "host-publication", reinterpret_cast<uint64_t>(this), tick, caller);
 	HangWatchdog::Scope wait("priority-completion", reinterpret_cast<uint64_t>(this), tick,
 	                         m_priority_active_tick, 0, m_priority_operations.size());
 	if (const auto spin_ns = PriorityWaitSpinNs(); spin_ns != 0) {
@@ -564,8 +607,20 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 		lock.lock();
 	}
 	++m_priority_waiters;
+	const auto publication_wait_begin = std::chrono::steady_clock::now();
 	m_operation_available.wait(lock, [this, tick] { return PriorityDoneLocked(tick); });
 	--m_priority_waiters;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuPublicationWaits);
+	const auto publication_wait_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - publication_wait_begin).count());
+	Common::DebugCounters::Add(
+	    Common::DebugCounters::Counter::GpuPublicationWaitNs, publication_wait_ns);
+	if (GuestGpu::IsGpuThread()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CpPublicationWaits);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CpPublicationWaitNs,
+		                          publication_wait_ns);
+	}
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

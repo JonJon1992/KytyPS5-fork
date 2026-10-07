@@ -1,3 +1,4 @@
+#include "common/hangTrace.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -553,7 +554,12 @@ void Swapchain::Destroy() {
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		graphics.submission_queue.DrainPendingLocked();
-		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+		RequireVulkanSuccess(
+		    HangTrace::MeasureSyncWait(
+		        "queue-idle", "swapchain-destroy",
+		        reinterpret_cast<uint64_t>(static_cast<VkQueue>(graphics.queue)), 0,
+		        [&] { return graphics.queue.waitIdle(); }),
+		    "wait for swapchain queue");
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -670,9 +676,11 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		m_frame_ticks[m_frame_index] = 0;
 	}
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result = HangTrace::MeasureSyncWait("swapchain-acquire", "presentation",
+	    reinterpret_cast<uint64_t>(static_cast<VkSwapchainKHR>(m_handle)), m_frame_index, [&] {
+	    return m_window.graphic_ctx.device.acquireNextImageKHR(
+	        m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr, &m_image_index);
+	});
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1166,7 +1174,9 @@ Swapchain::Status Swapchain::Present() {
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		result = HangTrace::MeasureSyncWait("queue-present", "presentation",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_window.graphic_ctx.queue)), 0,
+		    [&] { return m_window.graphic_ctx.queue.presentKHR(&present); });
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

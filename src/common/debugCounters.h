@@ -44,6 +44,12 @@ enum class Counter {
 	GuestFileReadBytes,
 	GuestFileWriteBytes,
 	AudioUnderruns,
+	GpuPublicationWaits, // CPU blocked on a GPU-dependent host publication.
+	GpuPublicationWaitNs,
+	CpGpuWaits,
+	CpGpuWaitNs,
+	CpPublicationWaits,
+	CpPublicationWaitNs,
 	Count
 };
 

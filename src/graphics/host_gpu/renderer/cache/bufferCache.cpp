@@ -56,6 +56,8 @@ Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultO
 Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
 // Live A/B control: 0 restores the previous extra-submission rule for eager publication.
 Live::Switch g_eager_current_tick("KYTY_READBACK_EAGER_CURRENT_TICK", Live::ParseDefaultOn);
+// A/B only until the publication dependency's throughput and latency are measured.
+Live::Switch g_readback_wait_publication("KYTY_READBACK_WAIT_PUBLICATION", Live::ParseDefaultOff);
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
@@ -674,7 +676,9 @@ struct BufferCache::SideReadbackState {
 		wait_info.semaphoreCount = 1;
 		wait_info.pSemaphores    = &semaphore;
 		wait_info.pValues        = &target;
-		RequireVulkanSuccess(graphics.device.waitSemaphores(&wait_info, UINT64_MAX),
+		RequireVulkanSuccess(HangTrace::MeasureSyncWait("gpu-timeline", "side-readback",
+		    reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(semaphore)), target,
+		    [&] { return graphics.device.waitSemaphores(&wait_info, UINT64_MAX); }),
 		                     "wait for side readback");
 	}
 
@@ -759,7 +763,9 @@ struct BufferCache::SparsePageTable {
 			result = submit(graphics.queue);
 		}
 		RequireVulkanSuccess(result, operation);
-		RequireVulkanSuccess(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX), operation);
+		RequireVulkanSuccess(HangTrace::MeasureSyncWait("gpu-fence", operation,
+		    reinterpret_cast<uint64_t>(static_cast<VkFence>(fence)), 0,
+		    [&] { return graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX); }), operation);
 		RequireVulkanSuccess(graphics.device.resetFences(1, &fence), operation);
 	}
 
@@ -820,6 +826,7 @@ struct BufferCache::SparsePageTable {
 
 	// Binds zeroed memory behind every block of table bytes [offset, offset + size) without any.
 	void EnsureResident(uint64_t offset, uint64_t size) {
+		HangTrace::SyncResource sync_resource(offset, size);
 		const auto first = offset / block_size;
 		const auto last  = (offset + size - 1) / block_size;
 		std::vector<vk::SparseMemoryBind> binds;
@@ -1674,7 +1681,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
+                             std::source_location caller) {
+	HangTrace::SyncResource sync_resource(vaddr, size);
+	HangTrace::SyncWait sync_wait("readback", is_write ? "fault-write-or-invalidate" : "fault-read-or-gpu-sync",
+	                              0, 0, caller);
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	HangWatchdog::Scope       read("buffer-readback", vaddr, size, 0, 0, is_write);
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ReadMemory);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1852,6 +1864,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
                                   ReadMemoryTrace& trace) {
+	// SendCommandSync crosses threads; the requesting thread's trace context does not.
+	HangTrace::SyncResource sync_resource(vaddr, size);
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -1881,13 +1895,21 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 		trace.downloaded = true;
 		const auto                    tick = m_scheduler.CurrentTick();
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
-		{
+		if (g_readback_wait_publication.On()) {
+			// DownloadBufferMemory registered a priority callback for this exact recording.
+			// It waits for the GPU, invalidates staging, copies backing and ends publication.
+			// Waiting for that callback subsumes the separate native wait on the same tick.
 			ReadbackPhase phase(timing != nullptr ? &timing->drain_wait_ns : nullptr);
-			m_scheduler.Wait(tick);
-		}
-		{
-			ReadbackPhase phase(timing != nullptr ? &timing->completion_wait_ns : nullptr);
-			m_scheduler.WaitPriorityOperations(tick);
+			m_scheduler.FlushAndWaitPriorityPublication();
+		} else {
+			{
+				ReadbackPhase phase(timing != nullptr ? &timing->drain_wait_ns : nullptr);
+				m_scheduler.Wait(tick);
+			}
+			{
+				ReadbackPhase phase(timing != nullptr ? &timing->completion_wait_ns : nullptr);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
 		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
@@ -2204,6 +2226,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 }
 
 bool BufferCache::CompleteSideReadback(SideReadback& readback, HangTrace::ReadbackTiming* timing) {
+	HangTrace::SyncResource sync_resource(readback.begin, readback.end - readback.begin);
 	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
 	                         0, readback.eager);
 	HangWatchdog::DebugDelay("readback", readback.begin);
@@ -2409,6 +2432,7 @@ void BufferCache::IssueEagerReadbacks() {
 }
 
 EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page, uint64_t tick) {
+	HangTrace::SyncResource sync_resource(page, TRACKER_PAGE_SIZE);
 	using Result = EagerReadbackPages::IssueResult;
 	auto&      side = *m_side;
 	const auto end  = page + TRACKER_PAGE_SIZE;
@@ -4298,6 +4322,7 @@ void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	MaintainHotPages();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/hangWatchdog.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/deviceLostReport.h"
@@ -69,10 +70,25 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
-void MasterSemaphore::Wait(uint64_t tick) {
+void MasterSemaphore::Wait(uint64_t tick, std::source_location caller, const char* trace_reason) {
 	if (IsFree(tick)) {
 		return;
 	}
+	const auto reason = trace_reason != nullptr ? trace_reason : [] {
+		switch (Profiler::CurrentGpuWaitReason()) {
+			case Profiler::FrameWait::GpuWaitDrain: return "readback-drain";
+			case Profiler::FrameWait::GpuWaitOcclusion: return "occlusion";
+			case Profiler::FrameWait::GpuWaitStreamWrap: return "stream-ring-reuse";
+			case Profiler::FrameWait::GpuWaitLodStats: return "lod-stats";
+			case Profiler::FrameWait::GpuWaitUnmap: return "memory-unmap";
+			case Profiler::FrameWait::GpuWaitPredication: return "predication";
+			case Profiler::FrameWait::GpuWaitGds: return "gds";
+			case Profiler::FrameWait::GpuWaitSideCopy: return "eager-readback";
+			default: return "completion-or-resource-reuse";
+		}
+	}();
+	const auto semaphore = reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore));
+	HangTrace::SyncWait total("master", reason, semaphore, tick, caller);
 	// Attribute CP-thread blocking to its caller (Profiler::ScopedGpuWaitReason). Other threads
 	// (the completion runner, guest threads) wait here by design and are not counted.
 	std::optional<Profiler::ScopedFrameWait> frame_wait;
@@ -85,6 +101,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		    "master-dispatch", reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
 		    tick, submitted, 0, HangWatchdog::Enabled() ? CurrentTick() : 0);
 		while (submitted < tick) {
+			HangTrace::SyncWait dispatch_wait("host-dispatch", reason, semaphore, tick, caller);
+			KYTY_PROFILER_DETAIL_BLOCK("MasterSemaphore::Wait (submission dispatch)");
 			m_submission_progress->dispatched_tick.wait(submitted, std::memory_order_acquire);
 			submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
 			dispatch.Observed(submitted);
@@ -108,7 +126,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                         tick, HangWatchdog::Enabled() ? KnownGpuTick() : 0, 0,
 	                         HangWatchdog::Enabled() ? CurrentTick() : 0);
 	const auto wait_begin = std::chrono::steady_clock::now();
-	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto result = [&] {
+		HangTrace::SyncWait gpu_wait("gpu-timeline", reason, semaphore, tick, caller);
+		KYTY_PROFILER_DETAIL_BLOCK("MasterSemaphore::Wait (GPU timeline)");
+		return m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	}();
 	if (result != vk::Result::eSuccess) {
 		HangWatchdog::Scope error("master-wait-error",
 		                          reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
@@ -121,11 +143,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		     vk::to_string(result).c_str(), m_gpu_tick.load(std::memory_order_acquire));
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuWaits);
+	const auto wait_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - wait_begin).count());
 	Common::DebugCounters::Add(
-	    Common::DebugCounters::Counter::GpuWaitNs,
-	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                              std::chrono::steady_clock::now() - wait_begin)
-	                              .count()));
+	    Common::DebugCounters::Counter::GpuWaitNs, wait_ns);
+	if (GuestGpu::IsGpuThread()) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CpGpuWaits);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::CpGpuWaitNs, wait_ns);
+	}
 	Refresh();
 }
 

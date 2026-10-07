@@ -22,7 +22,8 @@ struct GraphicContext;
 // Per metadata slice it reproduces TextureCache's CPU fallback exactly, on the GPU and without a
 // readback: a validation dispatch reads the slice, and when its first byte is a clear code the CPU
 // decoder accepts for this binding and every byte equals it, an indirect dispatch writes the
-// clear value to every texel of the image layer and consumes the key (all bytes 0xFF). Otherwise
+// clear value to every texel of the image layer and optionally consumes the key (all bytes 0xFF).
+// Video-out retains the key. Otherwise
 // that dispatch has zero groups. The clear value's texel bits come from vkCmdClearColorImage on a
 // small palette image in the view format (the conversion the CPU path's clear uses) and are
 // stored through an unsigned integer view of the same texel size, so any color format whose texel
@@ -53,7 +54,8 @@ public:
 	// the CPU fallback would. The image and canonical metadata buffer must remain alive through
 	// this scheduler tick. metadata_offset must be 4-byte aligned.
 	void RecordSlice(Image& image, vk::Format view_format, uint32_t layer, vk::Buffer metadata,
-	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values);
+	                 uint64_t metadata_offset, uint64_t metadata_size, const ClearValues& values,
+	                 bool consume_metadata);
 
 private:
 	struct Push {
@@ -64,6 +66,7 @@ private:
 		uint32_t clear_groups;
 		uint32_t decodable_mask;
 		uint32_t texel_bytes;
+		uint32_t consume_metadata;
 	};
 	[[nodiscard]] static vk::Format AliasFormat(vk::Format view_format, uint32_t& texel_bytes);
 	void RecordPalette(vk::CommandBuffer command, vk::Format view_format, uint32_t texel_bytes,

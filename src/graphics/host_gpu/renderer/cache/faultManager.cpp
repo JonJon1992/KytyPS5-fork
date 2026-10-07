@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -96,6 +97,10 @@ Buffer* FaultManager::GetFaultBuffer() noexcept {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	HangTrace::SyncResource sync_resource(
+	    reinterpret_cast<uint64_t>(static_cast<VkBuffer>(m_download_buffer.Handle())),
+	    m_download_area_size);
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	(void)GetFaultBuffer();
 	KYTY_GPU_OP_SITE("fault.process");
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {

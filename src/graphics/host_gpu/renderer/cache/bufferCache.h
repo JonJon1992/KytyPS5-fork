@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -80,7 +81,8 @@ public:
 	// Reads use a side copy when every dirty byte they need was written by an already submitted
 	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
 	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  std::source_location caller = std::source_location::current());
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.

@@ -1,0 +1,22 @@
+{
+  "id": "PPSA05512",
+  "version": "01.512.000",
+  "process": "eboot.bin",
+  "name": "Ghost of Yotei: Performance mode without RTGI",
+  "source_sha256": "803466729b58db40882062edf38417855658f51c9a8c7c39992b5a97153bd299",
+  "source_xxh3_64": "b5c160d67525520a",
+  "description": "For this exact executable, selects the game's Performance mode (index 2) before its graphics-mode flags are derived. The RT mode range is 3-5. This does not force a fixed internal resolution or repair unrelated rendering faults.",
+  "mods": [
+    {
+      "name": "Select Performance mode before graphics flags are derived",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "0xd1fcc0",
+          "off": "49638554010000",
+          "on": "b8020000009090"
+        }
+      ]
+    }
+  ]
+}

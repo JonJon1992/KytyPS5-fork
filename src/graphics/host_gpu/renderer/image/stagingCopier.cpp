@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/hangWatchdog.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -71,6 +72,7 @@ void StagingCopier::WaitHost(uint64_t value) {
 	HangWatchdog::Scope scope("texture-staging-copy", reinterpret_cast<uint64_t>(this), value,
 	                          completed);
 	while (completed < value) {
+		HangTrace::SyncWait sync_wait("host-staging", "texture-staging-copy", reinterpret_cast<uint64_t>(this), value);
 		m_completed.wait(completed, std::memory_order_acquire);
 		completed = m_completed.load(std::memory_order_acquire);
 	}

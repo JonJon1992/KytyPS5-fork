@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <source_location>
 
 namespace Libs::Graphics {
 
@@ -44,7 +45,8 @@ public:
 	}
 
 	void Refresh();
-	void Wait(uint64_t tick);
+	void Wait(uint64_t tick, std::source_location caller = std::source_location::current(),
+	          const char* trace_reason = nullptr);
 
 private:
 	GraphicContext&       m_graphics;

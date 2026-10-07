@@ -644,6 +644,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 		m_idle_drains++;
 	} else {
 		if (m_mode == Mode::Thread) {
+			HangTrace::SyncWait sync_wait("host-recorder-drain", "command-stream-consumption",
+			                             reinterpret_cast<uint64_t>(this), m_recorded_tick.load());
 			m_encoder.Drain(m_drain_policy, m_drain_stats);
 		}
 	}
@@ -672,6 +674,8 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 		return;
 	}
 	EXIT_IF(m_mode != Mode::Thread);
+	HangTrace::SyncWait sync_wait("host-recorder-total", "command-recording",
+	                             reinterpret_cast<uint64_t>(this), tick);
 	HangWatchdog::Scope wait("recorder-recorded-tick", reinterpret_cast<uint64_t>(this), tick,
 	                         HangWatchdog::Enabled() ? m_recorded_tick.load() : 0);
 	if (from_producer) {
@@ -687,6 +691,7 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 				if (value >= tick) {
 					break;
 				}
+				HangTrace::SyncWait sync_wait("host-recorder", "command-recording", reinterpret_cast<uint64_t>(this), tick);
 				m_recorded_tick.wait(value, std::memory_order_acquire);
 			}
 			m_recorded_waiters.fetch_sub(1, std::memory_order_seq_cst);

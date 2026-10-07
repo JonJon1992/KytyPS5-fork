@@ -1,3 +1,4 @@
+#include "common/hangTrace.h"
 #include <SDL3/SDL.h>
 #include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
 #include <SDL3/SDL_vulkan.h>
@@ -1786,7 +1787,12 @@ WindowContext::~WindowContext() {
 	graphic_ctx.submission_queue.Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
-		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		RequireVulkanSuccess(
+		    HangTrace::MeasureSyncWait(
+		        "device-idle", "shutdown",
+		        reinterpret_cast<uint64_t>(static_cast<VkDevice>(graphic_ctx.device)), 0,
+		        [&] { return graphic_ctx.device.waitIdle(); }),
+		    "wait for Vulkan device shutdown");
 		DeviceLostReport::Unregister(&graphic_ctx);
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);

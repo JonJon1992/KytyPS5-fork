@@ -405,8 +405,8 @@ private:
 	                                                             uint32_t metadata_base_layer);
 	// The native inspection behind TryMaterializeGpuDccClear for any metadata whose uniform
 	// bytes select a clear value (values/decodable in DccClearHelper::ClearCodes order): clears
-	// the bound slices whose bytes all equal an accepted code and leaves those bytes 0xFF. cmask:
-	// CMASK bytes (only code 0x00), not counted as DCC work.
+	// the bound slices whose bytes all equal an accepted code. Non-video-out keys become 0xFF;
+	// video-out keys stay unchanged. cmask: CMASK bytes (only code 0x00), not counted as DCC work.
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
@@ -674,7 +674,7 @@ private:
 	// Caller holds m_lock, right after RecordSlice of the refreshed image.
 	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
 	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
-	                            GuestRange range);
+	                            GuestRange range, bool consume_metadata);
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};

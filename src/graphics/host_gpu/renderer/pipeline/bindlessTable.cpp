@@ -1,3 +1,4 @@
+#include "common/hangTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
 #include "common/assert.h"
@@ -344,8 +345,11 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		RequireVulkanSuccess(m_graphics.queue.submit(1, &submit, fence), "submit bindless init");
 	}
-	RequireVulkanSuccess(m_graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
-	                     "wait for bindless init");
+	RequireVulkanSuccess(
+	    HangTrace::MeasureSyncWait(
+	        "gpu-fence", "bindless-init", reinterpret_cast<uint64_t>(static_cast<VkFence>(fence)),
+	        0, [&] { return m_graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX); }),
+	    "wait for bindless init");
 	m_graphics.device.destroyFence(fence, nullptr);
 	m_graphics.device.destroyCommandPool(pool, nullptr);
 

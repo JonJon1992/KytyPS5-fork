@@ -90,6 +90,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <source_location>
 #include <string>
 #include <string_view>
 
@@ -130,6 +132,59 @@ void Shutdown();
 [[nodiscard]] std::string OutputDirectory();
 
 [[nodiscard]] uint64_t NowNs();
+
+// Opt-in wait census. CPU wall durations include time descheduled; nested scopes must not
+// be summed. The publisher writes rows off-thread, never while a Vulkan queue lock is held.
+[[nodiscard]] inline bool SyncWaitsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SYNC_WAITS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled && Enabled();
+}
+struct SyncResourceInfo {
+	uint64_t address = 0, size = 0;
+};
+inline thread_local SyncResourceInfo g_sync_resource;
+class SyncResource {
+public:
+	SyncResource(uint64_t address, uint64_t size): m_previous(g_sync_resource) {
+		if (SyncWaitsEnabled()) g_sync_resource = {address, size};
+	}
+	~SyncResource() { g_sync_resource = m_previous; }
+	SyncResource(const SyncResource&) = delete;
+	SyncResource& operator=(const SyncResource&) = delete;
+private:
+	SyncResourceInfo m_previous;
+};
+void RecordSyncWait(const char* kind, const char* reason, uint64_t begin_ns,
+                    uint64_t duration_ns, uint64_t object, uint64_t tick,
+                    SyncResourceInfo resource, std::source_location caller);
+class SyncWait {
+public:
+	SyncWait(const char* kind, const char* reason, uint64_t object = 0, uint64_t tick = 0,
+	         std::source_location caller = std::source_location::current())
+	    : m_kind(kind), m_reason(reason), m_object(object), m_tick(tick), m_caller(caller) {
+		if (SyncWaitsEnabled()) m_begin = NowNs();
+	}
+	~SyncWait() {
+		if (m_begin != 0) RecordSyncWait(m_kind, m_reason, m_begin, NowNs() - m_begin,
+		                               m_object, m_tick, g_sync_resource, m_caller);
+	}
+	SyncWait(const SyncWait&) = delete;
+	SyncWait& operator=(const SyncWait&) = delete;
+private:
+	const char* m_kind;
+	const char* m_reason;
+	uint64_t m_object, m_tick, m_begin = 0;
+	std::source_location m_caller;
+};
+template <typename F>
+auto MeasureSyncWait(const char* kind, const char* reason, uint64_t object, uint64_t tick,
+                     F&& operation, std::source_location caller = std::source_location::current()) {
+	SyncWait wait(kind, reason, object, tick, caller);
+	return operation();
+}
 
 // Guest code map, used to validate stack-scanned return addresses.
 void RegisterGuestCode(uint64_t base, uint64_t size, std::string_view name);

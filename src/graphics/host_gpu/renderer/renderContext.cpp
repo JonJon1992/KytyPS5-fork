@@ -192,6 +192,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	HangTrace::SyncResource sync_resource(vaddr, size);
 	const auto refused = [vaddr, size](const char* reason) {
 		// A failed SRT readiness retry otherwise reports only its caller's assert.
 		// Keep the rejected range and the first failing predicate without reading
@@ -274,6 +275,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
+		HangTrace::SyncResource sync_resource(vaddr, size);
 		if (m_command_scheduler.Active()) {
 			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
 			const auto                    tick = m_command_scheduler.CurrentTick();

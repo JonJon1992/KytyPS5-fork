@@ -1,6 +1,7 @@
 #include "common/hangTrace.h"
 
 #include "common/cpuPlacement.h"
+#include "common/debugCounters.h"
 #include "common/hangWatchdog.h"
 
 #include <algorithm>
@@ -183,6 +184,11 @@ constinit thread_local bool                          t_recent_below_clear = fals
 std::mutex               g_readback_mutex;
 std::vector<std::string> g_pending_readback_rows;
 uint64_t                 g_readback_rows_total = 0;
+
+std::mutex               g_sync_wait_mutex;
+std::vector<std::string> g_pending_sync_wait_rows;
+uint64_t                 g_sync_wait_rows_total = 0;
+uint64_t                 g_sync_wait_rows_dropped = 0;
 
 constexpr const char* kReadbackKindNames[] = {"invalidate",      "fault-read",
                                               "fault-write",     "gpu-sync",
@@ -479,6 +485,8 @@ struct Files {
 	std::FILE* modules       = nullptr;
 	std::FILE* queues        = nullptr;
 	std::FILE* readbacks     = nullptr;
+	std::FILE* sync_waits    = nullptr;
+	std::FILE* sync_wait_stats = nullptr;
 	std::FILE* images        = nullptr;
 	std::FILE* lodwatch      = nullptr;
 	std::FILE* occlusion     = nullptr;
@@ -753,6 +761,18 @@ void Publish() {
 		rows.swap(g_pending_readback_rows);
 	}
 	WriteRows(g_files.readbacks, rows);
+	uint64_t sync_rows = 0, sync_dropped = 0;
+	{
+		std::scoped_lock lock(g_sync_wait_mutex);
+		rows.swap(g_pending_sync_wait_rows);
+		sync_rows = g_sync_wait_rows_total;
+		sync_dropped = g_sync_wait_rows_dropped;
+	}
+	WriteRows(g_files.sync_waits, rows);
+	if (g_files.sync_wait_stats != nullptr) {
+		std::fprintf(g_files.sync_wait_stats, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+		             t_ms, sync_rows, sync_dropped);
+	}
 
 	{
 		std::scoped_lock lock(g_occlusion_mutex);
@@ -1027,6 +1047,21 @@ void Publish() {
 		// Memory predication packets that drained the GPU (appended last).
 		line += fmt::format(",{},{}", take(g_totals.pred_flush_waits),
 		                    take(g_totals.pred_flush_wait_ns) / 1000u);
+		// Aggregate native/publication waits independently of the optional per-event census.
+		// This allows A/B throughput checks with KYTY_SYNC_WAITS=0 and no CSV per wait.
+		using Counter = Common::DebugCounters::Counter;
+		constexpr std::array wait_counters {
+		    Counter::GpuWaits, Counter::GpuWaitNs,
+		    Counter::GpuPublicationWaits, Counter::GpuPublicationWaitNs,
+		    Counter::CpGpuWaits, Counter::CpGpuWaitNs,
+		    Counter::CpPublicationWaits, Counter::CpPublicationWaitNs};
+		static std::array<uint64_t, wait_counters.size()> previous_wait_counters {};
+		for (size_t i = 0; i < wait_counters.size(); ++i) {
+			const auto now = Common::DebugCounters::Get(wait_counters[i]);
+			const auto delta = now - previous_wait_counters[i];
+			previous_wait_counters[i] = now;
+			line += fmt::format(",{}", i % 2 == 0 ? delta : delta / 1000u);
+		}
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -1034,7 +1069,8 @@ void Publish() {
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
 	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles, g_files.frames,
-	                  g_files.unclean, g_files.timestamps, g_files.placement}) {
+	                  g_files.unclean, g_files.timestamps, g_files.placement, g_files.sync_waits,
+	                  g_files.sync_wait_stats}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -1166,6 +1202,8 @@ void Initialize() {
 	// Memory predication packets (op 3, wait) that submitted all GPU work and blocked until it
 	// finished, and the time blocked.
 	summary_header += ",pred_flush_waits,pred_flush_wait_us";
+	summary_header += ",master_gpu_waits,master_gpu_wait_us,publication_waits,publication_wait_us,"
+	                  "cp_gpu_waits,cp_gpu_wait_us,cp_publication_waits,cp_publication_wait_us";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1179,6 +1217,11 @@ void Initialize() {
 	                             "t_ms,reason,purpose,caller,page,count,bytes,first_address,"
 	                             "first_size,last_gpu_writer,last_gpu_write_age_ms,"
 	                             "last_gpu_write_size");
+	if (SyncWaitsEnabled()) {
+		g_files.sync_waits = OpenFile("syncwaits.csv",
+		    "start_ns,duration_ns,kind,reason,object,tick,address,size,host_tid,file,line,function");
+		g_files.sync_wait_stats = OpenFile("syncwaitstats.csv", "t_ms,rows_total,rows_dropped");
+	}
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
 	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
@@ -1273,7 +1316,8 @@ void Shutdown() {
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
 	                   &g_files.transfers, &g_files.compiles, &g_files.frames, &g_files.unclean,
-	                   &g_files.timestamps, &g_files.placement}) {
+	                   &g_files.timestamps, &g_files.placement, &g_files.sync_waits,
+	                   &g_files.sync_wait_stats}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1621,6 +1665,22 @@ void SetReadbackKind(ReadbackKind kind) {
 
 ReadbackKind GetReadbackKind() {
 	return g_readback_kind;
+}
+
+void RecordSyncWait(const char* kind, const char* reason, uint64_t begin_ns,
+                    uint64_t duration_ns, uint64_t object, uint64_t tick,
+                    SyncResourceInfo resource, std::source_location caller) {
+	if (!SyncWaitsEnabled()) return;
+	auto row = fmt::format("{},{},{},{},0x{:x},{},0x{:x},{},{},{},{},{}",
+	    begin_ns, duration_ns, kind, reason, object, tick, resource.address, resource.size,
+	    OsThreadId(), CsvEscape(caller.file_name()), caller.line(), CsvEscape(caller.function_name()));
+	std::scoped_lock lock(g_sync_wait_mutex);
+	if (g_sync_wait_rows_total < 5'000'000 && g_pending_sync_wait_rows.size() < 65536) {
+		++g_sync_wait_rows_total;
+		g_pending_sync_wait_rows.push_back(std::move(row));
+	} else {
+		++g_sync_wait_rows_dropped;
+	}
 }
 
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,

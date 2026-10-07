@@ -27,7 +27,7 @@ struct DccClearHelper::PaletteImages {
 DccClearHelper::DccClearHelper(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler),
       m_palette_images(std::make_unique<PaletteImages>()) {
-	static_assert(sizeof(Push) == 28);
+	static_assert(sizeof(Push) == 32);
 	const auto& limits = graphics.physical_device_properties.limits;
 	m_supported = graphics.max_push_descriptors >= 4 &&
 	              limits.maxComputeWorkGroupInvocations >= WorkgroupSize &&
@@ -278,7 +278,8 @@ void DccClearHelper::RecordPalette(vk::CommandBuffer command, vk::Format view_fo
 
 void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t layer,
                                  vk::Buffer metadata, uint64_t metadata_offset,
-                                 uint64_t metadata_size, const ClearValues& values) {
+	                                 uint64_t metadata_size, const ClearValues& values,
+	                                 bool consume_metadata) {
 	KYTY_GPU_OP_SITE("dcc.clear");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(SupportsImage(image, view_format, metadata_size) != Support::Ok ||
@@ -304,7 +305,8 @@ void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t 
 	                 image.backing.extent.height,
 	                 static_cast<uint32_t>(groups),
 	                 decodable,
-	                 texel_bytes};
+	                 texel_bytes,
+	                 consume_metadata ? 1u : 0u};
 	ImageViewInfo view_info {};
 	view_info.format      = alias;
 	view_info.type        = vk::ImageViewType::e2D;

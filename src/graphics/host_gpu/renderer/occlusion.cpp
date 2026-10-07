@@ -523,6 +523,7 @@ bool OcclusionCounter::PriorityPublication() {
 }
 
 bool OcclusionCounter::Dump(uint64_t address) {
+	HangTrace::SyncResource sync_resource(address, sizeof(uint64_t));
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	Initialize();

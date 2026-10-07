@@ -475,8 +475,14 @@ void GraphicContext::BindSparseImageLevels(VulkanImage& image, uint32_t first_le
 			result = queue.bindSparse(1, &bind_info, m_sparse_fence);
 		}
 		RequireVulkanSuccess(result, "bind sparse image memory");
-		RequireVulkanSuccess(device.waitForFences(1, &m_sparse_fence, VK_TRUE, UINT64_MAX),
-		                     "wait for sparse image binding");
+		HangTrace::SyncResource sync_resource(
+		    reinterpret_cast<uint64_t>(static_cast<VkImage>(image.image)), bytes);
+		RequireVulkanSuccess(
+		    HangTrace::MeasureSyncWait(
+		        "gpu-fence", "sparse-image-bind",
+		        reinterpret_cast<uint64_t>(static_cast<VkFence>(m_sparse_fence)), 0,
+		        [&] { return device.waitForFences(1, &m_sparse_fence, VK_TRUE, UINT64_MAX); }),
+		    "wait for sparse image binding");
 		RequireVulkanSuccess(device.resetFences(1, &m_sparse_fence), "reset sparse binding fence");
 	}
 	state.allocations.push_back(allocation);

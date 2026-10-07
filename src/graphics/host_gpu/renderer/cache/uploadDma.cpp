@@ -1,3 +1,4 @@
+#include "common/hangTrace.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 
 #include "common/alignment.h"
@@ -228,6 +229,7 @@ void UploadDma::WaitSubmittable(uint64_t value) {
 	HangWatchdog::Scope wait_scope("upload-dma-submit", reinterpret_cast<uint64_t>(this), value,
 	                               submitted);
 	while (submitted < value) {
+		HangTrace::SyncWait sync_wait("host-dispatch", "upload-dma-submit", reinterpret_cast<uint64_t>(this), value);
 		m_submitted.wait(submitted, std::memory_order_acquire);
 		submitted = m_submitted.load(std::memory_order_acquire);
 	}
@@ -240,8 +242,12 @@ void UploadDma::WaitHost(uint64_t value) {
 	wait.semaphoreCount = 1;
 	wait.pSemaphores    = &m_semaphore;
 	wait.pValues        = &value;
-	RequireVulkanSuccess(m_graphics.device.waitSemaphores(&wait, UINT64_MAX),
-	                     "wait upload DMA semaphore");
+	RequireVulkanSuccess(
+	    HangTrace::MeasureSyncWait(
+	        "gpu-timeline", "upload-dma",
+	        reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)), value,
+	        [&] { return m_graphics.device.waitSemaphores(&wait, UINT64_MAX); }),
+	    "wait upload DMA semaphore");
 }
 
 void UploadDma::SubmitBatch(std::vector<Job>& jobs) {

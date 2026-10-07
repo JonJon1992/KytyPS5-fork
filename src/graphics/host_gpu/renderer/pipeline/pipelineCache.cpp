@@ -485,6 +485,7 @@ struct ShaderReadAttempt {
 
 	bool Synchronize() const {
 		KYTY_PROFILER_DETAIL_BLOCK("SRT::ReadinessWait");
+		HangTrace::SyncWait sync_wait("shader-readiness", "GPU-written-shader-or-descriptor");
 		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ShaderReadiness);
 		if (overflow) EXIT("resource readiness exceeded 64 missing ranges\n");
 		bool ready = false;

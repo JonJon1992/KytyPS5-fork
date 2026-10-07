@@ -2,6 +2,7 @@
 
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -135,7 +136,10 @@ void QueueSubmissionBroker::Enqueue(QueuedSubmission submission) {
 	                         m_pending.size(), 0, submission.tick);
 	// The worker needs only queue_mutex and this mutex. In particular it never
 	// needs the renderer lock, which the producer can own while waiting for space.
-	m_space_available.wait(lock, [this] { return m_stopping || m_pending.size() < MaxQueued; });
+	if (!m_stopping && m_pending.size() >= MaxQueued) {
+		HangTrace::SyncWait sync_wait("host-broker", "queue-space", reinterpret_cast<uint64_t>(this), submission.tick);
+		m_space_available.wait(lock, [this] { return m_stopping || m_pending.size() < MaxQueued; });
+	}
 	EXIT_IF(m_stopping);
 	m_pending.push_back(std::move(submission));
 	++m_queued_count;

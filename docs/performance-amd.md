@@ -5,6 +5,39 @@ performance proposals to that revision's renderer. The development machine is a 
 a Ryzen 7 7800X3D and Radeon RX 9070 XT. Astro Bot gameplay and a 60 fps result have not been
 validated by this patch set.
 
+## EmK530 renderer comparison (2026-10-06)
+
+Reviewed `EmK530/KytyPS5` at `41f7794a44136950b79f2db7bf16d50347eeae43`.
+Its flat SRT evaluator is not imported: this tree already has optional compiled evaluation
+recipes (`KYTY_SRT_COMPILED_RECIPES=1`) and arithmetic tapes
+(`KYTY_SRT_ARITHMETIC_TAPES=1`, also requiring recipes). The local evaluator keeps memory
+reads and selections demand-driven, and records recipe, fallback, memo-hit and tape counters.
+Both switches remain off by default; equivalent results in focused tests do not establish
+an in-game performance gain.
+
+The adopted profiling idea uses the existing optional detailed Tracy zones. Enable the
+emulator's profiler and set `KYTY_PROFILE_DETAILS=1` with `KYTY_PROFILE_FRAMES_ONLY=0` to
+inspect scheduler flush/finish, forced submit-and-wait, buffer readback/collection and fault
+processing. `MasterSemaphore::Wait (submission dispatch)` measures waiting for the host
+submission worker; `MasterSemaphore::Wait (GPU timeline)` wraps the driver semaphore wait
+after the completed-tick checks. These are CPU durations, not GPU timestamp measurements.
+`StreamBuffer::WaitPendingOperations (ring reuse)` also includes immediately satisfied
+waits, so its duration alone does not prove a GPU stall. Existing aggregate counters retain
+their meaning; frame-only mode suppresses these detailed zones.
+
+For focused SRT checks, run the `resource_materialization` and `resource_tracking` CTest
+tests in separate processes with `(KYTY_SRT_COMPILED_RECIPES, KYTY_SRT_ARITHMETIC_TAPES)`
+set to `(0, 0)`, `(1, 0)` and `(1, 1)`. These switches are read once per process.
+The donor's RELEASE_MEM batching, DCC tick cache, draw flush interval and mesh-draw skipping
+are not part of this adaptation.
+
+Validation: the Linux Release emulator and the three focused test targets built successfully.
+`resource_materialization` passed in all three SRT configurations; `profiler_counters` passed.
+`resource_tracking` failed in all three configurations at `FMASK load specialization`, with
+`index >= args.size()` in `Value.cpp:188`. That target does not compile or link the five
+renderer translation units changed here. Its failure remains unresolved; this is not a
+fully passing resource-tracking validation or an in-game benchmark.
+
 ## Implemented changes
 
 - **Predicate synchronization (PR #702):** bool predicates skip submission when their bytes have

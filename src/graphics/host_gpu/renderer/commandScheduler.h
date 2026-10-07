@@ -46,13 +46,18 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
+	// A current-tick priority publication already carries a master-timeline dependency.
+	// Wait for it once; without such a callback retain the ordinary native timeline wait.
+	// Normal deferred resource retirement still belongs to PopPendingOperations.
+	void           FlushAndWaitPriorityPublication(
+	    std::source_location caller = std::source_location::current());
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {}, bool force_completion = false);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
-	void                      Wait(uint64_t tick);
+	void                      Wait(uint64_t tick, std::source_location caller = std::source_location::current());
 	// Runs every normal operation whose tick has completed, in order. Before each one it waits for
 	// the priority operations of that tick and earlier: a normal operation may free what they
 	// still use.
@@ -65,11 +70,12 @@ public:
 	void                      PopReadyOperations();
 	void                      DrainPriorityOperations();
 	// KYTY_PRIORITY_WAIT_SPIN_US (default 0): first spin that long for the priority runner.
-	void                      WaitPriorityOperations(uint64_t tick);
+	void                      WaitPriorityOperations(uint64_t tick, std::source_location caller = std::source_location::current());
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(
 	    Common::UniqueFunction<void>&& operation,
-	    PriorityOperationKind kind = PriorityOperationKind::Generic);
+	    PriorityOperationKind kind = PriorityOperationKind::Generic,
+	    std::source_location caller = std::source_location::current());
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Called on the completion runner after every priority operation (e.g. to wake queues
 	// suspended on what it published). Clear it, then DrainPriorityOperations, before the
@@ -167,6 +173,10 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		std::source_location         caller {};
+		PriorityOperationKind        kind = PriorityOperationKind::Generic;
+		uint64_t                     trace_address = 0;
+		uint64_t                     trace_size = 0;
 	};
 
 	void BeginNext();

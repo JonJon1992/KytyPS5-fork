@@ -2,8 +2,9 @@
   "source": "/run/media/jonathanbraga/SSD/PS5/Ghost_of_Yotei_extraido/eboot.bin",
   "sha256": "803466729b58db40882062edf38417855658f51c9a8c7c39992b5a97153bd299",
   "embedded_title_id": "PPSA05512",
-  "app_version": null,
-  "validation": "Static analysis only; game not launched; no patch applied.",
+  "app_version": "01.512.000",
+  "version_source": "sce_sys/pfs-version.dat; sce_sys/param.json is absent from this extraction",
+  "validation": "Static analysis plus runtime mode-state checks on this exact eboot; visual output and complete RT workload still require validation.",
   "image_relative_addresses": {
     "mode_name_table": "0x1fc1c10",
     "mode_flags_table": "0x1a78580",
@@ -60,6 +61,13 @@
   "predicate_bytes": "48630575b0f8034883c0fd4883f8030f92c0c3",
   "predicate_semantics": "Returns (uint64_t(int64_t(current_mode)) - 3) < 3, using unsigned comparison. Performance (2) returns false; modes 3, 4, 5 return true.",
   "render_gate": "At 0x137bca5: load current mode; add -6; unsigned compare against -3; jae 0x137bce0. Modes 3..5 enter that branch. Performance falls through, clears [rbx+0x4d1d], and returns via 0x137bcdf.",
-  "interpretation": "Strong static evidence that the RTGI-related path already excludes Performance. This does not prove absence of all ray-tracing GPU work or establish the current mode during emulation.",
-  "next_validation": "Read current_mode at relocated image base + 0x53029bc during a Performance session and correlate with RT/BVH GPU dispatches before designing any additional patch."
+  "interpretation": "Strong static evidence that the RTGI-related path excludes Performance. Runtime mode reads establish the active mode for the tested sessions, but do not prove the absence of all ray-tracing GPU work.",
+  "runtime_validation": {
+    "performance_patch": "tools/patches/PPSA05512-performance-no-rt.json",
+    "patch_site": "SELF file offset 0xd1fcc0 replaces the load of saved graphics mode with index 2 before the game derives its mode flags",
+    "performance_state": "desired, current, and previous mode were all 2 from 4s through 39s in yotei-performance-input-test; the final patch reproduced mode 2 through 32s in yotei-performance-final",
+    "rt_state": "desired, current, and previous mode were all 3 from 4s through 13s in yotei-rt-forced-control",
+    "limits": "RT control suffered a Vulkan device loss at 15.1s, while two Performance runs ended normally at 34.1s and 41.6s. This does not establish causation or a controlled FPS improvement. An unpatched run after the first Performance test also selected mode 2, so saved settings can persist across launches."
+  },
+  "next_validation": "Inspect visual output in Performance mode, verify RT/BVH dispatch differences, and profile comparable later-gameplay frames before claiming a rendering fix or FPS improvement."
 }

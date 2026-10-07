@@ -56,6 +56,9 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
+// Experimental video-out DCC inspection. The helper must preserve its guest clear key.
+static Live::Switch g_dcc_videoout_gpu("KYTY_DCC_VIDEOOUT_GPU", Live::ParseDefaultOff);
+
 // The DccImageState* cause in the DCC CPU fallback's stderr line.
 const char* DccImageStateName(Profiler::FrameEvent cause) {
 	using Event = Profiler::FrameEvent;
@@ -2748,11 +2751,14 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	if (!m_dcc_clear || !m_dcc_clear->Available()) {
 		return Event::DccFallbackDisabled;
 	}
-	// The video-out path does not consume its clear key; keep it on the CPU inspection.
-	if (desc.type == BindingType::VideoOut) {
+	const bool video_out = desc.type == BindingType::VideoOut;
+	if (video_out && !g_dcc_videoout_gpu.On()) {
 		return Event::DccFallbackBinding;
 	}
-	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+	const auto compression = desc.info.metadata.compression;
+	if ((!video_out && compression != VideoOutCompression::Uncompressed) ||
+	    (video_out && compression != VideoOutCompression::Dcc256_256_0 &&
+	     compression != VideoOutCompression::Dcc256_64_64)) {
 		return Event::DccFallbackShape;
 	}
 	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
@@ -2782,6 +2788,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	const auto layers = desc.info.TransferLayers();
 	const auto first  = metadata_base_layer;
 	const auto count  = view.layer_count;
+	const bool consume_metadata = desc.type != BindingType::VideoOut;
 	if (desc.info.IsVolume() || desc.info.resources.levels != 1 || desc.info.samples != 1 ||
 	    view.base_level != 0 || view.level_count != 1 ||
 	    view.aspect != vk::ImageAspectFlagBits::eColor ||
@@ -2808,7 +2815,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
 		// than that one reads the same bytes to the same no-op, for any image or layer; only the
 		// metadata processing is skipped, the caller still refreshes this image normally.
-		bool reusable = true;
+		// Video-out keeps its clear key. Its previous inspection cannot certify a later
+		// binding after image contents have changed.
+		bool reusable = consume_metadata;
 		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
 			const auto metadata = slice_range(slice);
 			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
@@ -2929,8 +2938,9 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
 		for (uint32_t slice = 0; slice < count; ++slice) {
-			helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
-			                         offset + slice_size * (first + slice), slice_size, values);
+				helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
+				                         offset + slice_size * (first + slice), slice_size, values,
+				                         consume_metadata);
 		}
 	}
 	CommitGpuWrite(image);
@@ -2939,7 +2949,8 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		Profiler::CountFrameEvent(Event::DccGpuRefreshes, count);
 		if (!verify_clears.empty()) {
 			RecordDccRefreshVerify(*buffer, offset + slice_size * first, slice_size,
-			                       std::move(verify_bytes), std::move(verify_clears), range);
+			                       std::move(verify_bytes), std::move(verify_clears), range,
+			                       consume_metadata);
 		}
 	}
 	if (!cmask) {
@@ -2948,6 +2959,10 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	}
 	for (uint32_t slice = 0; slice < count; ++slice) {
 		const auto metadata = slice_range(slice);
+		if (!consume_metadata) {
+			m_gpu_dcc_inspections.erase(metadata.address);
+			continue;
+		}
 		if (const auto revision =
 		        m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
 			// Retained metadata is independent of image lifetime; cap address reuse history.
@@ -2978,7 +2993,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 
 void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
                                           std::vector<uint8_t> before, std::vector<uint8_t> clears,
-                                          GuestRange range) {
+	                                          GuestRange range, bool consume_metadata) {
 	// Caller holds m_lock, right after the inspection was recorded: copy the inspected slices
 	// out behind it and, once the recording completed, check what the helper did to them against
 	// the CPU fallback's decision. A cleared slice has its key consumed (every byte 0xFF); any
@@ -3014,14 +3029,14 @@ void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uin
 	                       {}, 0, nullptr, 1, &barrier, 0, nullptr);
 	m_scheduler.DeferOperation([this, &download, mapped = mapped, download_offset = download_offset,
 	                            bytes, slice_size, before = std::move(before),
-	                            clears = std::move(clears), range] {
+		                            clears = std::move(clears), range, consume_metadata] {
 		download.Invalidate(download_offset, bytes);
 		const auto* after = mapped;
 		uint32_t    wrong = 0;
 		for (size_t slice = 0; slice < clears.size(); ++slice) {
 			const auto* now  = after + slice_size * slice;
 			const auto* then = before.data() + slice_size * slice;
-			const bool  ok   = clears[slice] != 0
+			const bool  ok   = consume_metadata && clears[slice] != 0
 			                       ? std::all_of(now, now + slice_size,
 			                                     [](uint8_t byte) { return byte == 0xffu; })
 			                       : std::memcmp(now, then, slice_size) == 0;
@@ -3050,6 +3065,10 @@ void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uin
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer, MetadataNoop* noop) {
+	static const bool trace_fallback = [] {
+		const auto* value = std::getenv("KYTY_DCC_FALLBACK_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
 	if (noop != nullptr) {
 		*noop = {};
 	}
@@ -3168,6 +3187,46 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 				++m_gpu_dcc_fallbacks;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
 				Profiler::CountFrameEvent(outcome);
+				// Opt-in diagnosis of a GPU-written metadata fallback. Keep the actual CPU
+				// readback until the refusal reason and its coherence requirements are known.
+				if (trace_fallback) {
+					uint32_t image_support = UINT32_MAX;
+					uint32_t native_format = 0, native_usage = 0, native_flags = 0, state = 0;
+					{
+						std::scoped_lock lock {m_lock};
+						if (const auto* image = m_slot_images.try_get(id)) {
+							if (m_dcc_clear != nullptr && layers != 0) {
+								image_support = static_cast<uint32_t>(
+								    m_dcc_clear->SupportsImage(*image, view.format, range.size / layers));
+							}
+							native_format = static_cast<uint32_t>(image->backing.format);
+							native_usage = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image->backing.usage));
+							native_flags = static_cast<uint32_t>(static_cast<VkImageCreateFlags>(image->backing.flags));
+							state = (image->registered ? 1u : 0u) |
+							        (image->FullyResident() ? 2u : 0u) |
+							        (image->IsGpuModified() ? 4u : 0u) |
+							        (image->IsCpuDirty() ? 8u : 0u) |
+							        (image->IsBufferModified() ? 16u : 0u);
+						}
+					}
+					std::fprintf(stderr,
+					             "DCC_FALLBACK_TRACE meta=0x%016" PRIx64 " bytes=%" PRIu64
+					             " data=0x%016" PRIx64 " data_bytes=%" PRIu64
+					             " reason=%u image_state=%u type=%u compression=%u"
+					             " format=%u view=%u extent=%ux%u image_support=%u"
+					             " native_format=%u native_usage=0x%x native_flags=0x%x state=0x%x"
+					             " layers=%u first=%u count=%u tick=%" PRIu64 "\n",
+					             range.address, range.size, desc.info.data.address,
+					             desc.info.data.size, static_cast<uint32_t>(outcome),
+					             outcome == Profiler::FrameEvent::DccFallbackImageState
+					                 ? static_cast<uint32_t>(m_image_state_reason) : 0u,
+					             static_cast<uint32_t>(desc.type),
+					             static_cast<uint32_t>(desc.info.metadata.compression),
+					             static_cast<uint32_t>(view.format), static_cast<uint32_t>(view.type),
+					             desc.info.extent.width, desc.info.extent.height, image_support,
+					             native_format, native_usage, native_flags, state, layers,
+					             first, count, m_scheduler.CurrentTick());
+				}
 				if (outcome == Profiler::FrameEvent::DccFallbackImageState) {
 					Profiler::CountFrameEvent(m_image_state_reason);
 					// The first few of every cause, also in release builds (LOGF may be off).
@@ -3310,6 +3369,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		}
 		vk::ClearValue clear {};
 		const bool     decoded = DecodeDccClear(desc, code, clear.color);
+		if (trace_fallback) {
+			std::fprintf(stderr, "DCC_SLICE_TRACE meta=0x%016" PRIx64
+			                     " code=0x%02x decoded=%u tick=%" PRIu64 "\n",
+			                     address, unsigned(code), decoded ? 1u : 0u,
+			                     m_scheduler.CurrentTick());
+		}
 		if (guest_keys) {
 			if (decoded) {
 				guest_keys = false; // the rest of the slice decides

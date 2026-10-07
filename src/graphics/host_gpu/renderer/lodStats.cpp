@@ -127,6 +127,7 @@ void LodStatsCounter::CheckCanary(uint64_t slot_offset) {
 }
 
 void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t control) {
+	HangTrace::SyncResource sync_resource(destination, size);
 	KYTY_GPU_OP_SITE("lodstats.report");
 	const auto mode = PublishMode();
 	// GET_LOD_STATS control bit 19 reports and resets, bit 18 forces a reset.
