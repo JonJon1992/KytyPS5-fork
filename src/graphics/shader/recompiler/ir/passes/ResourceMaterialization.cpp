@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/MaterializeTrail.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -44,12 +45,12 @@ bool SpecializationFail(std::string_view message) {
 	{
 		const std::lock_guard lock(mutex);
 		if (reported.size() >= 64 || !reported.emplace(message).second) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 	}
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
-	return false;
+	return KYTY_MATERIALIZE_FAIL(200000u);
 }
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
@@ -92,30 +93,30 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	if ((words[1] & 0x20000000u) != 0u || (words[2] & 0x70003000u) != 0u ||
 	    (!r128 && ((words[4] & 0xe000e000u) != 0u || (words[5] & 0xf9000000u) != 0u ||
 	               (words[6] & 0x00007b00u) != 0u))) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
 	    format > Prospero::BufferFormat::kBc7Srgb) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
 	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
 	// being treated as what it is: eight dwords that are not a descriptor.
 	if (!Prospero::IsDefinedBufferFormat(format)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	const bool array = type == Prospero::ImageType::kColor1DArray ||
 	                   type == Prospero::ImageType::kColor2DArray ||
 	                   type == Prospero::ImageType::kColor2DMsaaArray ||
 	                   type == Prospero::ImageType::kCube;
 	if (array && ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
 	    type == Prospero::ImageType::kColor2DMsaaArray) {
@@ -188,7 +189,7 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
 	if (descriptor.dword_count != std::size(result.fields)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
 	return true;
@@ -202,7 +203,7 @@ struct ReadCapture {
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -211,7 +212,7 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (!capture.source.read_memory(capture.source.userdata, address, values)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -227,7 +228,7 @@ bool ProbeStrictBacking(void* userdata, uint64_t address, std::span<uint32_t> va
 	const auto probe = capture.source.try_read_specialization_backing != nullptr
 	                       ? capture.source.try_read_specialization_backing
 	                       : capture.source.try_read_clean_backing;
-	if (!probe(capture.source.userdata, address, values)) return false;
+	if (!probe(capture.source.userdata, address, values)) return KYTY_MATERIALIZE_FAIL(200000u);
 	// The exact union has the same written-buffer intersections as its dwords.
 	// A failed probe is silent; scalar fallback records its actual successful prefix.
 	capture.ranges.emplace_back(address, values.size_bytes());
@@ -239,16 +240,16 @@ bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot&
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 		if (!program.info.buffers[i].written) continue;
 		ShaderBufferResource buffer;
-		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) return false;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) return KYTY_MATERIALIZE_FAIL(200000u);
 		const auto base = buffer.Base48();
 		const auto size = buffer.GetSize();
 		if (size == 0u) continue;
-		if (size - 1u > AddressMask - base) return false;
+		if (size - 1u > AddressMask - base) return KYTY_MATERIALIZE_FAIL(200000u);
 		for (const auto [address, bytes]: reads) {
 			if (bytes == 0u) continue;
 			if (address > AddressMask || bytes - 1u > AddressMask - address ||
 			    (address <= base ? base - address < bytes : address - base < size)) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(200000u);
 			}
 		}
 	}
@@ -306,7 +307,7 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 	base &= AddressMask & ~uint64_t {3};
 	if (offset > AddressMask - base) {
 		ObserveSrtRead(runtime, base, {}, false);
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	const auto address = base + offset;
 	const auto prefix = words.first(count);
@@ -396,7 +397,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		table_base = table.Base48();
 		table_size = table.GetSize();
 	} else {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	auto& keys = scratch.material_keys;
 	keys.clear();
@@ -407,7 +408,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		if (table_value.dword_count != 2u || !evaluated ||
 		    key_count > MaxIndirectImageProbes ||
 		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		keys.resize(key_count);
 		std::iota(keys.begin(), keys.end(), 0u);
@@ -417,7 +418,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
 		    !clean.Evaluate(indirect.selector_mask, mask) ||
 		    !clean.Evaluate(indirect.key_count, count) || count == 0u || count > 32u) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		if (count < 32u) mask &= (1u << count) - 1u;
 		const auto material_base =
@@ -427,10 +428,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			const auto index = std::countr_zero(mask);
 			const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
 			                    static_cast<uint64_t>(index) * indirect.selector_stride;
-			if (offset > UINT32_MAX) return false;
+			if (offset > UINT32_MAX) return KYTY_MATERIALIZE_FAIL(200000u);
 			uint32_t key = 0;
 			if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
-			                     runtime, {&key, 1})) return false;
+			                     runtime, {&key, 1})) return KYTY_MATERIALIZE_FAIL(200000u);
 			keys.push_back(key);
 			mask &= mask - 1u;
 		}
@@ -440,7 +441,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
 		    material.Stride() != indirect.selector_stride) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
 		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
@@ -448,7 +449,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
 		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 		if (probe_count > MaxIndirectImageProbes) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		keys.reserve(static_cast<size_t>(probe_count) + 1u);
 		keys.push_back(0u);
@@ -456,7 +457,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			uint32_t key = 0;
 			if (!ReadScalarTable(material.Base48(), material.GetSize(),
 			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(200000u);
 			}
 			keys.push_back(key);
 			if (limit - offset < step) {
@@ -479,7 +480,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		candidate.dword_count = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
 		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
@@ -502,7 +503,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			ordinal = lookup.ordinal;
 			if (ordinal > snapshot.images.size() - children_begin) {
 				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(200000u);
 				}
 				snapshot.images.push_back(candidate);
 				auto child = root_image;
@@ -605,7 +606,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		specialization.buffers.clear();
 		specialization.buffers.reserve(program.info.buffers.size());
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-			if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
+			if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -806,13 +807,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan) {
 	if (base.samplers.size() > plan.mapping.size()) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
 		if (pair.image >= images.size() || pair.sampler >= base.samplers.size()) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 	}
@@ -824,7 +825,7 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
 			const auto target = first ? index : plan.sampler_count++;
-			if (target >= ShaderInfo::MaxSamplers) return false;
+			if (target >= ShaderInfo::MaxSamplers) return KYTY_MATERIALIZE_FAIL(200000u);
 			mapping[type]         = target;
 			plan.bindings[target] = {index, static_cast<SamplerClass>(type)};
 			first                = false;
@@ -1193,7 +1194,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	snapshot.bindless_sampler_heaps.clear();
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	const bool masked_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
 		const auto* source = Source(program, image.source);
@@ -1203,7 +1204,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	if (masked_image &&
 	    (program.has_address_writes ||
 	     std::ranges::any_of(program.info.images, &ImageResource::written))) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(200000u);
 	}
 	const bool capture_reads = masked_image &&
 	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
@@ -1231,7 +1232,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::SRT refresh");
 		active = clean.FindActiveSources();
 		if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		snapshot.uniform_fill = {};
 		const auto& fill = program.uniform_fill;
@@ -1248,7 +1249,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		if (active.empty() || active[source]) {
 			return walker.EvaluateDescriptor(source, value);
@@ -1266,9 +1267,9 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		}
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 			if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(200000u);
 			}
-			if (fuse_buffers && !SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
+			if (fuse_buffers && !SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return KYTY_MATERIALIZE_FAIL(200000u);
 		}
 		if (capture_reads) {
 			for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
@@ -1276,7 +1277,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
 				DescriptorValue strict;
 				if (!clean.EvaluateDescriptor(buffer.source, strict) ||
-				    strict != snapshot.buffers[i]) return false;
+				    strict != snapshot.buffers[i]) return KYTY_MATERIALIZE_FAIL(200000u);
 			}
 		}
 	}
@@ -1311,7 +1312,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if constexpr (Optimize) specialization.images[i] = initial_image(image);
 			const auto* source = Source(program, image.source);
 			if (source == nullptr) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(200000u);
 			}
 			if (source->indirect_image.has_value()) {
 				snapshot.images[i] = {.dword_count = 8u};
@@ -1327,7 +1328,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                         DescriptorValue table;
                         ShaderBufferResource heap;
                         if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
-                            !DecodeBufferDescriptor(table, heap)) return false;
+                            !DecodeBufferDescriptor(table, heap)) return KYTY_MATERIALIZE_FAIL(200000u);
                         snapshot.bindless_heaps.push_back({heap.Base48(), heap.GetSize(),
                                                           indirect.table_offset, i, offset,
                                                           indirect.record_stride,
@@ -1343,11 +1344,11 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 				    !MaterializeIndirectImage<Optimize>(program, indirect, material, table, i, observed,
 				                                         clean, scratch, snapshot, specialization)) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(200000u);
 				}
 			} else {
 				if (!evaluate(image.source, snapshot.images[i])) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(200000u);
 				}
 				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 					if (!NullImageDescriptor(snapshot.images[i])) {
@@ -1375,7 +1376,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                     DescriptorValue table;
                     ShaderBufferResource heap;
                     if (!clean.EvaluateDescriptor(source_index, table) ||
-                        !DecodeBufferDescriptor(table, heap)) return false;
+                        !DecodeBufferDescriptor(table, heap)) return KYTY_MATERIALIZE_FAIL(200000u);
                     snapshot.bindless_sampler_heaps.push_back({heap.Base48(), heap.GetSize(),
                         source->bindless_sampler->table_offset, i, offset,
                         source->bindless_sampler->record_stride});
@@ -1383,7 +1384,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
                 continue;
             }
 			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(200000u);
 			}
 			if (program.info.samplers[i].gather_lod) {
 				const auto control = snapshot.samplers[i].dwords[2];
@@ -1401,7 +1402,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				}
 			}
 		}
-		if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
+		if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return KYTY_MATERIALIZE_FAIL(200000u);
 		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 		return BuildResourceSpecialization(program, snapshot, specialization, fuse_buffers);
 	}
@@ -1412,6 +1413,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSpecialization& specialization) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ResourceMaterialization);
+	MaterializeTrail::Reset();
 	static const bool optimized = [] {
 		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
 		return setting != nullptr && std::strcmp(setting, "optimized") == 0;

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/MaterializeTrail.h"
 
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -24,7 +25,7 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	}
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
-	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	                          : +[](void*, uint64_t, std::span<uint32_t>) { return KYTY_MATERIALIZE_FAIL(100000u); };
 	return runtime;
 }
 
@@ -50,19 +51,19 @@ std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::stri
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	if (offset < 0) {
 		const auto magnitude = uint64_t {0} - static_cast<uint64_t>(offset);
 		if (magnitude > base) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		result = base - magnitude;
 		return true;
 	}
 	const auto magnitude = static_cast<uint64_t>(offset);
 	if (magnitude > AddressMask - base) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	result = base + magnitude;
 	return true;
@@ -71,11 +72,11 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto index = inst.Flags<MemoryFlags>().index;
 	if (index >= values.memory_info.size()) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto kind = values.memory_info[index].kind;
 	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
@@ -88,7 +89,7 @@ bool IsDescriptorHandle(ValueOpcode opcode) {
 		case ValueOpcode::GetAddressResource:
 		case ValueOpcode::GetImageResource:
 		case ValueOpcode::GetSamplerResource: return true;
-		default: return false;
+		default: return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 }
 
@@ -146,7 +147,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::FPIsNan32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPTrunc32: return true;
-		default: return false;
+		default: return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 }
 
@@ -160,7 +161,7 @@ public:
 private:
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
-			if (!Validate(inst.Arg(index), require_uniform)) return false;
+			if (!Validate(inst.Arg(index), require_uniform)) return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		return true;
 	}
@@ -170,7 +171,7 @@ private:
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
 		if (m_type == RuntimeValueType::Integer &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
@@ -182,7 +183,7 @@ private:
 				case Type::U32:
 				case Type::U64:
 				case Type::F32: return true;
-				default: return false;
+				default: return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 		}
 		// Integer-only dependency checks do not depend on the active EXEC mask.
@@ -509,17 +510,17 @@ void BuildSrtReadRuns(ResourcePlan& program) {
 		const auto& read = program.srt_reads[index];
 		auto* inst = read.value.Resolve().TryInstruction();
 		if (inst == nullptr || !IsRawRead(program, *inst)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const bool buffer = inst->GetOpcode() == ValueOpcode::ReadConstBuffer;
-		if (inst->NumArgs() != (buffer ? 2u : 4u)) return false;
+		if (inst->NumArgs() != (buffer ? 2u : 4u)) return KYTY_MATERIALIZE_FAIL(100000u);
 		const auto& memory = program.memory_info[inst->Flags<MemoryFlags>().index];
 		// Scalar-address loads carry the address instruction's unused high offset
 		// and active predicate. Accept only the S_LOAD form understood by the CPU
 		// evaluator; other address forms retain their scalar path.
 		if (!buffer && (inst->Arg(2).Resolve() != Value(0u) ||
 		                inst->Arg(3).Resolve() != Value(true) || memory.address_is_full)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const auto offset = inst->Arg(1).Resolve();
 		const auto* handle = inst->Arg(0).ResolveInstruction();
@@ -527,10 +528,10 @@ void BuildSrtReadRuns(ResourcePlan& program) {
 		    handle->GetOpcode() != (buffer ? ValueOpcode::GetBufferResource
 		                                  : ValueOpcode::GetAddressResource) ||
 		    handle->NumArgs() != (buffer ? 4u : 2u)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
-		if (buffer && immediate < 0) return false;
+		if (buffer && immediate < 0) return KYTY_MATERIALIZE_FAIL(100000u);
 		result = {handle, inst->GetOpcode(),
 		          buffer ? (immediate + offset.U32()) & ~int64_t {3}
 		                 : (immediate & ~int64_t {3}) + (offset.U32() & ~3u),
@@ -664,10 +665,10 @@ void BuildSrtEvaluationRecipes(ResourcePlan& program) {
 			recipe.selection_mask = inst.Arg(0).Resolve();
 		}
 		const auto operands = [&](size_t count) {
-			if (count > recipe.operands.size() || inst.NumArgs() != count) return false;
+			if (count > recipe.operands.size() || inst.NumArgs() != count) return KYTY_MATERIALIZE_FAIL(100000u);
 			for (size_t i = 0; i < count; ++i) {
 				recipe.operands[i] = compile(inst.Arg(i));
-				if (recipe.operands[i].kind == Operand::Kind::Invalid) return false;
+				if (recipe.operands[i].kind == Operand::Kind::Invalid) return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			return true;
 		};
@@ -955,9 +956,9 @@ SrtWalker::~SrtWalker() {
 }
 
 bool SrtWalker::BorrowCleanValue(uint32_t index, uint64_t& result) {
-	if (!m_share_clean_values) return false;
+	if (!m_share_clean_values) return KYTY_MATERIALIZE_FAIL(100000u);
 	const auto& clean = m_clean_evaluator->m_context;
-	if (index >= clean.values.size() || clean.values[index].generation != clean.generation) return false;
+	if (index >= clean.values.size() || clean.values[index].generation != clean.generation) return KYTY_MATERIALIZE_FAIL(100000u);
 	// A completed strict result has already checked GPU ownership and contributed
 	// its exact semantic reads to the shared observer. Copy its value, not its
 	// generation. Failed/in-progress nodes and other EXEC contexts never cross over.
@@ -971,7 +972,7 @@ bool SrtWalker::BorrowCleanValue(uint32_t index, uint64_t& result) {
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
 	if (!EvaluateWide(value, wide)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	result = static_cast<uint32_t>(wide);
 	return true;
@@ -1008,12 +1009,12 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 			case Type::U32: result = value.U32(); return true;
 			case Type::U64: result = value.U64(); return true;
 			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
+			default: return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	if (!m_program.evaluation_recipes.empty()) {
 		const auto index = MemoIndex(*inst);
@@ -1035,7 +1036,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	// The low generation bit marks an instruction that is still being evaluated.
 	if (m_context.values[index].generation == (m_context.generation | 1u)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	if (BorrowCleanValue(index, result)) return true;
 	m_context.values[index].generation = m_context.generation | 1u;
@@ -1045,7 +1046,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
 		memo.generation = 0;
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	memo.value      = out;
 	memo.generation = m_context.generation;
@@ -1059,7 +1060,7 @@ bool SrtWalker::EvaluateRoot(Value value, const ResourcePlan::EvaluationOperand&
 		return Evaluate(value, result);
 	}
 	uint64_t wide = 0;
-	if (!EvaluateOperand(root, wide)) return false;
+	if (!EvaluateOperand(root, wide)) return KYTY_MATERIALIZE_FAIL(100000u);
 	result = static_cast<uint32_t>(wide);
 	return true;
 }
@@ -1084,14 +1085,14 @@ bool SrtWalker::EvaluateOperand(const ResourcePlan::EvaluationOperand& operand,
 	switch (operand.kind) {
 		case Kind::Immediate: result = operand.value; return true;
 		case Kind::Node: return EvaluateRecipeNode(operand.index, result);
-		case Kind::Invalid: return false;
+		case Kind::Invalid: return KYTY_MATERIALIZE_FAIL(100000u);
 	}
-	return false;
+	return KYTY_MATERIALIZE_FAIL(100000u);
 }
 
 bool SrtWalker::EvaluateRecipeNode(uint32_t index, uint64_t& result) {
 	using Kind = ResourcePlan::EvaluationRecipe::Kind;
-	if (index >= m_program.evaluation_recipes.size()) return false;
+	if (index >= m_program.evaluation_recipes.size()) return KYTY_MATERIALIZE_FAIL(100000u);
 	const auto& recipe = m_program.evaluation_recipes[index];
 	// EXEC overrides precede memo lookup just as in EvaluateWide. Do not evaluate
 	// a predicate, or cache this select under a different active-mask context.
@@ -1108,7 +1109,7 @@ bool SrtWalker::EvaluateRecipeNode(uint32_t index, uint64_t& result) {
 		result = m_context.values[index].value;
 		return true;
 	}
-	if (m_context.values[index].generation == (m_context.generation | 1u)) return false;
+	if (m_context.values[index].generation == (m_context.generation | 1u)) return KYTY_MATERIALIZE_FAIL(100000u);
 	if (BorrowCleanValue(index, result)) return true;
 	m_context.values[index].generation = m_context.generation | 1u;
 	if (m_count_recipes) {
@@ -1127,7 +1128,7 @@ bool SrtWalker::EvaluateRecipeNode(uint32_t index, uint64_t& result) {
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
 		memo.generation = 0;
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	memo.value = out;
 	memo.generation = m_context.generation;
@@ -1141,7 +1142,7 @@ bool SrtWalker::EvaluateArithmeticTape(const ResourcePlan::ArithmeticTape& tape,
 	const auto base = m_context.tape_values_used;
 	const auto end = base + tape.count;
 	if (end < base || tape.count == 0 ||
-	    static_cast<size_t>(tape.first) + tape.count > m_program.arithmetic_tape_instructions.size()) return false;
+	    static_cast<size_t>(tape.first) + tape.count > m_program.arithmetic_tape_instructions.size()) return KYTY_MATERIALIZE_FAIL(100000u);
 	if (m_context.tape_values.size() < end) m_context.tape_values.resize(end);
 	struct ScratchScope {
 		ResourcePlan::EvaluationContext& context;
@@ -1155,14 +1156,14 @@ bool SrtWalker::EvaluateArithmeticTape(const ResourcePlan::ArithmeticTape& tape,
 		uint64_t value = 0;
 		if (instruction.kind == Kind::Boundary) {
 			if (m_count_recipes) ++m_tape_boundary_calls;
-			if (!EvaluateRecipeNode(instruction.parameter, value)) return false;
+			if (!EvaluateRecipeNode(instruction.parameter, value)) return KYTY_MATERIALIZE_FAIL(100000u);
 		} else {
 			std::array<uint64_t, 4> operands {};
-			if (instruction.operand_count > operands.size()) return false;
+			if (instruction.operand_count > operands.size()) return KYTY_MATERIALIZE_FAIL(100000u);
 			for (uint32_t arg = 0; arg < instruction.operand_count; ++arg) {
 				const auto& operand = instruction.operands[arg];
 				// Only earlier results are legal, including under nested tape calls.
-				if (!operand.immediate && operand.value >= i) return false;
+				if (!operand.immediate && operand.value >= i) return KYTY_MATERIALIZE_FAIL(100000u);
 				operands[arg] = operand.immediate ? operand.value : m_context.tape_values[base + operand.value];
 			}
 			if (m_count_recipes) ++m_tape_operations;
@@ -1170,10 +1171,10 @@ bool SrtWalker::EvaluateArithmeticTape(const ResourcePlan::ArithmeticTape& tape,
 				case Kind::Operation:
 					if (!EvaluateInstWithOperands(*instruction.instruction, value,
 					        [&](size_t arg, uint64_t& out) {
-						        if (arg >= instruction.operand_count) return false;
+						        if (arg >= instruction.operand_count) return KYTY_MATERIALIZE_FAIL(100000u);
 						        out = operands[arg];
 						        return true;
-					        })) return false;
+					        })) return KYTY_MATERIALIZE_FAIL(100000u);
 					break;
 				case Kind::Forward: value = operands[0]; break;
 				case Kind::Extract: value = static_cast<uint32_t>(operands[0] >> (instruction.parameter * 32u)); break;
@@ -1182,7 +1183,7 @@ bool SrtWalker::EvaluateArithmeticTape(const ResourcePlan::ArithmeticTape& tape,
 					        static_cast<uint32_t>(operands[1]);
 					value = static_cast<uint32_t>(value >> (instruction.parameter * 32u));
 					break;
-				case Kind::Boundary: return false;
+				case Kind::Boundary: return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 		}
 		// A boundary can recursively resize scratch. Do not retain vector references
@@ -1204,7 +1205,7 @@ bool SrtWalker::EvaluateRecipe(const ResourcePlan::EvaluationRecipe& recipe,
 			return EvaluateInst(*recipe.instruction, result, &recipe);
 		case Kind::UserData:
 			if (recipe.parameter < m_program.user_data_base ||
-			    recipe.parameter - m_program.user_data_base >= m_runtime.user_data.size()) return false;
+			    recipe.parameter - m_program.user_data_base >= m_runtime.user_data.size()) return KYTY_MATERIALIZE_FAIL(100000u);
 			result = m_runtime.user_data[recipe.parameter - m_program.user_data_base];
 			return true;
 		case Kind::FlatRead:
@@ -1215,11 +1216,11 @@ bool SrtWalker::EvaluateRecipe(const ResourcePlan::EvaluationRecipe& recipe,
 			return EvaluateOperand(recipe.operands[0], result);
 		case Kind::Forward: return EvaluateOperand(recipe.operands[0], result);
 		case Kind::Extract:
-			if (!EvaluateOperand(recipe.operands[0], a)) return false;
+			if (!EvaluateOperand(recipe.operands[0], a)) return KYTY_MATERIALIZE_FAIL(100000u);
 			result = static_cast<uint32_t>(a >> (recipe.parameter * 32u));
 			return true;
 		case Kind::ExtractCarry:
-			if (!EvaluateOperand(recipe.operands[0], a) || !EvaluateOperand(recipe.operands[1], b)) return false;
+			if (!EvaluateOperand(recipe.operands[0], a) || !EvaluateOperand(recipe.operands[1], b)) return KYTY_MATERIALIZE_FAIL(100000u);
 			a = static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
 			result = static_cast<uint32_t>(a >> (recipe.parameter * 32u));
 			return true;
@@ -1227,17 +1228,17 @@ bool SrtWalker::EvaluateRecipe(const ResourcePlan::EvaluationRecipe& recipe,
 		case Kind::RawBuffer:
 			if (!ResolveRecipeReadAddress(recipe, a, b)) {
 				ObserveSrtRead(m_runtime, a, {}, false);
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			return ReadRawWord(a, result);
 		case Kind::Select: {
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-			if (!predicate.EvaluateOperand(recipe.operands[0], a)) return false;
+			if (!predicate.EvaluateOperand(recipe.operands[0], a)) return KYTY_MATERIALIZE_FAIL(100000u);
 			return EvaluateOperand(recipe.operands[a != 0u ? 1u : 2u], result);
 		}
 		case Kind::Fallback: break;
 	}
-	return false;
+	return KYTY_MATERIALIZE_FAIL(100000u);
 }
 
 bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -1252,23 +1253,23 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	const auto index = inst.Arg(1).Resolve();
 	if (!index.IsImmediate() || index.GetType() != Type::U32) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto component = index.U32();
 	if (component >= 2u) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 		uint64_t packed = 0;
 		if (!Arg(inst, 0, packed)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		result = static_cast<uint32_t>(packed >> (component * 32u));
 		return true;
 	}
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
@@ -1277,7 +1278,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		uint64_t lhs = 0;
 		uint64_t rhs = 0;
 		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const auto sum =
 		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
@@ -1285,7 +1286,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
 		return true;
 	}
-	return false;
+	return KYTY_MATERIALIZE_FAIL(100000u);
 }
 
 bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
@@ -1302,18 +1303,18 @@ bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
 	}
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
@@ -1322,10 +1323,10 @@ bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		if (immediate < 0) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		const auto byte_offset =
 		    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
@@ -1335,7 +1336,7 @@ bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		available = size - aligned;
 		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
@@ -1343,7 +1344,7 @@ bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 	}
 	return true;
@@ -1354,27 +1355,27 @@ bool SrtWalker::ResolveRecipeReadAddress(const ResourcePlan::EvaluationRecipe& r
 	uint64_t low = 0, high = 0, offset = 0;
 	if (!EvaluateOperand(recipe.operands[0], low) ||
 	    !EvaluateOperand(recipe.operands[1], high) ||
-	    !EvaluateOperand(recipe.operands[2], offset)) return false;
+	    !EvaluateOperand(recipe.operands[2], offset)) return KYTY_MATERIALIZE_FAIL(100000u);
 	const auto base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	available = UINT64_MAX;
 	if (recipe.kind == ResourcePlan::EvaluationRecipe::Kind::RawBuffer) {
 		uint64_t records = 0, word3 = 0;
 		// Word 3 is semantically evaluated even though the address math does not use it.
 		if (!EvaluateOperand(recipe.operands[3], records) ||
-		    !EvaluateOperand(recipe.operands[4], word3)) return false;
-		if (recipe.offset < 0) return false;
+		    !EvaluateOperand(recipe.operands[4], word3)) return KYTY_MATERIALIZE_FAIL(100000u);
+		if (recipe.offset < 0) return KYTY_MATERIALIZE_FAIL(100000u);
 		const auto byte_offset = static_cast<uint64_t>(recipe.offset) + static_cast<uint32_t>(offset);
 		const auto aligned = byte_offset & ~uint64_t {3};
 		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                              : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (aligned > size || size - aligned < sizeof(uint32_t)) return false;
+		if (aligned > size || size - aligned < sizeof(uint32_t)) return KYTY_MATERIALIZE_FAIL(100000u);
 		available = size - aligned;
 		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 	} else {
 		const auto relative = (recipe.offset & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) return false;
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	return true;
 }
@@ -1391,7 +1392,8 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 				result = 0;
 				return true;
 			}
-			return false;
+			MaterializeTrail::FailedRead(address);
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 	} else {
 		// A descriptor pointer the guest has not written yet reads as null, and the fields behind
@@ -1400,7 +1402,8 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		constexpr uint64_t null_page_limit = 0x10000;
 		if (address < null_page_limit) {
 			ObserveSrtRead(m_runtime, address, {&word, 1}, false);
-			return false;
+			MaterializeTrail::FailedRead(address);
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		constexpr uint64_t gpu_limit = uint64_t {1} << 40u;
 		// Read the exact clean bytes without faulting on unrelated dirty bytes in
@@ -1424,7 +1427,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint64_t available = 0;
 	if (!ResolveRawReadAddress(inst, address, available)) {
 		ObserveSrtRead(m_runtime, address, {}, false);
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	return ReadRawWord(address, result);
 }
@@ -1444,7 +1447,7 @@ bool SrtWalker::EvaluateFlatRun(uint32_t first, uint32_t end,
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
 	if (m_context.values[memo_index].generation == m_context.generation) return true;
-	if (m_context.values[memo_index].generation == (m_context.generation | 1u)) return false;
+	if (m_context.values[memo_index].generation == (m_context.generation | 1u)) return KYTY_MATERIALIZE_FAIL(100000u);
 	uint64_t shared_value = 0;
 	if (BorrowCleanValue(memo_index, shared_value)) return true;
 	// Preserve the normal recursion guard and operand-read order. Address resolution
@@ -1455,7 +1458,7 @@ bool SrtWalker::EvaluateFlatRun(uint32_t first, uint32_t end,
 	if (!ResolveRawReadAddress(*inst, address, available)) {
 		ObserveSrtRead(m_runtime, address, {}, false);
 		m_context.values[memo_index].generation = 0;
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	uint32_t words = 1;
 	while (first + words < end && words < MaxFlatReadRun &&
@@ -1489,7 +1492,7 @@ bool SrtWalker::EvaluateFlatRun(uint32_t first, uint32_t end,
 		uint64_t value = 0;
 		if (!ReadRawWord(address, value, words > 1u)) {
 			m_context.values[memo_index].generation = 0;
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		values[0] = static_cast<uint32_t>(value);
 		words = 1;
@@ -1527,7 +1530,7 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
 			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			result = m_runtime.user_data[reg - m_program.user_data_base];
 			return true;
@@ -1547,7 +1550,7 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
 		case ValueOpcode::CompositeConstructU64:
 			if (!binary()) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			result = static_cast<uint32_t>(a) |
 			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
@@ -1556,7 +1559,7 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 			const auto slot = inst.Arg(1).Resolve();
 			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			    slot.U32() >= m_program.srt_reads.size()) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			if (slot.U32() < m_clean_flat_slots.size() &&
 			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
@@ -1576,78 +1579,78 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				result = static_cast<uint32_t>(a + b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::IAdd64:
 			if (binary()) {
 				result = a + b;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ISub32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a - b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ISub64:
 			if (binary()) {
 				result = a - b;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::IMul32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a * b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::IMul64:
 			if (binary()) {
 				result = a * b;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::UMin32:
 			if (binary()) {
 				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ConvertF32U32:
 			if (arg(0, a)) {
 				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ConvertU32F32:
 			if (arg(0, a)) {
 				const auto value = Float32(a);
 				if (!std::isfinite(value) || value < 0.0f ||
 				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(100000u);
 				}
 				result = static_cast<uint32_t>(value);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::FPMul32:
 			if (binary()) {
 				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::FPTrunc32:
 			if (arg(0, a)) {
 				result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::FPIsNan32:
 			if (arg(0, a)) {
 				result = std::isnan(Float32(a));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::FPOrdLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
@@ -1663,80 +1666,80 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				             : operand(a) >= operand(b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitwiseAnd32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a & b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitwiseAnd64:
 			if (binary()) {
 				result = a & b;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitwiseOr32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a | b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitwiseXor32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a ^ b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitwiseNot32:
 			if (arg(0, a)) {
 				result = ~static_cast<uint32_t>(a);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftLeftLogical32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) << (b & 31u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftLeftLogical64:
 			if (binary()) {
 				result = a << (b & 63u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftRightLogical32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) >> (b & 31u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftRightLogical64:
 			if (binary()) {
 				result = a >> (b & 63u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftRightArithmetic32:
 			if (binary()) {
 				result = static_cast<uint32_t>(
 				    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ShiftRightArithmetic64:
 			if (binary()) {
 				result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitFieldUExtract:
 			if (ternary()) {
 				const auto offset = static_cast<uint32_t>(b);
 				const auto width  = static_cast<uint32_t>(c);
 				if (offset > 32u || width > 32u - offset) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(100000u);
 				}
 				const auto mask = width == 32u  ? UINT32_MAX
 				                  : width == 0u ? 0u
@@ -1744,13 +1747,13 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitFieldSExtract:
 			if (ternary()) {
 				const auto offset = static_cast<uint32_t>(b);
 				const auto width  = static_cast<uint32_t>(c);
 				if (offset > 32u || width > 32u - offset) {
-					return false;
+					return KYTY_MATERIALIZE_FAIL(100000u);
 				}
 				if (width == 0u) {
 					result = 0;
@@ -1764,16 +1767,16 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				result = bits;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::BitFieldInsert: {
 			uint64_t d = 0;
 			if (!ternary() || !arg(3, d)) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			const auto offset = static_cast<uint32_t>(c);
 			const auto width  = static_cast<uint32_t>(d);
 			if (offset > 32u || width > 32u - offset) {
-				return false;
+				return KYTY_MATERIALIZE_FAIL(100000u);
 			}
 			if (width == 0u) {
 				result = static_cast<uint32_t>(a);
@@ -1792,75 +1795,75 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 			if (predicate.EvaluateWide(inst.Arg(0), a)) {
 				return arg(a != 0u ? 1u : 2u, result);
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		case ValueOpcode::IEqual32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::INotEqual32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::ULessThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::UGreaterThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::SGreaterThanEqual32:
 			if (binary()) {
 				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
 				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::LogicalAnd:
 			if (binary()) {
 				result = (a != 0u) && (b != 0u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::LogicalOr:
 			if (binary()) {
 				result = (a != 0u) || (b != 0u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::LogicalXor:
 			if (binary()) {
 				result = (a != 0u) != (b != 0u);
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::LogicalNot:
 			if (arg(0, a)) {
 				result = a == 0u;
 				return true;
 			}
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		case ValueOpcode::UndefU1:
 		case ValueOpcode::UndefU8:
 		case ValueOpcode::UndefU16:
 		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
+		case ValueOpcode::UndefU64: return KYTY_MATERIALIZE_FAIL(100000u);
 		default: break;
 	}
-	return false;
+	return KYTY_MATERIALIZE_FAIL(100000u);
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
@@ -1871,7 +1874,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		                   result.dwords[index])
 		    : Evaluate(descriptor.dwords[index], result.dwords[index]);
 		if (!ok) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 	}
 	return true;
@@ -1944,7 +1947,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) {
-		return false;
+		return KYTY_MATERIALIZE_FAIL(100000u);
 	}
 	flat.resize(m_program.srt_reads.size());
 	for (uint32_t index = 0; index < m_program.srt_reads.size();) {
@@ -1952,10 +1955,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size()) return false;
+		if (read.flat_offset >= flat.size()) return KYTY_MATERIALIZE_FAIL(100000u);
 		if (evaluator.m_runtime.try_read_clean_backing != nullptr &&
 		    index < m_program.srt_read_run_ends.size() &&
 		    m_program.srt_read_run_ends[index] > index) {
@@ -1970,7 +1973,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				}
 			}
 			uint32_t consumed = 0;
-			if (!evaluator.EvaluateFlatRun(index, end, flat, consumed)) return false;
+			if (!evaluator.EvaluateFlatRun(index, end, flat, consumed)) return KYTY_MATERIALIZE_FAIL(100000u);
 			if (consumed != 0u) {
 				index += consumed;
 				continue;
@@ -1980,7 +1983,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		    ? evaluator.EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
 		    : evaluator.Evaluate(read.value, flat[read.flat_offset]);
 		if (!ok) {
-			return false;
+			return KYTY_MATERIALIZE_FAIL(100000u);
 		}
 		++index;
 	}

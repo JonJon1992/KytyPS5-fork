@@ -38,6 +38,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
+#include "graphics/shader/recompiler/ir/passes/MaterializeTrail.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuReadDelegate.h"
@@ -60,6 +61,7 @@
 #include <future>
 #include <fmt/format.h>
 #include <limits>
+#include <set>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -1937,6 +1939,31 @@ struct PipelineCache::ProgramCache {
 				            "draws/dispatches are dropped\n",
 				            count, read_attempt.count,
 				            read_attempt.count != 0 ? read_attempt.missing[0].address : 0);
+			}
+			// Diagnostic (diag-materialize-trail): the failed-return sites of this stage's
+			// materialization, once per shader and first site (100000 + line: SrtWalker.cpp,
+			// 200000 + line: ResourceMaterialization.cpp).
+			const auto& trail = ShaderRecompiler::IR::MaterializeTrail::Current();
+			static std::mutex                               trail_mutex;
+			static std::set<std::pair<uint64_t, uint32_t>> trail_reported;
+			bool                                            report = false;
+			{
+				std::scoped_lock trail_lock(trail_mutex);
+				report = trail_reported.size() < 48 &&
+				         trail_reported.emplace(runtime.shader_base, trail.count != 0 ? trail.sites[0] : 0u)
+				             .second;
+			}
+			if (report) {
+				std::string sites;
+				const auto  recorded =
+				    std::min(trail.count, ShaderRecompiler::IR::MaterializeTrail::Trail::Capacity);
+				for (uint32_t i = 0; i < recorded; i++) {
+					sites += fmt::format(" {}", trail.sites[i]);
+				}
+				std::printf("MaterializeTrail: shader at 0x%016" PRIx64 " dropped; %u failed returns:%s; "
+				            "%u failed SRT reads (first 0x%016" PRIx64 ")\n",
+				            runtime.shader_base, trail.count, sites.c_str(), trail.failed_reads,
+				            trail.first_failed_read);
 			}
 			return false;
 		}
