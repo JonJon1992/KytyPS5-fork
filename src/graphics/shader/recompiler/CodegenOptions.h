@@ -77,7 +77,8 @@ struct CodegenOptions {
 	// (no buffer store or atomic, no coherent load) without NonWritable. With it, the AMD driver
 	// loads a uniform address once per wave into scalar registers instead of once per lane
 	// (serbru20066666/brunoKytyPs5 def478029: a lighting shader of ASTRO's PLAYROOM 3.45 -> 2.76 ms
-	// on an RX 6800 XT); other drivers may use their read-only caches.
+	// on an RX 6800 XT); other drivers may use their read-only caches. The page table, shader data
+	// and flattened SRT buffers, which no program writes, are NonWritable in every program.
 	bool readonly_buffers = true;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;

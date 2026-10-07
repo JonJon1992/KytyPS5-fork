@@ -353,6 +353,16 @@ void DefineDescriptors(EmitterState& state) {
 			                            IR::NativeBinding(state.program.stage, binding.kind));
 			return variable;
 		};
+		// KYTY_READONLY_BUFFERS: the page table, the shader data and the flattened SRT are host
+		// written and only loaded by every program, whatever it does with its own buffers. Their
+		// uniform loads (a descriptor of the SRT, a dword of shader data, the page of a uniform
+		// pointer) can then go through the scalar cache on AMD as well.
+		const auto DefineReadOnly = [&](uint32_t variable) {
+			if (GetCodegenOptions().readonly_buffers) {
+				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			}
+			return variable;
+		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
@@ -392,20 +402,22 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
+				state.bda_pagetable_variable =
+				    DefineReadOnly(Define(StorageBufferU64Type(state), "bda_pagetable"));
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
-				    Define(StorageBufferType(state), "shader_data");
+				    DefineReadOnly(Define(StorageBufferType(state), "shader_data"));
 				break;
 			case IR::DescriptorBindingKind::MipStats:
 				state.mip_stats_variable = Define(StorageBufferType(state), "mip_stats");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
-				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				state.flattened_srt_variable =
+				    DefineReadOnly(Define(StorageBufferType(state), "flattened_srt"));
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),

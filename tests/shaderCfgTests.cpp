@@ -11609,6 +11609,7 @@ size_t CountSpirvOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
 
 // KYTY_READONLY_BUFFERS (CodegenOptions::readonly_buffers): a program without buffer stores or
 // atomics declares its storage buffers NonWritable; one that stores, or the switch off, does not.
+// The page table, shader data and flattened SRT are NonWritable whenever the switch is on.
 size_t CountSpirvDecoration(const std::vector<uint32_t> &binary, uint32_t decoration) {
   constexpr uint32_t OpDecorate = 71u;
   size_t count = 0;
@@ -11623,30 +11624,76 @@ size_t CountSpirvDecoration(const std::vector<uint32_t> &binary, uint32_t decora
 
 void TestReadOnlyBuffers() {
   constexpr uint32_t NonWritable = 24u;
+  // The fixture buffer in s[0:3] (raw offset bounds): a buffer at s[48:51] is all zero, whose
+  // stride-0 OOB_SELECT 0 bounds drop every store.
   const uint32_t load_only[] = {
-      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 12, 0), // buffer_load_dword v0
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0), // buffer_load_dword v0
       EncodeDs0(0x0d), EncodeDs1(0, 0, 0),                  // ds_write_b32 v0, v0
       0xbf810000u,
   };
   const uint32_t load_store[] = {
-      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 12, 0), // buffer_load_dword v0
-      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 12, 0), // buffer_store_dword v0
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0), // buffer_load_dword v0
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 0, 0), // buffer_store_dword v0
       0xbf810000u,
+  };
+  // A load through BDA, which reads the page table, and a buffer store.
+  const uint32_t flat_load_store[] = {
+      EncodeFlat0(0x0c, 0, 0), EncodeFlat1(0, 0x7d, 0, 1),  // flat_load_dword v0, v[1:2]
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 0, 0), // buffer_store_dword v0
+      0xbf810000u,
+  };
+  struct Compiled {
+    size_t non_writable  = 0;
+    size_t host_bindings = 0; // page table, shader data and flattened SRT bindings
+    bool   page_table    = false;
+    bool   stores        = false; // a buffer store or atomic survived translation
   };
   const auto saved   = ShaderRecompiler::GetCodegenOptions();
   const auto compile = [&](const auto &shader, bool readonly) {
+    using ShaderRecompiler::IR::DescriptorBindingKind;
     auto options             = saved;
     options.readonly_buffers = readonly;
     ShaderRecompiler::SetCodegenOptions(options);
     auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
     ShaderRecompiler::SetCodegenOptions(saved);
     CheckSpirvBinaryValidates(result.spirv);
-    return CountSpirvDecoration(result.spirv, NonWritable);
+    const auto has = [&](DescriptorBindingKind kind) {
+      return ShaderRecompiler::IR::FindBinding(result.program.bindings, kind) != nullptr;
+    };
+    Compiled compiled;
+    compiled.non_writable = CountSpirvDecoration(result.spirv, NonWritable);
+    compiled.page_table   = has(DescriptorBindingKind::BdaPagetable);
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        const auto access = ShaderRecompiler::IR::BufferAccessOf(inst.GetOpcode());
+        compiled.stores |= access == ShaderRecompiler::IR::BufferAccess::Write ||
+                           access == ShaderRecompiler::IR::BufferAccess::Atomic;
+      }
+    }
+    compiled.host_bindings = (compiled.page_table ? 1u : 0u) +
+                             (has(DescriptorBindingKind::ShaderData) ? 1u : 0u) +
+                             (has(DescriptorBindingKind::FlattenedSrt) ? 1u : 0u);
+    return compiled;
   };
-  Check(compile(load_only, true) == compile(load_only, false) + 1u,
+  // With the switch on, every host-written binding is NonWritable, and the buffers are too only
+  // in the program that never stores to them.
+  const auto added = [&](const auto &shader) {
+    const auto on  = compile(shader, true);
+    const auto off = compile(shader, false);
+    return std::pair {on.non_writable - off.non_writable, on.host_bindings};
+  };
+  const auto [load_only_added, load_only_host] = added(load_only);
+  Check(load_only_added == load_only_host + 1u,
         "read-only buffers: a load-only program did not declare its buffers NonWritable");
-  Check(compile(load_store, true) == compile(load_store, false),
+  const auto [load_store_added, load_store_host] = added(load_store);
+  Check(compile(load_store, true).stores && compile(flat_load_store, true).stores,
+        "read-only buffers: the store programs lost their buffer store");
+  Check(load_store_added == load_store_host,
         "read-only buffers: a program that stores declared its buffers NonWritable");
+  const auto [flat_added, flat_host] = added(flat_load_store);
+  Check(compile(flat_load_store, true).page_table && flat_added == flat_host,
+        "read-only buffers: the page table of a program that stores to its buffers is not "
+        "NonWritable");
 }
 
 void TestGeometryOutputGuard() {
@@ -15916,6 +15963,11 @@ int main(int argc, char **argv) {
     TestMeshIndirectParams();
     TestGeometryOutputGuard();
     std::printf("shader_cfg --mesh-indirect-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readonly-buffers-only") == 0) {
+    TestReadOnlyBuffers();
+    std::printf("shader_cfg --readonly-buffers-only: ok\n");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
