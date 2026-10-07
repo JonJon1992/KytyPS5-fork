@@ -210,14 +210,15 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
-bool HasShaderMemoryWrites(const Program& program) {
+bool HasShaderMemoryWrites(const Program& program, bool include_image_writes) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op     = inst.GetOpcode();
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op).access;
 			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    (include_image_writes &&
+			     (image == ImageAccess::Write || image == ImageAccess::Atomic)) ||
 			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
 				return true;
 			}

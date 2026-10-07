@@ -179,6 +179,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
+		m_table_writes  = HasShaderMemoryWrites(program, false);
 	}
 
 	void Run() {
@@ -988,9 +989,12 @@ private:
 		return true;
 	}
 
+	// A loop over a T# table that the CPU enumerates before the dispatch: the shader must not
+	// rewrite the table or the bound meanwhile. Storage image writes cannot (Ghost of Yotei's
+	// froxel passes sample a table of 3D textures and store a 3D image).
 	Value BoundedLoopCount(Value key, const Block* use) const {
 		const auto* phi = key.Resolve().TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		if (m_table_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return {};
@@ -1736,6 +1740,9 @@ private:
 	std::vector<BindlessSamplerPlan> m_bindless_samplers;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	// Writes that could reach a descriptor table or loop bound in guest memory: buffer, address
+	// and atomic stores, not storage image texels.
+	bool                                       m_table_writes = false;
 	bool                                       m_indirect_scalar_buffers = false;
 	uint32_t                                   m_unresolved_pc = UINT32_MAX;
 

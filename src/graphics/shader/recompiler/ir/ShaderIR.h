@@ -846,7 +846,9 @@ struct Program: ResourcePlan {
 };
 
 std::string ProgramToString(const Program& program);
-bool        HasShaderMemoryWrites(const Program& program);
+// Whether the program stores to or atomically updates memory; image texel writes count unless
+// `include_image_writes` is false.
+bool        HasShaderMemoryWrites(const Program& program, bool include_image_writes = true);
 
 // Deep copy of a translated program (ir/ProgramClone.cpp); false when `source` references an
 // instruction or block it does not own. The pipeline cache specializes such copies instead of
