@@ -758,7 +758,8 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		Profiler::CountFrameEvent(image.image != nullptr ? Profiler::FrameEvent::NativeImagePoolHits
 		                                                 : Profiler::FrameEvent::NativeImagePoolMisses);
 	}
-	const bool pool_hit = image.image != nullptr;
+	const bool pool_hit      = image.image != nullptr;
+	bool       system_memory = false;
 	if (image.image == nullptr) {
 		VmaAllocationCreateInfo alloc_info {};
 		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -788,6 +789,11 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			alloc_info.requiredFlags  = 0;
 			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 			result                    = allocate();
+			if (result == vk::Result::eSuccess) {
+				VkMemoryPropertyFlags memory_flags = 0;
+				vmaGetAllocationMemoryProperties(allocator, image.allocation, &memory_flags);
+				system_memory = (memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0;
+			}
 			static std::atomic<uint32_t> reported {0};
 			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
 				std::fprintf(stderr, "Vulkan: video memory full, %s: %ux%ux%u format=%d layers=%u levels=%u "
@@ -830,8 +836,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
-	image.pool_eligible = recycle;
-	image.pool_create_info = recycle ? image_info : vk::ImageCreateInfo {};
+	// An image in system memory is destroyed when it retires, not pooled: the next image of its
+	// shape tries video memory again instead of reusing the slow allocation for good.
+	image.pool_eligible = recycle && !system_memory;
+	image.pool_create_info = image.pool_eligible ? image_info : vk::ImageCreateInfo {};
 
 	return true;
 }
