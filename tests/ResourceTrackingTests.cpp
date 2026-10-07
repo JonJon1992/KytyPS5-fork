@@ -556,7 +556,10 @@ void TestInvariantIndirectImageMaterialization() {
 
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Guard { Nonzero, Zero, Unrelated, Bypass };
+  enum class Guard {
+    Nonzero, Conjunction, Disjunction, Sentinel, Join, AncestorRead,
+    Zero, Unrelated, Bypass, PositiveOr
+  };
   const auto make_plan = [](Guard guard) {
     Fixture fixture(ShaderType::Pixel);
     auto *entry = fixture.block;
@@ -570,11 +573,27 @@ void TestGuardedDirectImageTable() {
     before_sample->AddBranch(sample);
     sample->AddBranch(exit);
     if (guard == Guard::Bypass) exit->AddBranch(sample);
+    if (guard == Guard::Join) middle->AddBranch(sample);
     const auto mask = fixture.Emit(ValueOpcode::ReadFirstLane,
         {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
-    const auto nonzero = fixture.Emit(
+    auto nonzero = fixture.Emit(
         ValueOpcode::INotEqual32,
         {Value(0u), guard == Guard::Unrelated ? fixture.UserData(2) : mask});
+    if (guard == Guard::Conjunction) {
+      nonzero = fixture.Emit(ValueOpcode::LogicalAnd, {nonzero, Value(true)});
+    } else if (guard == Guard::Disjunction) {
+      nonzero = fixture.Emit(ValueOpcode::LogicalNot,
+          {fixture.Emit(ValueOpcode::LogicalOr,
+              {fixture.Emit(ValueOpcode::IEqual32, {mask, Value(0u)}),
+               fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(2), Value(0u)})})});
+    } else if (guard == Guard::PositiveOr) {
+      nonzero = fixture.Emit(ValueOpcode::LogicalOr,
+          {nonzero, fixture.Emit(ValueOpcode::INotEqual32,
+                                {fixture.UserData(2), Value(0u)})});
+    } else if (guard == Guard::Sentinel) {
+      nonzero = fixture.Emit(ValueOpcode::INotEqual32,
+          {fixture.Emit(ValueOpcode::FindILsb32, {mask}), Value(UINT32_MAX)});
+    }
     fixture.program.block_info[0].condition =
         fixture.Emit(ValueOpcode::LogicalNot, {nonzero});
     fixture.program.block_info[0].terminator = {
@@ -584,6 +603,13 @@ void TestGuardedDirectImageTable() {
     for (uint32_t block = 1; block < 4; ++block) {
       fixture.program.block_info[block].terminator = {
           .kind = CFG::TerminatorKind::Branch, .true_block = block + 1u};
+    }
+    if (guard == Guard::Join) {
+      fixture.program.block_info[1].condition = fixture.Emit(
+          ValueOpcode::INotEqual32, {fixture.UserData(3), Value(0u)}, 0, middle);
+      fixture.program.block_info[1].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = 2u, .false_block = 3u};
     }
     fixture.program.block_info[4].terminator = {
         .kind = guard == Guard::Bypass ? CFG::TerminatorKind::Branch
@@ -599,7 +625,7 @@ void TestGuardedDirectImageTable() {
           ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
           fixture.AddMemory(memory, 0x20));
     }
-    fixture.block = sample;
+    fixture.block = guard == Guard::AncestorRead ? before_sample : sample;
     const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
     const auto offset = fixture.Emit(ValueOpcode::IAdd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
@@ -620,6 +646,7 @@ void TestGuardedDirectImageTable() {
             fixture.AddMemory(memory, 0x100 + group * 8u));
       }
     }
+    fixture.block = sample;
     const auto image = fixture.Image(words, 0x128);
     const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
     MemoryInfo memory;
@@ -640,7 +667,11 @@ void TestGuardedDirectImageTable() {
   };
 
   auto plan = make_plan(Guard::Nonzero);
-  for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass}) {
+  for (const auto guard : {Guard::Conjunction, Guard::Disjunction, Guard::Sentinel, Guard::Join,
+                           Guard::AncestorRead}) {
+    (void)make_plan(guard);
+  }
+  for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass, Guard::PositiveOr}) {
     CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
                "direct table accepted a selector without a dominating nonzero guard");
   }
@@ -721,7 +752,7 @@ void TestGuardedDirectImageTable() {
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
-    Bounded, WrongGuard, EntryBypass, ExitBypass, GuardBlock, WrongStep
+    Bounded, EarlyIncrement, WrongGuard, EntryBypass, ExitBypass, GuardBlock, WrongStep
   };
   const auto make_plan = [](Variant variant) {
     Fixture fixture;
@@ -767,7 +798,7 @@ void TestBoundedComputeImageLoop() {
         fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header);
     const auto step = fixture.Emit(ValueOpcode::IAdd32,
                                    {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
-                                   0, latch);
+                                   0, variant == Variant::EarlyIncrement ? body : latch);
     phi.AddPhiOperand(entry, Value(0u));
     phi.AddPhiOperand(latch, step);
 
@@ -805,6 +836,7 @@ void TestBoundedComputeImageLoop() {
   };
 
   auto plan = make_plan(Variant::Bounded);
+  (void)make_plan(Variant::EarlyIncrement);
   CheckFatal([&] { make_plan(Variant::WrongGuard); },
              "not a valid runtime value",
              "compute image loop accepted an unrelated guard");
@@ -2051,6 +2083,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 }
 
 void TestPhiValidation() {
+  for (const bool store : {false, true}) {
   Fixture fixture;
   auto *left = fixture.block;
   auto *right = fixture.AddBlock();
@@ -2068,9 +2101,20 @@ void TestPhiValidation() {
                                    MemoryFlags{0, 20}, merge);
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-               fixture.AddMemory(memory, 20), merge);
+  const auto flags = fixture.AddMemory(memory, 20);
+  if (!store) {
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags, merge);
+    fixture.PlanAndTrack();
+    Check(fixture.program.resource_tracking_complete &&
+              fixture.program.info.uses_dma &&
+              fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
+          "scalar descriptor-phi load did not retain GPU evaluation");
+    continue;
+  }
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+               flags, merge);
 
   BuildSrtPlan(fixture.program);
   CheckFatal([&] { TrackResources(fixture.program); }, "not a valid runtime value",
@@ -2079,6 +2123,7 @@ void TestPhiValidation() {
             fixture.program.info.buffers.empty() &&
             fixture.program.descriptor_sources.empty(),
         "control-dependent descriptor phi was not rejected transactionally");
+  }
 }
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
@@ -3302,7 +3347,7 @@ void TestBufferWriteRanges() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -3311,6 +3356,18 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    if (argc == 2 && std::string_view(argv[1]) == "--indirect-buffer-only") {
+      Run("phi validation", TestPhiValidation);
+      std::cout << "indirect buffer resource tracking tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--indirect-image-only") {
+      Run("guarded direct image table", TestGuardedDirectImageTable);
+      Run("bounded compute image loop", TestBoundedComputeImageLoop);
+      Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
+      std::cout << "indirect image resource tracking tests passed\n";
+      return 0;
+    }
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

@@ -3697,6 +3697,18 @@ void TestNewShaderRecompilerVop1SdwaBfrev() {
   }
 }
 
+void TestPackedImageLoadDecode() {
+  for (uint32_t dmask = 0; dmask < 16; ++dmask) {
+    const uint32_t code[] = {0xf0000000u | (0x02u << 18u) | (dmask << 8u), 0u};
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(code, 0, decoded);
+    Check(decoded.opcode == (dmask == 1u
+              ? ShaderRecompiler::Decoder::Opcode::IMAGE_LOAD_PCK
+              : ShaderRecompiler::Decoder::Opcode::UNSUPPORTED),
+          "packed image load must accept only a single-DWORD encoding");
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -8229,9 +8241,10 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying vector-buffer descriptor did not terminate "
-              "compilation");
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma,
+        "loop-selected scalar buffer load did not retain GPU descriptor evaluation");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 #endif
 
@@ -10270,6 +10283,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
 
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.dump_ir = true;
+    // Exercise live loads and stores, rather than descriptors with a zero byte range.
+    auto user_data = std::array<uint32_t, 64>{};
+    std::ranges::copy(options.user_data, user_data.begin());
+    user_data[2] = 1u << 20u;
+    user_data[50] = 1u << 20u;
+    user_data[51] = 3u << 28u;
+    options.user_data = user_data;
     const auto saved = ShaderRecompiler::GetCodegenOptions();
     auto codegen = saved;
     codegen.robust_buffer_loads = robust_loads;
@@ -15670,6 +15690,19 @@ int main(int argc, char **argv) {
 #endif
   }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--packed-image-decode-only") {
+    TestPackedImageLoadDecode();
+    std::puts("ShaderCfgTests: packed image decode passed");
+    return 0;
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::string_view(argv[1]) == "--indirect-buffer-loop-only") {
+    TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
+    TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
+    std::puts("ShaderCfgTests: indirect buffer loop passed");
+    return 0;
+  }
+#endif
   if (argc == 2 && std::string_view(argv[1]) == "--runtime-buffer-stride-only") {
     TestRuntimeBufferStrideSharesProgram();
     std::puts("ShaderCfgTests: runtime buffer stride passed");
@@ -15955,6 +15988,7 @@ int main(int argc, char **argv) {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestPackedImageLoadDecode();
   TestRdna2IsaAccuracyDecode();
   TestRdna2LdsWaitcntBarrierAndFloatControls();
 

@@ -66,6 +66,7 @@ struct MemoryInfo {
 	bool                    data_signed                                           = false;
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
+	bool                    image_packed                                          = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
@@ -78,9 +79,12 @@ struct MemoryInfo {
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
+		if (typed || d16 || data_bits != 32u) return false;
+		if (opcode == ValueOpcode::ReadConstBuffer) return !formatted;
+		return (opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -166,6 +170,7 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          bindless          = false;
+	bool                          packed            = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

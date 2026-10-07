@@ -18,8 +18,8 @@ namespace {
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
-// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 12;
-// ImageResource 20; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 26; BufferResource 12;
+// ImageResource 21; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (IndirectImage
 // 9, BindlessSampler 2); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
@@ -29,7 +29,7 @@ static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 36, "IR::BufferResource changed: update ProgramCodec");
-static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
+static_assert(sizeof(ImageResource) == 88, "IR::ImageResource changed: update ProgramCodec");
 static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
@@ -304,6 +304,7 @@ void Write(CodecWriter& w, const MemoryInfo& v) {
 	w.Bool(v.data_signed);
 	w.Bool(v.typed);
 	w.Bool(v.formatted);
+	w.Bool(v.image_packed);
 	w.Bool(v.image_has_mip);
 	w.Bool(v.image_r128);
 	w.Bool(v.idxen);
@@ -333,6 +334,7 @@ void Read(CodecReader& r, MemoryInfo& v) {
 	v.data_signed              = r.Bool();
 	v.typed                    = r.Bool();
 	v.formatted                = r.Bool();
+	v.image_packed             = r.Bool();
 	v.image_has_mip            = r.Bool();
 	v.image_r128               = r.Bool();
 	v.idxen                    = r.Bool();
@@ -390,6 +392,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.Bool(v.cube);
 	w.Bool(v.r128);
 	w.Bool(v.bindless);
+	w.Bool(v.packed);
 	w.U32(v.indirect_root);
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
@@ -414,6 +417,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.cube                       = r.Bool();
 	v.r128                       = r.Bool();
 	v.bindless = r.Bool();
+	v.packed   = r.Bool();
 	v.indirect_root              = r.U32();
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();

@@ -1192,6 +1192,7 @@ private:
 		bool                                     cube              = false;
 		bool                                     r128              = false;
 		bool                                     atomic64          = false;
+		bool                                     packed            = false;
 
 		bool operator==(const TextureDescriptionKey&) const = default;
 	};

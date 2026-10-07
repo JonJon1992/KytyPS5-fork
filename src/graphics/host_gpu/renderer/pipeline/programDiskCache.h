@@ -167,7 +167,7 @@ public:
 
 	// File format constants (tests build damaged files from them).
 	static constexpr char     FileMagic[8]     = {'K', 'Y', 'P', 'R', 'O', 'G', 'C', '1'};
-	static constexpr uint32_t FormatVersion    = 1;
+	static constexpr uint32_t FormatVersion    = 2;
 	static constexpr uint32_t RecordMagic      = 0x4352504bu; // "KPRC"
 	static constexpr uint32_t RecordSource      = 1;
 	static constexpr uint32_t RecordPermutation = 2;

@@ -636,7 +636,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || resource.packed || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
@@ -786,7 +786,9 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
+	    storage || resource.numeric_class ==
+	        (resource.packed ? Prospero::TextureNumericClass::Uint
+	                         : Prospero::SampledTextureNumericClass(format));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -857,7 +859,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	auto pixel_format = surface_format.vk_format;
+	auto pixel_format = resource.packed ? vk::Format::eR32Uint : surface_format.vk_format;
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;
@@ -999,7 +1001,7 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	// The recompiler's specialization treats a sampled texture whose format the host cannot
 	// represent as a null image (ResourceMaterialization.cpp); bind a null texture for it here.
 	const bool unsupported_sampled_format =
-	    !storage && !resource.depth_compare &&
+	    !storage && !resource.packed && !resource.depth_compare &&
 	    !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
 	    Prospero::SampledTextureNumericClass(descriptor.Format()) ==
 	        Prospero::TextureNumericClass::Unsupported;
@@ -1025,7 +1027,8 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		                                 resource.shader_swizzle, resource.read,
 		                                 resource.written,        resource.atomic,
 		                                 resource.depth_compare,  resource.cube,
-		                                 resource.r128,           resource.atomic64};
+		                                 resource.r128,           resource.atomic64,
+		                                 resource.packed};
 		// TextureBindingMemo::Hash is this cache's hash of the dwords and key.
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
 		if (entry.valid && entry.key == key &&

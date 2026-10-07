@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -555,46 +556,87 @@ private:
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
 	}
 
-	bool NonzeroOnEntry(Value value, const Block* block) const {
-		if (m_program.blocks.size() != m_program.block_info.size()) {
-			return false;
+	// A true conjunction and a false disjunction constrain both operands. Facts
+	// from a true conjunction also let a negated conjunction constrain its other operand.
+	bool ConditionProvesNonzero(Value condition, bool positive, Value value,
+	                            std::vector<Value> facts = {}, uint32_t depth = 0) const {
+		if (depth > 12u) return false;
+		const auto* test = condition.Resolve().TryInstruction();
+		if (test == nullptr) return false;
+		const auto known = [&](Value candidate) {
+			return std::ranges::any_of(facts, [&](Value fact) {
+				return EquivalentValue(m_program, fact, candidate);
+			});
+		};
+		if (test->GetOpcode() == ValueOpcode::LogicalNot && test->NumArgs() == 1u) {
+			return ConditionProvesNonzero(test->Arg(0), !positive, value, facts, depth + 1u);
 		}
-		// Each unique predecessor must execute before this use. Stop at joins: an
-		// unrelated comparison is not a bound on FindILsb's zero-input sentinel.
-		for (size_t depth = 0; block != nullptr && depth < m_program.blocks.size(); ++depth) {
-			if (block->ImmPredecessors().size() != 1u) {
-				return false;
-			}
-			const auto* previous = block->ImmPredecessors()[0];
-			const auto current_it = std::ranges::find(m_program.blocks, block);
-			const auto previous_it = std::ranges::find(m_program.blocks, previous);
-			if (current_it == m_program.blocks.end() || previous_it == m_program.blocks.end()) {
-				return false;
-			}
-			const auto& info = m_program.block_info[previous_it - m_program.blocks.begin()];
-			const auto id = m_program.block_info[current_it - m_program.blocks.begin()].id;
-			const auto& term = info.terminator;
-			if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    (term.true_block == id) != (term.false_block == id)) {
-				bool positive = term.true_block == id;
-				const auto* test = info.condition.Resolve().TryInstruction();
-				while (test != nullptr && test->GetOpcode() == ValueOpcode::LogicalNot) {
-					positive = !positive;
-					test = test->Arg(0).Resolve().TryInstruction();
-				}
-				if (test != nullptr && test->NumArgs() == 2u &&
-				    ((test->GetOpcode() == ValueOpcode::INotEqual32 && positive) ||
-				     (test->GetOpcode() == ValueOpcode::IEqual32 && !positive))) {
-					for (uint32_t arg = 0; arg < 2u; ++arg) {
-						uint32_t immediate;
-						if (ImmediateU32(test->Arg(arg), immediate) && immediate == 0u &&
-						    EquivalentValue(m_program, test->Arg(arg ^ 1u), value)) {
-							return true;
-						}
-					}
-				}
-			}
-			block = previous;
+		if (test->NumArgs() != 2u) return false;
+		if (test->GetOpcode() == ValueOpcode::LogicalAnd && positive) {
+			auto with_b = facts;
+			with_b.push_back(test->Arg(1).Resolve());
+			auto with_a = facts;
+			with_a.push_back(test->Arg(0).Resolve());
+			return ConditionProvesNonzero(test->Arg(0), true, value, with_b, depth + 1u) ||
+			       ConditionProvesNonzero(test->Arg(1), true, value, with_a, depth + 1u);
+		}
+		if (test->GetOpcode() == ValueOpcode::LogicalOr && !positive) {
+			return ConditionProvesNonzero(test->Arg(0), false, value, facts, depth + 1u) ||
+			       ConditionProvesNonzero(test->Arg(1), false, value, facts, depth + 1u);
+		}
+		if (test->GetOpcode() == ValueOpcode::LogicalAnd && !positive) {
+			return (known(test->Arg(0)) &&
+			        ConditionProvesNonzero(test->Arg(1), false, value, facts, depth + 1u)) ||
+			       (known(test->Arg(1)) &&
+			        ConditionProvesNonzero(test->Arg(0), false, value, facts, depth + 1u));
+		}
+		if (!((test->GetOpcode() == ValueOpcode::INotEqual32 && positive) ||
+		      (test->GetOpcode() == ValueOpcode::IEqual32 && !positive))) return false;
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			uint32_t immediate;
+			if (!ImmediateU32(test->Arg(arg), immediate)) continue;
+			if (immediate == 0u && EquivalentValue(m_program, test->Arg(arg ^ 1u), value)) return true;
+			const auto* scan = test->Arg(arg ^ 1u).Resolve().TryInstruction();
+			// FindILsb returns UINT32_MAX for zero; rejecting that sentinel proves nonzero.
+			if (immediate == UINT32_MAX && scan != nullptr &&
+			    scan->GetOpcode() == ValueOpcode::FindILsb32 && scan->NumArgs() == 1u &&
+			    EquivalentValue(m_program, scan->Arg(0), value)) return true;
+		}
+		return false;
+	}
+
+	bool EdgeProvesNonzero(Value value, const Block* previous, const Block* block) const {
+		Value condition;
+		bool positive = false;
+		return ConditionalEdge(previous, block, condition, positive) &&
+		       ConditionProvesNonzero(condition, positive, value);
+	}
+
+	// All paths into the use must cross a guard. Mark in-progress nodes false so
+	// cycles and unguarded join predecessors fail closed.
+	bool NonzeroOnEntry(Value value, const Block* block,
+	                    std::unordered_map<const Block*, bool>* memo = nullptr) const {
+		if (m_program.blocks.size() != m_program.block_info.size() || block == nullptr) return false;
+		std::unordered_map<const Block*, bool> local;
+		if (memo == nullptr) memo = &local;
+		if (const auto it = memo->find(block); it != memo->end()) return it->second;
+		if (memo->size() >= m_program.blocks.size()) return false;
+		auto& proven = (*memo)[block];
+		proven = false;
+		if (block->ImmPredecessors().empty()) return false;
+		for (const auto* previous: block->ImmPredecessors()) {
+			if (!EdgeProvesNonzero(value, previous, block) &&
+			    !NonzeroOnEntry(value, previous, memo)) return false;
+		}
+		proven = true;
+		return true;
+	}
+
+	static bool ReadDominatesHandle(const Block* read, const Block* use) {
+		for (uint32_t depth = 0; use != nullptr && depth < 64u; ++depth) {
+			if (use == read) return true;
+			if (use->ImmPredecessors().size() != 1u) return false;
+			use = use->ImmPredecessors()[0];
 		}
 		return false;
 	}
@@ -1005,7 +1047,7 @@ private:
 			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
 			if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u ||
 			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
-			    step->Parent() != phi->PhiBlock(initial ^ 1u)) {
+			    !ReadDominatesHandle(step->Parent(), phi->PhiBlock(initial ^ 1u))) {
 				continue;
 			}
 			uint32_t increment = 0;
@@ -1130,7 +1172,8 @@ private:
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
 			                                      : ValueOpcode::GetBufferResource) ||
-			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
+			    (memory->kind == ResourceKind::ScalarAddress &&
+			     !ReadDominatesHandle(read->Parent(), handle.Parent())) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
 			    !matched() || memory->offset > UINT32_MAX - offset) {
@@ -1480,7 +1523,7 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
-			    image.atomic64 == atomic64) {
+			    image.atomic64 == atomic64 && image.packed == memory.image_packed) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1489,6 +1532,7 @@ private:
 			return UINT32_MAX;
 		}
 		ImageResource image;
+		image.packed = memory.image_packed;
 		image.source         = source;
 		image.first_use_pc   = pc;
 		image.resource_class = resource_class;
@@ -1617,7 +1661,7 @@ private:
 					}
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					     "requires a DWORD x1/x2/x3/x4 load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

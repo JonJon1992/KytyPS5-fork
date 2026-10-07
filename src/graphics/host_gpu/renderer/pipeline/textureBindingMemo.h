@@ -81,6 +81,7 @@ public:
 		bool                                      depth_compare     = false;
 		bool                                      cube              = false;
 		bool                                      r128              = false;
+		bool                                      packed            = false;
 
 		bool operator==(const Key&) const = default;
 	};

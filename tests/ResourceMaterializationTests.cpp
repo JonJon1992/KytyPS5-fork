@@ -621,6 +621,52 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+void TestPackedImageSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace P = Libs::Graphics::Prospero;
+  const auto make_program = [](P::BufferFormat format) {
+    auto program = MixedSamplerProgram();
+    program.info.samplers.clear();
+    program.info.sampled_pairs.clear();
+    program.info.images.erase(program.info.images.begin());
+    program.info.images[0].packed = true;
+    auto &source = program.descriptor_sources[program.info.images[0].source];
+    source.dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+    source.dwords[3] = Value(0x1acu | (static_cast<uint32_t>(P::ImageType::kColor2D) << 28u));
+    return program;
+  };
+  const std::array<uint32_t, 2> user_data{};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const auto format : {P::BufferFormat::k11_11_10Float, P::BufferFormat::k32SInt}) {
+    auto program = make_program(format);
+    Check(MaterializeResources(ExtractResourcePlan(program), runtime, snapshot, specialization),
+          "packed 32-bit image failed specialization");
+    ApplyResourceSpecialization(program, specialization);
+    const auto &image = program.info.images[0];
+    Check(image.packed && image.numeric_class == P::TextureNumericClass::Uint &&
+              image.conversion_format == P::BufferFormat::kInvalid &&
+              image.shader_swizzle == Libs::Graphics::DstSel(4, 5, 6, 7),
+          "packed image converted or swizzled the raw word");
+  }
+  for (const auto format : {P::BufferFormat::k8_8UNorm, P::BufferFormat::k32_32Float}) {
+    auto program = make_program(format);
+    Check(!MaterializeResources(ExtractResourcePlan(program), runtime, snapshot, specialization),
+          "packed image accepted a texel whose size is not one dword");
+  }
+  auto program = make_program(P::BufferFormat::k32UInt);
+  program.info.images[0].written = true;
+  program.info.images[0].resource_class = ImageResourceClass::Storage;
+  Check(!MaterializeResources(ExtractResourcePlan(program), runtime, snapshot, specialization),
+        "packed image accepted a storage write");
+  program.info.images[0].written = false;
+  program.info.images[0].resource_class = ImageResourceClass::Sampled;
+  program.info.images[0].depth_compare = true;
+  Check(!MaterializeResources(ExtractResourcePlan(program), runtime, snapshot, specialization),
+        "packed image accepted depth comparison");
+}
+
 #include "BindlessMaterializationTests.inc"
 
 } // namespace
@@ -648,6 +694,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestPackedImageSpecialization();
   TestBindlessSnapshots();
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();

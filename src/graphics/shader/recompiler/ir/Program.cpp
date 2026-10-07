@@ -515,7 +515,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
+					return Fail("indirect buffer requires a DWORD x1/x2/x3/x4 load");
 				}
 				if (buffer_components > 1u &&
 				    (!vector_buffer || memory.data_bits != 32u ||

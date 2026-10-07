@@ -639,7 +639,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
 		if (NullImageDescriptor(descriptor)) {
-			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
+			image.numeric_class = base.atomic || base.packed ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
@@ -667,6 +667,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                static_cast<uint32_t>(format)));
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
+		if (base.packed &&
+		    (storage || base.depth_compare || Prospero::NumBytesPerElement(format) != 4u ||
+		     Prospero::IsFmaskTextureFormat(format))) {
+			return SpecializationFail("packed image load requires a sampled 32-bit texel format");
+		}
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
 		if (image.fmask) {
 			if (storage || base.depth_compare ||
@@ -683,6 +688,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		if (base.packed) {
+			image.numeric_class     = Prospero::TextureNumericClass::Uint;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+			image.shader_swizzle    = ShaderImageIdentitySwizzle;
+		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {

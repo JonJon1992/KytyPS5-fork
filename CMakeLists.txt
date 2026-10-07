@@ -1327,6 +1327,20 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME resource_tracking_indirect_buffer
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-buffer-only)
+	add_test(NAME resource_tracking_indirect_image
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-image-only)
+	add_test(NAME shader_packed_image_decode
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --packed-image-decode-only)
+	if(NOT WIN32)
+		add_test(NAME shader_indirect_buffer_loop
+			COMMAND $<TARGET_FILE:shader_cfg_tests> --indirect-buffer-loop-only)
+	endif()
+	add_test(NAME shader_rdna2_compat
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rdna2-compat-only)
+	set_tests_properties(shader_rdna2_compat PROPERTIES
+		ENVIRONMENT "KYTY_TEST_VULKAN_VALIDATION=full" TIMEOUT 60)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME event_queue_semantics COMMAND $<TARGET_FILE:event_queue_semantics_tests>)
 	add_test(NAME thread_service COMMAND $<TARGET_FILE:thread_service_tests>)
