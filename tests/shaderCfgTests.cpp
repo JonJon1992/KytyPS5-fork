@@ -14361,11 +14361,25 @@ void TestSrtWalkerNullPointerReadsZero() {
                          [](uint32_t word) { return word == 0; }),
         "a reader that backs low addresses was overridden by the null-pointer rule");
 
+  // Without a reader the walker reads guest memory itself: a null pointer is a zero descriptor
+  // there too (it dropped the draws of Astro's Playroom's lit passes), and nothing is read.
+  user_data[8] = 0;
+  const ShaderRecompiler::IR::SrtRuntime direct{user_data, 0, nullptr, nullptr};
+  std::vector<uint32_t> direct_flat;
+  Check(ShaderRecompiler::IR::SrtWalker(ir, direct).RefreshFlatBuffer(direct_flat) &&
+            direct_flat.size() == 4 &&
+            std::all_of(direct_flat.begin(), direct_flat.end(),
+                        [](uint32_t word) { return word == 0; }),
+        "a null SRT pointer read directly did not read as zero");
+
   user_data[8] = 0x2000u;
   reads = 0;
   Check(!ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat),
         "an address on the second page was treated as a null SRT pointer");
   Check(reads > 0, "an address on the second page did not reach the memory reader");
+  // The rest of the unmapped low 64 KiB still fails without being read.
+  Check(!ShaderRecompiler::IR::SrtWalker(ir, direct).RefreshFlatBuffer(direct_flat),
+        "a direct read on the second page was treated as a null SRT pointer");
 }
 
 void TestSrtWalkerVccBaseTranslation() {
@@ -15968,6 +15982,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readonly-buffers-only") == 0) {
     TestReadOnlyBuffers();
     std::printf("shader_cfg --readonly-buffers-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-null-pointer-only") == 0) {
+    TestSrtWalkerNullPointerReadsZero();
+    std::printf("shader_cfg --srt-null-pointer-only: ok\n");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
