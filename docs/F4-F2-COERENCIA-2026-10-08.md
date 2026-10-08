@@ -94,3 +94,44 @@ zero mismatches. Ganho de fps ainda não medido nesta implementação.
 Contratos Vulkan seguem os wrappers existentes e documentação Khronos:
 https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/memory.adoc
 https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples
+
+
+## Yōtei: descritor PS em runtime (teste de 08/10)
+
+Na execução com F1/F2/F4, o shader PS 6a835f5fe4a5a4ac foi pulado no
+PC 0x1140. O código foi extraído do program cache da execução; sua chave
+(layout 5) registra bindless_images=0 e bindless_samplers=0. A instrução é
+image_sample_lz v15, v[3:4], s[8:15], s[32:35], uma leitura de textura 2D.
+
+Hipótese confirmada no tracker offline com os mesmos 17.968 bytes de código:
+
+| Configuração do compilador | Resultado |
+| --- | --- |
+| Bindless desligado | Reproduz aviso no PC 0x1140; 0 imagens; skip_dispatch=1 |
+| Bindless ligado (imagens e samplers) | 38 imagens, 2 bindless; skip_dispatch=0 |
+
+Foi usado shader_cfg_tests --structurize-file stage2_6a835f5fe4a5a4ac.bin,
+com KYTY_SRT_VARIANT_READS=1 e KYTY_STRUCTURIZE_FILE_SPIRV=1; o segundo
+teste acrescenta KYTY_STRUCTURIZE_FILE_BINDLESS=1. O helper usa estado PS
+sintético: a prova cobre a aceitação do descritor pelo tracker, sem emissão
+SPIR-V, renderização nativa ou comparação de FPS.
+
+A execução real requer KYTY_BINDLESS=1 como argumento de tools/run-u59.sh.
+Essa opção é lida durante a criação do dispositivo Vulkan e depende dos
+recursos de descriptor indexing. KYTY_BINDLESS_SAMPLERS já tem padrão 1.
+O comando anterior omitira KYTY_BINDLESS e deve ser corrigido:
+
+~~~bash
+cd /home/jonathanbraga/KytyPS5-fork
+KYTY_RUN_DIR="$PWD/_Build/coherence-f1/run-crash" bash tools/run-u59.sh   --game "/run/media/jonathanbraga/SSD/PS5/Ghost_of_Yotei_extraido/eboot.bin"   KYTY_COHERENCE_COPY=read KYTY_SRT_VARIANT_READS=1   KYTY_BDA_WRITES=candidates KYTY_BINDLESS=1   2>&1 | tee _Build/coherence-f1/yotei-bindless.log
+~~~
+
+F4 continua limitado aos dois shaders compute auditados. Aceitar esse PS
+não prova suporte a todos os outros descritores de runtime. Imagem e tempo
+precisam ser conferidos no jogo com a nova configuração, e qualquer A/B deve
+manter bindless idêntico nos dois lados.
+
+Artefatos da reprodução em
+/home/jonathanbraga/KytyPS5-fork/_Build/coherence-f1/validation/live-yotei-20261008/:
+descriptor-6a835f.json, stage2_6a835f5fe4a5a4ac.bin,
+stage2_6a835f5fe4a5a4ac.bin.rdna2, bindless-off.log e bindless-on.log.
