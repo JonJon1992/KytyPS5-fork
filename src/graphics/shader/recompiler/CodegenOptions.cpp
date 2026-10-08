@@ -70,6 +70,11 @@ CodegenOptions FromEnvironment() {
 	ParseHashList(std::getenv("KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS"),
 	              options.bindless_strided_compute_shaders);
 	ParseHashList(std::getenv("KYTY_BDA_WRITES_SHADERS"), options.bda_writes_shaders);
+	if (const auto* mode = std::getenv("KYTY_BDA_WRITES"); mode != nullptr) {
+		options.bda_write_mode = std::strcmp(mode, "candidates") == 0 ? BdaWriteMode::Candidates
+		    : std::strcmp(mode, "candidates-verify") == 0 ? BdaWriteMode::CandidatesVerify
+		    : BdaWriteMode::Off;
+	}
 	options.runtime_buffer_stride =
 	    EnvFlag("KYTY_RUNTIME_BUFFER_STRIDE", options.runtime_buffer_stride);
 	options.realtime_clock    = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
@@ -130,12 +135,25 @@ bool BindlessStridedComputeApplies(uint64_t shader_hash) {
 
 bool BdaWritesApplies(uint64_t shader_hash) {
 	const auto& options = Storage();
-	return std::ranges::find(options.bda_writes_shaders, shader_hash) !=
+	return BdaWriteCandidatesApplies(shader_hash) ||
+	       std::ranges::find(options.bda_writes_shaders, shader_hash) !=
 	       options.bda_writes_shaders.end();
 }
 
 bool BdaWritesEnabled() {
-	return !Storage().bda_writes_shaders.empty();
+	return !Storage().bda_writes_shaders.empty() || Storage().bda_write_mode != BdaWriteMode::Off;
+}
+
+bool BdaWriteCandidatesApplies(uint64_t shader_hash) {
+	return Storage().bda_write_mode != BdaWriteMode::Off &&
+	       (shader_hash == BdaWaterLightingHash || shader_hash == BdaShadowResolveHash);
+}
+bool BdaWriteCandidatesVerify() {
+	return Storage().bda_write_mode == BdaWriteMode::CandidatesVerify;
+}
+uint32_t BdaWriteCandidateStorePc(uint64_t shader_hash) {
+	return shader_hash == BdaWaterLightingHash ? 0x530u
+	     : shader_hash == BdaShadowResolveHash ? 0x1b4u : UINT32_MAX;
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

@@ -188,6 +188,147 @@ void ListedShadersOnly() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+void CandidateProofs() {
+  constexpr const char* name = "BdaCandidateProofs";
+  using namespace BdaWriteCandidates;
+  const auto make = [](uint64_t hash, u32 count) {
+    Plan p;
+    p.shader_hash = hash; p.table = 0x200000000ull;
+    p.words[0x70 / 4] = count;
+    const auto first = hash == ShaderRecompiler::BdaWaterLightingHash ? 8u : 4u;
+    const auto entries = hash == ShaderRecompiler::BdaWaterLightingHash ? 5u : count;
+    for (u32 i = 0; i < entries && i < MaxDescriptors; ++i) {
+      p.words[first + 4 * i] = 0x100000 + i * 0x10000;
+      p.words[first + 4 * i + 1] = 4u << 16;
+      p.words[first + 4 * i + 2] = 16;
+      p.words[first + 4 * i + 3] = 0x5204;
+    }
+    p.table_bytes = TableBytes(hash, p.words);
+    return p;
+  };
+  auto water = make(ShaderRecompiler::BdaWaterLightingHash, 0);
+  Require(name, "water", Resolve(water) && water.range_count == 5 && water.ranges[4].size == 64,
+      "clamped five-entry table lost a candidate");
+  auto shadow = make(ShaderRecompiler::BdaShadowResolveHash, 6);
+  Require(name, "runtime count", Resolve(shadow) && shadow.range_count == 6,
+      "shadow count silently clamped to the unproven four-entry layout");
+  auto bad = water; bad.words[11] |= 2u << 28;
+  Require(name, "unbounded OOB", !Resolve(bad), "OOB_SELECT=2 treated as bounded");
+  bad = water; bad.words[11] |= 3u << 28;
+  Require(name, "raw OOB index", !Resolve(bad), "OOB_SELECT=3 with a stride admitted unbounded indices");
+  bad = water; bad.table |= 1u;
+  Require(name, "unaligned table", !Resolve(bad), "host and shader could read different tables");
+  bad = water; bad.words[9] |= 1u << 31;
+  Require(name, "swizzle", !Resolve(bad), "swizzle admitted without proof");
+  bad = water; bad.words[10] = UINT32_MAX;
+  Require(name, "capacity", !Resolve(bad), "huge record count escaped the limit");
+  bad = water; bad.words[8] = static_cast<u32>(bad.table);
+  bad.words[9] = static_cast<u32>(bad.table >> 32) | (4u << 16);
+  Require(name, "self modifying", !Resolve(bad), "table self-writes admitted");
+  shadow.words[0x70 / 4] = MaxDescriptors + 1;
+  Require(name, "no truncation", TableBytes(shadow.shader_hash, shadow.words) == 0,
+      "descriptor count truncated");
+  auto empty = make(ShaderRecompiler::BdaShadowResolveHash, 0);
+  Require(name, "zero count", Resolve(empty) && empty.range_count == 0, "empty table rejected");
+  auto off = GetCodegenOptions(); off.bda_write_mode = ShaderRecompiler::BdaWriteMode::Off;
+  {
+    ScopedCodegenOptions scope(off);
+    Require(name, "opt in", !ShaderRecompiler::BdaWriteCandidatesApplies(water.shader_hash),
+        "candidates enabled by default");
+  }
+  auto options = GetCodegenOptions();
+  options.bda_write_mode = ShaderRecompiler::BdaWriteMode::Candidates;
+  ScopedCodegenOptions scope(options);
+  Require(name, "allowlist", !ShaderRecompiler::BdaWriteCandidatesApplies(123),
+      "unknown shader allowed to omit settle");
+  ProgramDiskCache::SourceKeyInputs inputs{};
+  ProgramDiskCache::SourceKey a, b, c;
+  inputs.bda_writes = true;
+  inputs.bda_write_mode = 0; ProgramDiskCache::BuildSourceKey(inputs, a);
+  inputs.bda_write_mode = 1; ProgramDiskCache::BuildSourceKey(inputs, b);
+  inputs.bda_write_mode = 2; ProgramDiskCache::BuildSourceKey(inputs, c);
+  Require(name, "cache mode", a.bytes != b.bytes && b.bytes != c.bytes && a.bytes != c.bytes,
+      "phase 0, candidates and verification shared a cache key");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+TestCase CandidateStore(bool verify) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = verify ? "BdaCandidatesBitmapReference" : "BdaCandidatesWithoutBitmap";
+  test.shader_hash = ShaderRecompiler::BdaWaterLightingHash;
+  test.initial.assign(2048, 0);
+  PutDescriptor(&test, 0, {static_cast<u32>(GuestBase + 4096), (4u << 16) | 1u, 64, 0x5204});
+  test.expected = test.initial;
+  std::fill_n(test.expected.begin() + 1024, 64, 0xc0ffee42u);
+  AppendSelectDescriptor(&test.code, 64, 1);
+  AppendVMovU32(&test.code, 2, 0xc0ffee42u);
+  while (test.code.size() * 4 < 0x530)
+    test.code.push_back(EncodeSMovB32(31, InlineU32(0)));
+  test.code.push_back(EncodeMubuf0(0x1c, 0, true, false));
+  test.code.push_back(EncodeMubuf1(2, 2, 0));
+  AppendEnd(&test.code);
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_dropped_writes = 0;
+  if (verify) {
+    test.expected_bda_written_pages = {GuestPage};
+    test.required_spirv = {"OpGroupNonUniformAllEqual"};
+  } else {
+    test.expected_bda_clean_pages = {GuestPage};
+    test.forbidden_spirv = {"OpGroupNonUniformAllEqual"};
+  }
+  test.opcodes = {O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// The count at table+0x70 must remain a GPU scalar read. Resource materialization precedes
+// freezing and cannot supply an older count through a flattened SRT slot.
+TestCase CandidateTableCount() {
+  TestCase test;
+  test.name = "BdaCandidatesGpuTableCount";
+  test.shader_hash = ShaderRecompiler::BdaShadowResolveHash;
+  test.initial.assign(128, 0);
+  test.initial[0x70 / 4] = 6;
+  test.expected = test.initial;
+  test.expected[0] = 6;
+  AppendSMovLiteral(&test.code, 20, static_cast<u32>(GuestBase));
+  AppendSMovLiteral(&test.code, 21, static_cast<u32>(GuestBase >> 32));
+  test.code.push_back(EncodeSmem0(0x00, 22, 10)); // s_load_dword s22, s[20:21], 0x70
+  test.code.push_back(EncodeSmem1(0x70, 125));
+  test.code.push_back(EncodeSopp(0x0c, 0xc07f));
+  AppendStoreSgpr(&test.code, 22, 0);
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {ShaderOpcode::S_LOAD_DWORD, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {"PhysicalStorageBuffer"};
+  return test;
+}
+
+void RunCandidates() {
+  auto options = GetCodegenOptions();
+  options.srt_variant_reads = true;
+  options.bda_writes_shaders.clear();
+  options.bda_write_mode = ShaderRecompiler::BdaWriteMode::Candidates;
+  ScopedCodegenOptions scope(options);
+  CandidateProofs();
+  VulkanHarness vulkan;
+  RunCase(&vulkan, CandidateStore(false));
+  RunCase(&vulkan, CandidateTableCount());
+  {
+    auto verify = options;
+    verify.bda_write_mode = ShaderRecompiler::BdaWriteMode::CandidatesVerify;
+    ScopedCodegenOptions check(verify);
+    RunCase(&vulkan, CandidateStore(true));
+  }
+  vulkan.CheckBdaWriteCandidates();
+}
+
 void RunAll() {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;

@@ -1097,10 +1097,14 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 				const auto host    = GetBdaPointer(ctx, guest);
 				const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), host,
 				                            ConstantDeviceAddress(state, 0));
-				EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
-				                [&]() { RecordBdaDroppedWrite(state); });
+				const bool candidates = BdaWriteCandidatesApplies(state.program.shader_hash) &&
+				                        !BdaWriteCandidatesVerify();
+				if (!candidates) {
+					EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
+					                [&]() { RecordBdaDroppedWrite(state); });
+				}
 				EmitIfCondition(state, present, [&]() {
-					RecordBdaWrite(state, guest);
+					if (!candidates) RecordBdaWrite(state, guest);
 					const auto pointer = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
 					                          pointer, host);

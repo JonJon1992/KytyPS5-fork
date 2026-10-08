@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -325,7 +326,8 @@ private:
 class PlanBuilder {
 public:
 	PlanBuilder(Program& program, bool variant_reads)
-	    : m_program(program), m_variant_reads(variant_reads) {}
+	    : m_program(program), m_variant_reads(variant_reads),
+	      m_candidate_table_reads(BdaWriteCandidatesApplies(program.shader_hash)) {}
 
 	void Run() {
 		m_program.srt_reads.clear();
@@ -415,7 +417,10 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		// Candidate enumeration freezes the GPU table after resource materialization. Scalar
+		// counts and pointers must read that same version, never an earlier flattened SRT slot.
+		if ((m_candidate_table_reads && inst->GetOpcode() == ValueOpcode::LoadAddressU32) ||
+		    !offset.IsImmediate() || offset.GetType() != Type::U32 ||
 		    (m_variant_reads && !EvaluableBeforeDispatch(inst->Arg(0)))) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
@@ -493,6 +498,7 @@ private:
 	std::unordered_set<const Inst*> m_visited;
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
+	bool               m_candidate_table_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
 };
 

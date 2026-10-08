@@ -92,6 +92,7 @@ public:
 		// per shader, so a listed shader is never served a plan or program translated unlisted
 		// (skipped, or without the written-page bitmap) and changing the list only moves those.
 		bool bda_writes = false;
+		uint8_t bda_write_mode = 0; // only for one of the two candidate shaders
 		std::span<const uint32_t> code;
 		std::span<const uint32_t> back_code;
 	};

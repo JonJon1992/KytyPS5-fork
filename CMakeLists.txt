@@ -1549,13 +1549,18 @@ if(BUILD_TESTING)
 	set(buffer_upload_test_env "KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_HOT_PAGES=1;KYTY_HOT_PAGE_FRAMES=2;KYTY_HOT_PAGE_CHECK_LIMIT=0;KYTY_HOT_PAGE_QUIET_FRAMES=1000;KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
 	# F1: source versions, live disable, pending native submission and unmap lifetime.
 	foreach(texture_async IN ITEMS 0 1)
-		foreach(copy_mode IN ITEMS 1 verify)
+		foreach(copy_mode IN ITEMS 1 verify read read-verify)
 			add_test(NAME coherence_copy_tex${texture_async}_${copy_mode}
 				COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherence-copy-only)
 			set_tests_properties(coherence_copy_tex${texture_async}_${copy_mode} PROPERTIES TIMEOUT 60
 				ENVIRONMENT "KYTY_COHERENCE_COPY=${copy_mode};KYTY_TEXTURE_ASYNC_STAGING=${texture_async};KYTY_UPLOAD_DMA=1;KYTY_WRITE_DATA_GPU=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_CP_RECORDER=${texture_async};KYTY_CP_SEQ=0")
 		endforeach()
 	endforeach()
+	# F2 must attach its worker dependency even when upload batching is disabled.
+	add_test(NAME coherence_copy_read_unbatched
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherence-copy-only)
+	set_tests_properties(coherence_copy_read_unbatched PROPERTIES TIMEOUT 60
+		ENVIRONMENT "KYTY_COHERENCE_COPY=read-verify;KYTY_TEXTURE_ASYNC_STAGING=0;KYTY_UPLOAD_DMA=1;KYTY_WRITE_DATA_GPU=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=0;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_CP_RECORDER=0;KYTY_CP_SEQ=0")
 	foreach(upload_batch IN ITEMS 0 1)
 		add_test(NAME buffer_upload_coalesce_batch${upload_batch}
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)
@@ -2323,6 +2328,12 @@ if(BUILD_TESTING)
 	# pages in the written-page bitmap (docs/ARQUITETURA-ESCRITAS-RUNTIME-2026-10-08.md, phase 0).
 	add_test(NAME bda_writes
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-writes-only)
+	foreach(recorder IN ITEMS 0 1)
+		add_test(NAME bda_candidates_cp${recorder}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-candidates-only)
+		set_tests_properties(bda_candidates_cp${recorder} PROPERTIES TIMEOUT 60
+			ENVIRONMENT "KYTY_CP_RECORDER=${recorder};KYTY_COHERENCE_COPY=read-verify;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_UPLOAD_BATCH=1;KYTY_DEFER_UNPROTECT=1;KYTY_RENDERER_BATCH=1")
+	endforeach()
 	# KYTY_PROGRAM_CACHE (pipeline/programDiskCache.h): source keys, codegen fingerprint and cache
 	# file (truncation, corruption, identity, verification); programs reloaded from the file
 	# render what translated ones render, with and without verify mode; and the renderer suites

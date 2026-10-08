@@ -802,3 +802,23 @@ esse código, ele não faz mais parte desta árvore.
 
 Os dois branches se juntam no `cpu-coherence-service` quando cada um estiver pronto, com revisão
 mútua antes.
+
+
+---
+
+## 12. F4 e F2 implementadas pelo Codex — 2026-10-08
+
+O worktree kyty-coherence, branch cpu-coherence-service, integra a fase 0
+(8288d755, 21b00d82, c5ffb21a) sobre a F1 final 9956c566.
+
+- F4: KYTY_BDA_WRITES=candidates / candidates-verify, com
+  KYTY_SRT_VARIANT_READS=1; somente os dois hashes auditados. Count Shadow
+  lido da tabela, destinos reservados antes do dispatch, tabela congelada
+  e restaurada na fila GPU, sem settle no modo candidates.
+- F2: KYTY_COHERENCE_COPY=read / read-verify; uploads do cache de leitura
+  reutilizam worker, pool de vetores, guards e dependência de submit da F1.
+- Build Release e 36 testes distintos aprovados. Ganho de fps e admissões
+  da F4 no jogo ainda precisam de A/B na mesma cena.
+
+Implementação, limites da prova, correções da revisão e artefatos:
+[F4-F2-COERENCIA-2026-10-08.md](F4-F2-COERENCIA-2026-10-08.md).

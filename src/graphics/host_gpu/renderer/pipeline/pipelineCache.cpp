@@ -2280,6 +2280,8 @@ struct PipelineCache::ProgramCache {
 		         ShaderRecompiler::BindlessStridedComputeApplies(key.hash),
 		     .bda_writes = key.stage == ShaderType::Compute &&
 		                   ShaderRecompiler::BdaWritesApplies(key.hash),
+		     .bda_write_mode = ShaderRecompiler::BdaWriteCandidatesApplies(key.hash)
+		         ? static_cast<uint8_t>(ShaderRecompiler::GetCodegenOptions().bda_write_mode) : uint8_t{0},
 		     .code                    = code_words,
 		     .back_code               = back_code_words},
 		    disk_key);

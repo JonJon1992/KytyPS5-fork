@@ -1662,10 +1662,18 @@ private:
 				    memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferStore(op) &&
 				    m_program.stage == ShaderType::Compute &&
 				    BdaWritesApplies(m_program.shader_hash)) {
+					const bool candidates = BdaWriteCandidatesApplies(m_program.shader_hash);
+					if (candidates &&
+					    (flags.pc != BdaWriteCandidateStorePc(m_program.shader_hash) ||
+					     op != ValueOpcode::StoreBufferU32 || !memory.idxen || memory.offen ||
+					     memory.offset != 0 || !inst.Arg(3).IsImmediate() || inst.Arg(3).U32() != 0)) {
+						MarkUnresolved(flags.pc);
+						return;
+					}
 					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 					m_info.uses_dma                         = true;
 					m_info.bda_writes                       = true;
-					m_program.has_address_writes            = true;
+					m_program.has_address_writes            |= !candidates;
 					return;
 				}
 				if (!indirect_scalar &&

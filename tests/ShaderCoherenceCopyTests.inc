@@ -9,7 +9,7 @@ void CheckCoherenceCopy() {
   using namespace std::chrono_literals;
   const auto* mode_env = std::getenv("KYTY_COHERENCE_COPY");
   const std::string mode = mode_env != nullptr ? mode_env : "";
-  Require(name, "mode", mode == "1" || mode == "verify", "fixture needs F1 enabled");
+  Require(name, "mode", mode == "1" || mode == "verify" || mode == "read" || mode == "read-verify", "fixture needs F1 enabled");
   Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
   const auto jobs_before = Profiler::FrameEventTotal(Event::CoherenceCopyJobs);
   const auto guards_before = Profiler::FrameEventTotal(Event::CoherenceCopyGuardWaits);
@@ -62,6 +62,14 @@ void CheckCoherenceCopy() {
     context.MapMemory(base, bytes);
     id = cache.FindBuffer(base, bytes);
   });
+  const bool read_bindings = mode == "read" || mode == "read-verify";
+  const auto prepare_upload = [&] {
+    if (read_bindings) {
+      (void)cache.ObtainBuffer(base, bytes, false, false, id);
+    } else {
+      context.PrepareBda();
+    }
+  };
   // A foreign publication can start before the first F1 job has installed its copier pointer.
   // Its lease must keep admission out until all backing bytes have landed.
   std::vector<uint8_t> initial(bytes, 0x41);
@@ -70,7 +78,7 @@ void CheckCoherenceCopy() {
   auto admission = std::async(std::launch::async, [&] {
     OnGpuThread(context, [&] {
       preparing.set_value();
-      context.PrepareBda();
+      prepare_upload();
     });
   });
   preparing.get_future().wait();
@@ -129,7 +137,7 @@ void CheckCoherenceCopy() {
   OnGpuThread(context, [&] {
     (void)context.InvalidateMemory(base, bytes); // ordinary cache alias tracking is separate
     SyncEpoch::Advance();
-    context.PrepareBda(); // switch 0, second source version is copied synchronously
+    prepare_upload(); // switch 0, second source version is copied synchronously
   });
   auto second = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
   snapshot(second);
@@ -149,7 +157,7 @@ void CheckCoherenceCopy() {
   copier->HoldWorkerForTest(true);
   OnGpuThread(context, [&] {
     SyncEpoch::Advance();
-    context.PrepareBda();
+    prepare_upload();
   });
   auto third = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
   snapshot(third);
@@ -168,7 +176,7 @@ void CheckCoherenceCopy() {
     OnGpuThread(context, [&] {
       (void)context.InvalidateMemory(base, bytes);
       SyncEpoch::Advance();
-      context.PrepareBda();
+      prepare_upload();
     });
   };
   dirty_and_prepare();
@@ -202,7 +210,11 @@ void CheckCoherenceCopy() {
     context.MapMemory(alias_address, bytes);
     const auto fallback_id = cache.FindBuffer(alias_address, bytes);
     SyncEpoch::Advance();
-    context.PrepareBda();
+    if (read_bindings) {
+      (void)cache.ObtainBuffer(alias_address, bytes, false, false, fallback_id);
+    } else {
+      context.PrepareBda();
+    }
     auto& command = scheduler.Current();
     command.EndRendering();
     const auto& fallback_buffer = cache.GetBuffer(fallback_id);
@@ -232,7 +244,7 @@ void CheckCoherenceCopy() {
   copier->HoldWorkerForTest(true);
   OnGpuThread(context, [&] {
     SyncEpoch::Advance();
-    context.PrepareBda();
+    prepare_upload();
   });
   auto unmap = std::async(std::launch::async, [&] {
     return LibKernel::Memory::KernelMunmap(base, bytes);
@@ -254,7 +266,7 @@ void CheckCoherenceCopy() {
       "source or GPU verification found a mismatch");
   Require(name, "range storage reused", Profiler::FrameEventTotal(Event::CoherenceCopyRangeReuses) >
       reused_before, "completed F1 jobs discarded their reusable range storage");
-  if (mode == "verify")
+  if (mode == "verify" || mode == "read-verify")
     Require(name, "GPU verification ran", Profiler::FrameEventTotal(Event::CoherenceCopyVerifyGpuChecks) >
         gpu_checks_before, "verify mode omitted native readback comparison");
   std::printf("[gpu]     %-32s ok (mode=%s)\n", name, mode.c_str());

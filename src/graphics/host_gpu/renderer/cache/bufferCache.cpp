@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/image/stagingCopier.h"
+#include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -62,10 +63,12 @@ Live::Switch g_readback_wait_publication("KYTY_READBACK_WAIT_PUBLICATION", Live:
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
-// F1: only collected BDA guest runs. 0 preserves the synchronous route; verify also checks
-// source mutation diagnostics and the bytes the GPU actually consumed.
+// F1: collected BDA guest runs. F2 (read/read-verify) also queues cached read bindings.
+// Hot snapshots and small stream copies stay inline; all modes reuse one worker and pool.
 Live::Switch g_coherence_copy("KYTY_COHERENCE_COPY", [](const char* value) -> int64_t {
 	if (value != nullptr && std::strcmp(value, "verify") == 0) return 2;
+	if (value != nullptr && std::strcmp(value, "read") == 0) return 3;
+	if (value != nullptr && std::strcmp(value, "read-verify") == 0) return 4;
 	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
 });
 Live::Switch g_coherence_copy_min_kb("KYTY_COHERENCE_COPY_MIN_KB",
@@ -2390,7 +2393,98 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size, uint64_t
 	}
 }
 
-void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
+bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
+                                             std::span<const uint32_t> user_data,
+                                             BdaWriteCandidates::Plan& plan) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	using namespace BdaWriteCandidates;
+	plan = {};
+	plan.shader_hash = shader_hash;
+	const auto prefix = PrefixBytes(shader_hash);
+	if (prefix == 0 || user_data.size() < 2) return false;
+	plan.table = uint64_t(user_data[0]) | (uint64_t(user_data[1]) << 32);
+	// ScalarAddress loads mask the low two bits; a raw unaligned snapshot is a different table.
+	if ((plan.table & 3u) != 0) return false;
+	plan.vm_generation = LibKernel::Memory::VirtualRangesGeneration();
+	const auto readable = [&](uint64_t bytes) {
+		return GuestRange{plan.table, bytes}.Valid() &&
+		       LibKernel::Memory::ClampRangeSizeQuiet(plan.table, bytes) == bytes &&
+		       !m_memory_tracker.IsRegionGpuModified(plan.table, bytes) &&
+		       !m_texture_cache.IsRegionGpuModified(plan.table, bytes);
+	};
+	// TryReadBacking does not fault on stale GPU bytes: reject them explicitly before reading.
+	if (!readable(prefix)) return false;
+	{
+		std::scoped_lock gate(m_source_write_mutex);
+		if (!LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), prefix)) return false;
+		plan.table_bytes = TableBytes(shader_hash, plan.words);
+		if (plan.table_bytes == 0 || !readable(plan.table_bytes) ||
+		    !LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), plan.table_bytes) ||
+		    !Resolve(plan)) return false;
+	}
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) return false;
+	const auto table_alias = reinterpret_cast<uintptr_t>(
+	    LibKernel::Memory::GuestBackingAlias(plan.table, plan.table_bytes));
+	if (table_alias == 0) return false;
+	// Validate the complete set before changing ownership. A mapped prefix never certifies a
+	// partially mapped candidate; neither virtual nor physical self-writes can change the table.
+	for (const auto& range: plan.Ranges()) {
+		if (LibKernel::Memory::ClampRangeSizeQuiet(range.address, range.size) != range.size)
+			return false;
+		const auto alias = reinterpret_cast<uintptr_t>(
+		    LibKernel::Memory::GuestBackingAlias(range.address, range.size));
+		if (alias == 0 || (alias < table_alias + plan.table_bytes &&
+		                   table_alias < alias + range.size)) return false;
+	}
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) return false;
+	(void)FindBuffer(plan.table, plan.table_bytes); // BDA table must cover the frozen table.
+	for (const auto& range: plan.Ranges()) {
+		(void)ObtainBuffer(range.address, range.size, true); // preserve image owners before writes
+	}
+	return true;
+}
+
+bool BufferCache::FinalizeBdaWriteCandidates(const BdaWriteCandidates::Plan& plan) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation ||
+	    m_memory_tracker.IsRegionGpuModified(plan.table, plan.table_bytes) ||
+	    m_texture_cache.IsRegionGpuModified(plan.table, plan.table_bytes)) return false;
+	const auto id = FindBuffer(plan.table, plan.table_bytes);
+	// Save the exact GPU table version, then freeze the CPU snapshot for this dispatch.
+	// A single device buffer suffices: save/use/restore are ordered on the graphics queue.
+	// Restore avoids overwriting the newer CPU version an earlier BDA upload may have captured.
+	if (!m_bda_candidate_table_backup) {
+		m_bda_candidate_table_backup = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+		    BdaWriteCandidates::MaxTableBytes);
+	}
+	auto& table = m_slot_buffers[id];
+	m_bda_candidate_table_backup->CopyFrom(m_scheduler.Current(), table,
+	                                       table.Offset(plan.table), 0, plan.table_bytes);
+	WriteDataBuffer(table, plan.table, plan.words.data(), plan.table_bytes);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateDispatches);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRanges, plan.range_count);
+	static uint32_t logs = 0;
+	if (logs++ < 32) {
+		LOGF("BDA candidates: shader=0x%016" PRIx64 " table=0x%016" PRIx64
+		     " bytes=%u ranges=%u verify=%u\n", plan.shader_hash, plan.table,
+		     plan.table_bytes, plan.range_count, ShaderRecompiler::BdaWriteCandidatesVerify() ? 1 : 0);
+	}
+	return true;
+}
+
+void BufferCache::RestoreBdaWriteCandidateTable(const BdaWriteCandidates::Plan& plan) {
+	EXIT_IF(!m_bda_candidate_table_backup || !GuestGpu::IsGpuThread());
+	const auto id = FindBuffer(plan.table, plan.table_bytes);
+	auto& table = m_slot_buffers[id];
+	// CopyFrom orders the dispatch's table reads before this write, and this write before the
+	// next use of the shared backup. No CPU wait and no change to the table's ownership bits.
+	table.CopyFrom(m_scheduler.Current(), *m_bda_candidate_table_backup,
+	               0, table.Offset(plan.table), plan.table_bytes);
+}
+
+void BufferCache::SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRange> candidates) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	static const bool verify = ParseEnvU64("KYTY_BDA_WRITES_VERIFY", 0) != 0;
@@ -2399,6 +2493,26 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
+	const bool verify_candidates = ShaderRecompiler::BdaWriteCandidatesApplies(shader_hash) &&
+	                               ShaderRecompiler::BdaWriteCandidatesVerify();
+	if (verify_candidates) {
+		uint64_t missing = 0;
+		writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+			for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+				const bool covered = std::ranges::any_of(candidates, [&](const GuestRange& range) {
+					return Common::AlignDown(range.address, CACHING_PAGESIZE) <= page &&
+					       page < Common::AlignUp(range.End(), CACHING_PAGESIZE);
+				});
+				missing += !covered;
+			}
+		});
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateMisses, missing);
+		if (missing != 0 || writes.dropped != 0 || writes.overflow) {
+			EXIT("BDA candidate verify: shader=0x%016" PRIx64
+			     " missing=%" PRIu64 " dropped=%u overflow=%u\n",
+			     shader_hash, missing, writes.dropped, writes.overflow ? 1u : 0u);
+		}
+	}
 	if (verify && writes.dropped != 0) {
 		EXIT("KYTY_BDA_WRITES_VERIFY: shader 0x%016" PRIx64 " dropped %u BDA writes to pages "
 		     "without a cache buffer\n",
@@ -2951,6 +3065,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
 	// when upload() runs (ForEachUploadRange), as for the copy made here.
 	auto&      host_copies = scratch->host_copies;
+	const auto copy_mode = g_coherence_copy.Get();
+	bool defer_coherence = false;
 	const auto upload = [&]() noexcept {
 		// A normal upload replaces whatever a hot page shadow described.
 		EraseHotShadowsForCopies(buffer, copies);
@@ -2969,10 +3085,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			if (!copies.empty()) source = m_staging_buffer.Handle();
 		} else {
 			reserved             = nullptr;
-			const bool defer_host = !is_written && UploadBatchEnabled() && m_upload_dma != nullptr &&
-			                        UploadDmaHostCopyEnabled() && !UploadDmaVerify() &&
-			                        m_staging_buffer.IsCoherent() &&
-			                        total_size >= m_upload_dma->MinBytes();
+			defer_coherence = (copy_mode == 3 || copy_mode == 4) && !is_written &&
+			                  !is_texel_buffer && stats == nullptr && guest_copies != 0 &&
+			                  host_base >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024;
+			const bool defer_host = defer_coherence ||
+			                        (!is_written && UploadBatchEnabled() && m_upload_dma != nullptr &&
+			                         UploadDmaHostCopyEnabled() && !UploadDmaVerify() &&
+			                         m_staging_buffer.IsCoherent() &&
+			                         total_size >= m_upload_dma->MinBytes());
 			source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
 			                      host_base, defer_host ? &host_copies : nullptr);
 		}
@@ -3066,6 +3186,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			                          copies.empty() ? vaddr
 			                                         : buffer.CpuAddress() + copies.front().dstOffset,
 			                          0, static_cast<uint32_t>(copies.size()), 0, total_size, size);
+		}
+		if (defer_coherence &&
+		    TryCoherenceUpload(buffer, source, copies, host_copies, copy_mode)) {
+			return false;
 		}
 		auto& command = m_scheduler.Current();
 		if (UploadBatchEnabled() && !late_source) {
@@ -3260,56 +3384,90 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 		                          0, static_cast<uint32_t>(copies.size()), 0, total_size,
 		                          pending.size);
 	}
-	std::shared_ptr<StagingCopier::Verification> verification;
-	bool queued = false;
-	if (defer_coherence && !host_copies.empty()) {
-		EXIT_IF(source != m_staging_buffer.Handle());
-		auto& copier = m_texture_cache.EnsureStagingCopier();
-		auto ranges = copier.AcquireRanges(host_copies.size());
-		uint64_t bytes = 0;
-		for (const auto& copy: host_copies) {
-			ranges.push_back({copy.guest_address, copy.destination, copy.size, copy.source});
-			bytes += copy.size;
-		}
-		if (copy_mode == 2) {
-			verification = std::make_shared<StagingCopier::Verification>();
-			verification->tracker = &m_memory_tracker;
-			verification->expected.resize(bytes);
-			verification->observed.resize(bytes);
-		}
-		// UploadCopies packed all runs into one reservation; non-coherent reservations have
-		// disjoint atoms. The worker flushes after writing, before publishing completion.
-		uint64_t begin = UINT64_MAX, end = 0;
-		for (const auto& copy: copies) {
-			begin = std::min(begin, copy.srcOffset);
-			end = std::max(end, copy.srcOffset + copy.size);
-		}
-		{
-			// Keep a foreign publication out from its final dependency check through admission.
-			// The gate exists before the first lazy copier/job, and is never held while waiting.
-			std::scoped_lock gate(m_source_write_mutex);
-			SetCoherenceCopier(&copier);
-			if (verification) {
-				verification->fault_epoch = m_bda_incremental_sync
-				                                ? m_memory_tracker.FaultMutationEpoch() : UINT64_MAX;
-				uint64_t offset = 0;
-				for (const auto& copy: host_copies) {
-					std::memcpy(verification->expected.data() + offset, copy.source, copy.size);
-					offset += copy.size;
-				}
-			}
-			copier.Enqueue(std::move(ranges), &m_staging_buffer, begin, end - begin, verification);
-		}
-		queued = true;
+	if (defer_coherence && TryCoherenceUpload(buffer, source, copies, host_copies, copy_mode)) {
+		return;
 	}
 	auto& command = m_scheduler.Current();
-	// UploadDma has its own submit dependency and can read the ring before this worker finishes.
-	// A queued F1 upload therefore stays on the graphics route protected by the copier dependency.
-	if (!queued) {
-		source = StageUploadDma(source, copies, &host_copies);
-	}
+	source = StageUploadDma(source, copies, &host_copies);
 	command.RequestUploadCopy(source, buffer.Handle(), copies);
 	buffer.MarkContentWritten();
+	if (m_upload_batch_depth == 0) {
+		command.FlushBarriers();
+	}
+}
+
+// Recording thread, after read pages have been protected and tracker locks released.
+// The queued source stays on the graphics route: UploadDma has a different dependency.
+bool BufferCache::TryCoherenceUpload(Buffer& buffer, vk::Buffer source,
+                                      std::span<vk::BufferCopy> copies,
+                                      const std::vector<UploadHostCopy>& host_copies,
+                                      int64_t copy_mode) {
+	if (host_copies.empty()) return false;
+	std::shared_ptr<StagingCopier::Verification> verification;
+	EXIT_IF(source != m_staging_buffer.Handle());
+	auto& copier = m_texture_cache.EnsureStagingCopier();
+	auto ranges = copier.AcquireRanges(host_copies.size());
+	uint64_t bytes = 0;
+	for (const auto& copy: host_copies) {
+		ranges.push_back({copy.guest_address, copy.destination, copy.size, copy.source});
+		bytes += copy.size;
+	}
+	if (copy_mode == 2 || copy_mode == 4) {
+		verification = std::make_shared<StagingCopier::Verification>();
+		verification->tracker = &m_memory_tracker;
+		verification->expected.resize(bytes);
+		verification->observed.resize(bytes);
+	}
+	// UploadCopies packed all runs into one reservation; non-coherent reservations have
+	// disjoint atoms. The worker flushes after writing, before publishing completion.
+	uint64_t begin = UINT64_MAX, end = 0;
+	for (const auto& copy: copies) {
+		begin = std::min(begin, copy.srcOffset);
+		end = std::max(end, copy.srcOffset + copy.size);
+	}
+	{
+		// Keep a foreign publication out from its final dependency check through admission.
+		// The gate exists before the first lazy copier/job, and is never held while waiting.
+		std::scoped_lock gate(m_source_write_mutex);
+		SetCoherenceCopier(&copier);
+		if (verification) {
+			verification->fault_epoch = m_bda_incremental_sync
+			                                ? m_memory_tracker.FaultMutationEpoch() : UINT64_MAX;
+			uint64_t offset = 0;
+			for (const auto& copy: host_copies) {
+				std::memcpy(verification->expected.data() + offset, copy.source, copy.size);
+				offset += copy.size;
+			}
+		}
+		copier.Enqueue(std::move(ranges), &m_staging_buffer, begin, end - begin, verification);
+	}
+	auto& command = m_scheduler.Current();
+	if (UploadBatchEnabled()) {
+		command.RequestUploadCopy(source, buffer.Handle(), copies);
+		buffer.MarkContentWritten();
+	} else {
+		// Same native dependency as synchronous read uploads, one barrier pair for all runs.
+		// The submit still waits for the copier to publish and flush the host reservation.
+		command.EndRendering();
+		const auto native = command.Handle();
+		vk::BufferMemoryBarrier before{};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		before.srcQueueFamilyIndex = before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer = buffer.Handle();
+		before.size = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+		buffer.MarkContentWritten();
+		auto after = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	}
 	if (verification) {
 		// Compare GPU readback to the worker's host snapshot, without reading write-combined staging.
 		const uint64_t bytes = verification->observed.size();
@@ -3341,9 +3499,8 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 			}
 		});
 	}
-	if (m_upload_batch_depth == 0) {
-		command.FlushBarriers();
-	}
+	if (m_upload_batch_depth == 0) command.FlushBarriers();
+	return true;
 }
 
 vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,

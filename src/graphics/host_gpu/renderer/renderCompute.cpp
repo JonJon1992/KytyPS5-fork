@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -36,6 +37,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -406,11 +408,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
 	bindings.has_dispatch_groups = true;
 	FindBuffers(bindings);
+	std::optional<BdaWriteCandidates::Plan> candidate_plan;
+	const bool candidate_writes = program.info.bda_writes &&
+	    ShaderRecompiler::BdaWriteCandidatesApplies(program.shader_hash);
+	if (candidate_writes) candidate_plan.emplace();
+	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
+	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		static uint32_t rejects = 0;
+		if (rejects++ < 32) LOGF("BDA candidates: shader=0x%016" PRIx64
+		                        " rejected: table or destination lacks a complete proof\n",
+		                        program.shader_hash);
+		ResetBindings();
+		return;
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
+	if (candidate_writes &&
+	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		ResetBindings();
+		return;
+	}
 
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
@@ -435,6 +457,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (candidate_writes) m_context.GetBufferCache().RestoreBdaWriteCandidateTable(*candidate_plan);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -480,8 +503,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ResetBindings();
 	// Phase 0: the written pages are settled before the command processor goes on.
-	if (program.info.bda_writes) {
-		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	if (program.info.bda_writes &&
+	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash,
+		    candidate_plan ? candidate_plan->Ranges() : std::span<const GuestRange>{});
 	}
 }
 
@@ -515,8 +540,22 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
-	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	FindBuffers(bindings);
+	std::optional<BdaWriteCandidates::Plan> candidate_plan;
+	const bool candidate_writes = program.info.bda_writes &&
+	    ShaderRecompiler::BdaWriteCandidatesApplies(program.shader_hash);
+	if (candidate_writes) candidate_plan.emplace();
+	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
+	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		static uint32_t rejects = 0;
+		if (rejects++ < 32) LOGF("BDA candidates: shader=0x%016" PRIx64
+		                        " rejected: table or destination lacks a complete proof\n",
+		                        program.shader_hash);
+		ResetBindings();
+		return;
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -526,6 +565,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	if (candidate_writes &&
+	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		ResetBindings();
+		return;
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
 	buffer.BeginEmission();
@@ -563,10 +608,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	if (candidate_writes) m_context.GetBufferCache().RestoreBdaWriteCandidateTable(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (program.info.bda_writes) {
-		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	if (program.info.bda_writes &&
+	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash,
+		    candidate_plan ? candidate_plan->Ranges() : std::span<const GuestRange>{});
 	}
 }
 

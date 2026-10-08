@@ -8,6 +8,10 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 // How V_MAD_F32/V_MAC_F32/V_MADMK_F32/V_MADAK_F32 (unfused on PS5: the product is rounded before
 // the add) are emitted, and which float arithmetic may not be contracted by the host compiler.
+inline constexpr uint64_t BdaWaterLightingHash = 0x86da5eb7b8257bb0ull;
+inline constexpr uint64_t BdaShadowResolveHash = 0xd8959888aafd2552ull;
+enum class BdaWriteMode : uint8_t { Off, Candidates, CandidatesVerify };
+
 enum class MadMode : uint8_t {
 	// Every MAD is an FMul plus an FAdd, and every guest FMul/FAdd/FSub is NoContraction: bit
 	// exact everywhere, at the cost of one extra instruction per MAD.
@@ -151,6 +155,9 @@ struct CodegenOptions {
 	// opt-in per shader, the correctness reference for the deferred designs. Requires
 	// KYTY_SRT_VARIANT_READS (the V# is a runtime read).
 	std::vector<uint64_t> bda_writes_shaders;
+	// KYTY_BDA_WRITES=candidates|candidates-verify: finite destinations of the two audited
+	// Yotei shaders, reserved before dispatch. Verify retains phase 0's bitmap and settle.
+	BdaWriteMode bda_write_mode = BdaWriteMode::Off;
 	// KYTY_RUNTIME_BUFFER_STRIDE (default on; 0 disables): unswizzled structured buffers read
 	// their stride from the shader data instead of specializing on it (IR::PackedStrideRuntime).
 	bool runtime_buffer_stride = true;
@@ -210,6 +217,9 @@ bool BindlessStridedComputeApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWritesApplies(uint64_t shader_hash);
 // KYTY_BDA_WRITES_SHADERS lists a shader: the fault buffer carries the written-page bitmap.
 [[nodiscard]] bool BdaWritesEnabled();
+[[nodiscard]] bool BdaWriteCandidatesApplies(uint64_t shader_hash);
+[[nodiscard]] bool BdaWriteCandidatesVerify();
+[[nodiscard]] uint32_t BdaWriteCandidateStorePc(uint64_t shader_hash);
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only

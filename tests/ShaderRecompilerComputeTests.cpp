@@ -44,6 +44,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
+#include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -1860,6 +1861,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  uint64_t shader_hash = 0;
 };
 
 struct GraphicsCase {
@@ -2265,6 +2267,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
+  options.shader_hash = test.shader_hash;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -29549,6 +29552,7 @@ public:
 #include "ShaderBdaNewBufferTests.inc"
 #include "ShaderBufferUploadCoalesceTests.inc"
 #include "ShaderCoherenceCopyTests.inc"
+#include "ShaderBdaCandidateNativeTests.inc"
 
 private:
   RenderContext &Renderer() {
@@ -52733,6 +52737,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsWideLdsPartialBounds());
     RunCase(&vulkan, DsAtomic64Bounds(false));
     RunCase(&vulkan, DsAtomic64Bounds(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-candidates-only") == 0) {
+    BdaWritesTests::RunCandidates();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-writes-only") == 0) {
