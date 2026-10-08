@@ -303,3 +303,25 @@ aberto, sem evidência de ganho ou perda de FPS atribuível apenas a este merge.
 O binário desses testes também contém a edição local ainda não commitada de
 `spirvEmitterMemory.cpp`; ela ficou fora do commit de integração. Uma validação do commit exato,
 sem essa edição, precisa de um build limpo separado.
+
+## 8. Compilação e limpeza após a integração
+
+No Linux sem IPO, `kyty_full_emulator_objects` compila as 221 fontes comuns uma vez e as liga
+ao emulador e aos testes que usam o mesmo conjunto de fontes. `virtual_memory_allocation_tests`
+continua com objetos próprios porque usa `KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1` e
+`-fexceptions`; builds com IPO e outras plataformas mantêm a compilação anterior. No grafo
+Ninja, os nove alvos completos passaram de **1.998 para 451 compilações C++** (menos 77,4%).
+Para `kyty_emulator`, `shader_cfg_tests` e `shader_recompiler_compute_tests` juntos, passaram
+de 666 para 224. Cada executável ainda tem seu link próprio; os números são de compilações
+planejadas, não uma medição de tempo de build ou FPS.
+
+Após essa mudança, os 10 testes CTest de host selecionados passaram, assim como oito testes
+com acesso à GPU (`kernel_file_system`, cinco modos de `mesh_indirect`, `srt_variant_reads` e
+`srt_unmapped_reads`). Também passaram os sete modos focados de `shader_cfg_tests` e
+`virtual_memory_allocation_tests --fiber-only`. O teste `kernel_file_system` precisa de acesso
+ao dispositivo Vulkan; falhou no sandbox sem GPU e passou fora dele.
+
+A limpeza do diretório de trabalho removeu 1.734 saídas antigas que já não constavam do grafo
+Ninja, a configuração CMake incompleta em `build/` (sem executável) e 52 arquivos temporários
+`.o.tmp` de compilações interrompidas. `_Build/linux-clang`, perfis A/B, caches e binários
+de comparação foram mantidos. A edição local de BDA em `spirvEmitterMemory.cpp` não foi alterada.

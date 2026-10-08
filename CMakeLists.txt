@@ -596,8 +596,26 @@ list(APPEND check_headers
 	${KYTY_SOURCE_DIR}
 )
 
+# Full-emulator tests normally compile the same sources once per executable. On Linux, compile
+# them once and link the objects into each target. The virtual-memory test keeps its own objects:
+# KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS and -fexceptions change their compilation.
+if(LINUX)
+	add_library(kyty_full_emulator_objects OBJECT EXCLUDE_FROM_ALL ${kyty_emulator_src})
+	target_link_libraries(kyty_full_emulator_objects ${kyty_emulator_link_libraries})
+	target_include_directories(kyty_full_emulator_objects PRIVATE ${inc_headers})
+	list(APPEND KYTY_IWYU kyty_full_emulator_objects)
+	list(APPEND KYTY_CLANG_TIDY kyty_full_emulator_objects)
+	clang_tidy_check(kyty_full_emulator_objects "" "${check_headers}" "${inc_headers}")
+	include_what_you_use(kyty_full_emulator_objects "${inc_headers}")
+endif()
+
 function(add_kyty_full_emulator_test target source)
-	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	if(LINUX AND NOT "${target}" STREQUAL "virtual_memory_allocation_tests")
+		add_executable(${target} EXCLUDE_FROM_ALL ${source})
+		target_link_libraries(${target} kyty_full_emulator_objects)
+	else()
+		add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	endif()
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
@@ -2526,10 +2544,16 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
-add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+option(KYTY_EMULATOR_IPO "Enable release interprocedural optimization for the emulator target" OFF)
+if(LINUX AND NOT KYTY_EMULATOR_IPO)
+	add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp")
+	target_link_libraries(kyty_emulator kyty_full_emulator_objects)
+else()
+	# An IPO build must compile the emulator sources with its own target properties.
+	add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
-option(KYTY_EMULATOR_IPO "Enable release interprocedural optimization for the emulator target" OFF)
 if(KYTY_EMULATOR_IPO)
 	set_property(TARGET kyty_emulator PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()
