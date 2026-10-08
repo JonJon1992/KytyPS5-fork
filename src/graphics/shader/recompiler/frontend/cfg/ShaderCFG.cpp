@@ -2296,9 +2296,20 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 namespace {
 
-// A loop-body conditional can enter a break region containing nested selections or loops.
-// That region is still inside the enclosing loop construct, so the conditional needs its own
-// selection merge on the region's exit edge. Other loop exits remain ordinary breaks.
+// A conditional in a loop body with one arm in the loop and the other arm a "break region": blocks
+// outside the natural loop (they never return to its header) that are not the loop's merge or
+// continue target, and that leave through the loop's merge. IsInnermostLoopControlConditional
+// counts it as loop control, but in SPIR-V the region lies inside the loop construct, so the branch
+// is a selection and needs a merge ("Selection must be structured"). Astro Bot's BVH traversals
+// have it: the first body block of the traversal loop either continues the walk or enters a
+// region with its own loop that ends the traversal.
+// The region's own selections and loops already have their merges; following them from the
+// region's entry (its spine) reaches the block that breaks to the loop merge. A synthetic block on
+// that edge becomes the conditional's merge: the region reaches it, the other arm leaves through
+// breaks and continues, and it breaks to the loop merge. Other exits of the region stay breaks. A
+// region without such a spine fails structurization, as any other unstructured CFG. Runs after
+// every other merge is assigned; the new block is placed before the loop merge (renumbering the
+// graph), and it is fresh, so it cannot be any other construct's merge.
 bool StructureBreakRegions(Graph& graph) {
 	const auto budget = static_cast<uint32_t>(graph.blocks.size());
 	for (uint32_t pass = 0; pass <= budget; ++pass) {
@@ -2362,8 +2373,9 @@ bool StructureBreakRegions(Graph& graph) {
 		}
 		if (exit_block == UINT32_MAX) {
 			SetFailure(graph, FailureKind::StructuredControlFlow, header_id,
-			           fmt::format("conditional block {} enters break region {} of loop merge {} "
-			                       "without a structured exit", header_id, region, loop_merge));
+			           fmt::format("conditional block {} enters break region {} of the loop with "
+			                       "merge {}, and the region has no structured exit to that merge",
+			                       header_id, region, loop_merge));
 			return false;
 		}
 

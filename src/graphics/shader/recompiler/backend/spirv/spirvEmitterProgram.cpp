@@ -1110,6 +1110,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
+	EmitGeometryOutputDefaults(state);
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

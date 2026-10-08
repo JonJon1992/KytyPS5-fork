@@ -11601,6 +11601,174 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// KYTY_VS_OUTPUT_GUARD / KYTY_MESH_OUTPUT_GUARD (SpirvEmitter.h, HostGeometryGuard): with the guard
+// a vertex shader stores a zero position and a culling clip-guard distance before the guest code,
+// and a mesh shader clamps its counts and culls primitives naming vertices past the count. Off, the
+// SPIR-V is unchanged.
+size_t CountSpirvOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size() && (binary[i] >> 16u) != 0u; i += binary[i] >> 16u) {
+    count += (binary[i] & 0xffffu) == opcode ? 1u : 0u;
+  }
+  return count;
+}
+
+// KYTY_READONLY_BUFFERS (CodegenOptions::readonly_buffers): a program without buffer stores or
+// atomics declares its storage buffers NonWritable; one that stores, or the switch off, does not.
+// The page table, shader data and flattened SRT are NonWritable whenever the switch is on.
+size_t CountSpirvDecoration(const std::vector<uint32_t> &binary, uint32_t decoration) {
+  constexpr uint32_t OpDecorate = 71u;
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size() && (binary[i] >> 16u) != 0u; i += binary[i] >> 16u) {
+    count += (binary[i] & 0xffffu) == OpDecorate && (binary[i] >> 16u) >= 3u &&
+                     i + 2u < binary.size() && binary[i + 2u] == decoration
+                 ? 1u
+                 : 0u;
+  }
+  return count;
+}
+
+void TestReadOnlyBuffers() {
+  constexpr uint32_t NonWritable = 24u;
+  // The fixture buffer in s[0:3] (raw offset bounds): a buffer at s[48:51] is all zero, whose
+  // stride-0 OOB_SELECT 0 bounds drop every store.
+  const uint32_t load_only[] = {
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0), // buffer_load_dword v0
+      EncodeDs0(0x0d), EncodeDs1(0, 0, 0),                  // ds_write_b32 v0, v0
+      0xbf810000u,
+  };
+  const uint32_t load_store[] = {
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0), // buffer_load_dword v0
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 0, 0), // buffer_store_dword v0
+      0xbf810000u,
+  };
+  // A load through BDA, which reads the page table, and a buffer store.
+  const uint32_t flat_load_store[] = {
+      EncodeFlat0(0x0c, 0, 0), EncodeFlat1(0, 0x7d, 0, 1),  // flat_load_dword v0, v[1:2]
+      EncodeMubuf0(0x1c, 4, false), EncodeMubuf1(0, 0, 0), // buffer_store_dword v0
+      0xbf810000u,
+  };
+  struct Compiled {
+    size_t non_writable  = 0;
+    size_t host_bindings = 0; // page table, shader data and flattened SRT bindings
+    bool   page_table    = false;
+    bool   stores        = false; // a buffer store or atomic survived translation
+  };
+  const auto saved   = ShaderRecompiler::GetCodegenOptions();
+  const auto compile = [&](const auto &shader, bool readonly) {
+    using ShaderRecompiler::IR::DescriptorBindingKind;
+    auto options             = saved;
+    options.readonly_buffers = readonly;
+    ShaderRecompiler::SetCodegenOptions(options);
+    auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto has = [&](DescriptorBindingKind kind) {
+      return ShaderRecompiler::IR::FindBinding(result.program.bindings, kind) != nullptr;
+    };
+    Compiled compiled;
+    compiled.non_writable = CountSpirvDecoration(result.spirv, NonWritable);
+    compiled.page_table   = has(DescriptorBindingKind::BdaPagetable);
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        const auto access = ShaderRecompiler::IR::BufferAccessOf(inst.GetOpcode());
+        compiled.stores |= access == ShaderRecompiler::IR::BufferAccess::Write ||
+                           access == ShaderRecompiler::IR::BufferAccess::Atomic;
+      }
+    }
+    compiled.host_bindings = (compiled.page_table ? 1u : 0u) +
+                             (has(DescriptorBindingKind::ShaderData) ? 1u : 0u) +
+                             (has(DescriptorBindingKind::FlattenedSrt) ? 1u : 0u);
+    return compiled;
+  };
+  // With the switch on, every host-written binding is NonWritable, and the buffers are too only
+  // in the program that never stores to them.
+  const auto added = [&](const auto &shader) {
+    const auto on  = compile(shader, true);
+    const auto off = compile(shader, false);
+    return std::pair {on.non_writable - off.non_writable, on.host_bindings};
+  };
+  const auto [load_only_added, load_only_host] = added(load_only);
+  Check(load_only_added == load_only_host + 1u,
+        "read-only buffers: a load-only program did not declare its buffers NonWritable");
+  const auto [load_store_added, load_store_host] = added(load_store);
+  Check(compile(load_store, true).stores && compile(flat_load_store, true).stores,
+        "read-only buffers: the store programs lost their buffer store");
+  Check(load_store_added == load_store_host,
+        "read-only buffers: a program that stores declared its buffers NonWritable");
+  const auto [flat_added, flat_host] = added(flat_load_store);
+  Check(compile(flat_load_store, true).page_table && flat_added == flat_host,
+        "read-only buffers: the page table of a program that stores to its buffers is not "
+        "NonWritable");
+}
+
+void TestGeometryOutputGuard() {
+  namespace Spirv = ShaderRecompiler::Spirv;
+  const auto saved = Spirv::GetHostGeometryGuard();
+  constexpr uint32_t OpStore = 62u, OpUGreaterThanEqual = 174u, OpConstantNull = 46u;
+
+  const uint32_t vertex_shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
+      EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7), // PARAM0
+      0xbf810000u,
+  };
+  const auto compile_vertex = [&](bool guard) {
+    Spirv::SetHostGeometryGuard({.vertex_outputs = guard, .mesh_outputs = false});
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    auto result  = RecompileForTest(vertex_shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result.spirv;
+  };
+  const auto vertex_off = compile_vertex(false);
+  const auto vertex_on  = compile_vertex(true);
+  Check(CountSpirvOpcode(vertex_on, OpStore) == CountSpirvOpcode(vertex_off, OpStore) + 2u,
+        "vertex output guard: expected a position store and a clip-guard store before the guest code");
+  Check(CountSpirvOpcode(vertex_off, OpConstantNull) <= CountSpirvOpcode(vertex_on, OpConstantNull),
+        "vertex output guard: the zero position constant is missing");
+  Check(compile_vertex(false) == vertex_off, "vertex output guard off: SPIR-V must not change");
+
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u, // three vertices, one primitive
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // s_sendmsg MSG_GS_ALLOC_REQ
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0), // POS0
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0), // PARAM0
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),        // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 64;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 21;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 64;
+  mesh.max_primitives = 64;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto compile_mesh = [&](bool guard) {
+      Spirv::SetHostGeometryGuard({.vertex_outputs = false, .mesh_outputs = guard});
+      ShaderRecompiler::CompileOptions options{};
+      options.stage = ShaderType::Mesh;
+      options.input_info.vertex = &input;
+      const auto result = RecompileForTest(mesh_shader, options, nullptr, nullptr,
+                                           ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+      CheckSpirvBinaryValidates(result.spirv);
+      return result.spirv;
+    };
+    const auto mesh_off = compile_mesh(false);
+    const auto mesh_on  = compile_mesh(true);
+    const uint32_t lanes = subgroup_size == 32u ? 2u : 1u;
+    Check(CountSpirvOpcode(mesh_on, OpUGreaterThanEqual) ==
+              CountSpirvOpcode(mesh_off, OpUGreaterThanEqual) + 3u * lanes,
+          "mesh output guard: every lane must range-check its three primitive indices");
+    Check(CountSpirvOpcode(mesh_on, OpStore) >= CountSpirvOpcode(mesh_off, OpStore) + 2u * lanes,
+          "mesh output guard: lane position and primitive defaults are missing");
+    Check(compile_mesh(false) == mesh_off, "mesh output guard off: SPIR-V must not change");
+  }
+  Spirv::SetHostGeometryGuard(saved);
+  std::printf("shader_cfg geometry output guard: ok\n");
+}
+
 void TestNewShaderRecompilerExpVertexOutputs() {
   const uint32_t shader[] = {
       EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), // POS0
@@ -14225,11 +14393,25 @@ void TestSrtWalkerNullPointerReadsZero() {
                          [](uint32_t word) { return word == 0; }),
         "a reader that backs low addresses was overridden by the null-pointer rule");
 
+  // Without a reader the walker reads guest memory itself: a null pointer is a zero descriptor
+  // there too (it dropped the draws of Astro's Playroom's lit passes), and nothing is read.
+  user_data[8] = 0;
+  const ShaderRecompiler::IR::SrtRuntime direct{user_data, 0, nullptr, nullptr};
+  std::vector<uint32_t> direct_flat;
+  Check(ShaderRecompiler::IR::SrtWalker(ir, direct).RefreshFlatBuffer(direct_flat) &&
+            direct_flat.size() == 4 &&
+            std::all_of(direct_flat.begin(), direct_flat.end(),
+                        [](uint32_t word) { return word == 0; }),
+        "a null SRT pointer read directly did not read as zero");
+
   user_data[8] = 0x2000u;
   reads = 0;
   Check(!ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat),
         "an address on the second page was treated as a null SRT pointer");
   Check(reads > 0, "an address on the second page did not reach the memory reader");
+  // The rest of the unmapped low 64 KiB still fails without being read.
+  Check(!ShaderRecompiler::IR::SrtWalker(ir, direct).RefreshFlatBuffer(direct_flat),
+        "a direct read on the second page was treated as a null SRT pointer");
 }
 
 void TestSrtWalkerVccBaseTranslation() {
@@ -15841,7 +16023,23 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {
     TestMeshExportStorage();
     TestMeshIndirectParams();
+    TestGeometryOutputGuard();
     std::printf("shader_cfg --mesh-indirect-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readonly-buffers-only") == 0) {
+    TestReadOnlyBuffers();
+    std::printf("shader_cfg --readonly-buffers-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-null-pointer-only") == 0) {
+    TestSrtWalkerNullPointerReadsZero();
+    std::printf("shader_cfg --srt-null-pointer-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--break-region-only") == 0) {
+    TestTraversalLoopBreakRegion();
+    std::printf("shader_cfg --break-region-only: ok\n");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
@@ -15985,6 +16183,8 @@ int main(int argc, char **argv) {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMeshIndirectParams();
+  TestGeometryOutputGuard();
+  TestReadOnlyBuffers();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

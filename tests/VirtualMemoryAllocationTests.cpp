@@ -4586,6 +4586,45 @@ void TestSmallFiberStacksAndMigration() {
 		std::printf("[host]    %s stack=%zu ok\n", test, stack_size);
 	}
 }
+
+void KYTY_SYSV_ABI ReturningFiberEntry(uint64_t initial, uint64_t /*arg*/) {
+	volatile uint8_t local = 0;
+	*reinterpret_cast<uint64_t*>(initial) = reinterpret_cast<uint64_t>(&local);
+}
+
+// A small fiber whose entry returns runs on a guest stack of its own (KYTY_FIBER_GUEST_STACK)
+// and gives it back when the run ends: sceFiberFinalize refuses a terminated fiber.
+void TestReturnedFiberGivesStackBack() {
+	const char* test = "ReturnedFiberGivesStackBack";
+	// Below the 256 KiB default of KYTY_FIBER_GUEST_STACK, and a size no other test's fibers use,
+	// so the stack cache holds no other stack of this shape.
+	constexpr size_t   ContextSize = 0x10000;
+	constexpr uint64_t StackSize   = ContextSize + 0x40000; // FIBER_STACK_EXTRA
+	alignas(8) std::array<uint8_t, 256> object {};
+	std::vector<uint8_t> context(ContextSize + 16);
+	auto* context_start = reinterpret_cast<uint8_t*>(
+	    (reinterpret_cast<uintptr_t>(context.data()) + 15u) & ~static_cast<uintptr_t>(15u));
+	auto*    fiber         = reinterpret_cast<Libs::Fiber::FiberObject*>(object.data());
+	uint64_t stack_address = 0;
+	CheckOk(test, Libs::Fiber::FiberInitialize(fiber, "returning", ReturningFiberEntry,
+	    reinterpret_cast<uint64_t>(&stack_address), context_start, ContextSize, nullptr, 0x0a000000),
+	    "initialize fiber");
+	Check(test, Libs::Fiber::FiberRun(fiber, 0, nullptr) == FiberErrorState,
+	      "a run whose entry returned did not report the terminated fiber");
+	const auto context_begin = reinterpret_cast<uint64_t>(context_start);
+	Check(test, stack_address != 0 &&
+	                (stack_address < context_begin || stack_address >= context_begin + ContextSize),
+	      "a small fiber did not run on a guest stack of its own");
+	Check(test, Libs::Fiber::FiberFinalize(fiber) == FiberErrorState,
+	      "finalize accepted a terminated fiber");
+	const auto stack = Libs::LibKernel::MapGuestStack(StackSize);
+	Check(test, stack != 0 && stack_address >= stack && stack_address < stack + StackSize,
+	      "the guest stack of a fiber whose entry returned was not given back");
+	if (stack != 0) {
+		Libs::LibKernel::UnmapGuestStack(stack, StackSize);
+	}
+	std::printf("[host]    %s ok\n", test);
+}
 #endif
 
 } // namespace
@@ -4597,6 +4636,7 @@ int main(int argc, char** argv) {
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
+		RunTest(TestReturnedFiberGivesStackBack);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -4634,6 +4674,7 @@ int main(int argc, char** argv) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
+	RunTest(TestReturnedFiberGivesStackBack);
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);

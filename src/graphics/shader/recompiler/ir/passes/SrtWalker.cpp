@@ -1394,6 +1394,21 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 			return false;
 		}
 	} else {
+		// A descriptor pointer the guest has not written yet reads as null, and the fields behind
+		// it land in the first pages, which no guest maps (Ghost of Yotei reads 0x10). Nothing is
+		// read from there. As with a reader above, the first page is a null table (an unset table,
+		// because this path is not taken) and reads as a zero descriptor: failing it dropped every
+		// draw of Astro's Playroom's lit passes (a table read at 0x28), leaving the scene black.
+		// The rest of the low 64 KiB fails like the GPU's faulting access.
+		constexpr uint64_t null_page_limit = 0x10000;
+		if (address < null_page_limit) {
+			ObserveSrtRead(m_runtime, address, {&word, 1}, false);
+			if (address < 0x1000u) {
+				result = 0;
+				return true;
+			}
+			return false;
+		}
 		constexpr uint64_t gpu_limit = uint64_t {1} << 40u;
 		// Read the exact clean bytes without faulting on unrelated dirty bytes in
 		// the same protected page. A failed probe leaves the original read intact.

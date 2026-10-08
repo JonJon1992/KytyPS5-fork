@@ -47,6 +47,7 @@ CodegenOptions FromEnvironment() {
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
+	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
 	options.sample_offsets = EnvFlag("KYTY_SAMPLE_OFFSETS", options.sample_offsets);
 	options.sample_lod_clamp = EnvFlag("KYTY_SAMPLE_LOD_CLAMP", options.sample_lod_clamp);
@@ -79,12 +80,15 @@ CodegenOptions FromEnvironment() {
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.dispatcher_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
 	}
-	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit (renderer/meshIndirect.h: GPU-converted indirect
-	// mesh draws); unset, 0 and "empty" keep the pushed-dword-only mesh draw parameters.
-	if (const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH"); mode != nullptr) {
+	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit, or unset/empty (the default, renderer/meshIndirect.h:
+	// GPU-converted indirect mesh draws); 0 and "empty" keep the pushed-dword-only mesh draw
+	// parameters.
+	{
+		const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH");
 		options.mesh_indirect_params =
-		    std::strcmp(mode, "1") == 0 || std::strcmp(mode, "on") == 0 ||
-		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
+		    mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "1") == 0 ||
+		    std::strcmp(mode, "on") == 0 || std::strcmp(mode, "verify") == 0 ||
+		    std::strcmp(mode, "exit") == 0;
 	}
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {

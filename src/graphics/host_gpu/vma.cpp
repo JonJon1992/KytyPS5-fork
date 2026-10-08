@@ -90,6 +90,16 @@ bool NativeImagePoolEnabled() {
 	return enabled;
 }
 
+// KYTY_IMAGE_SYSMEM_FALLBACK=0: an image that does not fit in video memory ends the emulator
+// ("failed to create image") instead of going to system memory.
+static bool ImageSystemMemoryFallbackEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_SYSMEM_FALLBACK");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // KYTY_NATIVE_IMAGE_POOL_IDLE_MS=N (default 0: off): a retained native image that no create has
 // reused for N ms is destroyed (TrimRetiredImages, from the garbage collector). The pool then holds
 // what the current churn recycles instead of up to its whole limit of images retired in earlier
@@ -255,6 +265,26 @@ bool GraphicContext::CreateAllocator() {
 				     "(KYTY_VMA_BUDGET_CACHE_MS)\n",
 				     interval_ms);
 			}
+		}
+	}
+	// KYTY_VRAM_LIMIT_MB=<n> (test tool, from chenxiao07/KytyPS5 05e64602f): every device-local heap
+	// as on a GPU with n MiB of video memory (VMA's heap size limit): its budget, the cache thresholds
+	// derived from the budget, and allocations past it failing. Code that reads the driver's heap
+	// sizes directly still sees the real ones.
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
+	if (const char* text = std::getenv("KYTY_VRAM_LIMIT_MB"); text != nullptr) {
+		const uint64_t limit_mb = std::strtoull(text, nullptr, 10);
+		if (limit_mb > 0) {
+			heap_limits.fill(VK_WHOLE_SIZE);
+			const auto properties = physical_device.getMemoryProperties();
+			for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+				if (properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+					heap_limits[heap] = std::min<VkDeviceSize>(limit_mb << 20u,
+					                                           properties.memoryHeaps[heap].size);
+				}
+			}
+			info.pHeapSizeLimit = heap_limits.data();
+			std::fprintf(stderr, "KYTY_VRAM_LIMIT_MB: device-local heaps limited to %" PRIu64 " MiB\n", limit_mb);
 		}
 	}
 
@@ -503,6 +533,16 @@ void GraphicContext::ClearRetiredImages() {
 	m_retired_image_bytes = 0;
 }
 
+uint64_t GraphicContext::ReleaseRetainedMemory() {
+	uint64_t bytes = 0;
+	{
+		std::scoped_lock lock(m_retired_image_mutex);
+		bytes = m_retired_image_bytes;
+	}
+	ClearRetiredImages();
+	return bytes;
+}
+
 void GraphicContext::TrimRetiredImages() {
 	const auto idle = RetiredImageIdleLimit();
 	if (idle.count() == 0 || allocator == nullptr) {
@@ -718,7 +758,8 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		Profiler::CountFrameEvent(image.image != nullptr ? Profiler::FrameEvent::NativeImagePoolHits
 		                                                 : Profiler::FrameEvent::NativeImagePoolMisses);
 	}
-	const bool pool_hit = image.image != nullptr;
+	const bool pool_hit      = image.image != nullptr;
+	bool       system_memory = false;
 	if (image.image == nullptr) {
 		VmaAllocationCreateInfo alloc_info {};
 		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -740,6 +781,30 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			// Retained objects are optional. Release them before one allocation retry.
 			ClearRetiredImages();
 			result = allocate();
+		}
+		if (result == vk::Result::eErrorOutOfDeviceMemory && ImageSystemMemoryFallbackEnabled()) {
+			// From chenxiao07/KytyPS5 86910c0d2: out of video memory, the image goes to any memory
+			// type the driver allows for it (NVIDIA: system memory for optimal images). Slower to
+			// sample, but the game goes on instead of ending at "failed to create image".
+			alloc_info.requiredFlags  = 0;
+			alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			result                    = allocate();
+			if (result == vk::Result::eSuccess) {
+				VkMemoryPropertyFlags memory_flags = 0;
+				vmaGetAllocationMemoryProperties(allocator, image.allocation, &memory_flags);
+				system_memory = (memory_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::fprintf(stderr, "Vulkan: video memory full, %s: %ux%ux%u format=%d layers=%u levels=%u "
+				     "(KYTY_IMAGE_SYSMEM_FALLBACK)\n",
+				     result == vk::Result::eSuccess ? "an image is in system memory"
+				                                    : "an image could not be created",
+				     image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+				     static_cast<int>(image_info.format), image_info.arrayLayers,
+				     image_info.mipLevels);
+				LogMemoryBudget();
+			}
 		}
 		if (result != vk::Result::eSuccess) {
 			LogMemoryBudget();
@@ -771,8 +836,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
-	image.pool_eligible = recycle;
-	image.pool_create_info = recycle ? image_info : vk::ImageCreateInfo {};
+	// An image in system memory is destroyed when it retires, not pooled: the next image of its
+	// shape tries video memory again instead of reusing the slow allocation for good.
+	image.pool_eligible = recycle && !system_memory;
+	image.pool_create_info = image.pool_eligible ? image_info : vk::ImageCreateInfo {};
 
 	return true;
 }

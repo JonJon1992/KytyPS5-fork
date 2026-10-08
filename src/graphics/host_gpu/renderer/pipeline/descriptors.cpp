@@ -2064,6 +2064,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	bool  write_ranges_evaluated = false;
 	// All bindings' uploads share one barrier pair (KYTY_UPLOAD_BATCH).
 	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
+	// KYTY_CP_BINDING_BATCH_PREFETCH: the memo slots of every read binding first, so their cache
+	// misses overlap (a hint only; the lookups below are unchanged). A single binding has nothing
+	// to overlap with: its hint would only hash it once more right before its own lookup.
+	if (program.info.buffers.size() > 1) {
+		auto& buffer_cache = m_context.GetBufferCache();
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& source   = prepared.buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (source.address != 0 && source.size != 0 && !resource.written && !resource.formatted) {
+				buffer_cache.PrefetchReadBinding(source.address, source.size);
+			}
+		}
+	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
 		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
@@ -2586,6 +2599,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
+		// KYTY_GUEST_STORAGE_REPEAT: these are the guest draw's or dispatch's own transitions.
+		const Image::GuestTransitScope guest_transitions;
 		// KYTY_DRAW_RUN continuation: every image is in the state the previous draw's transitions
 		// left it in (RenderExecutor::DrawRunImagesUnchanged), which the bindings' layouts record.
 		for (uint32_t i = 0; !keep_images && i < program.info.images.size(); i++) {

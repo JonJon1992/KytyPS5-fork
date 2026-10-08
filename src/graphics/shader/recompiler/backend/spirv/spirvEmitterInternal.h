@@ -76,6 +76,9 @@ struct SpirvRequirements {
 	bool buffer_int64_atomics         = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// A buffer store or atomic anywhere in the program; without one (and without coherent loads)
+	// the storage buffers are declared NonWritable (CodegenOptions::readonly_buffers).
+	bool buffer_writes                = false;
 	bool float64                      = false;
 	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
 	bool shader_clock                 = false;
@@ -453,6 +456,7 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitGeometryOutputDefaults(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
