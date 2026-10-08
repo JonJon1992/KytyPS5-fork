@@ -3756,7 +3756,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	// A GPU-built indirect mesh draw (KYTY_NATIVE_INDIRECT_MESH) reads its instance count on the
+	// GPU; its draw carries no count here, and adding it showed about 2^32 instances per frame.
+	if (!mesh_indirect) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	}
 	if (emit.predicate != 0) {
 		vk_buffer.endConditionalRenderingEXT();
 	}
