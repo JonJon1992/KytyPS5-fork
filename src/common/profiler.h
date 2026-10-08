@@ -1227,6 +1227,15 @@ enum class FrameEvent : uint32_t {
 	CpCommitTexDccRejects,
 	// A source skipped after a failed flat SRT read through a loop-carried address.
 	VariantPlanSkips,
+	// KYTY_BDA_WRITES_SHADERS (BufferCache::SettleBdaWrites): settles after a dispatch that wrote
+	// through BDA, the caching pages they made GPU-owned, writes dropped on pages without a cache
+	// buffer, written pages a guest write had made CPU-dirty meanwhile (the GPU's bytes win), and
+	// written ranges under a GPU-modified image (its bytes there are lost).
+	BdaSettles,
+	BdaSettlePages,
+	BdaDroppedWrites,
+	BdaSettleCpuDirtyPages,
+	BdaAliasHits,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1355,6 +1364,9 @@ enum class FrameWait : uint32_t {
 	// for work the batch reads: texture staging copies still running, upload DMA transfers not
 	// submitted yet (SubmitDependency).
 	SubmitDependencyWait,
+	// KYTY_BDA_WRITES_SHADERS: the GPU thread waiting for a dispatch that wrote through BDA and the
+	// compaction of its written-page bitmap (FaultManager::CollectBdaWrites, phase 0: synchronous).
+	BdaSettle,
 	Count,
 };
 

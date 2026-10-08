@@ -668,6 +668,7 @@ void Write(CodecWriter& w, const ShaderInfo& v) {
 	w.I32(v.instance_offset_sgpr);
 	w.Bool(v.has_bitwise_xor);
 	w.Bool(v.uses_dma);
+	w.Bool(v.bda_writes);
 }
 
 void Read(CodecReader& r, ShaderInfo& v) {
@@ -685,6 +686,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	v.instance_offset_sgpr = r.I32();
 	v.has_bitwise_xor      = r.Bool();
 	v.uses_dma             = r.Bool();
+	v.bda_writes           = r.Bool();
 }
 
 void Write(CodecWriter& w, const BindingLayout& v) {

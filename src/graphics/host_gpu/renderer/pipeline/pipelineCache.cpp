@@ -2278,6 +2278,8 @@ struct PipelineCache::ProgramCache {
 		     .bindless_strided_compute =
 		         key.stage == ShaderType::Compute && options.bindless_images &&
 		         ShaderRecompiler::BindlessStridedComputeApplies(key.hash),
+		     .bda_writes = key.stage == ShaderType::Compute &&
+		                   ShaderRecompiler::BdaWritesApplies(key.hash),
 		     .code                    = code_words,
 		     .back_code               = back_code_words},
 		    disk_key);

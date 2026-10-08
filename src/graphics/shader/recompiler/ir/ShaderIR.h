@@ -87,6 +87,17 @@ struct MemoryInfo {
 		       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 	}
 
+	// KYTY_BDA_WRITES_SHADERS: the raw (unformatted) DWORD x1-x4 stores that write through BDA when
+	// their V# is a runtime value. Formatted, typed, D16 and sub-DWORD stores and atomics keep
+	// dropping the program.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		if (typed || d16 || formatted || data_bits != 32u) return false;
+		return (opcode == ValueOpcode::StoreBufferU32 && data_dwords == 1u) ||
+		       (opcode == ValueOpcode::StoreBufferU32x2 && data_dwords == 2u) ||
+		       (opcode == ValueOpcode::StoreBufferU32x3 && data_dwords == 3u) ||
+		       (opcode == ValueOpcode::StoreBufferU32x4 && data_dwords == 4u);
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 
@@ -542,6 +553,9 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// KYTY_BDA_WRITES_SHADERS: the program stores through a V# it computed (IndirectBuffer), marking
+	// written pages in the fault buffer's bitmap; the dispatch is settled after it runs.
+	bool                             bda_writes         = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

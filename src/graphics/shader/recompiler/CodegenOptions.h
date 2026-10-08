@@ -143,6 +143,14 @@ struct CodegenOptions {
 	// KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS=<hex hash>,...: the same for these compute shaders only
 	// (to find which of them breaks a title).
 	std::vector<uint64_t> bindless_strided_compute_shaders;
+	// KYTY_BDA_WRITES_SHADERS=<hex hash>,...: raw DWORD x1-x4 stores of these compute shaders
+	// through a V# the shader computed (ResourceKind::IndirectBuffer) write through BDA instead of
+	// dropping the program; each write marks its page in the fault buffer's written-page bitmap
+	// and the renderer settles the written pages synchronously after the dispatch
+	// (BufferCache::SettleBdaWrites). Phase 0 of docs/ARQUITETURA-ESCRITAS-RUNTIME-2026-10-08.md:
+	// opt-in per shader, the correctness reference for the deferred designs. Requires
+	// KYTY_SRT_VARIANT_READS (the V# is a runtime read).
+	std::vector<uint64_t> bda_writes_shaders;
 	// KYTY_RUNTIME_BUFFER_STRIDE (default on; 0 disables): unswizzled structured buffers read
 	// their stride from the shader data instead of specializing on it (IR::PackedStrideRuntime).
 	bool runtime_buffer_stride = true;
@@ -198,6 +206,10 @@ struct CodegenOptions {
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);
 // KYTY_BINDLESS_STRIDED_COMPUTE, or the shader is listed in KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS.
 bool BindlessStridedComputeApplies(uint64_t shader_hash);
+// The compute shader is listed in KYTY_BDA_WRITES_SHADERS.
+[[nodiscard]] bool BdaWritesApplies(uint64_t shader_hash);
+// KYTY_BDA_WRITES_SHADERS lists a shader: the fault buffer carries the written-page bitmap.
+[[nodiscard]] bool BdaWritesEnabled();
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
 // Test hook: replaces the options for subsequent compilations. Not thread-safe; call it only

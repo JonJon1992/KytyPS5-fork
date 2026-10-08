@@ -420,7 +420,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	// KYTY_BDA_WRITES_SHADERS: stores through runtime V#s write cache buffers through BDA.
 	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    program.info.bda_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written &&
 		           image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -477,6 +479,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	ResetBindings();
+	// Phase 0: the written pages are settled before the command processor goes on.
+	if (program.info.bda_writes) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -526,6 +532,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
+	    program.info.bda_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -558,6 +565,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (program.info.bda_writes) {
+		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash);
+	}
 }
 
 } // namespace Libs::Graphics

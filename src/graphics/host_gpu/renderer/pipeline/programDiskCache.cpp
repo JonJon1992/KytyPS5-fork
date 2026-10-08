@@ -99,7 +99,7 @@ void ProgramDiskCache::BuildSourceKey(const SourceKeyInputs& inputs, SourceKey& 
 	bytes.clear();
 	bytes.reserve(64 + inputs.static_state.size_bytes() + inputs.code.size_bytes() +
 	              inputs.back_code.size_bytes());
-	Put<uint32_t>(bytes, 3); // key layout
+	Put<uint32_t>(bytes, 4); // key layout
 	Put<uint32_t>(bytes, inputs.stage);
 	Put<uint64_t>(bytes, inputs.hash);
 	Put<uint32_t>(bytes, inputs.user_data_count);
@@ -111,6 +111,7 @@ void ProgramDiskCache::BuildSourceKey(const SourceKeyInputs& inputs, SourceKey& 
 	Put<uint8_t>(bytes, inputs.bindless_images);
 	Put<uint8_t>(bytes, inputs.bindless_samplers);
 	Put<uint8_t>(bytes, inputs.bindless_strided_compute ? 1u : 0u);
+	Put<uint8_t>(bytes, inputs.bda_writes ? 1u : 0u);
 	PutWords(bytes, inputs.code);
 	PutWords(bytes, inputs.back_code);
 	const auto digest = XXH3_128bits(bytes.data(), bytes.size());

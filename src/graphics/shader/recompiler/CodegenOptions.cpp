@@ -69,6 +69,7 @@ CodegenOptions FromEnvironment() {
 	    EnvFlag("KYTY_BINDLESS_STRIDED_COMPUTE", options.bindless_strided_compute);
 	ParseHashList(std::getenv("KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS"),
 	              options.bindless_strided_compute_shaders);
+	ParseHashList(std::getenv("KYTY_BDA_WRITES_SHADERS"), options.bda_writes_shaders);
 	options.runtime_buffer_stride =
 	    EnvFlag("KYTY_RUNTIME_BUFFER_STRIDE", options.runtime_buffer_stride);
 	options.realtime_clock    = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
@@ -125,6 +126,16 @@ bool BindlessStridedComputeApplies(uint64_t shader_hash) {
 	return options.bindless_strided_compute ||
 	       std::ranges::find(options.bindless_strided_compute_shaders, shader_hash) !=
 	           options.bindless_strided_compute_shaders.end();
+}
+
+bool BdaWritesApplies(uint64_t shader_hash) {
+	const auto& options = Storage();
+	return std::ranges::find(options.bda_writes_shaders, shader_hash) !=
+	       options.bda_writes_shaders.end();
+}
+
+bool BdaWritesEnabled() {
+	return !Storage().bda_writes_shaders.empty();
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

@@ -52,6 +52,19 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Fault buffer layout (FaultManager), in bytes:
+	//   [0, FAULT_BITMAP_BYTES)                 page-fault bitmap, one bit per caching page
+	//   [FAULT_BITMAP_BYTES, +32)               ShaderTrapRecord
+	//   [BDA_WRITE_BITMAP_OFFSET, +BITMAP)      written-page bitmap (KYTY_BDA_WRITES_SHADERS only)
+	//   [BDA_DROPPED_WRITES_OFFSET, +4)         writes dropped on pages without a cache buffer
+	// The written-page bitmap starts on its own 256-byte boundary past the trap record, so neither
+	// the trap claim nor the fault parser's range ever covers it.
+	static constexpr uint64_t FAULT_BITMAP_BYTES        = CACHING_NUMPAGES / 8;
+	static constexpr uint64_t BDA_WRITE_BITMAP_OFFSET   = FAULT_BITMAP_BYTES + 256;
+	static constexpr uint64_t BDA_DROPPED_WRITES_OFFSET = BDA_WRITE_BITMAP_OFFSET + FAULT_BITMAP_BYTES;
+	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE = BDA_DROPPED_WRITES_OFFSET + 256;
+	static constexpr uint64_t BDA_WRITE_BITMAP_WORD     = BDA_WRITE_BITMAP_OFFSET / sizeof(uint32_t);
+	static constexpr uint64_t BDA_DROPPED_WRITES_WORD   = BDA_DROPPED_WRITES_OFFSET / sizeof(uint32_t);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -144,6 +157,16 @@ public:
 	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	// KYTY_BDA_WRITES_SHADERS, right after recording a dispatch of a program with bda_writes
+	// (phase 0: synchronous). Submits and waits for the dispatch and the compaction of its
+	// written-page bitmap (FaultManager::CollectBdaWrites), then settles every written page as a
+	// writable binding over it would have been, metadata only: the pages become GPU-owned (tracker
+	// and protection), their buffers get new content revisions, clean verdicts, known fills and
+	// overlapping images are invalidated. Nothing is uploaded after the writer: a page a guest
+	// write made CPU-dirty meanwhile keeps the GPU's bytes (counted, fatal with
+	// KYTY_BDA_WRITES_VERIFY=1, as are dropped writes and written pages under a GPU-modified image).
+	// GPU thread.
+	void SettleBdaWrites(uint64_t shader_hash);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
@@ -596,8 +619,11 @@ private:
 	// Returns true when this call published the readback (false: it was already done).
 	bool CompleteSideReadback(SideReadback& readback, HangTrace::ReadbackTiming* timing = nullptr);
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
-	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
-	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
+	// Every GPU-side write of cached buffer contents for a guest range (GPU thread). writer_tick:
+	// the tick that recorded the writer when it is not the current one (0: the current tick).
+	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size, uint64_t writer_tick = 0);
+	// SettleBdaWrites for one run of written caching pages; `writer_tick` recorded the writer.
+	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t writer_tick, bool verify);
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,
@@ -620,6 +646,9 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
+	// KYTY_BDA_WRITES_SHADERS: the last collection, kept to reuse its storage (GPU thread).
+	FaultManager::BdaWrites                           m_bda_writes;
+	uint64_t                                          m_bda_settle_logs = 0;
 	// KYTY_BDA_PAGETABLE_SPARSE (GraphicContext::sparse_residency_buffer_enabled): the BDA page
 	// table is a sparse residency buffer. Its blocks get zeroed memory, bound before any entry in
 	// them is written (EnsureBdaTableResident, before ChangeRegister's write); an unbound block

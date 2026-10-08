@@ -178,7 +178,8 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
+		m_info.uses_dma   = false;
+		m_info.bda_writes = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 		m_table_writes  = HasShaderMemoryWrites(program, false);
 	}
@@ -1653,6 +1654,20 @@ private:
 				const bool indirect_scalar = m_indirect_scalar_buffers &&
 				                             memory.kind == ResourceKind::ScalarBuffer &&
 				                             memory.SupportsIndirectBufferLoad(op);
+				// KYTY_BDA_WRITES_SHADERS: a raw DWORD store of a listed compute shader through such
+				// a V# writes through BDA and marks its page; the renderer settles the written pages
+				// after the dispatch. Address writes keep the unbounded-writer handling at commit
+				// (content revisions, verdicts and hot pages are invalidated).
+				if (m_indirect_scalar_buffers && buffer == BufferAccess::Write &&
+				    memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferStore(op) &&
+				    m_program.stage == ShaderType::Compute &&
+				    BdaWritesApplies(m_program.shader_hash)) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_info.uses_dma                         = true;
+					m_info.bda_writes                       = true;
+					m_program.has_address_writes            = true;
+					return;
+				}
 				if (!indirect_scalar &&
 				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {
 					if (m_indirect_scalar_buffers) {

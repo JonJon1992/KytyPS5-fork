@@ -2370,11 +2370,11 @@ void BufferCache::CompleteAllSideReadbacks() {
 	}
 }
 
-void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
+void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size, uint64_t writer_tick) {
 	if (m_side == nullptr) {
 		return;
 	}
-	m_write_ticks.Assign(vaddr, size, m_scheduler.CurrentTick());
+	m_write_ticks.Assign(vaddr, size, writer_tick != 0 ? writer_tick : m_scheduler.CurrentTick());
 	if (m_write_ticks.Size() >= m_write_tick_prune_size) {
 		// Completed writers need no entry: their ranges read back as the prune floor.
 		const auto completed = m_scheduler.GetMasterSemaphore().KnownGpuTick();
@@ -2388,6 +2388,103 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 		// recorded, so the read after it finds a submitted (ideally finished) producer.
 		m_eager_flush = true;
 	}
+}
+
+void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	static const bool verify = ParseEnvU64("KYTY_BDA_WRITES_VERIFY", 0) != 0;
+	auto&             writes = m_bda_writes;
+	m_fault_manager.CollectBdaWrites(writes);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
+	if (verify && writes.dropped != 0) {
+		EXIT("KYTY_BDA_WRITES_VERIFY: shader 0x%016" PRIx64 " dropped %u BDA writes to pages "
+		     "without a cache buffer\n",
+		     shader_hash, writes.dropped);
+	}
+	if (writes.overflow) {
+		// The page list is partial: every cache buffer may hold written pages.
+		EXIT_IF(verify);
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			LOGF("BDA writes: shader 0x%016" PRIx64 " wrote %" PRIu64
+			     " pages, more than one settle lists; settling every cache buffer\n",
+			     shader_hash, writes.pages);
+		}
+		writes.written.Clear();
+		for (const auto& [address, id]: m_buffers) {
+			writes.written.Add(address, m_slot_buffers[id].Size());
+		}
+	}
+	writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+		SettleBdaWrittenRange(begin, end - begin, writes.tick, verify);
+	});
+	// The written runs of the first settles, for checking them against the candidate V#s
+	// (docs/ARQUITETURA-ESCRITAS-RUNTIME-2026-10-08.md, section 6).
+	if (m_bda_settle_logs < 64) {
+		m_bda_settle_logs++;
+		std::string runs;
+		uint32_t    listed = 0;
+		writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+			if (listed++ < 16) {
+				runs += fmt::format(" 0x{:x}+0x{:x}", begin, end - begin);
+			}
+		});
+		LOGF("BDA writes settle: shader=0x%016" PRIx64 " tick=%" PRIu64 " pages=%" PRIu64
+		     " dropped=%u runs=%u:%s%s\n",
+		     shader_hash, writes.tick, writes.pages, writes.dropped, listed, runs.c_str(),
+		     listed > 16 ? " ..." : "");
+	}
+}
+
+void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t writer_tick,
+                                        bool verify) {
+	// The pages become GPU-owned as a written upload leaves them (tracker bits and protection).
+	// Nothing is copied after the writer: a page a guest write made CPU-dirty during the dispatch
+	// loses that CPU-dirty state and keeps the GPU's bytes.
+	uint64_t cpu_dirty_bytes = 0;
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, true, [&](uint64_t, uint64_t bytes) noexcept { cpu_dirty_bytes += bytes; },
+	    []() noexcept {});
+	if (cpu_dirty_bytes != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettleCpuDirtyPages,
+		                          (cpu_dirty_bytes + CACHING_PAGESIZE - 1) / CACHING_PAGESIZE);
+		if (verify) {
+			EXIT("KYTY_BDA_WRITES_VERIFY: 0x%" PRIx64 " guest bytes written during a BDA-writing "
+			     "dispatch in 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			     cpu_dirty_bytes, vaddr, size);
+		}
+	}
+	// Each cache buffer holding a written page has new contents (binding and draw-prep revisions).
+	BufferId   last {};
+	const auto end_page = (vaddr + size) >> CACHING_PAGEBITS;
+	for (auto page = vaddr >> CACHING_PAGEBITS; page < end_page; ++page) {
+		const auto* owner = m_page_table.Find(page);
+		if (owner != nullptr && *owner && *owner != last) {
+			m_slot_buffers[*owner].MarkContentWritten();
+			last = *owner;
+		}
+	}
+	if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtyAdd);
+		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	NoteBufferContentWrite(vaddr, size, writer_tick);
+	ForgetKnownFills(vaddr, size);
+	HangTrace::NoteGpuWrite(vaddr, size);
+	// An image the GPU wrote over these pages owned bytes the writer did not see (no
+	// PreserveImagesForGpuWrite before an unknown destination); its other bytes are lost.
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaAliasHits);
+		if (verify) {
+			EXIT("KYTY_BDA_WRITES_VERIFY: BDA writes in 0x%016" PRIx64 "+0x%" PRIx64
+			     " under a GPU-modified image\n",
+			     vaddr, size);
+		}
+	}
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 }
 
 bool BufferCache::ShaderWriteRetickEnabled() {

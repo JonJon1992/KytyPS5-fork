@@ -1845,6 +1845,12 @@ struct TestCase {
   std::vector<uint64_t> storage_buffer_descriptor_bytes;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
+  // KYTY_BDA_WRITES_SHADERS: caching pages (guest address >> CACHING_PAGEBITS) whose bit in the
+  // fault buffer's written-page bitmap must be set, or clear, after the dispatch, and the expected
+  // count of writes dropped on pages without a mapping.
+  std::vector<uint64_t> expected_bda_written_pages;
+  std::vector<uint64_t> expected_bda_clean_pages;
+  std::optional<u32> expected_bda_dropped_writes;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -18396,6 +18402,148 @@ public:
                 deferred ? ", deferred labels" : "");
   }
 
+  // KYTY_BDA_WRITES_SHADERS through the real RenderExecutor and buffer cache: a listed compute
+  // shader stores through V#s it selects at runtime. Right after DispatchDirect (the synchronous
+  // settle) the written page is GPU-owned and its neighbour and the unbacked page are not; a guest
+  // read afterwards faults and reads the BDA stores back; the store to a page without a cache
+  // buffer is dropped.
+  void CheckBdaWritesSettle() {
+    constexpr const char *name = "BdaWritesSettle";
+    constexpr uintptr_t base = 0x0000000207400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t table = base;                // bound through the user-data V#
+    constexpr uint64_t header = base + 0x40000;     // has a cache buffer: written
+    constexpr uint64_t neighbour = header + 0x4000; // the next 16 KiB page: not written
+    constexpr uint64_t unbacked = base + 0x100000;  // no cache buffer: the write is dropped
+    EnsureRuntimeContext();
+
+    static std::vector<u32> code;
+    code.clear();
+    AppendVMovU32(&code, 30, 32);
+    AppendBufferLoadDword(&code, 0, 30);           // v0 = table[8] (selector of the header V#)
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(0))); // v_readfirstlane_b32 s20, v0
+    AppendVMovU32(&code, 30, 36);
+    AppendBufferLoadDword(&code, 0, 30);           // v0 = table[9] (selector of the unbacked V#)
+    code.push_back(EncodeVop1(0x02, 21, Vgpr(0))); // v_readfirstlane_b32 s21, v0
+    code.push_back(EncodeSmem0(0x0a, 8, 0));       // s_buffer_load_dwordx4 s[8:11], s[0:3], s20
+    code.push_back(EncodeSmem1(0, 20));
+    code.push_back(EncodeSmem0(0x0a, 12, 0));      // s_buffer_load_dwordx4 s[12:15], s[0:3], s21
+    code.push_back(EncodeSmem1(0, 21));
+    AppendVMovU32(&code, 1, 0xc0ffee42u);
+    AppendVMovU32(&code, 2, 0);
+    AppendVMovU32(&code, 3, 5);
+    code.push_back(EncodeMubuf0(0x1c));            // buffer_store_dword v1, v2, s[8:11] offen
+    code.push_back(EncodeMubuf1(1, 2, 2));
+    code.push_back(EncodeMubuf0(0x1c, 4));         // buffer_store_dword v3, v2, s[8:11] offen:4
+    code.push_back(EncodeMubuf1(3, 2, 2));
+    code.push_back(EncodeMubuf0(0x1c));            // buffer_store_dword v1, v2, s[12:15] offen
+    code.push_back(EncodeMubuf1(1, 3, 2));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+    // Headerless code is identified by the XXH3 of its words (ShaderMapUserData). The options are
+    // set before the render context exists: its fault manager sizes the fault buffer from them.
+    struct RestoreOptions {
+      ShaderRecompiler::CodegenOptions saved = ShaderRecompiler::GetCodegenOptions();
+      ~RestoreOptions() { ShaderRecompiler::SetCodegenOptions(saved); }
+    } restore_options;
+    auto options = restore_options.saved;
+    options.srt_variant_reads = true;
+    options.bda_writes_shaders = {XXH3_64bits(code.data(), code.size() * sizeof(u32))};
+    ShaderRecompiler::SetCodegenOptions(options);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-write direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA-write direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto v_sharp = [](uint64_t address, uint32_t records) {
+      return std::array<u32, 4>{static_cast<u32>(address), static_cast<u32>(address >> 32u),
+                                records, (3u << 28u) | (0x16u << 12u) | 0xfacu};
+    };
+    auto *table_words = reinterpret_cast<u32 *>(table);
+    const auto header_vsharp = v_sharp(header, 16);
+    const auto unbacked_vsharp = v_sharp(unbacked, 16);
+    std::copy(header_vsharp.begin(), header_vsharp.end(), table_words);
+    std::copy(unbacked_vsharp.begin(), unbacked_vsharp.end(), table_words + 4);
+    table_words[8] = 0; // selectors: byte offsets of the two V#s in the table
+    table_words[9] = 16;
+    reinterpret_cast<u32 *>(neighbour)[0] = 0x0badf00du;
+
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        auto &cache = context.GetBufferCache();
+        context.MapMemory(base, allocation_size);
+        // Other dispatches bind the header through static V#s first: it has a cache buffer.
+        (void)cache.FindBuffer(header, BufferCache::CACHING_PAGESIZE);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        const auto table_vsharp = v_sharp(table, 64);
+        for (uint32_t i = 0; i < table_vsharp.size(); i++) {
+          shaders.SetCsUserSgpr(i, table_vsharp[i], HW::UserSgprType::Unknown);
+        }
+        context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+        // Settled synchronously: nothing else was recorded, submitted or waited for.
+        Require(name, "written page owned", cache.IsRegionGpuModified(header, 8),
+                "the page the dispatch wrote through BDA is not GPU-owned after the dispatch");
+        Require(name, "other pages clean",
+                !cache.IsRegionGpuModified(neighbour, 4) &&
+                    !cache.IsRegionGpuModified(unbacked, 4),
+                "a page the dispatch did not write became GPU-owned");
+      });
+      // Guest-thread reads: the protected page faults and is read back from the GPU.
+      const auto header_word = *reinterpret_cast<volatile u32 *>(header);
+      const auto header_second = *reinterpret_cast<volatile u32 *>(header + 4);
+      const auto neighbour_word = *reinterpret_cast<volatile u32 *>(neighbour);
+      const auto unbacked_word = *reinterpret_cast<volatile u32 *>(unbacked);
+      Require(name, "CPU read after the dispatch",
+              header_word == 0xc0ffee42u && header_second == 5u,
+              "a guest read after the dispatch did not see the BDA stores: " + Hex(header_word) +
+                  " " + Hex(header_second));
+      Require(name, "unwritten and dropped pages",
+              neighbour_word == 0x0badf00du && unbacked_word == 0u,
+              "a page the dispatch did not write changed: " + Hex(neighbour_word) + " " +
+                  Hex(unbacked_word));
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-write mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "BDA-write allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_SRT_VARIANT_READS skips a program that calls a function through S_SWAPPC_B64, through
   // the real pipeline cache. With the shader dump on, it also saves the callee next to the
   // program's dump: the callee address comes from the dispatch's user data (s[4:5], copied into
@@ -25905,7 +26053,78 @@ public:
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
+    // KYTY_BDA_WRITES_SHADERS: the bitmap word of every checked page, then the dropped-write count.
+    std::vector<uint64_t> bda_checked_pages = test.expected_bda_written_pages;
+    bda_checked_pages.insert(bda_checked_pages.end(), test.expected_bda_clean_pages.begin(),
+                             test.expected_bda_clean_pages.end());
+    const bool check_bda_writes =
+        !bda_checked_pages.empty() || test.expected_bda_dropped_writes.has_value();
+    Buffer bda_writes_readback;
+    if (check_bda_writes) {
+      Require(test.name, "dispatch", uses_bda && ShaderRecompiler::BdaWritesEnabled(),
+              "written-page checks need a BDA test with KYTY_BDA_WRITES_SHADERS");
+      bda_writes_readback = CreateHostBuffer(
+          test.name, (bda_checked_pages.size() + 1) * sizeof(u32),
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferMemoryBarrier2 written{};
+      written.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+      written.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+      written.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+      written.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+      written.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      written.buffer = m_fault_buffer.buffer;
+      written.offset = BufferCache::BDA_WRITE_BITMAP_OFFSET;
+      written.size = BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE -
+                     BufferCache::BDA_WRITE_BITMAP_OFFSET;
+      vk::DependencyInfo dependency{};
+      dependency.bufferMemoryBarrierCount = 1;
+      dependency.pBufferMemoryBarriers = &written;
+      cmd.pipelineBarrier2(dependency);
+      std::vector<vk::BufferCopy> copies;
+      copies.reserve(bda_checked_pages.size() + 1);
+      for (size_t index = 0; index < bda_checked_pages.size(); ++index) {
+        copies.push_back({BufferCache::BDA_WRITE_BITMAP_OFFSET +
+                              (bda_checked_pages[index] / 32u) * sizeof(u32),
+                          index * sizeof(u32), sizeof(u32)});
+      }
+      copies.push_back({BufferCache::BDA_DROPPED_WRITES_OFFSET,
+                        bda_checked_pages.size() * sizeof(u32), sizeof(u32)});
+      cmd.copyBuffer(m_fault_buffer.buffer, bda_writes_readback.buffer,
+                     static_cast<u32>(copies.size()), copies.data());
+      vk::BufferMemoryBarrier2 host{};
+      host.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+      host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      host.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host.buffer = bda_writes_readback.buffer;
+      host.offset = 0;
+      host.size = bda_writes_readback.size;
+      dependency.pBufferMemoryBarriers = &host;
+      cmd.pipelineBarrier2(dependency);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (check_bda_writes) {
+      const auto words =
+          ReadBuffer(test.name, bda_writes_readback, bda_checked_pages.size() + 1);
+      for (size_t index = 0; index < bda_checked_pages.size(); ++index) {
+        const auto page = bda_checked_pages[index];
+        const bool set = ((words[index] >> (page % 32u)) & 1u) != 0u;
+        const bool want = index < test.expected_bda_written_pages.size();
+        Require(test.name, "written-page bitmap", set == want,
+                "page " + Hex(static_cast<u32>(page)) +
+                    (want ? " is not marked written" : " is marked written"));
+      }
+      if (test.expected_bda_dropped_writes.has_value()) {
+        Require(test.name, "dropped writes",
+                words.back() == *test.expected_bda_dropped_writes,
+                std::to_string(words.back()) + " dropped writes, expected " +
+                    std::to_string(*test.expected_bda_dropped_writes));
+      }
+      DestroyBuffer(&bda_writes_readback);
+    }
     if (elapsed_us != nullptr) {
       std::array<uint64_t, 2> stamps{};
       RequireVk(test.name, "timestamps",
@@ -30176,8 +30395,13 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
+    // With KYTY_BDA_WRITES_SHADERS the fault buffer also holds the written-page bitmap and the
+    // dropped-write count (BufferCache's fault buffer layout), read back after the dispatch.
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name,
+        ShaderRecompiler::BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
+                                             : BufferCache::CACHING_NUMPAGES / 8,
+        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -52408,6 +52632,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderAsyncPipelineTests.inc"
 #include "GuestSyncTests.inc"
 #include "ScalarMaskPairCases.inc"
+#include "ShaderBdaWritesTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -52508,6 +52733,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsWideLdsPartialBounds());
     RunCase(&vulkan, DsAtomic64Bounds(false));
     RunCase(&vulkan, DsAtomic64Bounds(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-writes-only") == 0) {
+    BdaWritesTests::RunAll();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-mask-pair-only") == 0) {

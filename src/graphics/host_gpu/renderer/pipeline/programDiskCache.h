@@ -88,6 +88,10 @@ public:
 		// (ShaderRecompiler::BindlessStridedComputeApplies): per shader, so changing the list
 		// only invalidates the shaders it moves.
 		bool bindless_strided_compute = false;
+		// KYTY_BDA_WRITES_SHADERS lists this compute shader (ShaderRecompiler::BdaWritesApplies):
+		// per shader, so a listed shader is never served a plan or program translated unlisted
+		// (skipped, or without the written-page bitmap) and changing the list only moves those.
+		bool bda_writes = false;
 		std::span<const uint32_t> code;
 		std::span<const uint32_t> back_code;
 	};

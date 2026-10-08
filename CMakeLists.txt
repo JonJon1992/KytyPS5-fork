@@ -429,6 +429,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+# KYTY_BDA_WRITES_SHADERS: the same compaction over the written-page bitmap, with room for 64Ki
+# written pages (1 GiB) per settle (FaultManager::CollectBdaWrites).
+set(bda_write_shader_spv "${gpu_tiler_generated_dir}/bda_write_process.spv")
+set(bda_write_shader_header "${gpu_tiler_generated_dir}/bda_write_process_spv.h")
+add_custom_command(
+	OUTPUT "${bda_write_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=65536
+	        -o "${bda_write_shader_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${bda_write_shader_spv} -DOUTPUT=${bda_write_shader_header}
+	        -DSYMBOL=BDA_WRITE_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${bda_write_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -2303,6 +2319,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-call-target-only)
 	add_test(NAME srt_unmapped_reads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-unmapped-only)
+	# KYTY_BDA_WRITES_SHADERS: raw DWORD stores through runtime V#s write through BDA and mark their
+	# pages in the written-page bitmap (docs/ARQUITETURA-ESCRITAS-RUNTIME-2026-10-08.md, phase 0).
+	add_test(NAME bda_writes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-writes-only)
 	# KYTY_PROGRAM_CACHE (pipeline/programDiskCache.h): source keys, codegen fingerprint and cache
 	# file (truncation, corruption, identity, verification); programs reloaded from the file
 	# render what translated ones render, with and without verify mode; and the renderer suites
