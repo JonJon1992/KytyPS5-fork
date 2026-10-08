@@ -234,7 +234,10 @@ uint32_t LoadBdaInline(ValueEmitContext& ctx, uint32_t address, uint32_t active,
 		    bits == 8u ? ConstantBool(state, false)
 		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto combine = [&](uint32_t second) {
+		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
+			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
+		});
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
 		const auto upper_shift =
@@ -247,20 +250,9 @@ uint32_t LoadBdaInline(ValueEmitContext& ctx, uint32_t address, uint32_t active,
 		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
 		           Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, shift),
 		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), second, upper_shift));
-			return merged;
-		};
-		const auto load_second = [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
-			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
-		};
-		// An aligned dword is already complete: no shifts, OR or zero tail are needed.
-		if (bits == 32u) {
-			return EmitValueOrDefaultIfCondition(state, crosses, TypeU32(state), first,
-			                                      [&]() { return combine(load_second()); });
-		}
-		const auto merged = combine(EmitValueOrZeroIfCondition(state, crosses, load_second));
-		return Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
-		              ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+		return bits == 32u ? merged
+		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
+		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
 }
 
