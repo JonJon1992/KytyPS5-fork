@@ -1,8 +1,9 @@
 # Escritas da GPU por V# de runtime: nova arquitetura do lado da CPU
 
 Data: 2026-10-08. Autor: sessão Claude Code (mesmo usuário). Base: `guest-sync-release-mem` em `192afd16`.
-**Estado:** rascunho para revisão do Codex. As seções 1b, 5 e 6 estão detalhadas. Nada foi
-implementado.
+**Estado:** rascunho com parecer do Codex na seção 9. As seções 1b, 5 e 6 estão detalhadas;
+as condições e divergências apontadas na revisão ainda precisam ser resolvidas antes da
+implementação. Nada foi implementado.
 
 **Regra do usuário:** as nossas otimizações ficam. Nada pode substituir ou reverter:
 
@@ -473,3 +474,234 @@ Fontes:
 - [AMD RDNA Performance Guide](https://gpuopen.com/learn/rdna-performance-guide/)
 - [AMD RDNA 2 ISA](https://gpuopen.com/rdna2-isa-available/)
 - [Mesa RADV MR 12974](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/12974)
+
+---
+
+## 9. Parecer do Codex: arquitetura para o menor tempo possível
+
+Data: 2026-10-08. Base inspecionada: `192afd16`, com as alterações locais já descritas na seção 4.
+Revisão do código e deste documento, complementada por uma consulta independente ao Claude Code
+com ferramentas de leitura. Nenhum código, preset, build ou jogo foi alterado nesta revisão.
+O desempenho da arquitetura proposta ainda não foi medido.
+
+Esta seção registra o parecer do Codex e as condições para implementação. Os desenhos anteriores
+permanecem como histórico da proposta do Claude; previsão aprendida, escapes corrigidos depois
+e publicação antecipada de labels ainda são divergências a resolver.
+
+### 9.1 Prioridade de desempenho: destinos comprovados antes do dispatch
+
+Recomenda-se um caminho com destinos comprovados e outro com settle adiado:
+
+1. **Destinos comprovados:** listar os descritores possíveis e tratar suas faixas como bindings
+   graváveis antes da execução. Com cobertura e estabilidade comprovadas, isso dispensa bitmap,
+   compactação, readback e settle posterior. É o caminho com menos trabalho de sincronização.
+2. **Escritas com destinos ainda desconhecidos:** registrar pendências e processar o resultado
+   depois da conclusão da GPU, sem espera imediatamente após o dispatch no `Thread_Gpu`.
+
+Os hashes alvo da fase 0 são `86da5eb7b8257bb0` e `d8959888aafd2552`, confirmados como pulados por
+falta de caminho BDA no log local. A possibilidade de dispensar settle depende de verificar:
+
+- a estabilidade das tabelas durante a gravação e a execução, inclusive escritores anteriores
+  da GPU e mudanças de geração do mapeamento;
+- os descritores, `num_records`, limites de endereço e a cobertura conservadora de cada store;
+- o limite real do `d895…`: "o layout implica ≤ 4" na seção 6 ainda é uma hipótese;
+- que a leitura das tabelas esteja certificada pelo predicado exato de memória limpa.
+
+A fase 0 deve conferir os destinos candidatos contra o conjunto escrito. Uma união das últimas
+execuções pode orientar prefetch e dimensionamento, mas não prova o conjunto de destinos.
+
+### 9.2 Fluxo do settle adiado
+
+```mermaid
+flowchart LR
+    A[Thread_Gpu registra pendência e protege destinos] --> B[GPU executa e compacta]
+    B --> C[Runner aguarda conclusão e lê resultado]
+    C --> D[Fila de serviços do Thread_Gpu]
+    D --> E[Aplica metadados e conclui ticket]
+    E --> F[Libera labels e EOP dependentes]
+```
+
+| Componente | Responsabilidade |
+| --- | --- |
+| `Thread_Gpu`, na gravação | Registrar o domínio possível de escrita, preservar imagens anteriores e preparar a proteção antes da execução |
+| GPU | Executar stores/atomics e compactar as páginas escritas |
+| Runner existente | Esperar o tick, invalidar a memória mapeada quando necessário e produzir uma lista imutável de faixas |
+| `Thread_Gpu`, pela fila de serviços | Aplicar revisões, ownership, dirty ranges e invalidações de caches |
+| Publicação ao guest | Liberar labels, EOP, interrupções e flips dependentes após o ticket de settle correspondente |
+
+O runner não aplica estado dos caches e não espera a aplicação pelo `Thread_Gpu`. Não usa
+`SendCommandSync`. A aplicação também não pode esperar a conclusão de callbacks prioritários
+que dependam dela. Isso evita ciclos com `WaitPriorityOperations`, unmap e finalização.
+
+O registro por submissão deve identificar:
+
+```text
+sequência/fila guest + tick Vulkan + fronteira de publicação
+geração do mapeamento + domínio possível de escrita
+recursos e slot de resultado retidos + ticket de settle
+```
+
+A sequência guest e o tick Vulkan são distintos: uma submissão guest pode gerar vários ticks.
+O tick definitivo deve ser capturado depois de qualquer submit ocorrido durante a preparação,
+antes da emissão do escritor. Um label intermediário pode exigir uma nova fronteira.
+
+Tickets em voo sobre a mesma página permanecem separados. Concluir A não libera a página ainda
+pendente em B. O controle precisa de produtores por página e geração do mapeamento; observar
+apenas o maior tick concluído não basta para desfazer ownership ou proteção.
+
+### 9.3 Época de escritas desconhecidas e acesso da CPU
+
+Usar contador de pendências e geração monotônica, com publicação release/acquire:
+
+- abrir a pendência antes de emitir o escritor;
+- suspender certificados, fills conhecidos e verdicts de memória limpa enquanto os destinos
+  efetivos não estiverem assentados;
+- incluir a pendência no predicado exato `IsGpuRangeCleanForBackingRead`, em `src/kernel/memory.cpp`;
+- rejeitar certificados preparados em uma geração anterior;
+- fechar a pendência depois da aplicação dos metadados e da publicação do ticket de settle.
+
+Invalidar somente o cache de verdicts é insuficiente: uma consulta sem cache também precisa
+recusar bytes cujo ownership ainda não foi determinado. Fechar a última pendência não revalida
+certificados anteriores ao escritor.
+
+O acesso da CPU espera os tickets dos produtores que podem atingir aquela página, seguido do
+readback necessário para disponibilizar os bytes. O settle atualiza metadados; não exige copiar
+todos os buffers de volta ao guest. Não se usa uma espera global ou drain de todas as submissões.
+
+Antes de receber o bitmap, conhecem-se os destinos possíveis, não as páginas efetivamente
+escritas. A espera por página exige um domínio conservador comprovado e pode incluir falsos
+positivos. Escritores sem domínio restrito podem exigir proteção e esperas conservadoras maiores.
+Não se deve prometer seleção exata por página antes de conhecer o resultado.
+
+Se o próprio CP precisar dos bytes, suspende a operação dependente e continua atendendo serviços
+e outras filas. Um `memcpy` direto que cause fault no `Thread_Gpu` não pode ser o mecanismo de
+espera: as leituras precisam passar por verificações de disponibilidade em pontos suspensíveis.
+
+### 9.4 Correções necessárias ao caminho de previsão e escapes da seção 5
+
+1. **Previsão aprendida não garante correção.** Um escape pode ter sido lido pela CPU, usado por
+   uma imagem ou descartado pelo GC antes do parse. Corrigi-lo depois não desfaz esses efeitos.
+   O caminho adiado exige cobertura conservadora comprovada ou um mecanismo que impeça o escape
+   antes da escrita.
+2. **Labels dependentes precisam aguardar o settle nesse caminho.** Isso não pode ficar restrito
+   a um modo `strict` opcional. O gate deve cobrir o prefixo de escritas que aquele evento ordena,
+   incluindo interrupções sem label e flips, sem aguardar escritores posteriores independentes.
+3. **O settle posterior aplica metadados.** Repetir `SynchronizeBuffer` ou preservar imagens
+   depois do dispatch pode gravar cópias que sobrescrevam o resultado. Uploads e preservação de
+   imagens devem estar ordenados antes do escritor.
+4. **Lifetime inclui o consumo na CPU.** Buffers, slots e gerações de mapeamento permanecem
+   retidos até a aplicação do resultado. Unmap não pode liberar recursos ainda referenciados.
+   Shutdown conclui as pendências antes de encerrar a admissão da fila de serviços; descartar
+   com log não autoriza publicar uma conclusão bem-sucedida ao guest.
+5. **Overflow da lista exige tratamento conservador.** Não truncar páginas escritas. Aplicar
+   o domínio conservador retido pela pendência ou usar fallback explícito. O ring também precisa
+   de política de capacidade e métricas de pressão; nenhuma implementação finita garante
+   ausência de backpressure sob carga ilimitada.
+
+O `FaultManager` fornece compactação, barreiras e um ring reaproveitáveis. Hoje seu callback comum
+roda no `Thread_Gpu` depois das operações prioritárias do mesmo tick (`CommandScheduler::PopOperations`).
+Por isso, reaproveitar apenas `DeferOperation` não garante settle antes dos labels. Usar a etapa
+de coleta no runner e uma dependência explícita do ticket de aplicação para a publicação.
+
+O bitmap de escritas precisa de área própria, sem colisão com `ShaderTrapRecord`. O resultado
+deve respeitar barreira para leitura do host, conclusão da GPU e invalidação da memória mapeada
+quando não coerente. Invalidação sozinha não sincroniza com o dispositivo.
+Fontes: [Khronos, exemplos de sincronização](https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples)
+e [Khronos, memória](https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/memory.adoc).
+
+### 9.5 Fases, arquivos, testes e métricas
+
+Estimativas iniciais de esforço de engenharia; dependem da confirmação das tabelas e do port.
+Estas fases 0–2 tratam das escritas runtime. As fases F0–F5 da seção 1b tratam também do serviço
+de uploads e permanecem um plano separado a revisar.
+
+| Fase | Entrega | Esforço inicial | Risco |
+| --- | --- | --- | --- |
+| 0 | Settle síncrono opt-in nos dois hashes; referência de correção e validação dos destinos candidatos | 8–10 dias | Médio: codegen, layout e coerência |
+| 1 | Pendências, época, settle adiado, leitores suspensíveis e publicação condicionada; caminho sem settle onde os destinos forem comprovados | 7–10 dias | Alto: ordenação e lifetime |
+| 2 | Compactação agrupada por tick e fronteira de conclusão observável | 3–5 dias | Médio: batching, ring e overflow |
+
+**Fase 0**
+
+- **Arquivos:** `src/graphics/shader/recompiler/{CodegenOptions.*,ShaderRecompiler.cpp}`;
+  `ir/passes/ResourceTracking.cpp`; `backend/spirv/{SpirvEmitter.cpp,spirvEmitterMemory.cpp}`;
+  metadados de IR necessários; `src/graphics/host_gpu/renderer/{renderCompute.cpp,cache/faultManager.*}`;
+  `cache/bufferCache.*`; `tests/ShaderRecompilerComputeTests.cpp` e configuração dos testes.
+- **Testes:** stores/atomics, limites por dword e por atomic, descritores selecionados em runtime,
+  proteção anterior à execução, aliases de imagens, trap separado e isolamento da identidade
+  de cache. Conferir que os loads existentes preservem a codegen anterior.
+- **Métrica A/B:** custo de settle por dispatch, páginas fora dos candidatos, escritas descartadas
+  e igualdade dos resultados. A fase estabelece a referência correta, sem promessa de ganho de FPS.
+
+**Fase 1**
+
+- **Arquivos:** `cache/{faultManager.*,bufferCache.*}`, `renderer/{commandScheduler.*,renderContext.cpp,sync.cpp}`,
+  `host_gpu/{memoryTracker.*,pageManager.*,cleanVerdictCache.h,coherenceLog.h}`,
+  `renderer/drawPrep/{drawPrep.cpp,readSet.h}`, `src/kernel/{memory.cpp,memoryAddressSpace.inc}`
+  e `src/graphics/guest_gpu/graphicsRun.cpp`; testes de compute, memória e DrawPrep correspondentes.
+- **Testes:** fault de leitura e escrita antes da conclusão; página independente sem espera;
+  labels/EOP invisíveis antes do settle; escritores A/B sobrepostos; CP suspenso continuando a
+  atender serviços; unmap/remap; shutdown; certificados e fills anteriores ao escritor.
+- **Métrica A/B:** espera de settle no `Thread_Gpu`, latência de publicação, espera por página,
+  pendências máximas e p50/p95/p99 dos frames. A meta é zero espera imediatamente após dispatch
+  no caminho adiado, com os testes de coerência passando.
+
+**Fase 2**
+
+- **Arquivos:** `renderer/commandScheduler.*`, `cache/faultManager.*` e
+  `src/graphics/host_gpu/shaders/fault_buffer_process.comp`, com testes de agrupamento e pressão.
+- **Contrato:** compor o hook de submissão com o hook já usado pela oclusão; não sobrescrevê-lo.
+  Gravar pela interface do recorder. Não agrupar através de um EOP ou leitor intermediário que
+  precise daquela conclusão. Avaliar sumário hierárquico de palavras escritas por medição.
+- **Testes:** ring cheio, overflow, várias submissões em voo, EOP intermediário, retomada do CP
+  e ordem dos resultados após agrupamento.
+- **Métrica A/B:** compactações por fronteira observável, tempo de GPU, bytes de readback e custo
+  de aplicação na CPU. Reavaliar o custo adicional de atomics no shader antes de adotar append
+  ou agregação por subgroup.
+
+### 9.6 Respostas às perguntas da seção 4
+
+1. **UFFD:** o backend atual de write-protection bloqueia escritas, mas permite leituras.
+   Páginas GPU-owned ou pendentes que precisam bloquear ambos continuam usando `NoAccess` via
+   `mprotect`. Ver `uffdWriteWatch.h` e `GuestAddressSpace::ProtectTrackedPieceUnlocked`.
+2. **Batch:** `RunBdaPass` coleta uploads, encerra `PageManager::DeferProtectScope` e depois faz
+   as cópias. O escopo atual agrupa write-watches; read-watch/`NoAccess` continua síncrono.
+   Ele não é um hook de settle nem fornece automaticamente um lote de proteção para destinos
+   desconhecidos. A aplicação em lote desse caso precisa de contrato próprio.
+3. **Divisão de arquivos:** nesta revisão não há implementação em andamento pelo Codex em
+   `faultManager.*` ou `bufferCache.*`. Antes de implementar em paralelo, definir responsáveis
+   pelos arquivos compartilhados e pela integração com as otimizações existentes.
+
+### 9.7 Critério de A/B na RX 9070 XT
+
+- Mesma cena, câmera parada, resolução, configuração, shaders executando e caches aquecidos.
+- Comparar fase 0, fase 1 e fase 2 com alternâncias repetidas; registrar p50/p95/p99 dos frames,
+  CPU do `Thread_Gpu`, espera de settle, atraso de labels, espera por página e backlog.
+- O caminho atual que pula os shaders serve como diagnóstico, mas executa menos trabalho;
+  seu FPS não é uma comparação equivalente de desempenho com o suporte correto.
+- Separar redução de CPU, eliminação de esperas e FPS. Menos trabalho no `Thread_Gpu` não
+  determina sozinho o ganho do jogo se a dependência crítica estiver em outro componente.
+
+### 9.8 Integração com o serviço de uploads da seção 1b
+
+O settle adiado elimina a espera que o suporte runtime acrescentaria ao Yōtei. Para reduzir
+o gargalo atual do Crash 4, o serviço de uploads precisa de uma revisão própria sobre fontes
+versionadas e dependências por faixa. As estimativas de ganho da seção 1b ainda não são resultados.
+
+Antes de implementar o serviço, explicitar:
+
+- o ponto em que a fonte e a proteção de cada cópia ficam prontas, preservando a ordem dos
+  pacotes do CP e o contrato de escritas concorrentes do guest;
+- a retenção da geração do mapeamento e do alias até o worker consumir os bytes;
+- a recusa de leitura pelo alias quando os dados ainda forem GPU-owned ou estiverem pendentes;
+- que a proteção necessária esteja aplicada antes da cópia e da execução que dela dependem;
+- a dependência da submissão nativa nas cópias prontas, evitando transformar o submit num novo
+  bloqueio do `Thread_Gpu`;
+- com dois workers, conclusão por ticket ou fronteira contígua: o maior valor concluído
+  isoladamente não prova a conclusão dos jobs anteriores;
+- o custo de enfileirar, acordar e aplicar resultados, preferindo lotes quando preservar a
+  ordem permitir, sem gerar um comando de serviço por página ou dispatch.
+
+**Meta do desenho:** dispensar settle quando os destinos forem comprovados; nos demais casos,
+manter a gravação assíncrona, aplicar metadados em lote no proprietário atual e limitar a espera
+às dependências reais de leitores e eventos do guest.
