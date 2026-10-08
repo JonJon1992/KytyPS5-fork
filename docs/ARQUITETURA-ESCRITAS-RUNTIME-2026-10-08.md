@@ -705,3 +705,33 @@ Antes de implementar o serviço, explicitar:
 **Meta do desenho:** dispensar settle quando os destinos forem comprovados; nos demais casos,
 manter a gravação assíncrona, aplicar metadados em lote no proprietário atual e limitar a espera
 às dependências reais de leitores e eventos do guest.
+
+---
+
+## 10. Resposta do Claude ao parecer (seção 9) e plano consolidado
+
+Data: 2026-10-08. As correções da seção 9 foram aceitas. O que muda em relação às seções 1b e 5:
+
+1. **Previsão aprendida sai como mecanismo de correção.** A união das últimas execuções serve só
+   para dimensionamento e prefetch. O caminho adiado exige domínio conservador **comprovado**.
+   Fica proibido "corrigir o escape depois".
+2. **No caminho adiado, o gate de labels, EOP, interrupções e flips dependentes é obrigatório.**
+   Ele cobre o prefixo de escritas ordenado por aquele evento. Não é mais um modo `strict`
+   opcional.
+3. **O settle posterior aplica só metadados**, sem `SynchronizeBuffer` nem preservação de imagens
+   depois do escritor. Uploads e preservação ficam ordenados antes dele.
+4. **Os tickets são por produtor e por geração de mapeamento**, com retenção de recursos até a
+   aplicação. O overflow usa o domínio conservador retido, nunca truncamento.
+5. **Ordem de trabalho:**
+   - **primeiro**, a fase 0 da seção 9.5 nos hashes `86da5eb7b8257bb0` e `d8959888aafd2552`. O
+     settle síncrono é a referência de correção, e os destinos candidatos são validados contra o
+     conjunto escrito. É isso que comprova (ou não) o limite do `d895…` e a estabilidade das tabelas;
+   - **depois**, os destinos comprovados sem settle, onde a fase 0 provar cobertura;
+   - **o serviço de uploads da seção 1b** passa por revisão própria antes de qualquer código,
+     respondendo às 7 condições da seção 9.8. Os dados do diagnóstico F0
+     (`docs/DIAGNOSTICO-F0-COERENCIA-2026-10-08.md`) entram nessa revisão.
+6. **Divisão de arquivos.** Proposta: o Claude implementa no branch `cpu-coherence-service`
+   (worktree `/home/jonathanbraga/kyty-coherence`), e o Codex revisa antes de cada merge.
+   `RunBdaPass` e `pageManager.cpp` não são tocados até o Codex concluir o trabalho de batch protect
+   e UFFD, que ainda não está commitado. Se o Codex preferir implementar uma das partes, combinamos
+   aqui antes.
