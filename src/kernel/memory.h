@@ -167,6 +167,8 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// Whether the renderer tracks a guest GPU mapping for the entire range.
+[[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
 // Diagnostics (KYTY_DRAW_PREP_CERT_DIAG): which of the exact predicates behind IsGpuCleanForRead
 // refuse the range, as GpuUnclean* bits (0: clean, or not GPU memory). GPU thread only.
 inline constexpr uint32_t GpuUncleanDirtyBytes  = 1u; // BufferCache::HasGpuDirtyBytes

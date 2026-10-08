@@ -1243,6 +1243,23 @@ void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t ins
 }
 
 void Engine::CommitHead(const HeadPatch* patch) {
+	auto& slot = ReadyHead();
+	if (patch != nullptr) {
+		// The preparation (and the preparing thread's reads of the slot) is complete.
+		slot.submit_id = patch->submit_id;
+		if (patch->instance_count != UINT32_MAX) {
+			if (slot.kind == DrawKind::Index) {
+				slot.index_args.instance_count = patch->instance_count;
+			} else {
+				slot.auto_args.instance_count = patch->instance_count;
+			}
+		}
+	}
+	Commit(slot);
+	m_workers->window.Retire();
+}
+
+Engine::Slot& Engine::ReadyHead() {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
 	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
@@ -1333,19 +1350,69 @@ void Engine::CommitHead(const HeadPatch* patch) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
 	}
-	if (patch != nullptr) {
-		// The preparation (and the preparing thread's reads of the slot) is complete.
-		slot.submit_id = patch->submit_id;
-		if (patch->instance_count != UINT32_MAX) {
-			if (slot.kind == DrawKind::Index) {
-				slot.index_args.instance_count = patch->instance_count;
-			} else {
-				slot.auto_args.instance_count = patch->instance_count;
-			}
-		}
+	return slot;
+}
+
+bool Engine::IndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_PREP_INDIRECT");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint64_t Engine::PublishIndirect(bool indexed, const HW::Context& context,
+                                 const HW::UserConfig& user_config, const HW::Shader& shaders,
+                                 const std::function<bool()>& wait_for_space) {
+	// GPU-owned counts cannot be read here. A nonzero placeholder lets the worker prepare the
+	// programs; the actual draw still checks the true counts and validates that preparation.
+	if (indexed) {
+		DrawIndexArgs args;
+		args.index_count    = 1;
+		args.instance_count = 1;
+		return Publish(&args, nullptr, context, user_config, shaders, wait_for_space);
 	}
-	Commit(slot);
-	window.Retire();
+	DrawAutoArgs args;
+	args.vertex_count   = 1;
+	args.instance_count = 1;
+	return Publish(nullptr, &args, context, user_config, shaders, wait_for_space);
+}
+
+void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& draw) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
+	        m_workers->window.Head() != position);
+	auto& slot     = ReadyHead();
+	auto& executor = m_renderer.GetRenderExecutor();
+	// Placeholder counts cannot certify vertex ranges. With run continuation enabled, the
+	// remaining plan and structure key are still valid candidates for normal validation.
+	const bool commit = DrawRun::IndirectRunsEnabled();
+	if (commit && slot.plan.valid) {
+		slot.plan.vertex_ranges.valid = false;
+	} else {
+		slot.plan.Reset();
+	}
+	executor.m_prepared_draw       = &slot.prepared;
+	executor.m_binding_plan        = slot.plan.valid ? &slot.plan : nullptr;
+	executor.m_binding_plan_active = false;
+	executor.m_run_key             = commit ? slot.run_key : 0;
+	executor.m_in_engine_commit    = commit;
+	CommitStats::BeginDraw();
+	draw();
+	CommitStats::EndDraw();
+	executor.m_in_engine_commit = false;
+	executor.m_run_key          = 0;
+	if (slot.plan.valid) {
+		CountCommittedPlan(executor.m_binding_plan_active);
+		slot.plan.Reset();
+	}
+	if (executor.m_prepared_draw != nullptr) {
+		executor.m_prepared_draw = nullptr;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepUnused);
+	}
+	executor.m_binding_plan        = nullptr;
+	executor.m_binding_plan_active = false;
+	m_workers->window.Retire();
 }
 
 void Engine::Drain() {
@@ -1474,7 +1541,9 @@ void PrintDrawPrepSummary() {
 
 void Engine::Commit(Slot& slot) {
 	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
-	CommitStats::BeginDraw();
+	if (CommitStats::Enabled() && !CommitStats::IndirectOnly()) {
+		CommitStats::BeginDraw();
+	}
 	auto&      scheduler = m_renderer.GetCommandScheduler();
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto previous  = scheduler.BindRegisters(slot.registers.context,

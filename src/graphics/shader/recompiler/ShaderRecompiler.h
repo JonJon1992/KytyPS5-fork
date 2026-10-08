@@ -29,11 +29,19 @@ struct CompileOptions {
 	bool                        bindless_samplers = false;
 };
 
+// Function pointer recovered from user SGPRs for a skipped S_SWAPPC_B64 program.
+struct CallTarget {
+	uint64_t address     = 0;
+	uint32_t user_sgpr   = 0;
+	uint32_t return_sgpr = 0;
+};
+
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
 	bool        skip_dispatch = false;
+	std::vector<CallTarget> call_targets;
 };
 
 struct CompileResult {

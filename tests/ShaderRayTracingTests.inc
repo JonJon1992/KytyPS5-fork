@@ -260,7 +260,52 @@ void TestUnsupportedBvhSkipsDispatch() {
   }
 }
 
+// Astro Bot's BVH traversal enters a break region containing its own loop. The conditional
+// entering that region needs a selection merge before the enclosing loop's merge.
+void TestTraversalLoopBreakRegion() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  namespace CFG = ShaderRecompiler::CFG;
+  const std::vector<uint32_t> code {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 132),    // outer: s0 < 4
+      EncodeSopp(0x05, 5),         // branch to body
+      EncodeSMovB32(1, 128),       // break region: s1 = 0
+      EncodeSop2(0x00, 1, 1, 129), // inner: ++s1
+      EncodeSopc(0x0a, 1, 131),    // s1 < 3
+      EncodeSopp(0x05, 0xfffdu),   // branch to inner
+      EncodeSopp(0x02, 4),         // branch to done
+      EncodeSop2(0x00, 0, 0, 129), // body: ++s0
+      EncodeSopc(0x06, 0, 178),    // s0 == 50
+      EncodeSopp(0x05, 1),         // branch to done
+      EncodeSopp(0x02, 0xfff5u),   // branch to outer
+      EncodeSopp(0x01),            // done
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(code, decoded);
+  auto graph = CFG::BuildGraph(decoded);
+  Check(!graph.unsupported && !graph.irreducible && CFG::Structurize(graph),
+        "traversal-loop break region did not structurize");
+  const auto conditional = std::ranges::find_if(graph.blocks, [](const CFG::BasicBlock &block) {
+    return block.start_pc == 4u && block.inst_begin != block.inst_end &&
+           block.terminator.kind == CFG::TerminatorKind::ConditionalBranch;
+  });
+  Check(conditional != graph.blocks.end(), "traversal-loop conditional not found");
+  const auto *merge = graph.FindBlock(conditional->terminator.merge_block);
+  Check(merge != nullptr && merge->inst_begin == merge->inst_end &&
+            merge->terminator.kind == CFG::TerminatorKind::Branch &&
+            graph.FindBlock(merge->terminator.true_block) != nullptr &&
+            graph.FindBlock(merge->terminator.true_block)->start_pc == 48u,
+        "traversal-loop conditional lacks a selection merge before the loop exit");
+  for (const auto stage : {ShaderType::Compute, ShaderType::Pixel}) {
+    const auto compiled = RecompileForTest(code, MakeCompileOptions(stage));
+    Check(!compiled.program.dispatcher_fallback,
+          "traversal-loop shader fell back to the dispatcher");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 void TestRayTracingDispatchDetection() {
   TestWolverineInstructions();
   TestUnsupportedBvhSkipsDispatch();
+  TestTraversalLoopBreakRegion();
 }

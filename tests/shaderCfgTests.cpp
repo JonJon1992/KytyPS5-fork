@@ -11372,19 +11372,22 @@ void TestMeshInputAssembly() {
     options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
+    input.start_instance_sgpr = 10;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
     // split_groups: a part of a split draw starts at draw dword 6's group and WorkgroupId.x
     // counts from there, so the same group is reached with WorkgroupId.x 0. A program without
     // split_groups (NVIDIA) must not read dword 6.
     const uint32_t first_group = split != 0 ? test.group : 0u;
     const uint32_t draw[] = {test.count,       test.base_vertex, 7, test.width,
-                             test.address_low, 0x12,             first_group};
-    static_assert(std::size(draw) == PushData::MeshDrawDwords(true));
+                             test.address_low, 0x12,             first_group, 31};
+    static_assert(std::size(draw) == PushData::MeshDrawDwords(true, true));
     uint32_t first_group_reads = 0;
+    uint32_t start_instance_reads = 0;
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
         first_group_reads += inst.Arg(0).U32() == PushData::MeshFirstGroupDword ? 1u : 0u;
+        start_instance_reads += inst.Arg(0).U32() == PushData::MeshStartInstanceDword ? 1u : 0u;
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
@@ -11399,6 +11402,7 @@ void TestMeshInputAssembly() {
     }
     Check(first_group_reads == split,
           "mesh prolog read the first-group draw dword without split_groups, or not with it");
+    Check(start_instance_reads == 1u, "mesh prolog lost the start-instance draw dword");
     ConstantPropagationPass(program.blocks);
     Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
               load->Arg(3).Resolve().U1() == test.fetch,
@@ -11411,17 +11415,19 @@ void TestMeshInputAssembly() {
     load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
     ConstantPropagationPass(program.blocks);
     std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
+    std::array<uint32_t, 11> sgprs{};
     for (const auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
         vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
       } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
+        const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+        if (reg < sgprs.size()) sgprs[reg] = inst.Arg(1).Resolve().U32();
       }
     }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+    Check(sgprs[3] == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9 &&
+              sgprs[10] == 31,
+          "mesh prolog changed input assembly, instance chunk, or start-instance SGPR");
    }
   }
 }
@@ -12980,6 +12986,8 @@ void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
         "vertex shader missing VertexIndex input");
   Check(ProgramHasInput(result.program, StageInputKind::InstanceIndex),
         "vertex shader missing InstanceIndex input");
+  Check(ProgramHasInput(result.program, StageInputKind::BaseInstance),
+        "vertex shader missing BaseInstance input");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
@@ -12987,9 +12995,33 @@ void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
         "vertex SPIR-V does not load gl_VertexIndex");
   Check(CountSourceOccurrences(source, "OpLoad %int %gl_InstanceIndex") == 1u,
         "vertex SPIR-V does not load gl_InstanceIndex");
+  Check(CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "vertex instance ID does not subtract gl_BaseInstance");
   Check((source.find("%v5") == std::string::npos) &&
             (source.find("%v8") == std::string::npos),
         "vertex system values were routed through guest VGPR mirrors");
+}
+
+void TestNewShaderRecompilerVertexStartInstanceSgpr() {
+  using StageInputKind = ShaderRecompiler::IR::StageInputKind;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 10), // v0 = s10, the named START_INST_LOC user SGPR
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  vertex.start_instance_sgpr = 10;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check(ProgramHasInput(result.program, StageInputKind::BaseInstance),
+        "START_INST_LOC did not use BaseInstance");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpCapability DrawParameters") != std::string::npos &&
+            CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "START_INST_LOC did not read gl_BaseInstance");
 }
 
 void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
@@ -15253,11 +15285,11 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeExp1(0, 0, 0, 0), // POS0.x
       EncodeSopp(0x01),
   };
-  // +4 words / +1 instruction: the Invariant decoration on the position (MadMode::Position).
+  // The position has Invariant; the instance ID also subtracts gl_BaseInstance.
   const auto wqm_result = compile("wqm", wqm,
-                                  {.words = 411,
-                                   .instructions = 100,
-                                   .variables = 4,
+                                  {.words = 438,
+                                   .instructions = 107,
+                                   .variables = 5,
                                    .loads = 3,
                                    .stores = 2,
                                    .labels = 6,
@@ -15690,6 +15722,22 @@ int main(int argc, char **argv) {
 #endif
   }
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--start-instance-only") {
+    TestMeshInputAssembly();
+    TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
+    TestNewShaderRecompilerVertexStartInstanceSgpr();
+    std::puts("ShaderCfgTests: start instance passed");
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--spirv-size-only") {
+    TestNewShaderRecompilerSpirvSizeBaselines();
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--traversal-break-region-only") {
+    TestTraversalLoopBreakRegion();
+    std::puts("ShaderCfgTests: traversal break region passed");
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--packed-image-decode-only") {
     TestPackedImageLoadDecode();
     std::puts("ShaderCfgTests: packed image decode passed");
@@ -15956,6 +16004,7 @@ int main(int argc, char **argv) {
 #endif
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
+  TestNewShaderRecompilerVertexStartInstanceSgpr();
   TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();

@@ -1394,14 +1394,6 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 			return false;
 		}
 	} else {
-		// A descriptor pointer the guest has not written yet reads as null, and the fields behind
-		// it land in the first pages, which no guest maps (Ghost of Yotei reads 0x10). Fail that
-		// read like the GPU's faulting access instead of faulting the host.
-		constexpr uint64_t null_page_limit = 0x10000;
-		if (address < null_page_limit) {
-			ObserveSrtRead(m_runtime, address, {&word, 1}, false);
-			return false;
-		}
 		constexpr uint64_t gpu_limit = uint64_t {1} << 40u;
 		// Read the exact clean bytes without faulting on unrelated dirty bytes in
 		// the same protected page. A failed probe leaves the original read intact.
@@ -1411,11 +1403,35 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		    address != 0 && address < gpu_limit && sizeof(word) < gpu_limit - address &&
 		    m_runtime.try_read_clean_backing(m_runtime.userdata, address, {&word, 1});
 		if (!probed) {
+			if (!InPlaceReadable(address)) {
+				// The plan may include a path this dispatch never takes. No synchronization can
+				// make an unmapped address readable; it contributes a zero flat slot. Mark the
+				// observation unsuccessful so a speculative DrawPrep read cannot certify it.
+				ObserveSrtRead(m_runtime, address, {&word, 1}, false);
+				result = 0;
+				return true;
+			}
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 	}
 	ObserveSrtRead(m_runtime, address, {&word, 1}, true);
 	result = word;
+	return true;
+}
+
+bool SrtWalker::InPlaceReadable(uint64_t address) {
+	if (NeverMappedAddress(address, sizeof(uint32_t))) {
+		return false;
+	}
+	if (m_runtime.is_guest_mapped == nullptr || (address >> 12u) == m_mapped_page) {
+		return true;
+	}
+	// Raw reads are dword-aligned. Remember only a confirmed page within this walk; guest
+	// mappings cannot change while the GPU thread materializes the plan.
+	if (!m_runtime.is_guest_mapped(address, sizeof(uint32_t))) {
+		return false;
+	}
+	m_mapped_page = address >> 12u;
 	return true;
 }
 
@@ -1989,6 +2005,43 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+bool FindVariantFlatRead(const ResourcePlan& program, uint32_t& pc) {
+	std::unordered_set<const Inst*> visited;
+	std::vector<Value>              pending;
+	for (const auto& read: program.srt_reads) {
+		const auto* read_inst = read.value.Resolve().TryInstruction();
+		if (read_inst == nullptr) {
+			continue;
+		}
+		// Only the address operands matter; the loaded value is not known yet.
+		pending.clear();
+		for (size_t index = 0; index < read_inst->NumArgs(); ++index) {
+			pending.push_back(read_inst->Arg(index));
+		}
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(program, value);
+				if (invariant.IsEmpty()) {
+					pc = read_inst->Flags<MemoryFlags>().pc;
+					return true;
+				}
+				pending.push_back(invariant);
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				pending.push_back(inst->Arg(index));
+			}
+		}
+	}
+	return false;
 }
 
 void BuildSrtPlan(Program& program, bool variant_reads) {

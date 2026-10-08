@@ -110,12 +110,12 @@ Conversion Convert(const Inputs& inputs, std::span<const uint32_t, 5> args) {
 		                      live ? std::min(per_dispatch, instances - first) : 0u, live ? 1u : 0u};
 		result.params[k]   = {count,
 		                      vertex_offset,
-		                      first_instance + first,
+		                      first,
 		                      index_size,
 		                      static_cast<uint32_t>(address),
 		                      static_cast<uint32_t>(address >> 32u),
 		                      0u,
-		                      0u};
+		                      first_instance};
 	}
 	return result;
 }

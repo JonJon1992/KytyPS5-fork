@@ -165,6 +165,14 @@ struct DrawAutoArgs {
 // is not continued after all, BeginRendering() records the left-out barrier before the next
 // one (CommandBuffer::NoteFeedbackKeep). KYTY_DEPTH_FEEDBACK_KEEP=0 restores the toggles.
 [[nodiscard]] bool DepthFeedbackKeepEnabled();
+// Defer the depth attachment + shader-read union until a draw samples the attachment, or the
+// union is already tracked. An unsampled read-only draw needs no promotion or rendering split.
+// KYTY_DEPTH_FEEDBACK_LAZY=0 restores eager promotion.
+[[nodiscard]] bool DepthFeedbackLazyEnabled();
+[[nodiscard]] constexpr bool DepthFeedbackAdoptsUnion(bool keep, bool lazy, bool sampled,
+                                                      bool attachment_only) {
+	return keep && !(lazy && !sampled && attachment_only);
+}
 // KYTY_DEPTH_LAYOUT_STABLE (default on): a depth target the draw does not sample keeps its
 // current attachment layout while that layout allows the draw's writes, instead of taking the
 // narrowest layout for each draw's write aspects (depth_stable_attachment_layout in
@@ -296,6 +304,7 @@ public:
 	[[nodiscard]] uint64_t ActiveRenderingSerial() const {
 		return m_rendering ? m_rendering_serial : 0;
 	}
+	[[nodiscard]] uint32_t OcclusionControl() const { return m_occlusion_control; }
 	// Image barriers queued for the next flush point (inspection).
 	[[nodiscard]] size_t PendingImageBarriers() const { return m_pending.images.size(); }
 	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);

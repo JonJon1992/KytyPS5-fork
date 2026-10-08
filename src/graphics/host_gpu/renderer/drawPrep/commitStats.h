@@ -41,11 +41,18 @@ enum class Phase : uint8_t {
 
 namespace Detail {
 [[nodiscard]] bool ReadEnabled();
+[[nodiscard]] bool ReadIndirectOnly();
 } // namespace Detail
 
 [[nodiscard]] inline bool Enabled() {
 	static const bool enabled = Detail::ReadEnabled();
 	return enabled;
+}
+
+// KYTY_CP_COMMIT_STATS=indirect limits the phase report to prepared indirect draws.
+[[nodiscard]] inline bool IndirectOnly() {
+	static const bool indirect = Detail::ReadIndirectOnly();
+	return indirect;
 }
 
 // What one recorded draw bound, for the classification (hashes; 0 where not applicable).

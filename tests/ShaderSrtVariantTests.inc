@@ -3,8 +3,9 @@
 //
 // Astro Bot's tiled deferred-lighting kernels walk a BVH: they load an instance record through a
 // loop-carried pointer (S_LOAD) and read the record's V# with S_BUFFER_LOAD. Without the switch
-// such a record read is a flat SRT slot that cannot be evaluated before the dispatch (the dispatch
-// is dropped), and an S_BUFFER_LOAD through a runtime V# fails resource tracking. With it, both
+// such a record read is a flat SRT slot that cannot be evaluated before the dispatch (the pipeline
+// cache skips the source after its first failure), and an S_BUFFER_LOAD through a runtime V# fails
+// resource tracking. With it, both
 // are read in the shader through BDA, with the RDNA2 bounds of a bound scalar buffer.
 
 namespace SrtVariantTests {
@@ -156,12 +157,264 @@ TestCase ScalarLoadsThroughLoopCarriedRecords() {
   return test;
 }
 
+namespace UnmappedFlatRead {
+constexpr uint64_t Unmapped = 0x0000010000000000ull;
+uint32_t refused = 0;
+
+bool GuestMapped(uint64_t address, uint64_t size) {
+  if (address >= Unmapped && address < Unmapped + 0x1000u && size <= 0x1000u) {
+    ++refused;
+    return false;
+  }
+  return true;
+}
+
+bool Probe(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address < 0x10000u ||
+      (address >= Unmapped && address < Unmapped + 0x1000u)) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
+  return true;
+}
+} // namespace UnmappedFlatRead
+
+// An optional null or unmapped pointer must not be dereferenced during SRT materialization.
+void NullBasedFlatReadReadsZero() {
+  namespace IR = ShaderRecompiler::IR;
+  std::vector<u32> code {
+      EncodeSmem0(0x01, 8, 0), EncodeSmem1(0, 125),
+      EncodeSopp(0x0c, 0xc07f),
+      EncodeSmem0(0x01, 10, 4), EncodeSmem1(0x30, 125),
+      EncodeSopp(0x0c, 0xc07f),
+  };
+  const u32 header_pc = 3u * sizeof(u32);
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreSgpr(&code, 11, 1);
+  AppendEnd(&code);
+  static std::array<uint64_t, 16> table{};
+  static std::array<u32, 32> header{};
+  header[12] = 0x1234u;
+  header[13] = 0x5678u;
+
+  const auto run = [&](uint64_t pointer, IR::SrtMappedRange mapped, IR::SrtMemoryReader probe) {
+    table[0] = pointer;
+    auto user_data = MakeNativeUserData(nullptr);
+    const uint64_t table_address = reinterpret_cast<uint64_t>(table.data());
+    user_data[0] = static_cast<u32>(table_address);
+    user_data[1] = static_cast<u32>(table_address >> 32u);
+    ShaderComputeInputInfo info{};
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &info;
+    options.user_data = user_data;
+    const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require("NullBasedFlatReadReadsZero", "translate", !translated.skip_dispatch,
+            "pointer-chasing shader did not translate");
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    const IR::SrtRuntime runtime {
+        .user_data = user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .try_read_clean_backing = probe,
+        .is_guest_mapped = mapped,
+    };
+    Require("NullBasedFlatReadReadsZero", "materialize",
+            IR::MaterializeResources(plan, runtime, resources, specialization),
+            "an unmapped optional pointer stopped materialization");
+    std::vector<u32> values;
+    for (const auto &read : plan.srt_reads) {
+      const auto *inst = read.value.Resolve().TryInstruction();
+      if (inst != nullptr && inst->Flags<IR::MemoryFlags>().pc == header_pc &&
+          read.flat_offset < resources.flattened_srt.size()) {
+        values.push_back(resources.flattened_srt[read.flat_offset]);
+      }
+    }
+    std::ranges::sort(values);
+    Require("NullBasedFlatReadReadsZero", "flat slots", values.size() == 2u,
+            "header load did not produce two flat slots");
+    return std::pair {values[0], values[1]};
+  };
+
+  for (const auto probe : {IR::SrtMemoryReader{}, IR::SrtMemoryReader{UnmappedFlatRead::Probe}}) {
+    const auto null_values = run(0, nullptr, probe);
+    Require("NullBasedFlatReadReadsZero", "null", null_values == std::pair{0u, 0u},
+            "null header pointer was not read as zero");
+    const auto valid_values = run(reinterpret_cast<uint64_t>(header.data()),
+                                  UnmappedFlatRead::GuestMapped, probe);
+    Require("NullBasedFlatReadReadsZero", "mapped",
+            valid_values == std::pair{0x1234u, 0x5678u}, "mapped header was changed");
+    UnmappedFlatRead::refused = 0;
+    const auto absent_values = run(UnmappedFlatRead::Unmapped,
+                                    UnmappedFlatRead::GuestMapped, probe);
+    Require("NullBasedFlatReadReadsZero", "unmapped",
+            absent_values == std::pair{0u, 0u} && UnmappedFlatRead::refused >= 2u,
+            "unmapped header pointer was not guarded");
+  }
+  std::printf("[compute] NullBasedFlatReadReadsZero       ok\n");
+}
+
+void VariantPlanIsFound() {
+  constexpr const char *name = "VariantPlanIsFound";
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = false;
+  ScopedCodegenOptions scope(codegen);
+  ShaderComputeInputInfo compute_info{};
+  const auto translate = [&](const TestCase &test, std::array<u32, 64> &user_data) {
+    user_data = MakeNativeUserData(nullptr);
+    user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute_info;
+    options.user_data = user_data;
+    auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+    Require(name, "translate", !translated.skip_dispatch && !translated.program.blocks.empty(),
+            std::string(test.name) + " did not translate");
+    return ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  };
+
+  const auto records = ScalarLoadsThroughLoopCarriedRecords();
+  std::array<u32, 64> user_data{};
+  const auto plan = translate(records, user_data);
+  std::vector<uint32_t> loop_reads;
+  {
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(records.code, decoded);
+    for (const auto &inst : decoded.instructions) {
+      if (inst.opcode == ShaderOpcode::S_LOAD_DWORDX2 ||
+          inst.opcode == ShaderOpcode::S_LOAD_DWORDX4 ||
+          inst.opcode == ShaderOpcode::S_BUFFER_LOAD_DWORDX4) {
+        loop_reads.push_back(inst.pc);
+      }
+    }
+  }
+  uint32_t pc = UINT32_MAX;
+  Require(name, "loop-carried read",
+          ShaderRecompiler::IR::FindVariantFlatRead(plan, pc) &&
+              std::ranges::find(loop_reads, pc) != loop_reads.end(),
+          "no flat read through the loop-carried pointer was found (pc " + Hex(pc) + ")");
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data,
+      .shader_base = reinterpret_cast<uint64_t>(records.code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = const_cast<std::vector<u32> *>(&records.initial),
+  };
+  Require(name, "no materialization",
+          !ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "a plan with a loop-carried flat read materialized");
+
+  // A single pointer chase outside a loop can still be evaluated before dispatch.
+  TestCase chase;
+  chase.name = "PointerChase";
+  chase.initial.resize(64);
+  chase.code.push_back(EncodeSmem0(0x01, 8, 0));
+  chase.code.push_back(EncodeSmem1(0, 125));
+  chase.code.push_back(EncodeSopp(0x0c, 0xc07f));
+  chase.code.push_back(EncodeSmem0(0x01, 10, 4));
+  chase.code.push_back(EncodeSmem1(0x30, 125));
+  chase.code.push_back(EncodeSopp(0x0c, 0xc07f));
+  AppendStoreSgpr(&chase.code, 10, 0);
+  AppendEnd(&chase.code);
+  std::array<u32, 64> chase_user_data{};
+  const auto chase_plan = translate(chase, chase_user_data);
+  Require(name, "pointer chase", !ShaderRecompiler::IR::FindVariantFlatRead(chase_plan, pc),
+          "a pointer loaded outside any loop was reported as loop-carried");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+// The callees a skipped S_SWAPPC_B64 program jumps to, from the dispatch's user data: Psr's
+// shader-mesh builders copy a callback record from user SGPRs into s[14:17] before each
+// s_swappc_b64 s[14:15], s[14:15] (the swappc writes the return address into its destination pair,
+// which does not make a target unknown). A call directly through user SGPRs names them. A target
+// the program computes some other way is only counted as unresolved in the log line.
+void CallTargetsFromUserData() {
+  constexpr const char *name = "CallTargetsFromUserData";
+  std::vector<u32> code;
+  for (u32 i = 0; i < 4; ++i) {
+    code.push_back(EncodeSMovB32(14 + i, 4 + i)); // s_mov_b32 s[14 + i], s[4 + i]
+  }
+  code.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(0xbe94210au); // s_swappc_b64 s[20:21], s[10:11]
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  user_data[4] = 0x00001000u;
+  user_data[5] = 0x00000002u;
+  user_data[8] = 0x00003000u;
+  user_data[9] = 0x00000004u;
+  user_data[10] = 0x00005000u;
+  user_data[11] = 0x00010006u; // bits above 48 are not part of the address
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "skipped", result.skip_dispatch, "the calling program was not skipped");
+  const auto &targets = result.call_targets;
+  const auto has = [&](uint64_t address, u32 user_sgpr, u32 return_sgpr) {
+    return std::ranges::any_of(targets, [&](const ShaderRecompiler::CallTarget &target) {
+      return target.address == address && target.user_sgpr == user_sgpr &&
+             target.return_sgpr == return_sgpr;
+    });
+  };
+  Require(name, "targets",
+          targets.size() == 3u && has(0x0000000200001000ull, 4, 14) &&
+              has(0x0000000400003000ull, 8, 14) && has(0x0000000600005000ull, 10, 20),
+          "the callees were not read from user data (" + std::to_string(targets.size()) +
+              " found)");
+
+  // A target the program computes from a user-data copy has no known callee.
+  std::vector<u32> computed;
+  computed.push_back(EncodeSMovB32(14, 4));
+  computed.push_back(EncodeSMovB32(15, 5));
+  computed.push_back(EncodeSop2(0x00, 14, 14, InlineU32(4))); // s_add_u32 s14, s14, 4
+  computed.push_back(0xbe8e210eu);
+  AppendEnd(&computed);
+  const auto partial = ShaderRecompiler::TranslateProgram(computed, options);
+  Require(name, "computed target", partial.skip_dispatch && partial.call_targets.empty(),
+          "a computed target was reported as a user-data callee");
+
+  // Across control flow: a copy in the entry block reaches a call behind a branch target; a copy
+  // on one path only does not.
+  std::vector<u32> branchy;
+  branchy.push_back(EncodeSMovB32(14, 4));
+  branchy.push_back(EncodeSMovB32(15, 5));
+  branchy.push_back(EncodeSopp(0x04, 1)); // s_cbranch_scc0 over the next instruction
+  branchy.push_back(EncodeSMovB32(20, 6));
+  branchy.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15] (a branch target)
+  AppendEnd(&branchy);
+  const auto dominated = ShaderRecompiler::TranslateProgram(branchy, options);
+  Require(name, "entry copy", dominated.skip_dispatch && dominated.call_targets.size() == 1u &&
+                                  dominated.call_targets[0].address == 0x0000000200001000ull,
+          "an entry-block copy did not reach a call behind a branch target");
+  std::vector<u32> one_path;
+  one_path.push_back(EncodeSopp(0x04, 2)); // s_cbranch_scc0 over the two copies
+  one_path.push_back(EncodeSMovB32(14, 4));
+  one_path.push_back(EncodeSMovB32(15, 5));
+  one_path.push_back(0xbe8e210eu);
+  AppendEnd(&one_path);
+  const auto conditional = ShaderRecompiler::TranslateProgram(one_path, options);
+  Require(name, "one-path copy", conditional.skip_dispatch && conditional.call_targets.empty(),
+          "a copy on one path only was reported as the callee");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  VariantPlanIsFound();
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
   ScopedCodegenOptions scope(options);
+  CallTargetsFromUserData();
   RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
   RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
+  vulkan->CheckVariantPlanSkipped();
+  vulkan->CheckCallTargetDump();
 }
 
 } // namespace SrtVariantTests

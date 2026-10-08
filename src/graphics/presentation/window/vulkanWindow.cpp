@@ -543,9 +543,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	image_view_min_lod.minLod = VK_TRUE;
 	depth_clip_control.pNext  = &image_view_min_lod;
 	depth_clip_control.depthClipControl = VK_TRUE;
+	vk::PhysicalDeviceShaderDrawParametersFeatures draw_parameters {};
+	draw_parameters.pNext = &depth_clip_control;
+	draw_parameters.shaderDrawParameters = VK_TRUE;
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &depth_clip_control;
+	features12.pNext = &draw_parameters;
 	// drawIndirectCount is set below, once the supported features are known.
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
@@ -643,6 +646,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	supported_features12.pNext = supported_features2.pNext;
 	supported_features2.pNext  = &supported_features12;
+	vk::PhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {};
+	supported_draw_parameters.pNext = supported_features2.pNext;
+	supported_features2.pNext = &supported_draw_parameters;
 	const bool color_write_extension =
 	    HasExtension(device_extensions, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT supported_color_write {};
@@ -938,6 +944,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_draw_parameters.shaderDrawParameters != VK_TRUE);
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;

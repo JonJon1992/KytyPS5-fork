@@ -85,7 +85,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
-	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
+	    kind == IR::StageInputKind::BaseInstance || kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
@@ -671,7 +671,9 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh ||
-	    index >= IR::PushData::MeshDrawDwords(state.input_info.vertex->mesh.split_groups != 0)) {
+	    index >= IR::PushData::MeshDrawDwords(
+	                 state.input_info.vertex->mesh.split_groups != 0,
+	                 state.input_info.vertex->start_instance_sgpr >= 0)) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
 	const auto push_dword = [&](uint32_t dword) {

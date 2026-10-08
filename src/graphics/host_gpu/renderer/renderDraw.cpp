@@ -1092,8 +1092,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			                          : !proof_serial   ? Profiler::FrameEvent::DepthFeedbackKeepMissSerial
 			                                            : Profiler::FrameEvent::DepthFeedbackKeepMissState);
 		}
-		if (DepthFeedbackKeepEnabled() && !draw_writes && proof_instance && proof_serial &&
-		    state_matches) {
+		const bool keep = DepthFeedbackKeepEnabled() && !draw_writes && proof_instance &&
+		                  proof_serial && state_matches;
+		if (keep && !DepthFeedbackAdoptsUnion(true, DepthFeedbackLazyEnabled(),
+		                                      static_cast<bool>(sampled_aspects),
+		                                      tracked.access_mask == access)) {
+			DrawRun::GetTotals().depth_promotions_deferred.fetch_add(1, std::memory_order_relaxed);
+		} else if (keep) {
 			// Without the keep: a barrier back to the attachment scope when the previous draw
 			// sampled, and one to the sampled scope when this draw samples.
 			const uint64_t avoided = (tracked.access_mask == sampled ? 1u : 0u) +
@@ -2594,7 +2599,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.images.clear();
 	{
 		std::scoped_lock lock {m_context.GetTextureCache().m_lock};
-		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() &&
+		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() && !DepthFeedbackLazyEnabled() &&
 		    !state.depth_info.AttachmentWriteAspects()) {
 			const auto* depth = m_context.GetTextureCache().m_slot_images.try_get(state.depth_info.image_id);
 			const auto attachment_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
@@ -3336,7 +3341,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// barriers). The rendering instance is part of the certificate, not just image identity.
 	// Unless every kept image is as the previous draw left it, the structure is resolved now, in the normal order relative to the buffer
 	// bindings, which are made again after it (their reservations follow the image identities).
-	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+	// A continued indirect draw can reuse the rendering instance only after its
+	// argument barrier has been recorded for that instance.
+	const bool run_indirect_barrier =
+	    indirect != nullptr && buffer.ActiveRenderingSerial() != m_indirect_barrier_rendering;
+	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                     run_indirect_barrier)) {
 		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 		DrawRun::CountMiss(DrawRun::Miss::Images);
 		m_run_active = false;
@@ -3361,11 +3371,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
 		}
 		index_binding = PrepareIndexBuffer(buffer, index_source);
+		if (indirect != nullptr) {
+			indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+		}
 	}
 	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
 	// path's own texture resolution ran before it here). A draw that would have fallen back is
 	// not compared.
-	if (m_run_verify && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+	if (m_run_verify && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true) ||
+	                     run_indirect_barrier)) {
 		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
 		DrawRun::CountMiss(DrawRun::Miss::Images);
 		m_run_verify = false;
@@ -3695,10 +3709,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (emit.predicate != 0) {
 		vk_buffer.beginConditionalRenderingEXT(m_predicates->Use(emit.predicate));
 	}
-	// Mesh programs with split_groups read a seventh draw dword (MeshFirstGroupDword).
+	// Mesh shaders read the split-group offset and, for START_INST_LOC, a separate draw start.
 	const uint32_t mesh_draw_dwords =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
-	                      state.vertex_info[0].mesh.split_groups != 0)
+	                      state.vertex_info[0].mesh.split_groups != 0,
+	                      state.vertex_info[0].start_instance_sgpr >= 0)
 	                : 0u;
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
@@ -3709,8 +3724,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const uint32_t draw_data[] {static_cast<uint32_t>(address),
 			                            static_cast<uint32_t>(address >> 32u), 0u,
 			                            ShaderRecompiler::IR::PushData::MeshIndirectSentinel, 0u, 0u,
-			                            0u};
-			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
+			                            0u, 0u};
+			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwords(true, true));
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment, 0,
 			    mesh_draw_dwords * sizeof(uint32_t), draw_data);
@@ -3724,9 +3739,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto address = index_source.address +
 			    static_cast<uint64_t>(segment.first) * index_source.guest_element_size;
 			// A segment with more groups than X allows is dispatched in parts (split_groups only),
-			// each pushing its first group. The shader's instance index is the pushed first instance
-			// plus WorkgroupId.y, so a part with more instances than one dispatch carries is split
-			// into instance ranges.
+			// each pushing its first group. The shader's instance index is this dispatch's
+			// zero-based instance offset plus WorkgroupId.y; START_INST_LOC receives the draw's
+			// firstInstance independently, including after the Y dispatch limit splits it.
 			const auto groups_per_dispatch = MeshGroupsPerDispatch(segment.groups, mesh, limits);
 			for (uint32_t first_group = 0; first_group < segment.groups;
 			     first_group += groups_per_dispatch) {
@@ -3736,11 +3751,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					const uint32_t draw_data[] {
 					    segment.count,
 					    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-					    emit.first_instance + base, index_source.guest_element_size,
+					    base, index_source.guest_element_size,
 					    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
-					    first_group};
+					    first_group, emit.first_instance};
 					static_assert(std::size(draw_data) ==
-					              ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
+					              ShaderRecompiler::IR::PushData::MeshDrawDwords(true, true));
 					vk_buffer.pushConstants(pipeline.pipeline_layout,
 					    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment,
 					    0, mesh_draw_dwords * sizeof(uint32_t), draw_data);
@@ -3847,7 +3862,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return static_cast<bool>(state.depth_info.image_id) && state.depth_info.image_id == id;
 		};
 		bool eligible = m_in_engine_commit && m_prepared_validated && m_run_key != 0 &&
-		                !mesh_active && indirect == nullptr && vertex_stages.size() == 1 &&
+		                !mesh_active &&
+		                (indirect == nullptr || DrawRun::IndirectRunsEnabled()) &&
+		                vertex_stages.size() == 1 &&
 		                !shader_write_stages && !feedback_aspects &&
 		                buffer.ActiveRenderingSerial() != 0 &&
 		                RenderStateFastEnabled(RenderStatePart::Reset) &&

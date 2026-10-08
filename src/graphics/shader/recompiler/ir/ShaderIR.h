@@ -217,6 +217,7 @@ enum class StageInputKind {
 	PrimitiveId,
 	TessCoord,
 	InstanceIndex,
+	BaseInstance,
 	FragCoord,
 	FrontFacing,
 	PackedAncillary,
@@ -359,8 +360,12 @@ struct PushData {
 	// workgroup of this part of a draw split past the host's X group limit (0 when unsplit; a
 	// native indirect draw's parameter block holds 0 there).
 	static constexpr uint32_t MeshFirstGroupDword = MeshDrawDwordCount;
-	[[nodiscard]] static constexpr uint32_t MeshDrawDwords(bool split_groups) {
-		return MeshDrawDwordCount + (split_groups ? 1u : 0u);
+	// Kept separate from the chunk offset in dword 2: a mesh draw may need several Y dispatches.
+	static constexpr uint32_t MeshStartInstanceDword = MeshFirstGroupDword + 1u;
+	[[nodiscard]] static constexpr uint32_t MeshDrawDwords(bool split_groups,
+	                                                       bool start_instance_sgpr = false) {
+		return start_instance_sgpr ? MeshStartInstanceDword + 1u
+		                           : MeshDrawDwordCount + (split_groups ? 1u : 0u);
 	}
 	// Mesh draw dword 3 (the index size: 0, 1, 2 or 4 when pushed by the CPU) marking a native
 	// indirect mesh draw: dwords 0-1 then hold the device address of the dispatch's parameter

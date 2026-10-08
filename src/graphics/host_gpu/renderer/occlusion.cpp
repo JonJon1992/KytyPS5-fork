@@ -355,36 +355,18 @@ bool OcclusionCounter::WouldCount(uint32_t control) const noexcept {
 void OcclusionCounter::BreakGate(const char* reason, uint64_t address) {
 	if (m_gate_broken) return;
 	m_gate_broken = true;
-	m_open_pairs.clear();
 	std::printf("Occlusion counter: dump-pair gate disabled (%s, address=0x%016" PRIx64
 	            "); counting every instance from now on\n",
 	            reason, address);
 	std::fflush(stdout);
 }
 
-void OcclusionCounter::UpdateOpenPairs(uint64_t address) {
+void OcclusionCounter::UpdateGate(OcclusionDumpPairs::Kind kind, uint64_t address) {
 	if (!GateEnabled() || m_gate_broken) return;
-	const auto begin = address & ~uint64_t {0xf};
-	const auto found = std::find(m_open_pairs.begin(), m_open_pairs.end(), begin);
-	if ((address & 0xfu) == 0) {
-		// Begin dump: every instance until its end dump is counted. A repeated begin at an open
-		// pair keeps it open (its later end still differs against the newest begin).
-		if (found == m_open_pairs.end()) {
-			if (m_open_pairs.size() >= MaxOpenPairs) {
-				BreakGate("too many open dump pairs", address);
-				return;
-			}
-			m_open_pairs.push_back(begin);
-		}
-	} else if ((address & 0xfu) == 8u) {
-		if (found == m_open_pairs.end()) {
-			// An end without an observed begin: its begin value may predate gated instances.
-			BreakGate("end dump without an open begin", address);
-			return;
-		}
-		m_open_pairs.erase(found);
-	} else {
-		BreakGate("dump address outside the begin/end pair layout", address);
+	if (m_pairs.Dropped() != 0) {
+		BreakGate("an open dump pair was dropped", address);
+	} else if (kind == OcclusionDumpPairs::Kind::Begin && m_pairs.OpenCount() > MaxOpenPairs) {
+		BreakGate("too many open dump pairs", address);
 	}
 }
 
@@ -522,12 +504,41 @@ bool OcclusionCounter::PriorityPublication() {
 	return enabled;
 }
 
+bool OcclusionCounter::SplitEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_SPLIT");
+		const bool  on    = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		return on && BatchEnabled();
+	}();
+	return enabled;
+}
+
 bool OcclusionCounter::Dump(uint64_t address) {
 	HangTrace::SyncResource sync_resource(address, sizeof(uint64_t));
 	auto& scheduler = m_context.GetCommandScheduler();
-	scheduler.EndRendering();
+	if (!m_pool) {
+		scheduler.EndRendering(); // Initialize records outside rendering.
+	}
 	Initialize();
 	const bool batch = static_cast<bool>(m_batch_pipeline);
+	// A split closes only the query. Pool exhaustion, verification and a slot reuse that may
+	// submit the command buffer all retain the old end-rendering path.
+	const bool              active     = scheduler.Active();
+	const uint64_t          instance   = active ? scheduler.Current().ActiveRenderingSerial() : 0;
+	const vk::CommandBuffer command    = active ? scheduler.Current().Identity() : vk::CommandBuffer {};
+	const auto              tick       = scheduler.CurrentTick();
+	const auto              slot_index = static_cast<uint32_t>(m_issued % m_slot_count);
+	bool split = batch && SplitEnabled() && instance != 0 && !m_prepared && !m_verify_counter &&
+	             (m_issued < m_slot_count || scheduler.IsFree(m_slot_ticks[slot_index]));
+	if (split) {
+		End();
+		if (m_pending >= QueryCapacity) {
+			split = false;
+		}
+	}
+	if (!split) {
+		scheduler.EndRendering();
+	}
 	if (!batch) {
 		FlushPending();
 	}
@@ -645,9 +656,10 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		scheduler.DeferOperation(std::move(publish));
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
-	// Rendering has ended above and the value is published from everything counted so far: a
-	// begin opens its pair for the instances that follow, an end closes it after its snapshot.
-	UpdateOpenPairs(address);
+	// The current query ended above and the value is published from everything counted so far:
+	// a begin opens its pair for later queries, an end closes it after its snapshot.
+	const auto kind = m_pairs.Observe(address);
+	UpdateGate(kind, address);
 	if (HangTrace::Enabled()) {
 		HangTrace::OcclusionEvent event;
 		event.event         = "dump";
@@ -662,12 +674,29 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		event.depth_address = m_last_scope.depth_address;
 		HangTrace::RecordOcclusion(event);
 	}
-	// An end dump sits 8 bytes after its begin dump (interleaved begin/end pairs). A pair whose
+	// An end dump sits 8 bytes after its begin dump (on either 8-byte alignment). A pair whose
 	// latest counted scope rendered only depth is a visibility proxy (e.g. a bounding box).
-	const bool sync = SyncProxyDumps() && (address & 0xfu) == 8u && m_scopes_since_dump != 0 &&
+	const bool sync = SyncProxyDumps() && kind == OcclusionDumpPairs::Kind::End && m_scopes_since_dump != 0 &&
 	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
 	m_scopes_since_dump = 0;
 	m_last_scope        = {};
+	// A slot wait may have submitted the command buffer, ending its rendering instance.
+	split = split && scheduler.Active() && scheduler.Current().Identity() == command &&
+	        scheduler.CurrentTick() == tick && scheduler.Current().ActiveRenderingSerial() == instance;
+	if (split && WouldCount(scheduler.Current().OcclusionControl())) {
+		if (m_pending < QueryCapacity && m_reset_window.IsReset(m_pending)) {
+			scheduler.Current().Sink().beginQuery(m_pool, m_pending,
+			                                      vk::QueryControlFlagBits::ePrecise);
+			m_active = true;
+			++m_scopes_since_dump;
+			m_last_scope = m_instance_scope;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
+		} else {
+			scheduler.EndRendering();
+			split = false;
+		}
+	}
+	m_last_dump_kept = split;
 	return sync;
 }
 }

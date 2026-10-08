@@ -265,6 +265,15 @@ public:
 	// Resolver: commits the draw at window position `position` (the head), recorded with
 	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
 	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
+	// Prepare a single-record indirect draw from the sequencer's register snapshot. Its GPU-owned
+	// counts are unknown here, so only the programs may be offered at execution. Opt in with
+	// KYTY_DRAW_PREP_INDIRECT=1 after validating the target scene.
+	[[nodiscard]] static bool IndirectEnabled();
+	[[nodiscard]] uint64_t PublishIndirect(bool indexed, const HW::Context& context,
+	                                       const HW::UserConfig& user_config,
+	                                       const HW::Shader& shaders,
+	                                       const std::function<bool()>& wait_for_space);
+	void ExecuteIndirect(uint64_t position, const std::function<void()>& draw);
 
 	// P3c (KYTY_CP_SEQ_PREFETCH, cpOps.h): the sequencer's speculative parse past a wait publishes
 	// draws without ops. Each such slot carries the number of packets and the hash of every byte
@@ -310,6 +319,8 @@ private:
 	void Commit(Slot& slot);
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
 	void CommitHead(const HeadPatch* patch = nullptr);
+	// The acquired and prepared head; the caller commits or offers it, then retires it.
+	Slot& ReadyHead();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

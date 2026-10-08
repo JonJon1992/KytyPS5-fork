@@ -67,7 +67,7 @@ enum class Mode : uint8_t { Off, Empty, On, Verify, VerifyExit };
 [[nodiscard]] bool ConversionEnabled();
 
 // Slot layout (dwords): Records commands {x, y, z}, Records parameter blocks of 8 dwords
-// {count, vertex offset, first instance, index size, index address lo, hi, 0, 0}, the status
+// {count, vertex offset, instance chunk, index size, index address lo, hi, 0, first instance}, the status
 // word, the 5 argument dwords as read, and the generation the dispatch was recorded with.
 inline constexpr uint32_t Records        = 4;
 inline constexpr uint32_t CommandDwords  = 3;

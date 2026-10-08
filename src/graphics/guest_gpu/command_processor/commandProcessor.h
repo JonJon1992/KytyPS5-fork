@@ -341,7 +341,7 @@ private:
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
 	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
-	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);
+	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op, bool from_prepared = false);
 	void          ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op);
 	void          ExecDispatchDirect(const CpSeq::DispatchDirectOp& op);
 	void          ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op);

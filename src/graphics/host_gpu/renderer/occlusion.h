@@ -2,6 +2,7 @@
 #define KYTY_RENDERER_OCCLUSION_H_
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/occlusionPairs.h"
 #include "graphics/host_gpu/renderer/occlusionReset.h"
 #include <array>
 #include <atomic>
@@ -71,6 +72,14 @@ public:
 	[[nodiscard]] static ProxyMode GetProxyMode();
 	// Returns true when this dump is a proxy end dump the caller must order (see ProxyMode).
 	[[nodiscard]] bool Dump(uint64_t address);
+	// With batched reduction, end and restart queries inside a rendering instance when its next
+	// index has already been reset. Opt in with KYTY_OCCLUSION_SPLIT=1; the default ends rendering.
+	[[nodiscard]] static bool SplitEnabled();
+	[[nodiscard]] bool LastDumpKeptInstance() const noexcept { return m_last_dump_kept; }
+	void NoteInstance(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
+	                  bool has_depth, uint32_t depth_format) {
+		m_instance_scope = {depth_address, width, height, colors, has_depth, depth_format};
+	}
 	// Proxy detection enabled (any mode but Off).
 	[[nodiscard]] static bool SyncProxyDumps();
 	// Publications run on the completion (priority) runner instead of the GPU thread's pending
@@ -84,9 +93,9 @@ public:
 	[[nodiscard]] bool Active() const noexcept { return m_active; }
 	// KYTY_OCCLUSION_GATE (default on, needs KYTY_GPU_OCCLUSION=1). The guest reads only
 	// end - begin differences of the cumulative counter, taken by interleaved dump pairs (begin at
-	// A, A % 16 == 0; end at A + 8). Samples of rendering instances begun while no pair is open
-	// cannot reach any such difference, so they are not counted. Every dump ends rendering, so
-	// an instance never straddles a pair boundary. Unexpected dump patterns disable the gate for
+	// A, at any 8-byte alignment; end at A + 8). Samples of rendering instances begun while no pair is open
+	// cannot reach any such difference, so they are not counted. Every dump ends rendering or
+	// its active query, so no query straddles a pair boundary. Unexpected dump patterns disable the gate for
 	// the rest of the process (always-on counting, as without the gate).
 	[[nodiscard]] static bool GateEnabled();
 	// True when a rendering instance begun now with DB_COUNT_CONTROL `control` would be counted.
@@ -110,12 +119,12 @@ private:
 		return (control & 1u) == 0 && (control & 0xf00u) != 0;
 	}
 	[[nodiscard]] bool GateOpen() const noexcept {
-		return !GateEnabled() || m_gate_broken || !m_open_pairs.empty();
+		return !GateEnabled() || m_gate_broken || !m_pairs.Empty();
 	}
-	void UpdateOpenPairs(uint64_t address);
+	void UpdateGate(OcclusionDumpPairs::Kind kind, uint64_t address);
 	void BreakGate(const char* reason, uint64_t address);
 	static constexpr size_t MaxOpenPairs = 64;
-	std::vector<uint64_t> m_open_pairs; // begin addresses of dump pairs awaiting their end
+	OcclusionDumpPairs m_pairs; // tracked even when the gate is off: proxy detection needs pairs
 	bool m_gate_broken = false;
 	static constexpr uint32_t QueryCapacity = 1024;
 	RenderContext& m_context;
@@ -163,6 +172,8 @@ private:
 		uint32_t depth_format  = 0;
 	};
 	ScopeInfo m_last_scope {}; // hang-trace diagnostics only
+	ScopeInfo m_instance_scope {};
+	bool      m_last_dump_kept = false;
 };
 }
 #endif

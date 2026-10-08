@@ -1214,6 +1214,8 @@ enum class FrameEvent : uint32_t {
 	// decision's certificate, and memo lookups whose certificate no longer held.
 	CpCommitTexDccRecords,
 	CpCommitTexDccRejects,
+	// A source skipped after a failed flat SRT read through a loop-carried address.
+	VariantPlanSkips,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

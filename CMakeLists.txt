@@ -859,6 +859,9 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(audio_mix_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioMixTests.cpp")
+target_include_directories(audio_mix_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
 target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
@@ -869,6 +872,19 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
+
+# libSceAudioPropagation HLE state (libs/audioPropagation.h): handles and the direct-sound render.
+add_executable(audio_propagation_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AudioPropagationTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audioPropagation.cpp"
+)
+target_include_directories(audio_propagation_tests PRIVATE ${inc_headers})
+
+# Which unresolved-import calls are reported (loader/unresolvedImportLog.h).
+add_executable(unresolved_import_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UnresolvedImportLogTests.cpp"
+)
+target_include_directories(unresolved_import_log_tests PRIVATE ${inc_headers})
 
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
@@ -988,6 +1004,10 @@ add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Occlusi
 target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
 target_link_libraries(occlusion_reset_tests common)
 add_test(NAME occlusion_reset COMMAND $<TARGET_FILE:occlusion_reset_tests>)
+
+add_executable(occlusion_pairs_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionPairsTests.cpp")
+target_include_directories(occlusion_pairs_tests PRIVATE ${inc_headers})
+add_test(NAME occlusion_pairs COMMAND $<TARGET_FILE:occlusion_pairs_tests>)
 
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
@@ -1215,6 +1235,10 @@ if(BUILD_TESTING)
 	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
 	add_test(NAME shader_cfg_post_dominators
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --post-dominators-only)
+	add_test(NAME shader_traversal_break_region
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --traversal-break-region-only)
+	add_test(NAME shader_start_instance
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --start-instance-only)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
 	set_tests_properties(registered_shader_code_on PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME registered_shader_code_off COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
@@ -1347,8 +1371,11 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME audio_mix COMMAND $<TARGET_FILE:audio_mix_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME audio_propagation COMMAND $<TARGET_FILE:audio_propagation_tests>)
+	add_test(NAME unresolved_import_log COMMAND $<TARGET_FILE:unresolved_import_log_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
@@ -2230,6 +2257,12 @@ if(BUILD_TESTING)
 	# KYTY_SRT_VARIANT_READS: loop-variant scalar reads and runtime S_BUFFER_LOAD V#s through BDA.
 	add_test(NAME srt_variant_reads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
+	add_test(NAME srt_variant_plan
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-plan-only)
+	add_test(NAME srt_call_targets
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-call-target-only)
+	add_test(NAME srt_unmapped_reads
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-unmapped-only)
 	# KYTY_PROGRAM_CACHE (pipeline/programDiskCache.h): source keys, codegen fingerprint and cache
 	# file (truncation, corruption, identity, verification); programs reloaded from the file
 	# render what translated ones render, with and without verify mode; and the renderer suites
@@ -2446,6 +2479,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		occlusion_pairs_tests
 		binding_path_tests
 		cp_recorder_tests
 		event_queue_lifetime_tests
@@ -2454,8 +2488,11 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		audio_mix_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		audio_propagation_tests
+		unresolved_import_log_tests
 		pad_haptics_tests
 		controller_settings_tests
 		save_data_memory_tests

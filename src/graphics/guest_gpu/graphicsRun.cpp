@@ -1078,6 +1078,10 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 		        ? cache.TryWriteDataGpu(address, src + (dw_num - 1u), sizeof(uint32_t))
 		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
 		if (written) {
+			// This write is ordered on the GPU timeline and may change a run's resources.
+			if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled()) {
+				DrawRun::NoteForeignActivity();
+			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpu);
 			TraceCpLabel("wd-gpu", dst, src[write_one_address ? dw_num - 1u : 0u],
 			             uint64_t {dw_num} * 4u);
@@ -2584,11 +2588,35 @@ static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t ind
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	const auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	auto*      engine  = m_draw_prep.get();
+	const bool prepare = m_front_mode == FrontMode::Thread && engine != nullptr &&
+	                     engine->Parallel() && DrawPrep::Engine::IndirectEnabled();
+	if (prepare && engine->SpeculativeSlots() != 0) {
+		DropSpeculativeSlots();
+	}
+	auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	if (prepare) {
+		const auto position = engine->PublishIndirect(indexed, m_ctx, m_ucfg, m_sh_ctx,
+		                                              [this] { return WaitForWindowSpace(); });
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::IndirectFlagPrepared;
+			op.window = position;
+			m_published_ops.push_back(m_ops->Emitted());
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(CpSeq::OpKind::DrawIndirect, &op, sizeof(op));
 }
 
-void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op, bool from_prepared) {
+	if ((op.flags & CpSeq::IndirectFlagPrepared) != 0) {
+		auto plain = op;
+		plain.flags &= ~CpSeq::IndirectFlagPrepared;
+		m_draw_prep->ExecuteIndirect(op.window, [this, &plain] { ExecDrawIndirect(plain, true); });
+		return;
+	}
 	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
@@ -2606,6 +2634,11 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
 	                           .index_buffer_size   = op.index_buffer_size,
 	                           .index_type_and_size = op.index_type_and_size})) {
 		return;
+	}
+	// A prepared native indirect draw can continue a run, but this CPU fallback
+	// reads arguments and executes through the serial path instead.
+	if (from_prepared && DrawRun::Enabled() && DrawRun::IndirectRunsEnabled()) {
+		DrawRun::NoteForeignActivity();
 	}
 
 	m_pending_num_instances.clear();
@@ -3670,9 +3703,19 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			}
 			if (OcclusionCounter::Enabled()) {
 				bool sync = false;
+				bool kept = false;
 				{
 					Common::LockGuard lock(m_renderer.GetMutex());
-					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
+					auto& counter = m_renderer.GetOcclusionCounter();
+					sync = counter.Dump(event_address);
+					kept = counter.LastDumpKeptInstance();
+				}
+				// A split dump that neither waits nor ends rendering records only query commands.
+				const bool waits =
+				    sync && OcclusionCounter::GetProxyMode() == OcclusionCounter::ProxyMode::Sync;
+				if (DrawRun::Enabled() && DrawRun::QuietOpsEnabled() &&
+				    OcclusionCounter::SplitEnabled() && (!kept || waits)) {
+					DrawRun::NoteForeignActivity();
 				}
 				if (sync) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionProxyDumps);
@@ -3947,7 +3990,17 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
 	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch) {
-		DrawRun::NoteForeignActivity();
+		const bool quiet = DrawRun::QuietOpsEnabled() &&
+		                   (kind == OpKind::WriteData ||
+		                    (kind == OpKind::EventWrite &&
+		                     static_cast<const CpSeq::EventWriteOp*>(payload)->event_type == 0x39u &&
+		                     OcclusionCounter::Enabled() && OcclusionCounter::SplitEnabled()));
+		const bool indirect_commit =
+		    kind == OpKind::DrawIndirect && DrawRun::IndirectRunsEnabled() &&
+		    (static_cast<const CpSeq::DrawIndirectOp*>(payload)->flags & CpSeq::IndirectFlagPrepared) != 0;
+		if (!quiet && !indirect_commit) {
+			DrawRun::NoteForeignActivity();
+		}
 	}
 	switch (kind) {
 		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;

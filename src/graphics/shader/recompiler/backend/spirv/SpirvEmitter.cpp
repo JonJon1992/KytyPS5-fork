@@ -11,6 +11,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -28,6 +30,19 @@ std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
+
+// Structural validation is useful in development, but repeats a full IR walk for every
+// release shader. KYTY_VALIDATE_IR already enables the translator's earlier IR check.
+bool ValidateEmittedIr() {
+	static const bool enabled = [] {
+		if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+			return true;
+		}
+		const auto* value = std::getenv("KYTY_VALIDATE_IR");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -458,7 +473,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	if (ValidateEmittedIr()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	state.mip_stats_records = mip_stats_records;
 	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);

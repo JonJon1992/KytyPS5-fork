@@ -73,6 +73,22 @@ void NoteForeignActivity() noexcept {
 	g_activity.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool QuietOpsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool IndirectRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_RUN_INDIRECT");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 uint64_t ActivityEpoch() noexcept {
 	return g_activity.load(std::memory_order_relaxed);
 }
@@ -153,7 +169,7 @@ void PrintSummary() {
 		return;
 	}
 	static uint64_t                                          last_ns = 0;
-	static std::array<uint64_t, 13>                          last {};
+	static std::array<uint64_t, 14>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
 	static uint32_t                                          calls = 0;
 	// Runs after every commit: the clock is read on every 256th call only.
@@ -168,7 +184,7 @@ void PrintSummary() {
 	if (now - last_ns < 10'000'000'000ull) {
 		return;
 	}
-	const std::array<uint64_t, 13> values {
+	const std::array<uint64_t, 14> values {
 	    g_totals.draws.load(std::memory_order_relaxed),
 	    g_totals.eligible.load(std::memory_order_relaxed),
 	    g_totals.key_matches.load(std::memory_order_relaxed),
@@ -181,8 +197,9 @@ void PrintSummary() {
 	    g_totals.acquire_reused.load(std::memory_order_relaxed),
 	    g_totals.dynamic_emitted.load(std::memory_order_relaxed),
 	    g_totals.partial_pushes.load(std::memory_order_relaxed),
-	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed)};
-	std::array<uint64_t, 13> delta {};
+	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed),
+	    g_totals.depth_promotions_deferred.load(std::memory_order_relaxed)};
+	std::array<uint64_t, 14> delta {};
 	for (size_t i = 0; i < values.size(); i++) {
 		delta[i] = values[i] - last[i];
 	}
@@ -200,13 +217,14 @@ void PrintSummary() {
 	            " key matches, %" PRIu64 " continued (%.1f%%), %" PRIu64
 	            " late fallbacks; misses:%s; verify %" PRIu64 " checks, %" PRIu64
 	            " mismatches; %" PRIu64 " alias-excluded, %" PRIu64 " acquisitions reused, %" PRIu64
-	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded\n",
+	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64
+	            " depth-promotions excluded, %" PRIu64 " deferred\n",
 	            static_cast<double>(now - last_ns) * 1e-9,
 	            GetMode() == Mode::Verify ? "verify" : "on", delta[0], delta[1], delta[2], delta[3],
 	            delta[0] != 0 ? 100.0 * static_cast<double>(delta[3]) / static_cast<double>(delta[0])
 	                          : 0.0,
 	            delta[4], misses.empty() ? " none" : misses.c_str(), delta[6], delta[7], delta[8],
-	            delta[9], delta[10], delta[11], delta[12]);
+	            delta[9], delta[10], delta[11], delta[12], delta[13]);
 	std::fflush(stdout);
 	last    = values;
 	last_ns = now;

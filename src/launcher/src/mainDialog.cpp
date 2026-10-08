@@ -235,6 +235,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
+	args << "--audio-master-volume" << QString::number(info.audio_mix.master);
+	args << "--audio-main-volume" << QString::number(info.audio_mix.main);
+	args << "--audio-music-volume" << QString::number(info.audio_mix.music);
+	args << "--audio-pad-speaker-volume" << QString::number(info.audio_mix.pad_speaker);
+	args << "--audio-objects-volume" << QString::number(info.audio_mix.objects);
+	args << "--audio-objects" << (info.audio_mix.objects_enabled ? "on" : "off");
+	args << "--gpu-occlusion" << (info.gpu_occlusion_accurate ? "on" : "off");
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);

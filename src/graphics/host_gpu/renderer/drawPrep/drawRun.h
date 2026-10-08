@@ -114,6 +114,12 @@ extern Live::Switch g_push;    // KYTY_DRAW_RUN_PUSH
 
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the
 // GPU thread; other threads only bump it.
+// Opt in with KYTY_DRAW_RUN_QUIET_OPS=1 after validating the target scene; the default ends runs
+// for WRITE_DATA and occlusion dumps.
+[[nodiscard]] bool QuietOpsEnabled();
+// Opt-in: a native indirect draw with a prepared slot can commit and continue a
+// draw run. The argument barrier and vertex ranges remain resolved at execution.
+[[nodiscard]] bool IndirectRunsEnabled();
 void NoteForeignActivity() noexcept;
 [[nodiscard]] uint64_t ActivityEpoch() noexcept;
 
@@ -143,6 +149,7 @@ struct Totals {
 	std::atomic<uint64_t> pipeline_lookups {0};// continuation whose pipeline was looked up again
 	std::atomic<uint64_t> dynamic_emitted {0}; // continuation whose dynamic state was recorded again
 	std::atomic<uint64_t> depth_promotions_excluded {0}; // next depth acquisition broadens its access
+	std::atomic<uint64_t> depth_promotions_deferred {0}; // lazy feedback preserved attachment access
 	std::atomic<uint64_t> alias_excluded {0};  // eligible, but a texture lies over an attachment
 	std::atomic<uint64_t> acquire_reused {0};  // KYTY_DRAW_RUN_ACQUIRE (verify: would have)
 	std::atomic<uint64_t> partial_pushes {0};  // KYTY_DRAW_RUN_PUSH (verify: would have)

@@ -3,12 +3,12 @@
 // Native indirect mesh draws (KYTY_NATIVE_INDIRECT_MESH, renderer/meshIndirect.h). Converts one
 // guest DrawIndexedIndirect (5 dwords) or DrawIndirect (4 dwords) record into the host mesh
 // dispatches the CPU path (DrawIndex/DrawAuto -> ExecutePreparedDraw) records from the same
-// bytes, and the six draw dwords each dispatch pushes. MeshIndirect::Convert is the C++ twin of
+// bytes, and the mesh draw dwords each dispatch pushes. MeshIndirect::Convert is the C++ twin of
 // this shader; the two must stay identical (verify mode compares them).
 //
 // Slot layout (dwords from out_word): RECORDS dispatch commands {x, y, z}, RECORDS parameter
-// blocks of 8 dwords {count, vertex offset, first instance, index size, index address lo/hi,
-// 0, 0}, a status word, a copy of the 5 argument dwords as read, and the generation the host
+// blocks of 8 dwords {count, vertex offset, instance chunk, index size, index address lo/hi,
+// first group (0), first instance}, a status word, a copy of the 5 argument dwords as read, and the generation the host
 // recorded the dispatch with (its completion check ignores a slot rewritten since).
 layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
@@ -112,12 +112,12 @@ void main() {
 		const uint p = o + PARAMS_WORD + k * 8u;
 		slot.words[p] = count;
 		slot.words[p + 1u] = vertex_offset;
-		slot.words[p + 2u] = first_instance + first;
+		slot.words[p + 2u] = first;
 		slot.words[p + 3u] = index_size;
 		slot.words[p + 4u] = uint(address);
 		slot.words[p + 5u] = uint(address >> 32u);
 		slot.words[p + 6u] = 0u;
-		slot.words[p + 7u] = 0u;
+		slot.words[p + 7u] = first_instance;
 	}
 	slot.words[o + STATUS_WORD] = status;
 	slot.words[o + GENERATION_WORD] = push_data.generation;

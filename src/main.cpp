@@ -103,6 +103,15 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --audio-master-volume <0-200>       Volume of everything on the main output. Default: 100.\n");
+	::printf("  --audio-main-volume <0-200>         Game sound (main ports). Default: 100.\n");
+	::printf("  --audio-music-volume <0-200>        Music on BGM ports. Default: 100.\n");
+	::printf("  --audio-pad-speaker-volume <0-200>  Controller-speaker sounds played on the main output\n"
+	         "                                      when no DualSense takes them. Default: %u.\n",
+	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
+	::printf("  --audio-objects-volume <0-200>      3D audio objects (AudioOut2 object ports), mixed into\n"
+	         "                                      the game sound. Default: 100.\n");
+	::printf("  --audio-objects <on|off>            Play 3D audio objects (off: dropped). Default: on.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -119,6 +128,8 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --gpu-occlusion <on|off>             Count visible samples accurately (on) or report\n"
+	         "                                       all queried objects visible (off). The U59 preset uses on.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -395,6 +406,26 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
+		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume" ||
+		           arg == "--audio-objects-volume") {
+			auto& target = arg == "--audio-master-volume" ? options.config.audio_master_volume
+			               : arg == "--audio-main-volume" ? options.config.audio_main_volume
+			               : arg == "--audio-music-volume"
+			                   ? options.config.audio_music_volume
+			               : arg == "--audio-objects-volume"
+			                   ? options.config.audio_objects_volume
+			                   : options.config.audio_pad_speaker_main_volume;
+			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
+				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,
+				         value.c_str());
+				return false;
+			}
+		} else if (arg == "--audio-objects") {
+			if (!ParseBool(value, options.config.audio_objects_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -415,6 +446,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-occlusion") {
+			bool on = false;
+			if (!ParseBool(value, on)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			// OcclusionCounter reads the environment once, on its first query.
+#ifdef _WIN32
+			_putenv_s("KYTY_GPU_OCCLUSION", on ? "1" : "0");
+#else
+			setenv("KYTY_GPU_OCCLUSION", on ? "1" : "0", 1);
+#endif
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
