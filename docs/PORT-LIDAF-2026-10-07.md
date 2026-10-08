@@ -1,6 +1,6 @@
 # O que aproveitar do fork Xx-LiDAF-xX/KytyPS5 na guest-sync-release-mem
 
-Data: 2026-10-07. Base de comparação: `guest-sync-release-mem` em `a6037785`. Nada deste documento foi portado ainda.
+Data: 2026-10-07. Base de comparação: `guest-sync-release-mem` em `a6037785`. Portado até agora: só o par SGPR das máscaras (seção 4, primeira linha).
 
 **Regra do usuário:** as nossas otimizações ficam. Nada pode substituir ou reverter:
 
@@ -78,7 +78,7 @@ O launcher do fork usa `performance_profile = 2` por padrão (`configuration.h:1
 
 | LiDAF | O que corrige | Como portar | Risco |
 | --- | --- | --- | --- |
-| `08a3215e` (`Translate.cpp`) | **Par SGPR das máscaras no wave64.** `ReadMask`, `ReadMaskValid` e `WriteMask` passam a usar `reg & ~1u`. Caso do fork: no CS `280e6a01e6b640f7` do Astro Bot, um V_CMP com `sdst=3` escrevia `s[3:4]` e corrompia o T# em `s4` | O hunk de `Translate.cpp` entra limpo. Dá para trazer junto `tests/ScalarMaskPairCases.inc`, mas o caso precisa ser registrado à mão | **Baixo**. Não muda nada com registrador par, e o LLVM decodifica da mesma forma (`Val>>1`). Antes de portar, conferir se aquele dispatch é mesmo wave64 (`shader.cpp:1247`): se for wave32, a correção esconde uma detecção errada. Ela também é parcial, porque `ReadU32Pair` (`Translate.cpp:507`) não alinha as outras fontes SGPR de 64 bits. Muda a versão do program cache |
+| `08a3215e` (`Translate.cpp`) — **portado** | **Par SGPR das máscaras no wave64.** `ReadMask`, `ReadMaskValid` e `WriteMask` passam a usar `reg & ~1u`. Caso do fork: no CS `280e6a01e6b640f7` do Astro Bot, um V_CMP com `sdst=3` escrevia `s[3:4]` e corrompia o T# em `s4` | O hunk de `Translate.cpp` entra limpo. Dá para trazer junto `tests/ScalarMaskPairCases.inc`, mas o caso precisa ser registrado à mão | **Baixo**. Não muda nada com registrador par, e o LLVM decodifica da mesma forma (`Val>>1`). Antes de portar, conferir se aquele dispatch é mesmo wave64 (`shader.cpp:1247`): se for wave32, a correção esconde uma detecção errada. Ela também é parcial, porque `ReadU32Pair` (`Translate.cpp:507`) não alinha as outras fontes SGPR de 64 bits. Muda a versão do program cache |
 | `78e776e9` | **IMAGE_BVH64_INTERSECT_RAY (0xe7):** 12 componentes, node pointer de 64 bits | `spirvEmitterBvh.cpp`, `Memory.cpp:1156` e `ShaderDecoder.cpp` entram limpos; `ImageOps.cpp:249/278` e `ShaderRecompiler.cpp` precisam de porte manual | **Médio**. Só vale se algum jogo nosso registrar `unsupported BVH intersection form ... opcode=0xe7`. Hoje esse dispatch é pulado (`ShaderRecompiler.cpp:772-793`). Não existe teste de GPU para BVH64. `ShaderRayTracingTests.inc:238` teria de mudar. A SPIR-V de todo shader com BVH muda. Muda a versão do program cache |
 | `08a3215e` (`controller.cpp`) | O gatilho não reenvia um efeito igual ao já entregue. O cache é invalidado quando `SDL_SendGamepadEffect` falha. A busca do gamepad e o envio ficam dentro de `SDL_LockJoysticks`, o que protege no hotplug | Manual, em `SetTriggerEffect` (`controller.cpp:811-846`) e `SendTriggerEffect` (~`:866-896`) | Baixo. Opcional: o fork não mediu ganho |
 | `c3a9c390` (`vma.cpp`) | Na falha de `vmaCreateImage`, logar VkResult, usage, flags e samples | 1 `LOGF` em `vma.cpp:809-811`. O chamador (`image.cpp:1011`) já loga extent e formato | Mínimo. Só diagnóstico |
@@ -134,6 +134,11 @@ Existem no código mas estão fora do preset U59: `KYTY_BDA_SHARED_BLOCKS`, `KYT
 
 ## 8. Ordem sugerida
 
-1. Par SGPR das máscaras (`08a3215e`, `Translate.cpp`), depois de confirmar o wave size do caso. Trazer junto o teste.
+1. ~~Par SGPR das máscaras (`08a3215e`, `Translate.cpp`)~~ **portado**, com o teste (`--scalar-mask-pair-only`, CTest `scalar_mask_pair`).
+   - O nosso wave size vem do `CS_W32_EN` do dispatch (`pm4.h:919`), então a correção só age quando o guest pediu wave64. Em wave32 nada muda.
+   - Sem a correção, o caso wave64 escreve em `s19:s20` e destrói o sentinela `s20`. Com ela, passa.
+   - Continuam passando: `wave_reductions`, `wave_halves`, `wave_reductions_fold_lane_masks`, `wave_reductions_linear_uses`, `isa_accuracy_linear_uses`, `fold_lane_masks_codegen` e `wave_row_reduction_codegen`.
+   - No `--new-opcodes-only` passam todos os casos até a falha antiga `VectorF64ModesModifiersAndExec`, e passam também os que vêm depois dela (F16, `ScalarBrevB64OperandsAndMasks` 32/64).
+   - Fica pendente o `ReadU32Pair` das outras fontes SGPR de 64 bits.
 2. O log do `vmaCreateImage` e a deduplicação do efeito de gatilho, se houver interesse.
 3. BVH64 e `2e8eae14` (o do Bry), só quando um log ou uma medida de jogo nosso pedir.

@@ -1244,6 +1244,7 @@ if(BUILD_TESTING)
 	set_tests_properties(isa_accuracy_linear_uses PROPERTIES
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
+	add_test(NAME scalar_mask_pair COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-mask-pair-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME runtime_buffer_stride COMMAND $<TARGET_FILE:shader_cfg_tests> --runtime-buffer-stride-only)
 	add_test(NAME shader_frontend_optimization

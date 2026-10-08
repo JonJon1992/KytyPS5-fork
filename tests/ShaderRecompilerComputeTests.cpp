@@ -52400,6 +52400,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderProgramCacheTests.inc"
 #include "ShaderAsyncPipelineTests.inc"
 #include "GuestSyncTests.inc"
+#include "ScalarMaskPairCases.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -52500,6 +52501,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsWideLdsPartialBounds());
     RunCase(&vulkan, DsAtomic64Bounds(false));
     RunCase(&vulkan, DsAtomic64Bounds(true));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-mask-pair-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, OddScalarMaskPair(32));
+    RunCase(&vulkan, OddScalarMaskPair(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {

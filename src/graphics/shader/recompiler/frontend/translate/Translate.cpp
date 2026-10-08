@@ -699,9 +699,14 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
-			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
+			// A wave64 mask is an aligned SGPR pair: an odd encoding names the pair below it.
+			auto pair = operand;
+			if (program.wave_size == 64u) {
+				pair.reg &= ~1u;
+			}
+			const auto reg  = static_cast<IR::ScalarReg>(pair.reg);
 			const auto mask = program.wave_size == 64u
-			                      ? ReadU32Pair(operand)
+			                      ? ReadU32Pair(pair)
 			                      : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))};
 			return IR::U1(ir.Emit(
 			    IR::ValueOpcode::SelectU1,
@@ -735,7 +740,8 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Null:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U1(IR::Value(true));
 		case Decoder::OperandKind::Sgpr:
-			return ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(operand.reg));
+			return ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(
+			    program.wave_size == 64u ? operand.reg & ~1u : operand.reg));
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
@@ -752,7 +758,10 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 	const auto mask = BallotMask(value);
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
-			const auto reg  = static_cast<IR::ScalarReg>(operand.reg);
+			// A 64-bit mask destination is an aligned SGPR pair; an odd encoding aliases the pair
+			// below it, not the following register.
+			const auto reg = static_cast<IR::ScalarReg>(
+			    write_64 || program.wave_size == 64u ? operand.reg & ~1u : operand.reg);
 			ir.SetThreadBitScalarReg(reg, value);
 			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(true)));
 			if (IR::RegIndex(reg) > 0u) {
