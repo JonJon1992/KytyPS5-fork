@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
@@ -243,6 +244,9 @@ void EopTimestampRing::PublishEntry(const Entry& entry, bool available, uint64_t
 		Profiler::CountFrameEvent(Profiler::FrameEvent::EopTimestampsUnavailable);
 		g_flip.unavailable.fetch_add(1, std::memory_order_relaxed);
 		return;
+	}
+	if (m_buffer_cache != nullptr) {
+		m_buffer_cache->BeforeEmulatorWrite(entry.address, sizeof(uint64_t));
 	}
 	auto* slot = reinterpret_cast<uint64_t*>(entry.address);
 	// The guest may have reused the slot since (a ring of timer slots): keep what it wrote.

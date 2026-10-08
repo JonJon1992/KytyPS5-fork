@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
+#include "graphics/host_gpu/renderer/image/stagingCopier.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -60,6 +61,17 @@ Live::Switch g_eager_current_tick("KYTY_READBACK_EAGER_CURRENT_TICK", Live::Pars
 Live::Switch g_readback_wait_publication("KYTY_READBACK_WAIT_PUBLICATION", Live::ParseDefaultOff);
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
+
+// F1: only collected BDA guest runs. 0 preserves the synchronous route; verify also checks
+// source mutation diagnostics and the bytes the GPU actually consumed.
+Live::Switch g_coherence_copy("KYTY_COHERENCE_COPY", [](const char* value) -> int64_t {
+	if (value != nullptr && std::strcmp(value, "verify") == 0) return 2;
+	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
+});
+Live::Switch g_coherence_copy_min_kb("KYTY_COHERENCE_COPY_MIN_KB",
+                                    [](const char* value) -> int64_t {
+	return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 65536) : 16;
+});
 
 Live::Switch g_bda_hot_ranges_merge("KYTY_BDA_HOT_RANGES_MERGE", Live::ParseDefaultOff);
 
@@ -3080,6 +3092,26 @@ void BufferCache::QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t
 	}
 }
 
+void BufferCache::BeforeEmulatorWrite(uint64_t address, uint64_t size) {
+	if (auto* copier = m_coherence_copier.load(std::memory_order_acquire); copier != nullptr) {
+		copier->BeforeEmulatorWrite(address, size);
+	}
+}
+
+std::unique_lock<std::mutex> BufferCache::AcquireEmulatorWrite(uint64_t address, uint64_t size) {
+	std::unique_lock gate(m_source_write_mutex);
+	for (;;) {
+		auto* copier = m_coherence_copier.load(std::memory_order_acquire);
+		const auto value = copier != nullptr ? copier->PendingSourceValue(address, size) : 0;
+		if (value == 0) {
+			return gate;
+		}
+		gate.unlock();
+		copier->WaitSource(value);
+		gate.lock(); // Recheck: recording may have admitted another overlapping source meanwhile.
+	}
+}
+
 // The copy half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT), after the pass's protection:
 // the same steps as its upload lambda and what follows it with UploadBatch on.
 void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
@@ -3097,9 +3129,13 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 	if (!pending.hot_ranges.empty()) {
 		CollectHotPages(buffer, pending.hot_ranges, copies, total_size, demote_hot, settle_hot);
 	}
-	const bool defer_host = m_upload_dma != nullptr && UploadDmaHostCopyEnabled() &&
-	                        !UploadDmaVerify() && m_staging_buffer.IsCoherent() &&
-	                        total_size >= m_upload_dma->MinBytes();
+	const auto copy_mode = g_coherence_copy.Get();
+	const bool defer_coherence = copy_mode != 0 && guest_copies != 0 &&
+	                             host_base >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024;
+	const bool defer_host = defer_coherence ||
+	                        (m_upload_dma != nullptr && UploadDmaHostCopyEnabled() &&
+	                         !UploadDmaVerify() && m_staging_buffer.IsCoherent() &&
+	                         total_size >= m_upload_dma->MinBytes());
 	auto source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
 	                           host_base, defer_host ? &host_copies : nullptr);
 	if (pending.memo_applies) {
@@ -3127,10 +3163,87 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 		                          0, static_cast<uint32_t>(copies.size()), 0, total_size,
 		                          pending.size);
 	}
+	std::shared_ptr<StagingCopier::Verification> verification;
+	bool queued = false;
+	if (defer_coherence && !host_copies.empty()) {
+		EXIT_IF(source != m_staging_buffer.Handle());
+		auto& copier = m_texture_cache.EnsureStagingCopier();
+		auto ranges = copier.AcquireRanges(host_copies.size());
+		uint64_t bytes = 0;
+		for (const auto& copy: host_copies) {
+			ranges.push_back({copy.guest_address, copy.destination, copy.size, copy.source});
+			bytes += copy.size;
+		}
+		if (copy_mode == 2) {
+			verification = std::make_shared<StagingCopier::Verification>();
+			verification->tracker = &m_memory_tracker;
+			verification->expected.resize(bytes);
+			verification->observed.resize(bytes);
+		}
+		// UploadCopies packed all runs into one reservation; non-coherent reservations have
+		// disjoint atoms. The worker flushes after writing, before publishing completion.
+		uint64_t begin = UINT64_MAX, end = 0;
+		for (const auto& copy: copies) {
+			begin = std::min(begin, copy.srcOffset);
+			end = std::max(end, copy.srcOffset + copy.size);
+		}
+		{
+			// Keep a foreign publication out from its final dependency check through admission.
+			// The gate exists before the first lazy copier/job, and is never held while waiting.
+			std::scoped_lock gate(m_source_write_mutex);
+			SetCoherenceCopier(&copier);
+			if (verification) {
+				verification->fault_epoch = m_bda_incremental_sync
+				                                ? m_memory_tracker.FaultMutationEpoch() : UINT64_MAX;
+				uint64_t offset = 0;
+				for (const auto& copy: host_copies) {
+					std::memcpy(verification->expected.data() + offset, copy.source, copy.size);
+					offset += copy.size;
+				}
+			}
+			copier.Enqueue(std::move(ranges), &m_staging_buffer, begin, end - begin, verification);
+		}
+		queued = true;
+	}
 	auto& command = m_scheduler.Current();
-	source        = StageUploadDma(source, copies, &host_copies);
+	// UploadDma has its own submit dependency and can read the ring before this worker finishes.
+	// A queued F1 upload therefore stays on the graphics route protected by the copier dependency.
+	if (!queued) {
+		source = StageUploadDma(source, copies, &host_copies);
+	}
 	command.RequestUploadCopy(source, buffer.Handle(), copies);
 	buffer.MarkContentWritten();
+	if (verification) {
+		// Compare GPU readback to the worker's host snapshot, without reading write-combined staging.
+		const uint64_t bytes = verification->observed.size();
+		auto readback = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst, bytes);
+		std::vector<vk::BufferCopy> checks;
+		checks.reserve(host_copies.size());
+		uint64_t offset = 0;
+		for (const auto& copy: host_copies) {
+			checks.push_back({buffer.Offset(copy.guest_address), offset, copy.size});
+			offset += copy.size;
+		}
+		command.EndRendering();
+		const auto native = command.Handle(); // records uploads and their transfer-read barriers
+		native.copyBuffer(buffer.Handle(), readback->Handle(), checks.size(), checks.data());
+		vk::MemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr, 0, nullptr);
+		m_scheduler.DeferOperation([verification, readback, bytes] {
+			readback->Invalidate(0, bytes);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceCopyVerifyGpuChecks);
+			HangTrace::CountMemory(HangTrace::MemoryCounter::CoherenceGpuChecks);
+			if (std::memcmp(readback->Mapped().data(), verification->observed.data(), bytes) != 0) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceCopyVerifyMismatches);
+				HangTrace::CountMemory(HangTrace::MemoryCounter::CoherenceMismatches);
+				LOGF("Coherence copy verify: GPU upload differs from worker bytes\n");
+			}
+		});
+	}
 	if (m_upload_batch_depth == 0) {
 		command.FlushBarriers();
 	}
@@ -3247,7 +3360,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 			if (alias != nullptr) {
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
-				                     copy.size});
+				                     copy.size, buffer.CpuAddress() + copy.dstOffset});
 			} else {
 				std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
 			}

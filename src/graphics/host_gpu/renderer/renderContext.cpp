@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -36,6 +37,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_occlusion_counter(*this), m_lod_stats(*this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (auto* timestamps = m_command_scheduler.GuestTimestamps(); timestamps != nullptr) {
+		timestamps->SetBackingWriteCache(m_buffer_cache);
+	}
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.
 	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {
@@ -399,13 +403,13 @@ static bool HostWriteTrackingEnabled() {
 	return enabled;
 }
 
-void RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
-                                            HostWriter writer) noexcept {
+std::unique_lock<std::mutex> RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
+                                                                    HostWriter writer) noexcept {
 	// Only the GPU thread: it alone marks pages GPU-dirty, so the ownership checked below cannot
 	// change before the invalidation (which would then download from a completion runner).
 	if (!HostWriteTrackingEnabled() || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, size)) {
 		NoteHostBackingWrite(vaddr, size, writer);
-		return;
+		return m_buffer_cache.AcquireEmulatorWrite(vaddr, size);
 	}
 	const auto states = m_buffer_cache.CountPageStates(vaddr, size);
 	if (states.gpu_dirty == 0 && states.clean != 0 &&
@@ -417,11 +421,12 @@ void RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
 		Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWriteCleanPages, states.clean);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWritesTracked);
 		(void)InvalidateMemory(vaddr, size);
-		return;
+		return m_buffer_cache.AcquireEmulatorWrite(vaddr, size);
 	}
 	// GPU-owned bytes (a guest write would first download them, which a write made in a
 	// completion cannot), or nothing tracked as clean: counted and reported as before.
 	NoteHostBackingWrite(vaddr, size, writer);
+	return m_buffer_cache.AcquireEmulatorWrite(vaddr, size);
 }
 
 void RenderContext::NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allows_read,

@@ -808,6 +808,10 @@ add_executable(bda_hot_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaHotRa
 target_link_libraries(bda_hot_ranges_tests common)
 target_include_directories(bda_hot_ranges_tests PRIVATE ${inc_headers})
 
+add_executable(source_copy_tracker_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceCopyTrackerTests.cpp")
+target_link_libraries(source_copy_tracker_tests common Threads::Threads)
+target_include_directories(source_copy_tracker_tests PRIVATE ${inc_headers})
+
 # Device-capability choices for AMD, Intel and older NVIDIA GPUs (graphics/host_gpu/deviceCompat.h).
 add_executable(device_compat_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceCompatTests.cpp")
 target_link_libraries(device_compat_tests Vulkan::Headers)
@@ -1372,6 +1376,8 @@ if(BUILD_TESTING)
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
+	add_test(NAME source_copy_tracker COMMAND $<TARGET_FILE:source_copy_tracker_tests>)
+	set_tests_properties(source_copy_tracker PROPERTIES TIMEOUT 10)
 	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -1525,6 +1531,15 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_DRAW_PREP_CODE_DIGEST=0")
 	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
 	set(buffer_upload_test_env "KYTY_CP_RECORDER=0;KYTY_UPLOAD_DMA=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_HOT_PAGES=1;KYTY_HOT_PAGE_FRAMES=2;KYTY_HOT_PAGE_CHECK_LIMIT=0;KYTY_HOT_PAGE_QUIET_FRAMES=1000;KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
+	# F1: source versions, live disable, pending native submission and unmap lifetime.
+	foreach(texture_async IN ITEMS 0 1)
+		foreach(copy_mode IN ITEMS 1 verify)
+			add_test(NAME coherence_copy_tex${texture_async}_${copy_mode}
+				COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherence-copy-only)
+			set_tests_properties(coherence_copy_tex${texture_async}_${copy_mode} PROPERTIES TIMEOUT 60
+				ENVIRONMENT "KYTY_COHERENCE_COPY=${copy_mode};KYTY_TEXTURE_ASYNC_STAGING=${texture_async};KYTY_UPLOAD_DMA=1;KYTY_WRITE_DATA_GPU=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_CP_RECORDER=${texture_async};KYTY_CP_SEQ=0")
+		endforeach()
+	endforeach()
 	foreach(upload_batch IN ITEMS 0 1)
 		add_test(NAME buffer_upload_coalesce_batch${upload_batch}
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-upload-coalesce-only)

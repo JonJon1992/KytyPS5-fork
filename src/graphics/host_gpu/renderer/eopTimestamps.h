@@ -29,7 +29,8 @@
 //   is empty, unless the guest has written the slot since.
 // - A timestamp deferred with its label (TryDeferLabel) gets the converted value from the deferred
 //   write instead.
-// - The command processor never waits: an unavailable result or slot keeps the record-time value.
+// - Query results never wait: an unavailable result or slot keeps the record-time value.
+//   Publishing backing bytes may wait for an overlapping F1 host source copy.
 // gpu-verify: gpu, and each published value is checked against its record-time value (the GPU
 // cannot finish before the packet was recorded) and against the previously published value (the
 // single host queue executes in recording order).
@@ -39,6 +40,7 @@
 namespace Libs::Graphics {
 
 class CommandSink;
+class BufferCache;
 struct GraphicContext;
 
 namespace EopTimestamps {
@@ -85,8 +87,10 @@ public:
 	// The slot's value goes to `address`, which now holds `record_value`, once `tick` completed.
 	void Queue(uint32_t slot, uint64_t tick, uint64_t address, uint64_t record_value);
 	// At a packet boundary with the draw-prep window empty: rewrites every queued timestamp whose
-	// tick is known complete (never waits).
+	// tick is known complete (no GPU wait; the backing-source guard can wait for a host copy).
 	void Publish(uint64_t known_gpu_tick);
+	// A rewrite is a CPU backing write; pending source copies must finish before it.
+	void SetBackingWriteCache(BufferCache& cache) noexcept { m_buffer_cache = &cache; }
 	// Any thread, once the slot's tick has completed (a deferred label's write): the converted
 	// value, or record_value when unavailable. Frees the slot either way.
 	[[nodiscard]] uint64_t TakeDeferred(uint32_t slot, uint64_t record_value);
@@ -103,6 +107,7 @@ private:
 	void PublishEntry(const Entry& entry, bool available, uint64_t device_raw);
 
 	GraphicContext&          m_graphics;
+	BufferCache*             m_buffer_cache = nullptr;
 	vk::QueryPool            m_pool = nullptr;
 	EopTimestamps::QueryRing m_ring;
 	std::deque<Entry>        m_queue;   // queued timestamps in recording (and tick) order

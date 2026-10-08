@@ -68,6 +68,7 @@ struct UploadHostCopy {
 	uint8_t*       destination = nullptr;
 	const uint8_t* source      = nullptr;
 	uint64_t       size        = 0;
+	uint64_t       guest_address = 0; // F1 source guard, unused by UploadDma
 };
 
 class UploadDma final: public SubmitDependency {

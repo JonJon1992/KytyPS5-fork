@@ -350,6 +350,17 @@ enum class FrameEvent : uint32_t {
 	// (KYTY_TEXTURE_ASYNC_STAGING).
 	TextureAsyncCopies,
 	TextureAsyncCopyBytes,
+	// F1 host copies of BDA guest runs (KYTY_COHERENCE_COPY).
+	CoherenceCopyJobs,
+	CoherenceCopyBytes,
+	CoherenceCopyRangeAllocations,
+	CoherenceCopyRangeReuses,
+	CoherenceCopyGuardQueries,
+	CoherenceCopyGuardWaits,
+	CoherenceCopyVerifySourceChecks,
+	CoherenceCopyVerifyRedirties,
+	CoherenceCopyVerifyGpuChecks,
+	CoherenceCopyVerifyMismatches,
 	// Image refresh bytes by source route: an existing cache buffer or GPU-written bytes
 	// (BufferCache), a synchronous staging copy on the GPU thread, or the StagingCopier worker.
 	TextureUploadBytesBuffer,
@@ -1259,6 +1270,9 @@ enum class FrameWait : uint32_t {
 	TextureUpload,
 	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
 	TextureStagingCopy,
+	CoherenceStagingCopy, // worker time, excluded from GPU-thread critical path
+	CoherenceCopyGuard,   // emulator writer waiting for overlapping source copies
+	CoherenceCopyGuardLookup, // alias translation and interval query while sources are pending
 	// GPU (CP) thread blocked in MasterSemaphore::Wait (submission dispatch plus timeline wait;
 	// waits that find the tick already complete are not counted), attributed to the caller that
 	// set a ScopedGpuWaitReason: ReadMemory drains, occlusion publication waits (sync proxy,

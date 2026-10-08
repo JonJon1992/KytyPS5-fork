@@ -47,6 +47,9 @@ struct TextureCacheTestAccess;
 class TextureCache {
 public:
 	std::function<void(ImageId)> on_bindless_unregister;
+
+	// GPU recording thread. Buffer uploads share the worker without enabling texture staging.
+	StagingCopier& EnsureStagingCopier();
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
@@ -602,7 +605,8 @@ private:
 	// images already share the requested range, so overlapped images are not kept.
 	bool             m_overlap_crowded     = false;
 	uint64_t         m_partial_verify_mismatches = 0;
-	// KYTY_TEXTURE_ASYNC_STAGING=0: null, staging copies stay on the GPU thread.
+	bool m_texture_async_staging = false;
+	// Shared by texture uploads and opt-in BDA CPU copies.
 	std::unique_ptr<StagingCopier> m_staging_copier;
 	// Device-local host-visible (resizable BAR) staging ring for StagingCopier jobs, so detile
 	// reads VRAM instead of system memory over PCIe (KYTY_TEXTURE_STAGING_REBAR=0: none).

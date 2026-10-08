@@ -564,6 +564,8 @@ void RecordPipelineLibraryEvent(PipelineLibraryEvent event, uint64_t ns, uint64_
 //   mem_hot_upload_skipped               of those, unchanged pages whose copy was skipped
 //   mem_written_upload_late_pages        written-upload pages a racing guest write re-dirtied
 //                                        while copied outside the tracker lock (copied again)
+// mem_coherence_* appended columns: F1 jobs/bytes, worker/guard us and verify outcomes.
+// Available without a Tracy connection; durations sum across threads, not frame latency.
 enum class MemoryCounter : uint8_t {
 	WriteFaults,
 	ReadFaults,
@@ -591,6 +593,19 @@ enum class MemoryCounter : uint8_t {
 	HotUploadPages,
 	HotUploadSkipped,
 	WrittenUploadLatePages,
+	CoherenceCopyJobs,
+	CoherenceCopyBytes,
+	CoherenceRangeAllocations,
+	CoherenceRangeReuses,
+	CoherenceGuardQueries,
+	CoherenceGuardLookupNs,
+	CoherenceCopyNs,
+	CoherenceGuardWaits,
+	CoherenceGuardNs,
+	CoherenceSourceChecks,
+	CoherenceSourceRedirties,
+	CoherenceGpuChecks,
+	CoherenceMismatches,
 	Count
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);

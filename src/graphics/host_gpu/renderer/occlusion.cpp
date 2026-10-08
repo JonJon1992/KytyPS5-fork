@@ -631,10 +631,12 @@ bool OcclusionCounter::Dump(uint64_t address) {
 				}
 			}
 		}
-		m_context.PrepareHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
-		for (uint32_t db = 0; db < 16u; db++) {
-			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
-			                                         sizeof(uint64_t));
+		{
+			auto lease = m_context.PrepareHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
+			for (uint32_t db = 0; db < 16u; db++) {
+				(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
+				                                         sizeof(uint64_t));
+			}
 		}
 		// Backing bytes changed outside a publication: logged after the write.
 		Coherence::NoteContentWrite(address, 248, Coherence::Source::OcclusionWrite);

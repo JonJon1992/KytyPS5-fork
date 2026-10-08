@@ -2,6 +2,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
+#include "common/profiler.h"
 #include "common/logging/log.h"
 #include "common/rendererBatch.h"
 #include "common/subsystems.h"
@@ -25,6 +26,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
+#include "graphics/host_gpu/renderer/image/stagingCopier.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
@@ -102,6 +104,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -10370,13 +10373,16 @@ public:
         (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
         reuploaded = states(clean_offset);
         const std::array<uint8_t, 248> bytes{0x11, 0x22, 0x33};
-        context.PrepareHostBackingWrite(base + clean_offset, bytes.size(),
-                                        Libs::Graphics::RenderContext::HostWriter::LodStats);
-        (void)Libs::LibKernel::Memory::TryWriteBacking(base + clean_offset, bytes.data(),
-                                                        bytes.size());
+        {
+          auto lease = context.PrepareHostBackingWrite(base + clean_offset, bytes.size(),
+              Libs::Graphics::RenderContext::HostWriter::LodStats);
+          (void)Libs::LibKernel::Memory::TryWriteBacking(base + clean_offset, bytes.data(), bytes.size());
+        }
         host_written = states(clean_offset);
-        context.PrepareHostBackingWrite(base + written_offset, 248,
-                                        Libs::Graphics::RenderContext::HostWriter::LodStats);
+        {
+          auto lease = context.PrepareHostBackingWrite(base + written_offset, 248,
+              Libs::Graphics::RenderContext::HostWriter::LodStats);
+        }
         host_gpu = states(written_offset);
         (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
         next = states(clean_offset);
@@ -29323,6 +29329,7 @@ public:
 
 #include "ShaderBdaNewBufferTests.inc"
 #include "ShaderBufferUploadCoalesceTests.inc"
+#include "ShaderCoherenceCopyTests.inc"
 
 private:
   RenderContext &Renderer() {
@@ -53335,6 +53342,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--coherence-copy-only") == 0) {
+    VulkanHarness vulkan(false);
+    vulkan.CheckCoherenceCopy();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-upload-coalesce-only") == 0) {

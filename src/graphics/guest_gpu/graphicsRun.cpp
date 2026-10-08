@@ -922,6 +922,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 }
 
 void CommandProcessor::ExecDumpConstRam(const CpSeq::DumpConstRamOp& op, const uint32_t* src) {
+	m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, uint64_t {op.dw_num} * 4u);
 	memcpy(reinterpret_cast<uint32_t*>(op.dst), src, static_cast<size_t>(op.dw_num) * 4);
 	NoteCpWrite(op.dst, uint64_t {op.dw_num} * 4u);
 }
@@ -1088,6 +1089,8 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 			return;
 		}
 	}
+	m_renderer.GetBufferCache().BeforeEmulatorWrite(
+	    op.dst, write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * 4u);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataCpu);
 	TraceCpLabel("wd-cpu", dst, src[write_one_address ? dw_num - 1u : 0u], uint64_t {dw_num} * 4u);
 
@@ -1116,6 +1119,7 @@ void CommandProcessor::ExecReferenceClock(const CpSeq::ReferenceClockOp& op) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
+	m_renderer.GetBufferCache().BeforeEmulatorWrite(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	NoteCpWrite(dst_address, num_bytes);
@@ -3064,6 +3068,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    HangWatchdog::Scope write("deferred-label-write", address, written, tick, size);
 				    HangWatchdog::DebugDelay("label", address);
+				    renderer->GetBufferCache().BeforeEmulatorWrite(address, size);
 				    std::memcpy(reinterpret_cast<void*>(address), &written, size);
 			    }
 			    if (HangTrace::CpTraceEnabled()) {
@@ -3085,7 +3090,10 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		    });
 		    if (!sent) {
 			    // Shutdown: the GPU thread no longer runs commands. Best-effort direct write.
-			    (void)LibKernel::Memory::TryWriteBacking(address, &written, size);
+			    {
+				    auto lease = renderer->GetBufferCache().AcquireEmulatorWrite(address, size);
+				    (void)LibKernel::Memory::TryWriteBacking(address, &written, size);
+			    }
 			    gpu.RemoveDeferredLabel(address, tick);
 			    if (interrupt) {
 				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
@@ -3126,6 +3134,7 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 		return interrupt;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
+	m_renderer.GetBufferCache().BeforeEmulatorWrite(reinterpret_cast<uint64_t>(dst), size);
 	std::memcpy(dst, &value, size);
 	NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 	QueueEopTimestamp(timestamp_slot, dst, value);
@@ -3247,8 +3256,10 @@ bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32
 		    auto write = [renderer, &gpu, bytes = std::move(bytes), address, tick, interrupt,
 		                  event_id, interrupt_context_id](bool on_gpu_thread) {
 			    if (on_gpu_thread) {
+				    renderer->GetBufferCache().BeforeEmulatorWrite(address, bytes.size());
 				    std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
 			    } else {
+				    auto lease = renderer->GetBufferCache().AcquireEmulatorWrite(address, bytes.size());
 				    (void)LibKernel::Memory::TryWriteBacking(address, bytes.data(), bytes.size());
 			    }
 			    Coherence::NoteContentWrite(address, bytes.size(), Coherence::Source::CpWrite);
@@ -3358,6 +3369,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			// Guest label pages can be protected by resource tracking. Attribute any
 			// resulting fault separately from the end-of-pipe submission/interrupt work.
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
+			m_renderer.GetBufferCache().BeforeEmulatorWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 			std::memcpy(dst, &data, sizeof(data));
 		}
 		NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
@@ -3393,6 +3405,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitGds);
 					SynchronizeGpu();
+					m_renderer.GetBufferCache().BeforeEmulatorWrite(
+					    reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * 4u);
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * 4u);
@@ -3443,6 +3457,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 					{
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
+						m_renderer.GetBufferCache().BeforeEmulatorWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
 						std::memcpy(dst, &value, sizeof(value));
 					}
 					NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
@@ -3747,6 +3762,7 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			m_renderer.GetBufferCache().BeforeEmulatorWrite(event_address, 16u * 2u * sizeof(uint64_t));
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
@@ -3847,6 +3863,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 			}
 
+			m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
 			std::memcpy(dst_gpu_addr, &value, sizeof(value));
 			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
@@ -3878,6 +3895,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 				EXIT("unknown event type\n");
 			}
+			m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
 			std::memcpy(dst_gpu_addr, &value, sizeof(value));
 			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,

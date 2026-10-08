@@ -46,6 +46,19 @@ inline constexpr std::array<Profiler::FrameEvent, static_cast<size_t>(Counter::C
     Profiler::FrameEvent::HotPageUploads,
     Profiler::FrameEvent::HotPageUploadsSkipped,
     Profiler::FrameEvent::WrittenUploadLatePages,
+    Profiler::FrameEvent::CoherenceCopyJobs,
+    Profiler::FrameEvent::CoherenceCopyBytes,
+    Profiler::FrameEvent::CoherenceCopyRangeAllocations,
+    Profiler::FrameEvent::CoherenceCopyRangeReuses,
+    Profiler::FrameEvent::CoherenceCopyGuardQueries,
+    Profiler::FrameEvent::Count, // lookup ns use FrameWait::CoherenceCopyGuardLookup
+    Profiler::FrameEvent::Count, // worker ns use FrameWait::CoherenceStagingCopy
+    Profiler::FrameEvent::CoherenceCopyGuardWaits,
+    Profiler::FrameEvent::Count, // guard ns use FrameWait::CoherenceCopyGuard
+    Profiler::FrameEvent::CoherenceCopyVerifySourceChecks,
+    Profiler::FrameEvent::CoherenceCopyVerifyRedirties,
+    Profiler::FrameEvent::CoherenceCopyVerifyGpuChecks,
+    Profiler::FrameEvent::CoherenceCopyVerifyMismatches,
 }};
 // A missing initializer would leave the value-initialized first FrameEvent at the end.
 static_assert(kEvents.back() != Profiler::FrameEvent::SubmitBoundaryUnprotected,
@@ -62,7 +75,10 @@ inline void Count(Counter counter, uint64_t amount = 1) {
 		return;
 	}
 	HangTrace::CountMemory(counter, amount);
-	Profiler::CountFrameEvent(Detail::kEvents[static_cast<size_t>(counter)], amount);
+	const auto event = Detail::kEvents[static_cast<size_t>(counter)];
+	if (event != Profiler::FrameEvent::Count) {
+		Profiler::CountFrameEvent(event, amount);
+	}
 }
 
 // Adds the scope's duration to a nanosecond counter; reads no clock when nothing collects.

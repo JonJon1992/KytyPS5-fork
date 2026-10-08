@@ -33,6 +33,7 @@ class CommandScheduler;
 class TextureCache;
 class UploadDma;
 struct UploadHostCopy;
+class StagingCopier;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -187,6 +188,14 @@ public:
 	// Invalidate retained results before commands whose writes cannot be bounded to one buffer.
 	// Also disables side readbacks until the current recording is submitted.
 	void InvalidateContentRevisions();
+	// Recording-thread writes: waits for relevant copies even after the live option is disabled.
+	void BeforeEmulatorWrite(uint64_t address, uint64_t size);
+	// Foreign backing writes retain this lease until their bytes land. Waiting releases the gate;
+	// admission and the final write cannot race, including before the first copier job exists.
+	[[nodiscard]] std::unique_lock<std::mutex> AcquireEmulatorWrite(uint64_t address, uint64_t size);
+	void SetCoherenceCopier(StagingCopier* copier) noexcept {
+		m_coherence_copier.store(copier, std::memory_order_release);
+	}
 	// Image content serial (Image::NextContentSerial) taken when the latest unbounded writer was
 	// bound: an image whose ContentSerial is larger was written after it.
 	[[nodiscard]] uint64_t UnboundedWriteSerial() const noexcept { return m_unbounded_write_serial; }
@@ -914,6 +923,8 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	std::atomic<StagingCopier*>                       m_coherence_copier {nullptr};
+	std::mutex                                       m_source_write_mutex;
 	// KYTY_VRAM_IDLE_BUFFER_FRAMES=N (default 0: off; see TextureCache's KYTY_VRAM_IDLE_FRAMES):
 	// once every 32 frames, cache buffers unused for more than N presented frames without GPU-dirty
 	// bytes are untracked and deleted, as the collector below deletes them, whatever the memory

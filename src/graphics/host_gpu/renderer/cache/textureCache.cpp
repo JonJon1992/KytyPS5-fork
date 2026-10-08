@@ -565,9 +565,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	                                            : "on",
 	     m_resident_idle_frames);
 	// KYTY_TEXTURE_ASYNC_STAGING=0 keeps texture refresh staging copies on the GPU thread.
-	if (EnvNotZero("KYTY_TEXTURE_ASYNC_STAGING")) {
-		m_staging_copier = std::make_unique<StagingCopier>(graphics);
-		m_scheduler.SetSubmitDependency(m_staging_copier.get());
+	m_texture_async_staging = EnvNotZero("KYTY_TEXTURE_ASYNC_STAGING");
+	if (m_texture_async_staging) {
+		EnsureStagingCopier();
 		// With resizable BAR the worker writes straight into VRAM. Only when a device-local
 		// host-visible heap is large, so the ring cannot starve other users of a 256 MiB BAR.
 		const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
@@ -604,12 +604,21 @@ bool TextureCache::AliasBytesEnabled() {
 	return enabled;
 }
 
+StagingCopier& TextureCache::EnsureStagingCopier() {
+	if (!m_staging_copier) {
+		m_staging_copier = std::make_unique<StagingCopier>(m_graphics);
+		m_scheduler.SetSubmitDependency(m_staging_copier.get());
+	}
+	return *m_staging_copier;
+}
+
 StreamBuffer& TextureCache::StagingRing() {
 	return m_texture_staging ? *m_texture_staging
 	                         : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
 }
 
 TextureCache::~TextureCache() {
+	m_buffer_cache.SetCoherenceCopier(nullptr);
 	if (m_staging_copier) {
 		// The scheduler has drained by now; no later submission may wait on the copier.
 		m_scheduler.SetSubmitDependency(nullptr);
@@ -2638,16 +2647,16 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 			tile.tiled_offset = packed_total;
 			packed_total += tile.tiled_size;
 		}
-		auto& staging = m_staging_copier ? StagingRing()
+		auto& staging = m_texture_async_staging ? StagingRing()
 		                                 : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
 		auto [mapped, offset] = staging.Map(packed_total, 256);
 		if (mapped == nullptr) {
 			return result;
 		}
-		Profiler::CountFrameEvent(m_staging_copier ? Profiler::FrameEvent::TextureUploadBytesAsync
+		Profiler::CountFrameEvent(m_texture_async_staging ? Profiler::FrameEvent::TextureUploadBytesAsync
 		                                           : Profiler::FrameEvent::TextureUploadBytesStaging,
 		                          packed_total);
-		if (m_staging_copier) {
+		if (m_texture_async_staging) {
 			std::vector<StagingCopier::Range> copies;
 			copies.reserve(ranges.size());
 			for (const auto& range: ranges) {
@@ -2687,7 +2696,7 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 
 bool TextureCache::TryAsyncFullUpload(Image& image) {
 	const auto& info = image.info;
-	if (!m_staging_copier || image.depth_id || image.IsBufferModified() || info.samples != 1 ||
+	if (!m_texture_async_staging || image.depth_id || image.IsBufferModified() || info.samples != 1 ||
 	    image.backing.samples != 1 || !info.IsTiled() || info.IsDepth() ||
 	    info.metadata.compression != VideoOutCompression::Uncompressed ||
 	    UploadBinding(image) != BindingType::Texture) {
