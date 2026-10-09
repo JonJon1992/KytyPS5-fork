@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -496,6 +497,11 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	EmitterState state(program, input_info);
 	state.mip_stats_records = mip_stats_records;
 	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);
+	if (state.requirements.function_lds && GetCodegenOptions().function_lds_compact) {
+		auto layout = IR::PlanFunctionLdsLayout(program);
+		state.function_lds_slots = std::move(layout.slots);
+		state.compact_lds_dwords = layout.dwords;
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

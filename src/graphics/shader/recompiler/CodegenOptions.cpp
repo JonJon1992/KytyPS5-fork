@@ -108,6 +108,7 @@ CodegenOptions FromEnvironment() {
 			options.mad_mode = MadMode::Position;
 		}
 	}
+	options.function_lds_compact = EnvFlag("KYTY_FUNCTION_LDS_COMPACT", options.function_lds_compact);
 	return options;
 }
 

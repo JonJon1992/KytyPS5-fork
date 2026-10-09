@@ -359,6 +359,47 @@ static int read_save_blocks(const std::filesystem::path& directory, uint64_t* bl
 	return OK;
 }
 
+static int read_save_free_blocks(const std::filesystem::path& directory, uint64_t blocks,
+                                 uint64_t* free_blocks) {
+	static constexpr uint64_t BLOCK_BYTES = 65536;
+	// The allocation was validated by read_save_blocks. Saturate usage while
+	// scanning, but keep checking the remaining entries for filesystem errors.
+	const uint64_t capacity_bytes = blocks * BLOCK_BYTES;
+	uint64_t used_bytes = 0;
+	std::error_code error;
+	std::filesystem::recursive_directory_iterator it(directory, error), end;
+	if (error) {
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	for (; it != end; it.increment(error)) {
+		if (error) {
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
+		// Emulator metadata is outside the guest's data allocation.
+		if (it.depth() == 0 && it->path().filename() == "sce_sys") {
+			it.disable_recursion_pending();
+			continue;
+		}
+		const bool regular = it->is_regular_file(error);
+		if (error) {
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
+		if (regular) {
+			const auto size = it->file_size(error);
+			if (error) {
+				return SAVE_DATA_ERROR_INTERNAL;
+			}
+			used_bytes += std::min<uint64_t>(size, capacity_bytes - used_bytes);
+		}
+	}
+	if (error) {
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	const uint64_t used_blocks = used_bytes / BLOCK_BYTES + (used_bytes % BLOCK_BYTES != 0);
+	*free_blocks = blocks - used_blocks;
+	return OK;
+}
+
 static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
 	std::error_code error;
 	const bool exists = std::filesystem::exists(path, error);
@@ -641,8 +682,11 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 			if (status != OK) {
 				return status;
 			}
-			// Host-directory saves report their allocation as free space.
-			info.free_blocks = info.blocks;
+			const int usage_status = read_save_free_blocks(root / dir_list[i], info.blocks,
+			                                              &info.free_blocks);
+			if (usage_status != OK) {
+				return usage_status;
+			}
 		}
 	}
 
@@ -1264,9 +1308,15 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
 	if (status != OK) {
 		return status;
 	}
+	uint64_t free_blocks = 0;
+	const int usage_status = read_save_free_blocks(g_mount_slots.Directory(static_cast<size_t>(slot)),
+	                                              blocks, &free_blocks);
+	if (usage_status != OK) {
+		return usage_status;
+	}
 	*info = {};
 	info->blocks = blocks;
-	info->free_blocks = blocks;
+	info->free_blocks = free_blocks;
 
 	return OK;
 }

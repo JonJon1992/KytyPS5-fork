@@ -41,3 +41,13 @@ test, and `shader_recompiler_compute_tests --spirv-optimization-only` (original/
 readbacks for twelve integer, float, atomic, loop and LDS cases). `shader_cfg` inspects the raw
 emitter's exact CFG/instruction shapes; `lod_stats_codegen` validates optimized instrumented
 and plain mip-statistics variants.
+
+## Compact pixel LDS
+
+`KYTY_FUNCTION_LDS_COMPACT` defaults to `1`. Pixel shaders whose complete LDS
+access set proves scalar lane-relative addressing use one Function-storage cell
+per distinct wrapped offset. Original guest bounds and address masking remain
+unchanged; incompatible layouts retain their original storage. Set `0` to disable.
+The option participates in the program-cache fingerprint. See
+[the Demon integration report](PORT-DEMON-2026-10-09.md) for GPU equivalence tests,
+allocation measurements and limits.

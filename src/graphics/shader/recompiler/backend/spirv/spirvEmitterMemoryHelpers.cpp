@@ -206,6 +206,11 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		// Bounds still use the original wrapped guest index. Only the pointer into
+		// invocation-private pixel LDS uses the compact cell proved for this access.
+		if (access.kind == IR::ResourceKind::Lds && state.compact_lds_dwords != 0) {
+			index = ConstantU32(state, state.function_lds_index_slots.at(index));
+		}
 		const auto pointer = state.builder.AllocateId();
 		const auto storage_class =
 		    access.kind == IR::ResourceKind::Scratch ? spv::StorageClassFunction

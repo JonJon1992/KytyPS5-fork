@@ -100,6 +100,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.fold_lane_masks ? 1u : 0u);
 	b.U8(options.spirv_optimize ? 1u : 0u);
 	b.U8(options.spirv_optimize_extended ? 1u : 0u);
+	b.U8(options.function_lds_compact ? 1u : 0u);
 
 	// Host device state the emitter reads (set once by the device layer).
 	const auto float_controls = Spirv::GetHostFloatControls();

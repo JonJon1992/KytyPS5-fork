@@ -43921,6 +43921,7 @@ TestCase BufferAtomicFMinExactRawGlcModes() {
       0, static_cast<u32>(test.initial.size() * sizeof(u32)));
   std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
   test.user_data[50] = 1u << 20u;
+  test.user_data[51] = 3u << 28u; // Valid output V# at s[48:51] for AppendStoreVgpr.
   test.has_user_data = true;
   return test;
 }
@@ -44013,6 +44014,7 @@ TestCase BufferAtomicFMaxExactRawGlcModes() {
       0, static_cast<u32>(test.initial.size() * sizeof(u32)));
   std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
   test.user_data[50] = 1u << 20u;
+  test.user_data[51] = 3u << 28u; // Valid output V# at s[48:51] for AppendStoreVgpr.
   test.has_user_data = true;
   return test;
 }
@@ -52939,6 +52941,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 }
 
 #include "ShaderCodegenTests.inc"
+#include "ShaderFunctionLdsTests.inc"
 #include "ShaderGlobalWideTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
@@ -52984,6 +52987,19 @@ int main(int argc, char **argv) {
   }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && (std::strcmp(argv[1], "--function-lds-enabled") == 0 ||
+                    std::strcmp(argv[1], "--function-lds-disabled") == 0)) {
+    Require("FunctionLds", "environment option",
+            ShaderRecompiler::GetCodegenOptions().function_lds_compact ==
+                (std::strcmp(argv[1], "--function-lds-enabled") == 0),
+            "wrong compact Function LDS option");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--function-lds-only") == 0) {
+    VulkanHarness vulkan;
+    FunctionLdsTests::Check(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--srt-unmapped-only") == 0) {
     SrtVariantTests::NullBasedFlatReadReadsZero();
     return 0;

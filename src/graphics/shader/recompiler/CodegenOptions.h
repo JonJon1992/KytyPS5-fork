@@ -39,6 +39,10 @@ enum class PsLiveExec : uint8_t {
 // part of CodegenFingerprint, so the persistent program cache rejects incompatible options.
 // The driver pipeline cache is keyed by the SPIR-V code.
 struct CodegenOptions {
+	// KYTY_FUNCTION_LDS_COMPACT=0: retain full invocation-private pixel LDS arrays.
+	// Default on: scalar lane-relative LDS uses one cell per distinct wrapped offset,
+	// while the original guest address and bounds checks remain unchanged.
+	bool function_lds_compact = true;
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
 	bool movrel_range = true;

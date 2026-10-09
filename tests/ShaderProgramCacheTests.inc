@@ -230,6 +230,7 @@ void CheckFingerprint() {
   options_differ("fold_lane_masks", [](CodegenOptions &o) { o.fold_lane_masks = !o.fold_lane_masks; });
   options_differ("spirv_optimize", [](CodegenOptions &o) { o.spirv_optimize = !o.spirv_optimize; });
   options_differ("spirv_optimize_extended", [](CodegenOptions &o) { o.spirv_optimize_extended = !o.spirv_optimize_extended; });
+  options_differ("function_lds_compact", [](CodegenOptions &o) { o.function_lds_compact = !o.function_lds_compact; });
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;

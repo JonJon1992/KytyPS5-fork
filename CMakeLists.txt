@@ -658,6 +658,12 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+add_executable(function_lds_layout_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FunctionLdsLayoutTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp")
+target_link_libraries(function_lds_layout_tests common fmt::fmt)
+target_include_directories(function_lds_layout_tests PRIVATE ${inc_headers})
+
 file(GLOB shader_function_decode_sources CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp")
 add_executable(shader_function_tests EXCLUDE_FROM_ALL
@@ -1216,7 +1222,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests pipeline_compile_queue_tests)
+			virtual_memory_allocation_tests pipeline_compile_queue_tests function_lds_layout_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -1379,6 +1385,15 @@ if(BUILD_TESTING)
 	set_tests_properties(spirv_optimizer_on PROPERTIES ENVIRONMENT "KYTY_SPIRV_OPT=1")
 	add_test(NAME spirv_optimizer_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --spirv-optimization-only)
+	add_test(NAME function_lds_layout COMMAND $<TARGET_FILE:function_lds_layout_tests>)
+	add_test(NAME function_lds_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --function-lds-only)
+	set_tests_properties(function_lds_gpu PROPERTIES TIMEOUT 120)
+	add_test(NAME function_lds_default COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --function-lds-enabled)
+	set_tests_properties(function_lds_default PROPERTIES ENVIRONMENT "KYTY_FUNCTION_LDS_COMPACT=")
+	add_test(NAME function_lds_on COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --function-lds-enabled)
+	set_tests_properties(function_lds_on PROPERTIES ENVIRONMENT "KYTY_FUNCTION_LDS_COMPACT=1")
+	add_test(NAME function_lds_off COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --function-lds-disabled)
+	set_tests_properties(function_lds_off PROPERTIES ENVIRONMENT "KYTY_FUNCTION_LDS_COMPACT=0")
 	add_test(NAME shader_integer16_ternary
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
 	add_test(NAME shader_integer16_ternary_extended

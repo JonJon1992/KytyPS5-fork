@@ -1057,7 +1057,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
-		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
+		    TypeU32ArrayPointer(state, spv::StorageClassFunction,
+		                        state.compact_lds_dwords != 0 ? state.compact_lds_dwords
+		                                                     : LdsDwordCount(state)),
 		    state.lds_variable, spv::StorageClassFunction);
 	}
 	if (state.requirements.function_scratch) {

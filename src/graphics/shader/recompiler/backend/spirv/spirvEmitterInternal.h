@@ -123,6 +123,9 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
+	std::unordered_map<const IR::Inst*, uint32_t>     function_lds_slots;
+	std::unordered_map<uint32_t, uint32_t>            function_lds_index_slots;
+	uint32_t                                        compact_lds_dwords = 0;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;

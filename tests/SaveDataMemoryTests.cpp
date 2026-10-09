@@ -436,7 +436,7 @@ void TestSaveAllocations() {
 	CHECK(SaveDataDirNameSearch(&cond, &search) == OK && search.set_num == 2);
 	for (size_t i = 0; i < names.size(); i++) {
 		CHECK(std::string(found[i].data) == names[i].data);
-		CHECK(infos[i].blocks == allocations[i] && infos[i].free_blocks == allocations[i]);
+		CHECK(infos[i].blocks == allocations[i] && infos[i].free_blocks == allocations[i] - 1);
 		struct SaveDataMount3 mount {};
 		mount.user_id = 1;
 		mount.dir_name = &names[i];
@@ -447,7 +447,7 @@ void TestSaveAllocations() {
 		std::ofstream(g_mounted_directory / "USR-DATA", std::ios::app) << "more data";
 		SaveDataMountInfo info {};
 		CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == OK);
-		CHECK(info.blocks == allocations[i] && info.free_blocks == allocations[i]);
+		CHECK(info.blocks == allocations[i] && info.free_blocks == allocations[i] - 1);
 		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
 	}
 	CHECK(infos[0].blocks + infos[1].blocks == 144);
@@ -458,6 +458,68 @@ void TestSaveAllocations() {
 	CHECK(fs::remove(metadata));
 	CHECK(SaveDataDirNameSearch(&cond, &search) == SAVE_DATA_ERROR_BROKEN);
 	CHECK(!fs::exists(metadata));
+}
+
+void TestSaveFreeBlocks() {
+	Reset("FREEBLOCKS");
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id = 1;
+	mount.dir_name = &name;
+	mount.mount_mode = 4;
+	mount.blocks = 48;
+	SaveDataMountResult result {};
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	const auto directory = g_mounted_directory;
+	const auto check_free = [&](uint64_t expected, int expected_status = OK) {
+		SaveDataMountInfo info {};
+		CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == expected_status);
+		if (expected_status == OK) {
+			CHECK(info.blocks == 48 && info.free_blocks == expected);
+		}
+		SceSaveDataDirName found {};
+		SaveDataSearchInfo search_info {};
+		SaveDataDirNameSearchCond cond {};
+		cond.user_id = 1;
+		SaveDataDirNameSearchResult search {};
+		search.dir_names = &found;
+		search.dir_names_num = 1;
+		search.infos = &search_info;
+		CHECK(SaveDataDirNameSearch(&cond, &search) == expected_status);
+		if (expected_status == OK) {
+			CHECK(search.set_num == 1);
+			CHECK(search_info.blocks == 48 && search_info.free_blocks == expected);
+		}
+	};
+	check_free(48);
+	std::ofstream(directory / "empty");
+	check_free(48);
+	std::ofstream(directory / "data") << "x";
+	check_free(47);
+	fs::resize_file(directory / "data", 65536);
+	check_free(47);
+	fs::create_directories(directory / "nested" / "deeper");
+	std::ofstream(directory / "nested" / "deeper" / "part") << "x";
+	check_free(46);
+	fs::resize_file(directory / "data", 65535);
+	check_free(47); // Round the aggregate, not each individual file.
+	fs::create_directories(directory / "sce_sys" / "nested");
+	std::ofstream(directory / "sce_sys" / "nested" / "metadata") << "x";
+	fs::resize_file(directory / "sce_sys" / "nested" / "metadata", 65536);
+	check_free(47);
+	fs::resize_file(directory / "data", 48 * 65536 - 1);
+	check_free(0);
+	fs::resize_file(directory / "data", 49 * 65536);
+	check_free(0);
+#ifndef _WIN32
+	// An inaccessible subtree must fail even when known usage already fills the save.
+	fs::permissions(directory / "nested", fs::perms::none);
+	if (geteuid() != 0) {
+		check_free(0, SAVE_DATA_ERROR_INTERNAL);
+	}
+	fs::permissions(directory / "nested", fs::perms::owner_all);
+#endif
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
 }
 
 void TestClassicSaveParams() {
@@ -618,6 +680,7 @@ int main(int argc, char** argv) {
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
 	TestSaveAllocations();
+	TestSaveFreeBlocks();
 	TestClassicSaveParams();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
