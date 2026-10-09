@@ -43,6 +43,16 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// KYTY_BDA_WRITES=candidates: a dispatch skipped because its proof failed (GPU thread).
+static void RejectBdaWriteCandidates(const BdaWriteCandidates::Plan& plan) {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+	static uint32_t logged = 0;
+	if (logged++ < 32) {
+		LOGF("BDA candidates: shader=0x%016" PRIx64 " skipped: %s\n", plan.shader_hash,
+		     plan.reject != nullptr ? plan.reject : "no complete proof");
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -414,11 +424,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes) candidate_plan.emplace();
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
-		static uint32_t rejects = 0;
-		if (rejects++ < 32) LOGF("BDA candidates: shader=0x%016" PRIx64
-		                        " rejected: table or destination lacks a complete proof\n",
-		                        program.shader_hash);
+		RejectBdaWriteCandidates(*candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -429,7 +435,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		RejectBdaWriteCandidates(*candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -548,11 +554,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes) candidate_plan.emplace();
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
-		static uint32_t rejects = 0;
-		if (rejects++ < 32) LOGF("BDA candidates: shader=0x%016" PRIx64
-		                        " rejected: table or destination lacks a complete proof\n",
-		                        program.shader_hash);
+		RejectBdaWriteCandidates(*candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -567,7 +569,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		RejectBdaWriteCandidates(*candidate_plan);
 		ResetBindings();
 		return;
 	}

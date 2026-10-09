@@ -33,6 +33,14 @@ void CheckBdaWriteCandidates() {
   }
   std::memcpy(mapped, table.data(), sizeof(table));
   const std::array<u32, 2> user_data{static_cast<u32>(base), static_cast<u32>(base >> 32)};
+  // A second table whose first destination is on the table's own 4 KiB tracker page.
+  constexpr uintptr_t shared_table = base + 0x8000;
+  auto shared = table;
+  shared[8] = static_cast<u32>(shared_table + 0x400);
+  shared[9] = static_cast<u32>((shared_table + 0x400) >> 32) | (4u << 16);
+  std::memcpy(reinterpret_cast<void*>(shared_table), shared.data(), sizeof(shared));
+  const std::array<u32, 2> shared_user_data{static_cast<u32>(shared_table),
+                                            static_cast<u32>(shared_table >> 32)};
   BdaWriteCandidates::Plan plan;
   auto frozen = CreateHostBuffer(name, sizeof(table), vk::BufferUsageFlagBits::eTransferDst, {0});
   auto restored = CreateHostBuffer(name, sizeof(table), vk::BufferUsageFlagBits::eTransferDst, {0});
@@ -59,6 +67,18 @@ void CheckBdaWriteCandidates() {
     BdaWriteCandidates::Plan invalid;
     Require(name, "unaligned table rejected", !cache.PrepareBdaWriteCandidates(
         ShaderRecompiler::BdaWaterLightingHash, unaligned, invalid), "unaligned table admitted");
+    // Claiming that destination would make the table's page GPU-owned, so Finalize would refuse
+    // after the claim: refused first, with no destination claimed.
+    BdaWriteCandidates::Plan shared_plan;
+    Require(name, "shared page rejected", !cache.PrepareBdaWriteCandidates(
+        ShaderRecompiler::BdaWaterLightingHash, shared_user_data, shared_plan) &&
+        shared_plan.reject != nullptr &&
+        std::strcmp(shared_plan.reject, "destination shares a tracked page with the table") == 0,
+        "a destination on the table's tracker page was admitted");
+    Require(name, "shared page unclaimed",
+        !cache.IsRegionGpuModified(shared_table, 0x1000) &&
+        !cache.IsRegionGpuModified(base + 0x10000, 0x50000),
+        "the refused plan claimed a destination");
     Require(name, "prepare", cache.PrepareBdaWriteCandidates(
         ShaderRecompiler::BdaWaterLightingHash, user_data, plan), "complete table rejected");
     Require(name, "all candidates owned", plan.range_count == 5 &&

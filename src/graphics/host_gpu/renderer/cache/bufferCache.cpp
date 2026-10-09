@@ -2401,11 +2401,15 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	using namespace BdaWriteCandidates;
 	plan = {};
 	plan.shader_hash = shader_hash;
+	const auto fail = [&](const char* why) {
+		plan.reject = why;
+		return false;
+	};
 	const auto prefix = PrefixBytes(shader_hash);
-	if (prefix == 0 || user_data.size() < 2) return false;
+	if (prefix == 0 || user_data.size() < 2) return fail("no table in the user data");
 	plan.table = uint64_t(user_data[0]) | (uint64_t(user_data[1]) << 32);
 	// ScalarAddress loads mask the low two bits; a raw unaligned snapshot is a different table.
-	if ((plan.table & 3u) != 0) return false;
+	if ((plan.table & 3u) != 0) return fail("unaligned table");
 	plan.vm_generation = LibKernel::Memory::VirtualRangesGeneration();
 	const auto readable = [&](uint64_t bytes) {
 		return GuestRange{plan.table, bytes}.Valid() &&
@@ -2414,30 +2418,44 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 		       !m_texture_cache.IsRegionGpuModified(plan.table, bytes);
 	};
 	// TryReadBacking does not fault on stale GPU bytes: reject them explicitly before reading.
-	if (!readable(prefix)) return false;
+	if (!readable(prefix)) return fail("table unmapped or GPU-modified");
 	{
 		std::scoped_lock gate(m_source_write_mutex);
-		if (!LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), prefix)) return false;
+		if (!LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), prefix))
+			return fail("table read failed");
 		plan.table_bytes = TableBytes(shader_hash, plan.words);
-		if (plan.table_bytes == 0 || !readable(plan.table_bytes) ||
-		    !LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), plan.table_bytes) ||
-		    !Resolve(plan)) return false;
+		if (plan.table_bytes == 0) return fail("table count out of range");
+		if (!readable(plan.table_bytes)) return fail("table unmapped or GPU-modified");
+		if (!LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), plan.table_bytes))
+			return fail("table read failed");
+		if (!Resolve(plan)) return false;
 	}
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) return false;
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation)
+		return fail("guest mappings changed");
 	const auto table_alias = reinterpret_cast<uintptr_t>(
 	    LibKernel::Memory::GuestBackingAlias(plan.table, plan.table_bytes));
-	if (table_alias == 0) return false;
+	if (table_alias == 0) return fail("table has no backing alias");
+	// Claiming a destination makes whole tracker pages GPU-owned. A destination on a page of the
+	// table would make the table GPU-modified: Finalize would refuse after the claim, and so would
+	// every later dispatch while the page stays GPU-owned.
+	const auto table_first = Common::AlignDown(plan.table, TRACKER_PAGE_SIZE);
+	const auto table_end = Common::AlignUp(plan.table + plan.table_bytes, TRACKER_PAGE_SIZE);
 	// Validate the complete set before changing ownership. A mapped prefix never certifies a
 	// partially mapped candidate; neither virtual nor physical self-writes can change the table.
 	for (const auto& range: plan.Ranges()) {
 		if (LibKernel::Memory::ClampRangeSizeQuiet(range.address, range.size) != range.size)
-			return false;
+			return fail("destination not fully mapped");
 		const auto alias = reinterpret_cast<uintptr_t>(
 		    LibKernel::Memory::GuestBackingAlias(range.address, range.size));
-		if (alias == 0 || (alias < table_alias + plan.table_bytes &&
-		                   table_alias < alias + range.size)) return false;
+		if (alias == 0) return fail("destination has no backing alias");
+		if (alias < table_alias + plan.table_bytes && table_alias < alias + range.size)
+			return fail("destination aliases the table");
+		if (Common::AlignDown(range.address, TRACKER_PAGE_SIZE) < table_end &&
+		    table_first < Common::AlignUp(range.End(), TRACKER_PAGE_SIZE))
+			return fail("destination shares a tracked page with the table");
 	}
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) return false;
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation)
+		return fail("guest mappings changed");
 	(void)FindBuffer(plan.table, plan.table_bytes); // BDA table must cover the frozen table.
 	for (const auto& range: plan.Ranges()) {
 		(void)ObtainBuffer(range.address, range.size, true); // preserve image owners before writes
@@ -2445,11 +2463,17 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	return true;
 }
 
-bool BufferCache::FinalizeBdaWriteCandidates(const BdaWriteCandidates::Plan& plan) {
+bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation ||
-	    m_memory_tracker.IsRegionGpuModified(plan.table, plan.table_bytes) ||
-	    m_texture_cache.IsRegionGpuModified(plan.table, plan.table_bytes)) return false;
+	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) {
+		plan.reject = "guest mappings changed before the dispatch";
+		return false;
+	}
+	if (m_memory_tracker.IsRegionGpuModified(plan.table, plan.table_bytes) ||
+	    m_texture_cache.IsRegionGpuModified(plan.table, plan.table_bytes)) {
+		plan.reject = "table became GPU-modified before the dispatch";
+		return false;
+	}
 	const auto id = FindBuffer(plan.table, plan.table_bytes);
 	// Save the exact GPU table version, then freeze the CPU snapshot for this dispatch.
 	// A single device buffer suffices: save/use/restore are ordered on the graphics queue.

@@ -23,6 +23,8 @@ struct Plan {
     uint64_t vm_generation = 0;
     uint32_t table_bytes = 0;
     uint32_t range_count = 0;
+    // Why the dispatch was refused (a string literal; null while the proof holds).
+    const char* reject = nullptr;
     std::array<uint32_t, MaxTableBytes / 4> words {};
     std::array<GuestRange, MaxDescriptors> ranges {};
     [[nodiscard]] std::span<const GuestRange> Ranges() const {
@@ -46,9 +48,13 @@ struct Plan {
 // Swizzled and short-stride layouts need a separate proof.
 [[nodiscard]] inline bool Resolve(Plan& plan) {
     plan.range_count = 0;
+    const auto fail = [&](const char* why) {
+        plan.reject = why;
+        return false;
+    };
     const auto bytes = TableBytes(plan.shader_hash, plan.words);
     if ((plan.table & 3u) != 0 || bytes == 0 || bytes != plan.table_bytes ||
-        !GuestRange{plan.table, bytes}.Valid()) return false;
+        !GuestRange{plan.table, bytes}.Valid()) return fail("table shape or count out of range");
     const auto count = plan.shader_hash == ShaderRecompiler::BdaWaterLightingHash
                            ? 5u : plan.words[0x70 / 4];
     const auto first = plan.shader_hash == ShaderRecompiler::BdaWaterLightingHash ? 32u : 16u;
@@ -62,14 +68,15 @@ struct Plan {
         if (descriptor.OutOfBounds() == 2 ||
             (descriptor.Stride() != 0 &&
              (descriptor.OutOfBounds() == 3 || descriptor.SwizzleEnabled() ||
-              descriptor.Stride() < 4))) return false;
+              descriptor.Stride() < 4))) return fail("unbounded or swizzled descriptor");
         const auto raw_size = std::max<uint64_t>(4, descriptor.GetSize());
         const auto address = descriptor.Base48() & ~uint64_t{3};
         const auto end = (descriptor.Base48() + raw_size + 3u) & ~uint64_t{3};
         const GuestRange range{address, end - address};
         if (!range.Valid() || range.size > MaxDestinationBytes ||
-            total > MaxDestinationBytes - range.size ||
-            (range.address < plan.table + bytes && plan.table < range.End())) return false;
+            total > MaxDestinationBytes - range.size) return fail("destination size limit");
+        if (range.address < plan.table + bytes && plan.table < range.End())
+            return fail("destination overlaps the table");
         total += range.size;
         plan.ranges[plan.range_count++] = range;
     }

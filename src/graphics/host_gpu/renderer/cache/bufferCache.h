@@ -170,10 +170,11 @@ public:
 	void SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRange> candidates = {});
 	// GPU preparation: CPU-owned descriptor table -> finite writable buffers. Finalize after
 	// the last PrepareBda/RebindBuffers, before emission, to freeze exactly this table version.
+	// A refusal leaves its reason in plan.reject.
 	[[nodiscard]] bool PrepareBdaWriteCandidates(uint64_t shader_hash,
 	                                             std::span<const uint32_t> user_data,
 	                                             BdaWriteCandidates::Plan& plan);
-	[[nodiscard]] bool FinalizeBdaWriteCandidates(const BdaWriteCandidates::Plan& plan);
+	[[nodiscard]] bool FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan);
 	void RestoreBdaWriteCandidateTable(const BdaWriteCandidates::Plan& plan);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
