@@ -178,3 +178,20 @@ cena/câmera/caches, mantendo todas as opções iguais e alterando somente
 KYTY_TEXTURE_BINDING_MEMO_SLOTS=4096 / =65536 como argumento do run-u59.sh.
 Artefatos: validation/live-yotei-20261008/bindless-cpu.perf,
 perf-map-summary.json, memo-red-test.log e memo-green-tests.log.
+
+### Nova captura com memo ampliado
+
+Na reabertura com 65.536 posições, o usuário informou 3 FPS na mesma área,
+com câmera parada. A captura perf foi de 12 s, 5.137 amostras, zero perdas;
+999 amostras pertencem ao Thread_Gpu. Mapa LLD dessa mesma compilação retido.
+
+FindImageWithSameBacking apareceu em 3,90% e FindOnFirstPage em
+SyncAliasFromOwner em 3,10% das amostras do Thread_Gpu, contra 14,90% e
+11,57% na captura anterior. TryResolve passou a 19,62%, FindSlot a 8,01%
+e ReleaseKey a 6,71%. Isso identifica o custo restante no caminho do memo
+e dos descritores bindless. Percentuais são amostras de CPU, não tempos por
+frame. A diferença 0,9 → 3 FPS é uma observação do usuário, não um A/B
+controlado do ajuste.
+
+Artefatos adicionais: validation/live-yotei-20261008/memo65536-cpu.perf,
+memo65536-ip.txt, memo65536-symbols.map e memo65536-summary.json.

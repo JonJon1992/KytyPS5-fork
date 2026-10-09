@@ -1,9 +1,9 @@
 # Escritas da GPU por V# de runtime: nova arquitetura do lado da CPU
 
 Data: 2026-10-08. Autor: sessão Claude Code (mesmo usuário). Base: `guest-sync-release-mem` em `192afd16`.
-**Estado:** rascunho com parecer do Codex na seção 9. As seções 1b, 5 e 6 estão detalhadas;
-as condições e divergências apontadas na revisão ainda precisam ser resolvidas antes da
-implementação. Nada foi implementado.
+**Estado atualizado:** fase 0 runtime e F1/F2/F4 integradas; F3 implementada e validada
+no worktree cpu-coherence-service. F5 ainda não implementada. As seções iniciais registram
+o desenho histórico; os contratos corrigidos estão na seção 9 e as entregas nas seções 12–13.
 
 **Regra do usuário:** as nossas otimizações ficam. Nada pode substituir ou reverter:
 
@@ -822,3 +822,31 @@ O worktree kyty-coherence, branch cpu-coherence-service, integra a fase 0
 
 Implementação, limites da prova, correções da revisão e artefatos:
 [F4-F2-COERENCIA-2026-10-08.md](F4-F2-COERENCIA-2026-10-08.md).
+
+---
+
+## 13. F3 implementada pelo Codex; F5 pendente — 2026-10-08
+
+Pedido atual do usuário: Codex segue com F3 e F5. Essa atribuição atualiza a
+divisão histórica de arquivos da seção 10. O worktree continua
+/home/jonathanbraga/kyty-coherence, branch cpu-coherence-service.
+
+F3: KYTY_COHERENCE_PROTECT=1, desligado por padrão. Passes BDA elegíveis
+transferem uma batch de write-watch para o mesmo worker F1/F2. O job aplica
+proteção antes das cópias, e o completed é publicado depois. Sem read-watch
+adiado; hot snapshots, verify, nested e passes pequenos ficam síncronos.
+Storage reutilizado com pool limitado. O segundo watcher síncrono também
+aplica proteção pendente antes de retornar, mesmo que count já seja positivo.
+
+Build Release e 24 testes finais aprovados, incluindo prefixo pendente no
+shutdown e a regressão de readiness (vermelho antes, verde após a correção).
+Ainda não há A/B da F3 no jogo. Implementação, limites e comando:
+[F3-COERENCIA-2026-10-08.md](F3-COERENCIA-2026-10-08.md).
+
+F5: o levantamento dos contratos está feito; não há código de settle adiado.
+A implementação precisa preservar os gates obrigatórios da seção 9:
+domínio protegido antes do writer, geração de mapping e recursos retidos,
+leitores CP suspensíveis, progresso de outras filas, publicação após Applied
+e fault por página. A fila FIFO de cópia não pode receber um job bloqueado
+esperando um native tick que dependa de cópias posteriores da mesma fila.
+Uma coleta independente é necessária para evitar esse ciclo.

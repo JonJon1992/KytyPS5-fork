@@ -1318,6 +1318,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME page_manager_protect_readiness
+		COMMAND $<TARGET_FILE:page_manager_tests> --protect-readiness-only)
 	add_test(NAME page_manager_protect_reuse COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME memory_tracker_protect_reuse COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	set_tests_properties(page_manager_protect_reuse memory_tracker_protect_reuse PROPERTIES
@@ -1554,6 +1556,15 @@ if(BUILD_TESTING)
 				COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherence-copy-only)
 			set_tests_properties(coherence_copy_tex${texture_async}_${copy_mode} PROPERTIES TIMEOUT 60
 				ENVIRONMENT "KYTY_COHERENCE_COPY=${copy_mode};KYTY_TEXTURE_ASYNC_STAGING=${texture_async};KYTY_UPLOAD_DMA=1;KYTY_WRITE_DATA_GPU=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_CP_RECORDER=${texture_async};KYTY_CP_SEQ=0")
+		endforeach()
+	endforeach()
+	# F3: held worker, protection-before-copy, verify fallback, submission and unmap.
+	foreach(copy_mode IN ITEMS 1 read verify read-verify)
+		foreach(recorder IN ITEMS 0 1)
+			add_test(NAME coherence_protect_${copy_mode}_rec${recorder}
+				COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --coherence-copy-only)
+			set_tests_properties(coherence_protect_${copy_mode}_rec${recorder} PROPERTIES TIMEOUT 60
+				ENVIRONMENT "KYTY_COHERENCE_PROTECT=1;KYTY_COHERENCE_COPY=${copy_mode};KYTY_TEXTURE_ASYNC_STAGING=${recorder};KYTY_UPLOAD_DMA=1;KYTY_WRITE_DATA_GPU=0;KYTY_HOT_PAGES=0;KYTY_FAULT_AHEAD_KB=0;KYTY_FAULT_AHEAD_ADAPT=0;KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_BATCH_PROTECT=1;KYTY_BDA_SYNC_PER_SUBMISSION=0;KYTY_BDA_SYNC_EPOCH=0;KYTY_RENDERER_BATCH=1;KYTY_UPLOAD_BATCH=1;KYTY_UPLOAD_DEFER_PROTECT=1;KYTY_DEFER_UNPROTECT=1;KYTY_BUFFER_RANGE_MEMO_VERIFY=0;KYTY_CP_RECORDER=${recorder};KYTY_CP_SEQ=0")
 		endforeach()
 	endforeach()
 	# F2 must attach its worker dependency even when upload batching is disabled.

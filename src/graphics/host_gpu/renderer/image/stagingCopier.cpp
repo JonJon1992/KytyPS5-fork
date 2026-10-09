@@ -28,6 +28,7 @@ StagingCopier::StagingCopier(GraphicContext& graphics): m_graphics(graphics) {
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
 	}
 	m_range_pool.reserve(MaxRangeVectors);
+	m_protect_pool.reserve(MaxProtectBatches);
 	m_worker = std::jthread([this](std::stop_token stop) { Worker(stop); });
 }
 
@@ -102,6 +103,34 @@ void StagingCopier::Enqueue(std::vector<Range> ranges, Buffer* flush_buffer, uin
 	if (wake) {
 		m_available.notify_one();
 	}
+}
+
+PageManager::ProtectBatch StagingCopier::AcquireProtection() {
+	std::scoped_lock lock(m_mutex);
+	if (m_protect_pool.empty()) return {};
+	auto batch = std::move(m_protect_pool.back());
+	m_protect_pool.pop_back();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectReuses);
+	return batch;
+}
+
+uint64_t StagingCopier::EnqueueProtection(PageManager::ProtectBatch batch) {
+	if (batch.Empty()) return 0;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectJobs);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectSpans, batch.Size());
+	Job job;
+	job.protection = std::move(batch);
+	job.value = ++m_enqueued;
+	const auto value = job.value;
+	bool wake;
+	{
+		std::scoped_lock lock(m_mutex);
+		EXIT_IF(m_stopping);
+		wake = m_waiting && m_jobs.empty();
+		m_jobs.push_back(std::move(job));
+	}
+	if (wake) m_available.notify_one();
+	return value;
 }
 
 uint64_t StagingCopier::PendingSourceValue(uint64_t address, uint64_t size) const {
@@ -206,6 +235,13 @@ void StagingCopier::WaitHost(uint64_t value) {
 }
 
 void StagingCopier::Run(Job& job) {
+	if (!job.protection.Empty()) {
+		EXIT_IF(!job.ranges.empty());
+		Profiler::ScopedFrameWait timing(Profiler::FrameWait::CoherenceProtect);
+		job.protection.Apply();
+		return;
+	}
+	EXIT_IF(job.ranges.empty());
 	const bool coherence = job.ranges.front().backing_source != nullptr;
 	const bool trace = coherence && HangTrace::Enabled();
 	const auto start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
@@ -290,7 +326,14 @@ void StagingCopier::Worker(std::stop_token stop) {
 			m_jobs.pop_front();
 		}
 		Run(job);
-		if (job.ranges.front().backing_source != nullptr &&
+		if (job.protection.Capacity() != 0 &&
+		    job.protection.Capacity() <= MaxRetainedProtectSpans) {
+			std::scoped_lock lock(m_mutex);
+			if (m_protect_pool.size() < MaxProtectBatches) {
+				m_protect_pool.push_back(std::move(job.protection));
+			}
+		}
+		if (!job.ranges.empty() && job.ranges.front().backing_source != nullptr &&
 		    job.ranges.capacity() <= MaxRetainedRanges) {
 			job.ranges.clear();
 			std::scoped_lock lock(m_mutex);

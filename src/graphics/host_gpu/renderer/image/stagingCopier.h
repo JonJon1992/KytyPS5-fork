@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/sourceCopyTracker.h"
+#include "graphics/host_gpu/pageManager.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -29,7 +30,8 @@ class MemoryTracker;
 // for a signal that only the host can make later. With KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1 the job
 // signals a timeline semaphore instead and the batch waits for it on the GPU (up to int7).
 //
-// The source pages are write-protected by the refreshed image before the job is queued. A
+// The source pages are protected before copying: by the image at admission, or by the F3
+// prefix job on this same FIFO worker. A
 // guest write racing with the copy faults and dirties its chunk (TextureCache), so the next
 // refresh replaces whatever the copy saw of that chunk.
 class StagingCopier final: public SubmitDependency {
@@ -60,6 +62,10 @@ public:
 	void Enqueue(std::vector<Range> ranges, Buffer* flush_buffer, uint64_t flush_offset,
 	             uint64_t flush_size, std::shared_ptr<Verification> verification = {});
 
+	// F3: one protection prefix per BDA pass; all its copy jobs follow on the same worker.
+	[[nodiscard]] PageManager::ProtectBatch AcquireProtection();
+	[[nodiscard]] uint64_t EnqueueProtection(PageManager::ProtectBatch batch);
+
 	// Recording thread only: no new job can be admitted between this guard and its write.
 	void BeforeEmulatorWrite(uint64_t address, uint64_t size);
 	// Foreign backing publications hold BufferCache's admission gate across their bytes.
@@ -86,6 +92,7 @@ private:
 		uint64_t           flush_size   = 0;
 		uint64_t           value        = 0;
 		std::shared_ptr<Verification> verification;
+		PageManager::ProtectBatch protection;
 	};
 
 	void Worker(std::stop_token stop);
@@ -99,6 +106,9 @@ private:
 	static constexpr size_t MaxRangeVectors = 64;
 	static constexpr size_t MaxRetainedRanges = 4096; // at most 8 MiB of metadata
 	std::vector<std::vector<Range>> m_range_pool; // protected by m_mutex
+	static constexpr size_t MaxProtectBatches = 32;
+	static constexpr size_t MaxRetainedProtectSpans = 4096; // at most 4 MiB of spans
+	std::vector<PageManager::ProtectBatch> m_protect_pool; // protected by m_mutex
 	uint64_t                m_enqueued = 0; // recording thread
 	std::atomic<uint64_t>   m_completed {0};
 	SourceCopyTracker       m_sources {m_completed};

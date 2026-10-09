@@ -71,6 +71,7 @@ Live::Switch g_coherence_copy("KYTY_COHERENCE_COPY", [](const char* value) -> in
 	if (value != nullptr && std::strcmp(value, "read-verify") == 0) return 4;
 	return value != nullptr && std::strcmp(value, "1") == 0 ? 1 : 0;
 });
+Live::Switch g_coherence_protect("KYTY_COHERENCE_PROTECT", Live::ParseDefaultOff);
 Live::Switch g_coherence_copy_min_kb("KYTY_COHERENCE_COPY_MIN_KB",
                                     [](const char* value) -> int64_t {
 	return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 65536) : 16;
@@ -3335,7 +3336,9 @@ std::unique_lock<std::mutex> BufferCache::AcquireEmulatorWrite(uint64_t address,
 
 // The copy half of a read SynchronizeBuffer (KYTY_BDA_BATCH_PROTECT), after the pass's protection:
 // the same steps as its upload lambda and what follows it with UploadBatch on.
-void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
+void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending,
+                                         StagingCopier* protection_copier,
+                                         uint64_t protection_value, int64_t copy_mode) {
 	auto&                       buffer     = *pending.buffer;
 	auto&                       copies     = pending.copies;
 	uint64_t                    total_size = pending.total_size;
@@ -3350,15 +3353,17 @@ void BufferCache::FinishBdaBatchedUpload(PendingBdaUpload& pending) {
 	if (!pending.hot_ranges.empty()) {
 		CollectHotPages(buffer, pending.hot_ranges, copies, total_size, demote_hot, settle_hot);
 	}
-	const auto copy_mode = g_coherence_copy.Get();
+	// F3 captures the mode once per pass; smaller runs share its already queued protection.
 	const bool defer_coherence = copy_mode != 0 && guest_copies != 0 &&
-	                             host_base >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024;
+	                             (protection_value != 0 ||
+	                              host_base >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024);
 	const bool defer_host = defer_coherence ||
 	                        (m_upload_dma != nullptr && UploadDmaHostCopyEnabled() &&
 	                         !UploadDmaVerify() && m_staging_buffer.IsCoherent() &&
 	                         total_size >= m_upload_dma->MinBytes());
 	auto source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
-	                           host_base, defer_host ? &host_copies : nullptr);
+	                           host_base, defer_host ? &host_copies : nullptr,
+	                           protection_copier, protection_value);
 	if (pending.memo_applies) {
 		const bool collected = !copies.empty() || !pending.hot_ranges.empty();
 		if (!collected && pending.memo_signature != 0 &&
@@ -3571,11 +3576,20 @@ vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCo
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size, size_t guest_copies,
                                      const uint8_t* host_data, uint64_t host_base,
-                                     std::vector<UploadHostCopy>* deferred) {
+                                     std::vector<UploadHostCopy>* deferred,
+                                     StagingCopier* protection_copier, uint64_t protection_value) {
 	if (copies.empty()) {
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	EXIT_IF((protection_copier == nullptr) != (protection_value == 0));
+	const auto wait_protection = [&] {
+		if (protection_value != 0 && !protection_copier->Submittable(protection_value)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectFallbacks);
+			Profiler::ScopedFrameWait timing(Profiler::FrameWait::CoherenceProtectWait);
+			protection_copier->WaitHost(protection_value);
+		}
+	};
 	// The first guest_copies read guest memory at their destination; the rest read host_data
 	// at (srcOffset - host_base).
 	const auto source_of = [&](size_t index, const vk::BufferCopy& copy) -> const void* {
@@ -3616,6 +3630,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
 				                     copy.size, buffer.CpuAddress() + copy.dstOffset});
 			} else {
+				if (index < guest_copies) wait_protection();
 				std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
 			}
 			copy.srcOffset += base_offset;
@@ -3624,6 +3639,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return m_staging_buffer.Handle();
 	}
 
+	if (guest_copies != 0) wait_protection();
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (size_t index = 0; index < copies.size(); index++) {
@@ -4940,15 +4956,36 @@ void BufferCache::RunBdaPass(Collect&& collect) {
 		return;
 	}
 	m_bda_pending_count = 0;
+	const auto copy_mode = g_coherence_copy.Get();
+	StagingCopier* protection_copier = nullptr;
+	uint64_t protection_value = 0;
 	{
-		const PageManager::DeferProtectScope defer_protect;
+		PageManager::DeferProtectScope defer_protect;
 		m_bda_pending = &m_bda_pending_pool;
 		collect();
 		m_bda_pending = nullptr;
+		bool asynchronous = g_coherence_protect.On() && (copy_mode == 1 || copy_mode == 3);
+		uint64_t bytes = 0;
+		for (size_t index = 0; asynchronous && index < m_bda_pending_count; index++) {
+			const auto& pending = m_bda_pending_pool[index];
+			// Hot snapshots and verification read on the recording thread; keep their
+			// original synchronous protection. Ordinary runs share one FIFO prefix.
+			asynchronous = pending.hot_ranges.empty() && UINT64_MAX - bytes >= pending.total_size;
+			if (asynchronous) bytes += pending.total_size;
+		}
+		if (asynchronous && bytes >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024) {
+			auto& copier = m_texture_cache.EnsureStagingCopier();
+			auto protection = copier.AcquireProtection();
+			if (defer_protect.DetachTo(protection)) {
+				protection_value = copier.EnqueueProtection(std::move(protection));
+				protection_copier = &copier;
+			}
+		}
 	}
 	const auto count = std::exchange(m_bda_pending_count, 0);
 	for (size_t index = 0; index < count; index++) {
-		FinishBdaBatchedUpload(m_bda_pending_pool[index]);
+		FinishBdaBatchedUpload(m_bda_pending_pool[index], protection_copier,
+		                       protection_value, copy_mode);
 	}
 }
 

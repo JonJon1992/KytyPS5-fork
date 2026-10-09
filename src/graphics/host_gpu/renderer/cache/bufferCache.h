@@ -523,7 +523,9 @@ private:
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
 	                                      uint64_t       host_base = 0,
-	                                      std::vector<UploadHostCopy>* deferred = nullptr);
+	                                      std::vector<UploadHostCopy>* deferred = nullptr,
+	                                      StagingCopier* protection_copier = nullptr,
+	                                      uint64_t protection_value = 0);
 	// Hot pages (GPU thread). Snapshots each hot page of hot_ranges, appends a copy (reading
 	// m_hot_scratch from the first appended srcOffset on) for those that differ from their
 	// shadow, and lists pages to return to normal tracking: `demote` (still CPU-dirty) and
@@ -729,7 +731,8 @@ private:
 	size_t                         m_bda_pending_count = 0;
 	void QueueBdaBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t size, BdaSyncStats* stats,
 	                           bool memo_applies, uint64_t memo_signature);
-	void FinishBdaBatchedUpload(PendingBdaUpload& pending);
+	void FinishBdaBatchedUpload(PendingBdaUpload& pending, StagingCopier* protection_copier,
+	                            uint64_t protection_value, int64_t copy_mode);
 	[[nodiscard]] bool TryCoherenceUpload(Buffer& buffer, vk::Buffer source,
 	                                      std::span<vk::BufferCopy> copies,
 	                                      const std::vector<UploadHostCopy>& host_copies,

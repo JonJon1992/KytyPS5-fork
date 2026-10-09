@@ -361,6 +361,10 @@ enum class FrameEvent : uint32_t {
 	CoherenceCopyVerifyRedirties,
 	CoherenceCopyVerifyGpuChecks,
 	CoherenceCopyVerifyMismatches,
+	CoherenceProtectJobs,
+	CoherenceProtectSpans,
+	CoherenceProtectReuses,
+	CoherenceProtectFallbacks,
 	// Image refresh bytes by source route: an existing cache buffer or GPU-written bytes
 	// (BufferCache), a synchronous staging copy on the GPU thread, or the StagingCopier worker.
 	TextureUploadBytesBuffer,
@@ -1284,6 +1288,8 @@ enum class FrameWait : uint32_t {
 	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
 	TextureStagingCopy,
 	CoherenceStagingCopy, // worker time, excluded from GPU-thread critical path
+	CoherenceProtect, // worker time applying F3 protection batches
+	CoherenceProtectWait, // inline fallback waiting only for its protection prefix
 	CoherenceCopyGuard,   // emulator writer waiting for overlapping source copies
 	CoherenceCopyGuardLookup, // alias translation and interval query while sources are pending
 	// GPU (CP) thread blocked in MasterSemaphore::Wait (submission dispatch plus timeline wait;

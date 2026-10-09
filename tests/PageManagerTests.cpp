@@ -13,6 +13,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -627,6 +628,126 @@ void TestDeferProtectScope(DeferMode mode) {
   SetDeferMode(DeferMode::On);
 }
 
+// A consumer outside the collecting scope may snapshot only after its watch is applied,
+// even when another owner already holds a count whose protection is still pending.
+void TestPendingProtectionReadiness(DeferMode mode, bool masked) {
+  SetDeferMode(DeferMode::On);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  PageManager::ProtectBatch batch;
+  {
+    PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address, page_size);
+    Check(scope.DetachTo(batch), "pending-readiness batch was not detached");
+  }
+  Check(IsWritable(memory), "fixture has no pending host protection");
+  SetDeferMode(mode);
+  if (masked) {
+    const auto region = address & ~(TRACKER_REGION_SIZE - 1);
+    RegionBits mask;
+    mask.Set((address - region) / page_size);
+    manager.UpdatePageWatchersForRegion<true>(region, mask);
+  } else {
+    manager.UpdatePageWatchers<true>(address, page_size);
+  }
+  Check(Protection(memory) == PAGE_READONLY,
+        "a synchronous second watcher returned before pending protection was applied");
+  Check(manager.CountWatchedPages(address, page_size).write == 1,
+        "the readiness reconciliation changed watcher ownership");
+  batch.Apply();
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "first release dropped the second owner");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(IsWritable(memory), "readiness test left protection without an owner");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  SetDeferMode(DeferMode::On);
+}
+
+// Transfer ownership, apply current counts, and keep storage for later batches.
+void TestTransferredProtectBatch() {
+  SetDeferMode(DeferMode::On);
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  PageManager::ProtectBatch batch;
+  {
+    PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address, page_size * 2);
+    Check(scope.DetachTo(batch) && !PageManager::InDeferProtectScope() && !batch.Empty(),
+          "outer protection batch was not transferred");
+  }
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "transferred batch reached the host on the collecting thread");
+  const auto capacity = batch.Capacity();
+  Check(batch.Size() != 0 && capacity >= batch.Size(), "transferred batch lost its spans");
+  std::thread([&] { batch.Apply(); }).join();
+  Check(batch.Empty() && batch.Capacity() == capacity &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READONLY,
+        "worker did not protect watched pages or retain batch storage");
+  manager.UpdatePageWatchers<false>(address, page_size * 2);
+  {
+    PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address, page_size * 2);
+    Check(scope.DetachTo(batch), "reused batch could not take new spans");
+  }
+  manager.UpdatePageWatchers<false>(address, page_size);
+  const auto region = address & ~(TRACKER_REGION_SIZE - 1);
+  RegionBits access;
+  access.Set((address - region) / page_size + 1);
+  manager.UpdatePageWatchersForRegion<true, true>(region, access);
+  std::thread([&] { batch.Apply(); }).join();
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_NOACCESS,
+        "late protection ignored an unwatch or loosened a new read watcher");
+  manager.UpdatePageWatchersForRegion<false, true>(region, access);
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  {
+    PageManager::ProtectBatch cancelled;
+    PageManager::DeferProtectScope scope;
+    manager.UpdatePageWatchers<true>(address + 2 * page_size, page_size);
+    Check(scope.DetachTo(cancelled), "cancelled batch was not detached");
+  }
+  Check(Protection(memory + 2 * page_size) == PAGE_READONLY,
+        "destroying an unqueued batch dropped pending protection");
+  manager.UpdatePageWatchers<false>(address + 2 * page_size, page_size);
+  {
+    PageManager::ProtectBatch first, second;
+    {
+      PageManager::DeferProtectScope scope;
+      manager.UpdatePageWatchers<true>(address + 3 * page_size, page_size);
+      Check(scope.DetachTo(first), "first move batch was not detached");
+    }
+    {
+      PageManager::DeferProtectScope scope;
+      manager.UpdatePageWatchers<true>(address + 4 * page_size, page_size);
+      Check(scope.DetachTo(second), "second move batch was not detached");
+    }
+    first = std::move(second);
+    Check(Protection(memory + 3 * page_size) == PAGE_READONLY && second.Empty(),
+          "move assignment dropped the destination's previous batch");
+    PageManager::ProtectBatch moved(std::move(first));
+    Check(first.Empty() && !moved.Empty(), "move construction lost batch ownership");
+    moved.Apply();
+  }
+  manager.UpdatePageWatchers<false>(address + 3 * page_size, 2 * page_size);
+  {
+    PageManager::DeferProtectScope outer;
+    {
+      PageManager::DeferProtectScope inner;
+      manager.UpdatePageWatchers<true>(address + 5 * page_size, page_size);
+      Check(!inner.DetachTo(batch), "nested scope detached its enclosing protection");
+    }
+    Check(IsWritable(memory + 5 * page_size), "nested scope applied the outer batch");
+  }
+  Check(Protection(memory + 5 * page_size) == PAGE_READONLY,
+        "nested fallback lost synchronous protection");
+  manager.UpdatePageWatchers<false>(address + 5 * page_size, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestDeferredReleaseWaitsForScope(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
@@ -1032,6 +1153,13 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--protect-readiness-only") == 0) {
+    for (const auto mode : {DeferMode::Off, DeferMode::On, DeferMode::Verify})
+      for (const bool masked : {false, true})
+        TestPendingProtectionReadiness(mode, masked);
+    std::puts("PageManagerTests: pending protection readiness passed");
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -1075,6 +1203,10 @@ int main(int argc, char **argv) {
     TestDeferredReleaseStress(mode);
     TestDeferProtectScope(mode);
   }
+  for (const auto mode : {DeferMode::Off, DeferMode::On, DeferMode::Verify})
+    for (const bool masked : {false, true})
+      TestPendingProtectionReadiness(mode, masked);
+  TestTransferredProtectBatch();
   TestDeferredBatchOverflow();
   TestParkingLock();
   const auto stats = PageManager::GetDeferStats();

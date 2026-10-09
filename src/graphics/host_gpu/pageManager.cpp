@@ -577,8 +577,7 @@ struct PageManager::Impl {
 	// End of the outermost DeferProtectScope: one ApplySpan per region over all of its pending
 	// runs, from the counts as they are now (pages between the runs that already have their level
 	// are bridged, pages that need another level split the call).
-	static void ApplyProtectBatch() noexcept {
-		auto& spans = t_protect_batch.spans;
+	static void ApplyProtectBatch(std::vector<ProtectSpan>& spans) noexcept {
 		if (spans.empty()) {
 			return;
 		}
@@ -745,8 +744,8 @@ struct PageManager::Impl {
 				{
 					SpinGuard host(region.host_lock);
 					SpinGuard counts(region.lock);
-					UpdateCountsLocked<track, is_read, masked>(region, base_addr, first, last, mask,
-					                                           &runs);
+					UpdateCountsLocked<track, is_read, masked, true>(region, base_addr, first, last, mask,
+					                                                 &runs);
 				}
 				for (size_t index = 0; index < runs.count; index++) {
 					t_protect_batch.spans.push_back(
@@ -770,7 +769,7 @@ struct PageManager::Impl {
 	// Caller holds both locks: updates the counts of the selected pages and protects the pages
 	// whose protection this changes. With `runs` the host calls are collected for after `lock`
 	// (a full list falls back to calling here); without, they are made here, as always before.
-	template <bool track, bool is_read, bool masked>
+	template <bool track, bool is_read, bool masked, bool defer_protect = false>
 	void UpdateCountsLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                        const RegionBits* mask, RunList* runs) {
 		const bool reuse_applied = track && !is_read && ReuseAppliedProtection();
@@ -813,7 +812,12 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
-			if (watcher_edge && old_perms != new_perms) {
+			// A detached F3 batch may already own a watch whose host call is pending.
+			// A new synchronous consumer must be protected even on the 1 -> 2 count edge.
+			// Both locks are held; deferred collectors leave this work to their batch.
+			const bool unapplied_watch = track && !is_read && !defer_protect &&
+			                              region.applied[page_index] < ToLevel(new_perms);
+			if ((watcher_edge && old_perms != new_perms) || unapplied_watch) {
 				// A deferred write release may still have the host read-only when an upload
 				// watches again. Both locks are held, so no PageManager host call is in flight;
 				// also check the actual host to catch protection changes outside PageManager.
@@ -873,13 +877,51 @@ PageManager::DeferUnprotectScope::~DeferUnprotectScope() {
 	}
 }
 
+struct PageManager::ProtectBatch::Storage {
+	std::vector<Impl::ProtectSpan> spans;
+};
+
+PageManager::ProtectBatch::ProtectBatch() noexcept = default;
+PageManager::ProtectBatch::~ProtectBatch() { Apply(); }
+PageManager::ProtectBatch::ProtectBatch(ProtectBatch&&) noexcept = default;
+
+PageManager::ProtectBatch& PageManager::ProtectBatch::operator=(ProtectBatch&& other) noexcept {
+	if (this != &other) {
+		Apply(); // replacing a pending batch must not drop its protection
+		m_storage = std::move(other.m_storage);
+	}
+	return *this;
+}
+
+void PageManager::ProtectBatch::Apply() noexcept {
+	if (m_storage) Impl::ApplyProtectBatch(m_storage->spans);
+}
+
+bool PageManager::ProtectBatch::Empty() const noexcept { return Size() == 0; }
+size_t PageManager::ProtectBatch::Size() const noexcept {
+	return m_storage ? m_storage->spans.size() : 0;
+}
+size_t PageManager::ProtectBatch::Capacity() const noexcept {
+	return m_storage ? m_storage->spans.capacity() : 0;
+}
+
+bool PageManager::DeferProtectScope::DetachTo(ProtectBatch& batch) noexcept {
+	auto& pending = Impl::t_protect_batch;
+	if (!m_active || pending.depth != 1 || pending.spans.empty() || !batch.Empty()) return false;
+	if (!batch.m_storage) batch.m_storage = std::make_unique<ProtectBatch::Storage>();
+	pending.spans.swap(batch.m_storage->spans);
+	pending.depth = 0;
+	m_active = false;
+	return true;
+}
+
 PageManager::DeferProtectScope::DeferProtectScope() noexcept {
 	Impl::t_protect_batch.depth++;
 }
 
 PageManager::DeferProtectScope::~DeferProtectScope() {
-	if (--Impl::t_protect_batch.depth == 0) {
-		Impl::ApplyProtectBatch();
+	if (m_active && --Impl::t_protect_batch.depth == 0) {
+		Impl::ApplyProtectBatch(Impl::t_protect_batch.spans);
 	}
 }
 

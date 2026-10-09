@@ -9,6 +9,9 @@ void CheckCoherenceCopy() {
   using namespace std::chrono_literals;
   const auto* mode_env = std::getenv("KYTY_COHERENCE_COPY");
   const std::string mode = mode_env != nullptr ? mode_env : "";
+  const auto* protect_env = std::getenv("KYTY_COHERENCE_PROTECT");
+  const bool protect_requested = protect_env != nullptr && std::strcmp(protect_env, "1") == 0;
+  const bool async_protect = protect_requested && (mode == "1" || mode == "read");
   Require(name, "mode", mode == "1" || mode == "verify" || mode == "read" || mode == "read-verify", "fixture needs F1 enabled");
   Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
   const auto jobs_before = Profiler::FrameEventTotal(Event::CoherenceCopyJobs);
@@ -16,6 +19,7 @@ void CheckCoherenceCopy() {
   const auto reused_before = Profiler::FrameEventTotal(Event::CoherenceCopyRangeReuses);
   const auto mismatches_before = Profiler::FrameEventTotal(Event::CoherenceCopyVerifyMismatches);
   const auto gpu_checks_before = Profiler::FrameEventTotal(Event::CoherenceCopyVerifyGpuChecks);
+  const auto protection_reuses_before = Profiler::FrameEventTotal(Event::CoherenceProtectReuses);
 
   auto owner = MakeRenderContext();
   auto &context = *owner;
@@ -62,7 +66,7 @@ void CheckCoherenceCopy() {
     context.MapMemory(base, bytes);
     id = cache.FindBuffer(base, bytes);
   });
-  const bool read_bindings = mode == "read" || mode == "read-verify";
+  const bool read_bindings = !protect_requested && (mode == "read" || mode == "read-verify");
   const auto prepare_upload = [&] {
     if (read_bindings) {
       (void)cache.ObtainBuffer(base, bytes, false, false, id);
@@ -74,6 +78,7 @@ void CheckCoherenceCopy() {
   // Its lease must keep admission out until all backing bytes have landed.
   std::vector<uint8_t> initial(bytes, 0x41);
   auto publication = context.PrepareHostBackingWrite(base, bytes, RenderContext::HostWriter::Occlusion);
+  const auto protect_before = PageManager::GetProtectBatchStats();
   std::promise<void> preparing;
   auto admission = std::async(std::launch::async, [&] {
     OnGpuThread(context, [&] {
@@ -91,6 +96,19 @@ void CheckCoherenceCopy() {
       unpublished && initial_written, "a source was admitted while its backing publication still held the lease");
   Require(name, "admitted job", Profiler::FrameEventTotal(Event::CoherenceCopyJobs) > jobs_before,
       "the fixture did not use FinishBdaBatchedUpload's host worker");
+  if (protect_requested) {
+    const auto after = PageManager::GetProtectBatchStats();
+    if (async_protect) {
+      Require(name, "pending protection returned", after.applies == protect_before.applies &&
+          copier->PendingValue() != 0,
+          "PrepareBda synchronously applied protection while its worker was held");
+      // The write before host protection must be included in the later worker copy.
+      std::memset(mapped, 0x52, bytes);
+    } else {
+      Require(name, "verify protection synchronous", after.applies > protect_before.applies,
+          "verification read its CPU snapshot before protecting the source");
+    }
+  }
   auto &buffer = cache.GetBuffer(id);
   const auto snapshot = [&](auto &readback) {
     OnGpuThread(context, [&] {
@@ -142,7 +160,7 @@ void CheckCoherenceCopy() {
   auto second = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
   snapshot(second);
   OnGpuThread(context, [&] { scheduler.Finish(); });
-  check(first, 0x41414141, "earlier upload bytes");
+  check(first, async_protect ? 0x52525252 : 0x41414141, "earlier upload bytes");
   check(second, 0x72727272, "later upload bytes");
 
   // A submission must not consume staging before its CPU copy. Gate the copier, then start
@@ -235,6 +253,33 @@ void CheckCoherenceCopy() {
       "an upload without a contiguous alias was deferred or its bytes changed");
   DestroyBuffer(&fallback_readback);
   OnGpuThread(context, [&] { context.UnmapMemory(alias_address, bytes); });
+
+  if (async_protect) {
+    // A stopping worker must drain a genuinely pending prefix even when the test hold
+    // would normally prevent it from starting. The VA remains mapped until below.
+    PageManager pages;
+    auto stopping = std::make_unique<StagingCopier>(scheduler.Graphics());
+    stopping->HoldWorkerForTest(true);
+    auto protection = stopping->AcquireProtection();
+    {
+      PageManager::DeferProtectScope scope;
+      pages.UpdatePageWatchers<true>(alias_address, pages.GetPageSize());
+      Require(name, "shutdown fixture detached", scope.DetachTo(protection),
+          "the shutdown fixture did not create a new pending write watch");
+    }
+    const auto applies_before = PageManager::GetProtectBatchStats().applies;
+    const auto prefix = stopping->EnqueueProtection(std::move(protection));
+    Require(name, "shutdown prefix held", prefix != 0 && !stopping->Submittable(prefix),
+        "the shutdown fixture did not retain pending protection");
+    stopping.reset(); // the destructor releases the hold by stopping and drains the prefix
+    Require(name, "shutdown drains protection",
+        PageManager::GetProtectBatchStats().applies > applies_before,
+        "worker destruction dropped its pending protection prefix");
+    pages.UpdatePageWatchers<false>(alias_address, pages.GetPageSize());
+    Require(name, "protection storage reused",
+        Profiler::FrameEventTotal(Event::CoherenceProtectReuses) > protection_reuses_before,
+        "completed protection jobs discarded their reusable batch storage");
+  }
 
   // Kernel unmap retains aliases until recording and its source copies have drained.
   OnGpuThread(context, [&] {

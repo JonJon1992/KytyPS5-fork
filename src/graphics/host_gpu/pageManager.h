@@ -92,12 +92,39 @@ public:
 	// The caller must not read the watched pages for an upload until the scope has ended: a write
 	// landing while the host call is pending does not fault, so only a copy made after the scope
 	// sees it (KYTY_BDA_BATCH_PROTECT: collect every upload of a pass, end the scope, then copy).
+	class DeferProtectScope;
+	// Move-only ownership of deferred write watches. Apply rechecks current watcher counts.
+	// Drain every batch before destroying its PageManager or mapping; cancellation applies it.
+	// Applied batches retain their storage for the caller's bounded recycling pool.
+	class ProtectBatch final {
+	public:
+		ProtectBatch() noexcept;
+		~ProtectBatch();
+		ProtectBatch(ProtectBatch&&) noexcept;
+		ProtectBatch& operator=(ProtectBatch&&) noexcept;
+		ProtectBatch(const ProtectBatch&) = delete;
+		ProtectBatch& operator=(const ProtectBatch&) = delete;
+		void Apply() noexcept;
+		[[nodiscard]] bool Empty() const noexcept;
+		[[nodiscard]] size_t Size() const noexcept;
+		[[nodiscard]] size_t Capacity() const noexcept;
+	private:
+		struct Storage;
+		std::unique_ptr<Storage> m_storage;
+		friend class DeferProtectScope;
+	};
+
 	class DeferProtectScope final {
 	public:
 		DeferProtectScope() noexcept;
 		~DeferProtectScope();
 		DeferProtectScope(const DeferProtectScope&)            = delete;
 		DeferProtectScope& operator=(const DeferProtectScope&) = delete;
+		// Only an outermost scope can transfer, into an empty reusable batch. Its destructor
+		// then has no work. A nested scope keeps the original synchronous outer-scope path.
+		[[nodiscard]] bool DetachTo(ProtectBatch& batch) noexcept;
+	private:
+		bool m_active = true;
 	};
 	// Whether the calling thread is inside a DeferProtectScope. A caller that copies right after
 	// its own scope ends must not open one nested in another: the host calls would wait for the
