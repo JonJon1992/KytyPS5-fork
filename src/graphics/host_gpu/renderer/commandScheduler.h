@@ -76,6 +76,14 @@ public:
 	    Common::UniqueFunction<void>&& operation,
 	    PriorityOperationKind kind = PriorityOperationKind::Generic,
 	    std::source_location caller = std::source_location::current());
+	// The recording owner applies results; the runner only collects immutable data.
+	using AppliedHook = uint64_t (*)(void*);
+	using ServiceHook = void (*)(void*);
+	void SetCoherenceHooks(AppliedHook applied, ServiceHook service, void* context);
+	void SetCoherencePrefix(uint64_t ticket);
+	void NotifyCoherenceApplied();
+	void ServiceCoherence();
+	void DeferCollectionOperation(Common::UniqueFunction<void>&& operation, uint64_t tick);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Called on the completion runner after every priority operation (e.g. to wake queues
 	// suspended on what it published). Clear it, then DrainPriorityOperations, before the
@@ -177,6 +185,7 @@ private:
 		PriorityOperationKind        kind = PriorityOperationKind::Generic;
 		uint64_t                     trace_address = 0;
 		uint64_t                     trace_size = 0;
+		uint64_t                     coherence_prefix = 0;
 	};
 
 	void BeginNext();
@@ -186,6 +195,8 @@ private:
 	void PopOperations(bool wait_for_priority);
 	// m_operation_mutex held: no priority operation of `tick` or earlier is queued or running.
 	[[nodiscard]] bool PriorityDoneLocked(uint64_t tick) const noexcept;
+	[[nodiscard]] bool CoherenceDoneLocked(uint64_t tick) const noexcept;
+	[[nodiscard]] bool PublicationReadyLocked() const noexcept;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -194,6 +205,17 @@ private:
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	std::queue<PendingOperation> m_collection_operations;
+	bool                         m_collection_active = false;
+	uint64_t                     m_collection_active_tick = 0;
+	AppliedHook                  m_coherence_applied = nullptr;
+	ServiceHook                  m_coherence_service = nullptr;
+	void*                        m_coherence_context = nullptr;
+	std::thread::id               m_coherence_owner;
+	bool                         m_servicing_coherence = false;
+	uint64_t                     m_coherence_prefix = 0;
+	struct CoherenceFrontier { uint64_t tick, prefix; };
+	std::vector<CoherenceFrontier> m_coherence_frontiers;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	// The completion runner sleeps on its own condition, so a push can wake exactly it.

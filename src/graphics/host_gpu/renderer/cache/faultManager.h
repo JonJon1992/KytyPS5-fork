@@ -44,6 +44,12 @@ public:
 	// (BdaCandidateDroppedWrites, a log line) and fatal with KYTY_BDA_WRITES_VERIFY. While every
 	// slot still waits for its recording, the count carries over to the next check.
 	void QueueBdaDroppedCheck(uint64_t shader_hash);
+	static constexpr uint32_t BdaWriteSlots = 8;
+	// Record belongs to the GPU owner; parse belongs to the native-completion
+	// runner. A slot is retained until the owner has applied its result.
+	[[nodiscard]] uint64_t RecordBdaWrites(uint32_t slot);
+	void ParseBdaWrites(uint32_t slot, BdaWrites& result);
+	void ReleaseBdaWrites(uint32_t slot);
 
 private:
 	void CreateBdaWriteResources();
@@ -64,11 +70,12 @@ private:
 	// KYTY_BDA_WRITES_SHADERS, created at the first collection: the 64Ki-page compaction of the
 	// written-page bitmap and its host-visible result (page list, then the dropped count).
 	vk::Pipeline                               m_bda_write_pipeline = nullptr;
-	std::unique_ptr<Buffer>                    m_bda_write_download;
 	// QueueBdaDroppedCheck's readback slots, shared with the completion callbacks.
 	struct DroppedChecks;
 	std::shared_ptr<DroppedChecks>             m_dropped_checks;
 	uint32_t                                   m_dropped_check_next = 0;
+	std::array<std::unique_ptr<Buffer>, BdaWriteSlots> m_bda_write_download;
+	std::array<uint64_t, BdaWriteSlots>              m_bda_write_ticks {};
 };
 
 } // namespace Libs::Graphics

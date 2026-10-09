@@ -53,6 +53,7 @@ public:
 	// Something a suspended (blocked) queue may wait for has changed: clear the blocked marks so
 	// the scheduler retries them now, and wake it. Any thread.
 	void NotifyProgress();
+	void NotifyCoherenceProgress();
 	// Some async compute queue has a submission that is not suspended. GPU thread.
 	[[nodiscard]] bool HasRunnableComputeWork();
 
@@ -113,7 +114,8 @@ private:
 	void              WaitForIdle();
 	void              ProcessCommands();
 	[[nodiscard]] bool HasPendingCommands() const noexcept {
-		return m_pending_commands.load(std::memory_order_acquire) != 0;
+		return m_pending_commands.load(std::memory_order_acquire) != 0 ||
+		       m_coherence_work.load(std::memory_order_acquire);
 	}
 	bool              Process(Submission& submission);
 	// KYTY_CP_SEQ=1: a queue-0 submission, executed from the sequencer's ops.
@@ -137,6 +139,7 @@ private:
 	// Polled by the GPU thread at every packet or op (HasPendingCommands): alone on its cache line,
 	// so the fields admissions write under m_queue_mutex do not evict it.
 	alignas(64) std::atomic_uint32_t               m_pending_commands {0};
+	std::atomic<bool>                             m_coherence_work {false};
 	alignas(64) std::deque<DeferredLabel>          m_deferred_labels; // m_queue_mutex
 	std::atomic_uint32_t                           m_deferred_label_count {0};
 	// Compute submissions in m_queues (changed under m_queue_mutex; HasRunnableComputeWork fast

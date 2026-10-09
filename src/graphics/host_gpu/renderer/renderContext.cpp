@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 
 #include "common/alignment.h"
@@ -195,6 +196,25 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::DeferGpuAccess(uint64_t address, uint64_t size) {
+	if (!ShaderRecompiler::BdaWritesDeferredEnabled() || !HasGpu() ||
+	    m_gpu->DeferredLabelTick(address, size) == 0) return false;
+	m_deferred_gpu_read = true;
+	return true;
+}
+
+bool RenderContext::DeferGpuRead(uint64_t address, uint64_t size) {
+	if (DeferGpuAccess(address, size)) return true;
+	m_command_scheduler.ServiceCoherence();
+	const auto ticket = m_buffer_cache.PendingBdaWrite(address, size);
+	if (ticket == 0) return false;
+	m_deferred_gpu_read = true;
+	// Submit recorded producers without waiting; the CP retries only this op.
+	if (m_buffer_cache.PendingBdaWriteTick(address, size) == m_command_scheduler.CurrentTick() &&
+	    !m_command_scheduler.Current().IsInvalid()) m_command_scheduler.Flush();
+	return true;
+}
+
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	HangTrace::SyncResource sync_resource(vaddr, size);
 	const auto refused = [vaddr, size](const char* reason) {
@@ -213,6 +233,7 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	if (!m_command_scheduler.Active()) return refused("inactive-scheduler");
 	if (m_command_scheduler.Current().IsInvalid()) return refused("invalid-recording");
 	if (!IsMapped(vaddr, size)) return refused("unmapped-range");
+	if (DeferGpuRead(vaddr, size)) return false;
 	// Old render targets whose memory the CPU rewrote (tables reusing it) give up their bytes:
 	// guest memory holds the current contents there.
 	(void)m_texture_cache.ReleaseCpuOverwrittenImages(vaddr, size);

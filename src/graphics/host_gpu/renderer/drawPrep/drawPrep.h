@@ -163,6 +163,7 @@ struct PreparedDraw {
 	PipelineCache::StagePrep                            pixel_prep;
 	ReadSet                                             reads;
 	uint64_t                                            coherence_generation  = 0;
+	uint64_t                                            unknown_write_epoch = 0;
 	uint64_t                                            shader_map_generation = 0;
 	// KYTY_DRAW_PREP_CERT_RANGES=worker: reads.BuildCertificate() of a successful preparation,
 	// built by the preparing thread (certificate_built); Validate uses it for the log check.

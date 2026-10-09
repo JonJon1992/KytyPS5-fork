@@ -259,27 +259,34 @@ void FaultManager::CreateBdaWriteResources() {
 	m_bda_write_pipeline =
 	    CreateCompactionPipeline(m_graphics.device, m_fault_process_pipeline_layout,
 	                             BDA_WRITE_PROCESS_SPV, "BDA Written-Page Parser");
-	m_bda_write_download =
-	    std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags,
-	                             BdaWriteDownloadSize(m_graphics));
-	SetVulkanObjectNameF(m_graphics.device, m_bda_write_download->Handle(),
-	                     "BDA Written-Page Readback");
+
 }
 
-void FaultManager::CollectBdaWrites(BdaWrites& result) {
+uint64_t FaultManager::RecordBdaWrites(uint32_t slot) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	KYTY_GPU_OP_SITE("fault.bda_writes");
-	EXIT_IF(!m_bda_writes);
+	EXIT_IF(!m_bda_writes || slot >= BdaWriteSlots || m_bda_write_ticks[slot] != 0);
 	(void)GetFaultBuffer();
 	if (m_bda_write_pipeline == nullptr) {
 		CreateBdaWriteResources();
 	}
-	// One readback area: the wait below completes the previous collection before this one.
-	auto&      download = *m_bda_write_download;
+	if (!m_bda_write_download[slot]) {
+		m_bda_write_download[slot] = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags,
+		    BdaWriteDownloadSize(m_graphics));
+		SetVulkanObjectNameF(m_graphics.device, m_bda_write_download[slot]->Handle(),
+		                     "BDA Written-Page Readback {}", slot);
+	}
+	auto&      download = *m_bda_write_download[slot];
 	const auto size     = download.Size();
 	auto*      mapped   = download.Mapped().data();
-	std::memset(mapped, 0, WrittenPageAreaSize + sizeof(uint32_t));
-	download.Flush(0, size);
+	// The compactor overwrites every reported entry. Clear just its counter
+	// and the dropped count instead of touching a 512 KiB list per dispatch.
+	std::memset(mapped, 0, sizeof(uint64_t));
+	std::memset(mapped + WrittenPageAreaSize, 0, sizeof(uint32_t));
+	// VMA rounds each range to non-coherent atoms; untouched list bytes need no flush.
+	download.Flush(0, sizeof(uint64_t));
+	download.Flush(WrittenPageAreaSize, sizeof(uint32_t));
 
 	// Producers: the dispatches that set bitmap bits and the dropped count (any stage, through
 	// BDA). Consumers: the compaction (reads and clears the bitmap) and the count's copy and clear.
@@ -310,7 +317,7 @@ void FaultManager::CollectBdaWrites(BdaWrites& result) {
 	}
 
 	m_scheduler.EndRendering();
-	auto               command = m_scheduler.Current().Handle();
+	auto               command = m_scheduler.Current().Sink();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -326,7 +333,7 @@ void FaultManager::CollectBdaWrites(BdaWrites& result) {
 	// Read the dropped count, then clear it once the copy has read it (write-after-read).
 	const vk::BufferCopy dropped_copy {BufferCache::BDA_DROPPED_WRITES_OFFSET, WrittenPageAreaSize,
 	                                   sizeof(uint32_t)};
-	command.copyBuffer(m_fault_buffer.Handle(), download.Handle(), dropped_copy);
+	command.copyBuffer(m_fault_buffer.Handle(), download.Handle(), 1, &dropped_copy);
 	vk::BufferMemoryBarrier2 dropped_barrier {};
 	dropped_barrier.srcStageMask     = vk::PipelineStageFlagBits2::eTransfer;
 	dropped_barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
@@ -363,11 +370,18 @@ void FaultManager::CollectBdaWrites(BdaWrites& result) {
 	dependency.pBufferMemoryBarriers    = post_barriers.data();
 	command.pipelineBarrier2(dependency);
 
-	result.tick = m_scheduler.CurrentTick();
-	{
-		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::BdaSettle);
-		m_scheduler.Wait(result.tick);
-	}
+	m_bda_write_ticks[slot] = m_scheduler.CurrentTick();
+	return m_bda_write_ticks[slot];
+}
+
+void FaultManager::ParseBdaWrites(uint32_t slot, BdaWrites& result) {
+	EXIT_IF(slot >= BdaWriteSlots || m_bda_write_ticks[slot] == 0);
+	// Its caller has already waited for the native timeline. No GPU-owned
+	// cache metadata is inspected or changed on the completion runner.
+	auto& download = *m_bda_write_download[slot];
+	const auto size = download.Size();
+	const auto* mapped = download.Mapped().data();
+	result.tick = m_bda_write_ticks[slot];
 	download.Invalidate(0, size);
 
 	result.written.Clear();
@@ -486,6 +500,21 @@ void FaultManager::QueueBdaDroppedCheck(uint64_t shader_hash) {
 			     shader_hash, dropped);
 		}
 	});
+}
+
+void FaultManager::ReleaseBdaWrites(uint32_t slot) {
+	EXIT_IF(slot >= BdaWriteSlots || m_bda_write_ticks[slot] == 0);
+	m_bda_write_ticks[slot] = 0;
+}
+
+void FaultManager::CollectBdaWrites(BdaWrites& result) {
+	const auto tick = RecordBdaWrites(0);
+	{
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::BdaSettle);
+		m_scheduler.Wait(tick);
+	}
+	ParseBdaWrites(0, result);
+	ReleaseBdaWrites(0);
 }
 
 } // namespace Libs::Graphics

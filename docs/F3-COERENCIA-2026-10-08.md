@@ -57,7 +57,8 @@ Artefatos em `/home/jonathanbraga/KytyPS5-fork/_Build/coherence-f1/validation/`:
 
 A/B da F3 no jogo ainda pendente. Os 3 FPS informados pelo usuário foram
 medidos antes desta F3, após ampliar o memo de texturas. Não atribuir esse
-resultado à F3. F5/settle adiado ainda não implementada.
+resultado à F3. A F5/settle adiado foi entregue posteriormente; veja
+[F5-COERENCIA-2026-10-08.md](F5-COERENCIA-2026-10-08.md).
 
 ## Testar Yōtei
 

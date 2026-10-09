@@ -79,6 +79,7 @@ private:
 	std::vector<BufferCursor> m_buffer_stack;
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
+	bool                      m_draining_draws = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
 	bool                      m_yield         = false; // stop after the current packet
@@ -473,6 +474,10 @@ private:
 		uint32_t expected     = 0;
 	};
 	std::vector<PendingNumInstances> m_pending_num_instances;
+	// A suspended CPU multi-draw keeps the first uncommitted record on this queue.
+	bool     m_indirect_batch_active = false;
+	uint32_t m_indirect_batch_next   = 0;
+	uint32_t m_indirect_batch_count  = 0;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
@@ -582,6 +587,8 @@ private:
 	HW::Shader     m_back_sh;
 	uint64_t       m_resolver_packets = 0;
 	uint64_t       m_retry_op         = 0;
+	bool           m_coherence_suspended = false;
+	[[nodiscard]] bool DeferCoherenceReads(CpSeq::OpKind kind, const void* payload);
 	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
 	bool m_packet_hook = false;
 };

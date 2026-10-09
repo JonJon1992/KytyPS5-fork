@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -183,6 +184,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
+	if (context.DeferGpuAccess(address, size))
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -1325,9 +1328,8 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
-	if (image.info.data.Empty()) {
-		return;
-	}
+	if (image.info.data.Empty() ||
+	    m_context.DeferGpuAccess(image.info.data.address, image.info.data.size)) return;
 	if (image.binding.is_bound) {
 		image.binding.force_general |= image.binding.shader_write != storage;
 	}
@@ -1340,6 +1342,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
+	if (m_context.DeferGpuAccess(image.info.data.address, image.info.data.size)) return;
 	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
 		m_bound_images.push_back(id);
 	}
@@ -2690,7 +2693,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// Read-only BDA access leaves contents unchanged; tracked descriptor writes carry
 	// their own canonical-buffer revisions.
 	if (std::ranges::any_of(prepared_bindings, [](const auto* prepared) {
-		    return prepared->runtime->program->has_address_writes;
+		    const auto& program = *prepared->runtime->program;
+		    return program.has_address_writes &&
+		        !(program.info.bda_writes && ShaderRecompiler::BdaWritesDeferredEnabled());
 	    })) {
 		m_context.GetBufferCache().InvalidateContentRevisions();
 	}

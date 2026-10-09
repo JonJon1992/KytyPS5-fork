@@ -73,6 +73,7 @@ CodegenOptions FromEnvironment() {
 	if (const auto* mode = std::getenv("KYTY_BDA_WRITES"); mode != nullptr) {
 		options.bda_write_mode = std::strcmp(mode, "candidates") == 0 ? BdaWriteMode::Candidates
 		    : std::strcmp(mode, "candidates-verify") == 0 ? BdaWriteMode::CandidatesVerify
+		    : std::strcmp(mode, "deferred") == 0 ? BdaWriteMode::Deferred
 		    : BdaWriteMode::Off;
 	}
 	options.runtime_buffer_stride =
@@ -142,6 +143,10 @@ bool BdaWritesApplies(uint64_t shader_hash) {
 
 bool BdaWritesEnabled() {
 	return !Storage().bda_writes_shaders.empty() || Storage().bda_write_mode != BdaWriteMode::Off;
+}
+
+bool BdaWritesDeferredEnabled() {
+	return Storage().bda_write_mode == BdaWriteMode::Deferred;
 }
 
 bool BdaWriteCandidatesApplies(uint64_t shader_hash) {

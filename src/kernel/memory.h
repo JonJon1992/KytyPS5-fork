@@ -136,6 +136,12 @@ bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t
 // the process lifetime: reading it never faults, whatever the guest view's protection, and after
 // the guest unmaps the range it shows whatever that backing then holds. Any thread.
 [[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool HasUniqueGuestBackingView(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool HasPendingGpuWrites() noexcept;
+[[nodiscard]] bool HasPendingGpuLabels() noexcept;
+[[nodiscard]] uint64_t UnknownGpuWriteEpoch() noexcept;
+[[nodiscard]] bool DeferGpuBackingRead(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool GpuBackingReadDeferred() noexcept;
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU fault report (post-mortem, any thread): text saying where the guest's mappings hold 8-byte values
 // whose low 48 bits lie in [low, high], that is, where a faulting address was loaded from

@@ -1040,6 +1040,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		const auto& buffer = m_slot_buffers[id];
 		CompleteSideReadbacks(buffer.CpuAddress(), buffer.Size());
 	}
+	// Unregistration during a native merge changes only lookup/table entries.
+	// The old allocation retires through the scheduler after CPU Applied.
+	// Guest unmap and GC drain before releasing ownership or mapping references.
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -1050,6 +1053,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                        const std::shared_ptr<EarlyReleasedDownload>& early) {
+	WaitBdaWritesForRange(vaddr, size);
 	// An older side publication of these pages must reach the backing (and settle its pages)
 	// before this newer download is queued; otherwise it could overwrite newer bytes.
 	CompleteSideReadbacks(vaddr, size);
@@ -1363,6 +1367,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	EXIT_IF(HasPendingBdaWrites());
+	if (m_deferred_bda_hooks) m_scheduler.SetCoherenceHooks(nullptr, nullptr, nullptr);
 	if (m_upload_dma != nullptr) {
 		// The scheduler has drained by now; no later submission may wait on the upload DMA.
 		m_scheduler.SetSubmitDependency(nullptr, 1);
@@ -1917,6 +1923,7 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
+	WaitBdaWritesForRange(vaddr, size);
 	if (is_write && m_false_sharing && TryFalseSharingWrite(vaddr, size, trace)) {
 		return;
 	}
@@ -1926,8 +1933,12 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	const uint64_t     WindowSize   = is_write ? WriteFaultWindow() : 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
-	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	if (PendingBdaWrite(window_begin, window_end - window_begin) != 0) {
+		window_begin = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer_begin);
+		window_end = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE), buffer_end);
+	}
 
 	trace.begin = window_begin;
 	trace.size  = window_end - window_begin;
@@ -2029,6 +2040,7 @@ bool BufferCache::TryFalseSharingWrite(uint64_t vaddr, uint64_t size, ReadMemory
 BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
     uint64_t vaddr, uint64_t size, std::shared_ptr<SideReadback>& issued) {
 	EXIT_IF(!GuestGpu::IsGpuThread() || m_side == nullptr);
+	WaitBdaWritesForRange(vaddr, size);
 	auto&      side    = *m_side;
 	const auto current = m_scheduler.CurrentTick();
 	// An address-writing shader in the unsubmitted recording may write any buffer byte.
@@ -2081,6 +2093,10 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		}
 		if (candidate.begin > page_begin || candidate.end < page_end ||
 		    candidate.end - candidate.begin > side.window) {
+			continue;
+		}
+		if (PendingBdaWrite(candidate.begin, candidate.end - candidate.begin) != 0) {
+			reason = SideIssueResult::Pending;
 			continue;
 		}
 		if (OverlapsPendingSideReadback(candidate.begin, candidate.end)) {
@@ -2464,6 +2480,9 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	plan.gds   = user_data.size() > 2 ? user_data[2] : 0u;
 	// ScalarAddress loads mask the low two bits; a raw unaligned snapshot is a different table.
 	if ((plan.table & 3u) != 0) return fail("unaligned table");
+	// KYTY_BDA_WRITES=deferred: a table a pending deferred writer may still write waits for it.
+	if (m_scheduler.Context().DeferGpuRead(plan.table, BdaWriteCandidates::MaxTableBytes))
+		return fail("table pending a deferred BDA writer");
 	plan.vm_generation = LibKernel::Memory::VirtualRangesGeneration();
 	const auto readable = [&](uint64_t bytes) {
 		return GuestRange{plan.table, bytes}.Valid() &&
@@ -2501,6 +2520,7 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	// Validate the complete set before changing ownership. A mapped prefix never certifies a
 	// partially mapped candidate; neither virtual nor physical self-writes can change the table.
 	for (const auto& range: plan.Ranges()) {
+		if (m_scheduler.Context().DeferGpuAccess(range.address, range.size)) return false;
 		if (LibKernel::Memory::ClampRangeSizeQuiet(range.address, range.size) != range.size)
 			return fail("destination not fully mapped");
 		const auto alias = reinterpret_cast<uintptr_t>(
@@ -2576,6 +2596,183 @@ void BufferCache::FinishBdaWriteCandidates(const BdaWriteCandidates::Plan& plan)
 	// The verify mode settles, which reads the dropped count; otherwise it is read asynchronously.
 	if (!ShaderRecompiler::BdaWriteCandidatesVerify()) {
 		m_fault_manager.QueueBdaDroppedCheck(plan.shader_hash);
+	}
+}
+
+bool BufferCache::PrepareDeferredBdaWrite() {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	ServiceDeferredBdaWrites();
+	// Bounded backpressure occurs before preparing this writer. Older results
+	// can apply while waiting; neither slots nor native storage are reused early.
+	if (m_bda_write_ledger.LastTicket() - m_bda_write_ledger.AppliedPrefix() ==
+	    BdaWriteLedger::Capacity) {
+		m_scheduler.Finish();
+		m_scheduler.DrainPriorityOperations();
+	}
+	if (!m_deferred_bda_hooks) {
+		m_scheduler.SetCoherenceHooks(
+		    [](void* p) { return static_cast<BufferCache*>(p)->m_bda_write_ledger.AppliedPrefix(); },
+		    [](void* p) { static_cast<BufferCache*>(p)->ServiceDeferredBdaWrites(); }, this);
+		m_deferred_bda_hooks = true;
+	}
+	// A preservation copy can merge buffers. Capture again if registration
+	// changed, retaining vector capacity and bounding retries before admission.
+	for (uint32_t attempt = 0; attempt < 4; ++attempt) {
+		auto& domain = m_deferred_bda_domain;
+		domain.clear();
+		for (const auto& [address, id] : m_buffers) {
+			const auto size = m_slot_buffers[id].Size();
+			if (!m_scheduler.Context().IsMapped(address, size) ||
+			    !LibKernel::Memory::HasUniqueGuestBackingView(address, size)) return false;
+			domain.push_back({address, size});
+		}
+		if (domain.empty()) return false;
+		// A previously queued host label must land before a later native writer
+		// can overwrite the same bytes. Suspend admission; the owner services it.
+		for (const auto range : domain) {
+			if (m_scheduler.Context().GetGpu().DeferredLabelTick(range.address, range.size) != 0) {
+				m_scheduler.Context().RequestDeferredGpuRead();
+				return false;
+			}
+		}
+		const auto registry = m_buffer_registry_epoch.load(std::memory_order_acquire);
+		// No unknown ticket exists yet: preparation may submit or retire native
+		// utility work without waiting for the writer it has not emitted.
+		for (const auto range : domain) {
+			const auto [buffer, offset] = ObtainBuffer(range.address, range.size, true, true);
+			(void)buffer;
+			(void)offset;
+			m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
+			m_deferred_bda_reserved.Add(range.address, range.size);
+		}
+		if (registry == m_buffer_registry_epoch.load(std::memory_order_acquire)) {
+			m_deferred_bda_registry = registry;
+			return true;
+		}
+	}
+	return false;
+}
+
+uint64_t BufferCache::BeginDeferredBdaWrite(uint64_t shader_hash) {
+	EXIT_IF(!GuestGpu::IsGpuThread() || m_deferred_bda_domain.empty() ||
+	        m_deferred_bda_registry != m_buffer_registry_epoch.load(std::memory_order_acquire));
+	const auto tick = m_scheduler.CurrentTick();
+	const auto ticket = m_bda_write_ledger.Open(
+	    tick, LibKernel::Memory::VirtualRangesGeneration(), m_deferred_bda_domain);
+	EXIT_IF(ticket == 0);
+	auto& result = m_deferred_bda_results[(ticket - 1) % BdaWriteLedger::Capacity];
+	EXIT_IF(result.ready.load(std::memory_order_acquire));
+	result.ticket = ticket;
+	result.shader_hash = shader_hash;
+	// Metadata was reserved before the writer. Retain only its final tick now;
+	// applying an older result must never retick or overwrite a later known writer.
+	for (const auto range : m_deferred_bda_domain)
+		NoteBufferContentWrite(range.address, range.size, tick);
+	CleanVerdict::Invalidate(0, UINT64_MAX, Coherence::Source::ContentRevisions);
+	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
+	m_scheduler.SetCoherencePrefix(ticket);
+	m_deferred_bda_domain.clear();
+	return ticket;
+}
+
+void BufferCache::QueueDeferredBdaWrite(uint64_t ticket) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	const auto slot = static_cast<uint32_t>((ticket - 1) % BdaWriteLedger::Capacity);
+	const auto* producer = m_bda_write_ledger.Get(ticket);
+	EXIT_IF(producer == nullptr || producer->applied);
+	const auto tick = m_fault_manager.RecordBdaWrites(slot);
+	EXIT_IF(tick != producer->tick);
+	m_scheduler.DeferCollectionOperation([this, slot] {
+		auto& result = m_deferred_bda_results[slot];
+		m_fault_manager.ParseBdaWrites(slot, result.writes);
+		result.ready.store(true, std::memory_order_release);
+		m_deferred_bda_available.notify_all();
+		// An internal wake survives closure of external service admission.
+		m_scheduler.Context().GetGpu().NotifyCoherenceProgress();
+	}, tick);
+}
+
+void BufferCache::ServiceDeferredBdaWrites() {
+	if (!m_bda_write_ledger.HasPending()) return;
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	bool changed = false;
+	for (uint32_t slot = 0; slot < BdaWriteLedger::Capacity; ++slot) {
+		auto& result = m_deferred_bda_results[slot];
+		if (!result.ready.load(std::memory_order_acquire)) continue;
+		const auto* producer = m_bda_write_ledger.Get(result.ticket);
+		EXIT_IF(producer == nullptr || producer->applied);
+		const auto& writes = result.writes;
+		if (writes.dropped != 0)
+			EXIT("BDA deferred coverage failure: shader=0x%016" PRIx64
+			     " ticket=%" PRIu64 " dropped=%u\n",
+			     result.shader_hash, result.ticket, writes.dropped);
+		writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+			auto cursor = begin;
+			// Domains are sorted and disjoint: skip earlier buffers in logarithmic time.
+			auto it = std::lower_bound(producer->domain.begin(), producer->domain.end(), cursor,
+			    [](GuestRange range, uint64_t address) { return range.End() <= address; });
+			for (; it != producer->domain.end() && it->address <= cursor; ++it) {
+				cursor = std::min(end, it->End());
+				if (cursor == end) break;
+			}
+			if (cursor != end)
+				EXIT("BDA deferred coverage failure: ticket=%" PRIu64
+				     " page=0x%016" PRIx64 " outside retained domain\n", result.ticket, cursor);
+		});
+		// Overflow keeps the entire captured domain GPU-owned. No late cache
+		// traversal, upload, image preservation or ownership transition is needed.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
+		EXIT_IF(!m_bda_write_ledger.Apply(result.ticket));
+		m_fault_manager.ReleaseBdaWrites(slot);
+		result.ready.store(false, std::memory_order_release);
+		changed = true;
+	}
+	if (changed) {
+		CleanVerdict::Invalidate(0, UINT64_MAX, Coherence::Source::ContentRevisions);
+		m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_scheduler.NotifyCoherenceApplied();
+		m_deferred_bda_available.notify_all();
+	}
+}
+
+void BufferCache::WaitBdaWritesForRange(uint64_t address, uint64_t size) {
+	if (!HasPendingBdaWrites()) return;
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	for (;;) {
+		ServiceDeferredBdaWrites();
+		const auto ticket = PendingBdaWrite(address, size);
+		if (ticket == 0) return;
+		const auto* producer = m_bda_write_ledger.Get(ticket);
+		EXIT_IF(producer == nullptr);
+		m_scheduler.Wait(producer->tick);
+		ServiceDeferredBdaWrites();
+		if (PendingBdaWrite(address, size) != 0) {
+			std::unique_lock lock(m_deferred_bda_mutex);
+			m_deferred_bda_available.wait_for(lock, std::chrono::microseconds(250));
+		}
+	}
+}
+
+void BufferCache::SynchronizeDeferredBdaAlias(uint64_t address, uint64_t size) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	if (!m_deferred_bda_reserved.Intersects(address, size)) return;
+	WaitBdaWritesForRange(address, size);
+	// Publish each registered intersection before the new view becomes visible.
+	// The mapping service itself runs on this owner, so another writer cannot
+	// enter between the drain and host mapping publication.
+	std::vector<GuestRange> ranges;
+	for (const auto& [begin, id] : m_buffers) {
+		const auto end = std::min(begin + m_slot_buffers[id].Size(), address + size);
+		const auto start = std::max(begin, address);
+		if (start < end) ranges.push_back({start, end - start});
+	}
+	for (const auto range : ranges) {
+		if (m_texture_cache.IsRegionGpuModified(range.address, range.size)) {
+			(void)ObtainBuffer(range.address, range.size, true, true);
+			m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
+		}
+		if (HasGpuDirtyBytes(range.address, range.size)) ReadMemory(range.address, range.size);
 	}
 }
 
@@ -4382,6 +4579,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
+	if (m_scheduler.Context().DeferGpuAccess(vaddr, size)) return;
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
@@ -4410,6 +4608,7 @@ bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t
 	    size > 65536 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	if (m_scheduler.Context().DeferGpuAccess(vaddr, size)) return false;
 	// Only bytes owned by recorded GPU work need ordering on the GPU timeline; everything else
 	// keeps the CPU write (which faults into the usual invalidation when tracked).
 	if (!HasGpuDirtyBytes(vaddr, size) && !HasPendingBackingPublication(vaddr, size)) {
@@ -4478,6 +4677,9 @@ std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size,
 }
 
 std::optional<uint32_t> BufferCache::KnownFillLocked(uint64_t vaddr, uint64_t size) const {
+	if (HasPendingBdaWrites()) return std::nullopt;
+	if (ShaderRecompiler::BdaWritesDeferredEnabled() && m_scheduler.Context().HasGpu() &&
+	    m_scheduler.Context().GetGpu().DeferredLabelTick(vaddr, size) != 0) return std::nullopt;
 	// The range may be covered by several adjacent fills (e.g. per-slice consumption); all of
 	// them must carry the same value.
 	const uint64_t          end    = vaddr + size;
@@ -4553,6 +4755,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	if ((dst_memory && m_scheduler.Context().DeferGpuAccess(dst_vaddr, size)) ||
+	    (src_memory && m_scheduler.Context().DeferGpuAccess(src_vaddr, size))) return;
 	// KYTY_ALIAS_BYTES: bytes a GPU-modified image owns without starting at the source (or at the
 	// destination) are not in guest memory either; the GPU path moves them into the buffer.
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
@@ -4692,7 +4896,7 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 std::optional<BufferContentRevision> BufferCache::GetContentRevision(uint64_t vaddr,
 	                                                                uint64_t size) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
-	if (!GuestRange {vaddr, size}.Valid() ||
+	if (HasPendingBdaWrites() || !GuestRange {vaddr, size}.Valid() ||
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size) ||
 	    HasPendingBackingPublication(vaddr, size)) {
 		return std::nullopt;
@@ -4844,6 +5048,8 @@ void BufferCache::RetireUnusedBuffers(uint64_t frame, uint64_t min_age) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	ServiceDeferredBdaWrites();
+	if (HasPendingBdaWrites()) return;
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	MaintainHotPages();
 	const auto tick = m_gc_tick++;

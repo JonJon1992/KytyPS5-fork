@@ -10,7 +10,7 @@ namespace Libs::Graphics::ShaderRecompiler {
 // the add) are emitted, and which float arithmetic may not be contracted by the host compiler.
 inline constexpr uint64_t BdaWaterLightingHash = 0x86da5eb7b8257bb0ull;
 inline constexpr uint64_t BdaShadowResolveHash = 0xd8959888aafd2552ull;
-enum class BdaWriteMode : uint8_t { Off, Candidates, CandidatesVerify };
+enum class BdaWriteMode : uint8_t { Off, Candidates, CandidatesVerify, Deferred };
 
 enum class MadMode : uint8_t {
 	// Every MAD is an FMul plus an FAdd, and every guest FMul/FAdd/FSub is NoContraction: bit
@@ -217,6 +217,7 @@ bool BindlessStridedComputeApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWritesApplies(uint64_t shader_hash);
 // KYTY_BDA_WRITES_SHADERS lists a shader: the fault buffer carries the written-page bitmap.
 [[nodiscard]] bool BdaWritesEnabled();
+[[nodiscard]] bool BdaWritesDeferredEnabled();
 [[nodiscard]] bool BdaWriteCandidatesApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWriteCandidatesVerify();
 [[nodiscard]] uint32_t BdaWriteCandidateStorePc(uint64_t shader_hash);

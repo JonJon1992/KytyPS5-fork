@@ -283,6 +283,38 @@ static bool CopyMetadataForPreparation(const ShaderMappedData& data, Preparation
 	return true;
 }
 
+
+bool ShaderDeferPendingReads(uint64_t address) {
+	if (address == 0 || (!LibKernel::Memory::HasPendingGpuWrites() && !LibKernel::Memory::HasPendingGpuLabels()) || DrawPrep::Speculative() || !GuestGpu::IsGpuThread()) return false;
+	const auto pending = [](const void* data, uint64_t size) {
+		return data != nullptr && size != 0 &&
+		    LibKernel::Memory::DeferGpuBackingRead(reinterpret_cast<uint64_t>(data), size);
+	};
+	const auto* code = reinterpret_cast<const uint32_t*>(address);
+	if (pending(code, 8)) return true;
+	ShaderMapEntry data;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		if (g_shader_map == nullptr) return false;
+		const auto found = g_shader_map->find(address);
+		if (found == g_shader_map->end()) return false;
+		data = found->second;
+	}
+	if (pending(code, data.code_size_bytes) ||
+	    pending(data.user_data, sizeof(ShaderUserData)) ||
+	    pending(data.input_semantics, uint64_t{data.num_input_semantics} * sizeof(ShaderSemantic)))
+		return true;
+	// Read only after the dependent range is ready. These reads retain the
+	// existing known-writer fault path; unknown producers have already deferred.
+	if (data.user_data != nullptr) {
+		const auto& header = *data.user_data;
+		if (pending(header.direct_resource_offset,
+		            uint64_t{header.direct_resource_count} * sizeof(uint16_t))) return true;
+	}
+	if (const auto* binary = GetBinaryInfo(code); pending(binary, sizeof(ShaderBinaryInfo))) return true;
+	return false;
+}
+
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	static const bool use_clean_backing = [] {
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
@@ -887,6 +919,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			}
 			if (!attribute_clean) {
 				if (speculative) return;
+				if (LibKernel::Memory::DeferGpuBackingRead(
+				        reinterpret_cast<uint64_t>(attrib + in.semantic), sizeof(attribute))) return;
 				attribute = attrib[in.semantic];
 			}
 		}
@@ -970,6 +1004,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		}
 		if (!descriptor_clean) {
 			if (speculative) return;
+			if (LibKernel::Memory::DeferGpuBackingRead(
+			        reinterpret_cast<uint64_t>(sharp), sizeof(r.fields))) return;
 			r.fields[0] = sharp[0];
 			r.fields[1] = sharp[1];
 			r.fields[2] = sharp[2];
@@ -1147,7 +1183,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
 		                           metadata.input_semantics_count, attrib, buffer, shader_addr,
 		                           data, user_sgpr, user_sgpr_num, metadata);
-		if (DrawPrep::SpeculativeFailed()) return false;
+		if (DrawPrep::SpeculativeFailed() || LibKernel::Memory::GpuBackingReadDeferred()) return false;
 		ShaderDetectBuffers(info);
 	}
 	return true;
@@ -1291,6 +1327,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 				return params;
 			}
+			if (LibKernel::Memory::GpuBackingReadDeferred()) return {};
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
@@ -1386,6 +1423,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	input_info = {};
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+		if (LibKernel::Memory::GpuBackingReadDeferred()) return {};
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;

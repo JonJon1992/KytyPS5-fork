@@ -142,6 +142,9 @@ void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst) {
 	    LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
 		return;
 	}
+	// Every CP caller checks readiness before effects. A missed guard must never
+	// wait on a raw fault on the thread that has to apply the producer.
+	EXIT_IF(LibKernel::Memory::DeferGpuBackingRead(vaddr, size));
 	std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
 }
 
@@ -284,6 +287,9 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::ProcessCommands() {
+	if (m_coherence_work.exchange(false, std::memory_order_acq_rel))
+		m_renderer.GetCommandScheduler().ServiceCoherence();
+
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
@@ -347,6 +353,15 @@ void GuestGpu::NotifyProgress() {
 			queue.front().blocked = false;
 		}
 	}
+	m_work_available.Signal();
+}
+
+void GuestGpu::NotifyCoherenceProgress() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_coherence_work.store(true, std::memory_order_release);
+	for (auto& queue : m_queues)
+		if (!queue.empty()) queue.front().blocked = false;
+	m_has_blocked.store(false, std::memory_order_release);
 	m_work_available.Signal();
 }
 
@@ -609,6 +624,9 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 
 bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
                                              const DrawAutoArgs*  auto_args) {
+	// Pending unknown writes invalidate worker certificates. Keep this draw at
+	// its packet until its serial program read is ready.
+	if (m_renderer.GetBufferCache().HasPendingBdaWrites()) return false;
 	if (DrawPrep::GetMode() == DrawPrep::Mode::Off) {
 		return false;
 	}
@@ -652,6 +670,9 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_indirect_batch_active            = false;
+	m_indirect_batch_next              = 0;
+	m_indirect_batch_count             = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -1048,6 +1069,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_t* src) {
 	auto*          dst           = reinterpret_cast<uint32_t*>(op.dst);
 	const uint32_t dw_num        = op.dw_num;
+	if (m_renderer.DeferGpuAccess(op.dst,
+	        ((op.write_control >> 16u) & 1u) != 0 ? 4 : uint64_t{dw_num} * 4u)) return;
 	const uint32_t write_control = op.write_control;
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
@@ -1089,6 +1112,8 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 			return;
 		}
 	}
+	if (m_renderer.DeferGpuRead(
+	        op.dst, write_one_address ? sizeof(uint32_t) : uint64_t{dw_num} * 4u)) return;
 	m_renderer.GetBufferCache().BeforeEmulatorWrite(
 	    op.dst, write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * 4u);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataCpu);
@@ -1308,18 +1333,22 @@ void GuestGpu::ThreadRun(void* data) {
 	const bool wakeups       = CpWakeupsEnabled();
 	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
 	for (;;) {
+		if (gpu->m_coherence_work.exchange(false, std::memory_order_acq_rel))
+			gpu->m_renderer.GetCommandScheduler().ServiceCoherence();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping &&
+			       !gpu->m_coherence_work.load(std::memory_order_acquire)) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				HangWatchdog::Scope idle("cp-no-work", reinterpret_cast<uint64_t>(gpu));
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
+			if (gpu->m_coherence_work.load(std::memory_order_acquire)) continue;
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
@@ -1707,6 +1736,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	EXIT_IF(m_front_mode == FrontMode::Reference);
+	m_renderer.ClearDeferredGpuRead();
+	if (execution.m_draining_draws) commands = {};
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
 		// A new stream (KYTY_CP_SEQ): ops refer to it by id and packet count.
@@ -1752,7 +1783,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	ProcessPm4(execution);
 	// Draw-prep: every draw parsed in this slice is committed before the slice ends.
 	DrainPreparedDraws();
-	const bool complete = execution.m_buffer_stack.empty();
+	execution.m_draining_draws = execution.m_buffer_stack.empty() &&
+	    m_draw_prep != nullptr && m_draw_prep->Pending();
+	const bool complete = execution.m_buffer_stack.empty() && !execution.m_draining_draws;
 	if (complete && m_verifier != nullptr && m_verifier->Follows(execution.m_stream_id)) {
 		// KYTY_CP_SEQ_VERIFY: the reference front must end its stream here too.
 		m_verifier->Finish();
@@ -1822,12 +1855,17 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	// P3c: the speculative front parses like the sequencer, without waiting for anything.
 	const bool prefetch  = m_front_mode == FrontMode::Prefetch;
 	const bool sequencer = m_front_mode == FrontMode::Thread || prefetch;
+	if (!reference && !sequencer) GetScheduler().ServiceCoherence();
 	if (g_gpu_state != nullptr && !reference && !sequencer) {
 		if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
 			// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
 			// they only run with an empty window.
 			if (g_gpu_state->HasPendingCommands()) {
 				m_draw_prep->Drain();
+				if (m_renderer.DeferredGpuRead()) {
+					execution.m_suspended = true;
+					return false;
+				}
 				g_gpu_state->ProcessCommands();
 			}
 		} else if (g_gpu_state->HasPendingCommands()) {
@@ -1858,6 +1896,11 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	                           : reinterpret_cast<uint64_t>(packet);
 	const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 	const auto        remaining_dw  = total_dw - cursor.offset_dw;
+	if (!reference && !sequencer && cursor.copy == nullptr &&
+	    m_renderer.DeferGpuRead(guest_packet, uint64_t{remaining_dw} * 4u)) {
+		execution.m_suspended = true;
+		return false;
+	}
 	const auto        packet_header = packet[0];
 	const auto        opcode        = (packet_header >> 8u) & 0xffu;
 	EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
@@ -1994,6 +2037,10 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 				engine->OnPacket(packet_class, fence_kind);
 			}
 		}
+	}
+	if (!reference && !sequencer && m_renderer.DeferredGpuRead()) {
+		execution.m_suspended = true;
+		return false;
 	}
 	const auto packet_dw =
 	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
@@ -2357,7 +2404,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		m_draw_prep->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
-		MaybeYieldSlice();
+		if (!m_renderer.DeferredGpuRead()) MaybeYieldSlice();
 		return;
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
@@ -2371,7 +2418,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		// Draw-prep: the engine runs MaybeFlushIdleGpu after it records (commits) each draw. The
 		// slice may count the draw now: a yield ends the slice after this packet, and the slice
 		// end commits the whole window before anything else runs.
-		MaybeYieldSlice();
+		if (!m_renderer.DeferredGpuRead()) MaybeYieldSlice();
 		return;
 	}
 	if (RepeatTrace::Enabled()) {
@@ -2379,6 +2426,7 @@ void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
 		RepeatTrace::OnUnpreparedDraw();
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	if (m_renderer.DeferredGpuRead()) return;
 	MaybeFlushIdleGpu();
 	MaybeYieldSlice();
 }
@@ -2495,6 +2543,17 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		source.index_type_and_size = 0;
 	}
 
+	// Reduce retained instance history only after proving all of its CPU reads ready,
+	// and before the current draw can emit. A retry then has no native side effects.
+	if (source.count_addr != 0 && m_pending_num_instances.size() >= 64) {
+		for (const auto& old : m_pending_num_instances) {
+			if ((old.count_addr != 0 && m_renderer.DeferGpuRead(old.count_addr, 4)) ||
+			    (old.max_count != 0 && m_renderer.DeferGpuRead(old.args_addr,
+			        uint64_t{old.max_count - 1} * old.stride + IndirectInstanceCountOffset + 4))) return true;
+		}
+		(void)NumInstances();
+	}
+
 	PendingNumInstances pending {.args_addr  = source.args_addr,
 	                             .stride     = source.stride,
 	                             .max_count  = source.max_count,
@@ -2517,11 +2576,10 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallback);
 		return false;
 	}
+	if (m_renderer.DeferredGpuRead()) return true;
 	if (source.count_addr == 0) {
 		// At least one record was drawn: older sources can no longer decide.
 		m_pending_num_instances.clear();
-	} else if (m_pending_num_instances.size() >= 64) {
-		(void)NumInstances();
 	}
 	m_pending_num_instances.push_back(pending);
 	if (RepeatTrace::Enabled()) {
@@ -2639,6 +2697,7 @@ void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op, bool fr
 	                           .index_type_and_size = op.index_type_and_size})) {
 		return;
 	}
+	if (m_renderer.DeferredGpuRead()) return;
 	// A prepared native indirect draw can continue a run, but this CPU fallback
 	// reads arguments and executes through the serial path instead.
 	if (from_prepared && DrawRun::Enabled() && DrawRun::IndirectRunsEnabled()) {
@@ -2691,7 +2750,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
-	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
+	if (!m_indirect_batch_active && (op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
 		m_num_instances = op.num_instances;
 		m_pending_num_instances.clear();
 	}
@@ -2707,7 +2766,7 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 
 	// The renderer rejects strides shorter than a record; the CPU path below reports them.
 	const auto args_base = op.args_base + op.data_offset;
-	if (TryDrawIndirectNative({.args_addr           = args_base,
+	if (!m_indirect_batch_active && TryDrawIndirectNative({.args_addr           = args_base,
 	                           .stride              = stride_in_bytes,
 	                           .max_count           = max_count_or_count,
 	                           .count_addr          = count_addr,
@@ -2718,8 +2777,9 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		return;
 	}
 
-	uint32_t draw_count = max_count_or_count;
-	if (count_addr != 0) {
+	if (m_renderer.DeferredGpuRead()) return;
+	uint32_t draw_count = m_indirect_batch_active ? m_indirect_batch_count : max_count_or_count;
+	if (!m_indirect_batch_active && count_addr != 0) {
 		draw_count = ReadGuestForCp<uint32_t>(count_addr);
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -2730,16 +2790,22 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		return;
 	}
 	// Native indirect draws above read their count on the GPU and are not counted here.
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
+	if (!m_indirect_batch_active)
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
 	// Every drawn record sets the count, so pending native sources cannot decide any more.
-	m_pending_num_instances.clear();
+	if (!m_indirect_batch_active) {
+		m_pending_num_instances.clear();
+		m_indirect_batch_count  = draw_count;
+		m_indirect_batch_next   = 0;
+		m_indirect_batch_active = true;
+	}
 
 	const uint64_t index_size = indexed ? IndexElementSize(op.index_type_and_size) : 0;
 
-	for (uint32_t i = 0; i < draw_count; i++) {
+	for (uint32_t i = m_indirect_batch_next; i < draw_count; i++) {
 		const auto args_addr = args_base + static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
@@ -2748,6 +2814,8 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 			ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
 			                                 args.start_vertex_location,
 			                                 args.start_instance_location));
+			if (m_renderer.DeferredGpuRead()) return;
+			m_indirect_batch_next = i + 1;
 			continue;
 		}
 
@@ -2773,7 +2841,11 @@ void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
 		ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
 		                                   static_cast<int32_t>(args.base_vertex_location),
 		                                   args.start_instance_location, op.index_type_and_size));
+		if (m_renderer.DeferredGpuRead()) return;
+		m_indirect_batch_next = i + 1;
 	}
+	m_indirect_batch_active = false;
+	m_indirect_batch_next   = 0;
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
@@ -2831,7 +2903,7 @@ void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
 		}
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, command, thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
-		MaybeFlushIdleGpu();
+		if (!m_renderer.DeferredGpuRead()) MaybeFlushIdleGpu();
 	}
 }
 
@@ -2871,7 +2943,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), op.args_addr,
 	                                                op.mode);
-	MaybeFlushIdleGpu();
+	if (!m_renderer.DeferredGpuRead()) MaybeFlushIdleGpu();
 }
 
 void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint32_t control) {
@@ -2931,7 +3003,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		m_draw_prep->CommitPublished(
 		    op.window, m_submit_id,
 		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
-		MaybeYieldSlice();
+		if (!m_renderer.DeferredGpuRead()) MaybeYieldSlice();
 		return;
 	}
 	if (RepeatTrace::Enabled()) {
@@ -2939,7 +3011,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 	}
 	if (TrySubmitPreparedDraw(nullptr, &args)) {
 		// See DrawIndex: idle flushes follow each commit, the slice counts the draw now.
-		MaybeYieldSlice();
+		if (!m_renderer.DeferredGpuRead()) MaybeYieldSlice();
 		return;
 	}
 	if (RepeatTrace::Enabled()) {
@@ -2947,6 +3019,7 @@ void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
 		RepeatTrace::OnUnpreparedDraw();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	if (m_renderer.DeferredGpuRead()) return;
 	MaybeFlushIdleGpu();
 	MaybeYieldSlice();
 }
@@ -3023,7 +3096,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	const auto address = reinterpret_cast<uint64_t>(dst);
 	auto&      gpu     = m_renderer.GetGpu();
 	const bool proxy   = m_defer_next_label;
-	const bool all     = LabelCompletionMode();
+	const bool all     = LabelCompletionMode() || ShaderRecompiler::BdaWritesDeferredEnabled();
 	// End-of-pipe writes become visible in order on hardware: while any older deferred write
 	// (label or GDS snapshot) is pending, a later label must not overtake it.
 	(void)address;
@@ -3102,7 +3175,8 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	    },
 	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
 	              : CommandScheduler::PriorityOperationKind::Generic);
-	if (proxy) {
+	if (proxy || ShaderRecompiler::BdaWritesDeferredEnabled()) {
+		// Seal the publication before recording any later unknown writer.
 		// A guest thread is about to wait for this label: submit its tick now rather than at the
 		// next EOP batch or slice boundary, which can be most of a frame away.
 		BufferFlush();
@@ -3195,7 +3269,8 @@ static bool GdsEopDeferEnabled() {
 
 bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
                                        bool interrupt, uint32_t interrupt_context_id) {
-	if (!GdsEopDeferEnabled() || dst == nullptr || dw_size == 0) {
+	if ((!GdsEopDeferEnabled() && !ShaderRecompiler::BdaWritesDeferredEnabled()) ||
+	    dst == nullptr || dw_size == 0) {
 		return false;
 	}
 	const auto* gds    = m_renderer.GetBufferCache().GetGdsBuffer();
@@ -3275,6 +3350,7 @@ bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32
 	    },
 	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
 	              : CommandScheduler::PriorityOperationKind::Generic);
+	if (ShaderRecompiler::BdaWritesDeferredEnabled()) BufferFlush();
 	return true;
 }
 
@@ -3863,9 +3939,11 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 			}
 
-			m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
-			std::memcpy(dst_gpu_addr, &value, sizeof(value));
-			NoteCpWrite(op.dst, sizeof(value));
+			if (!TryDeferLabel(dst_gpu_addr, value, sizeof(value), false, 0)) {
+				m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
+				std::memcpy(dst_gpu_addr, &value, sizeof(value));
+				NoteCpWrite(op.dst, sizeof(value));
+			}
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
 			Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command,
@@ -3895,9 +3973,11 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 				EXIT("unknown event type\n");
 			}
-			m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
-			std::memcpy(dst_gpu_addr, &value, sizeof(value));
-			NoteCpWrite(op.dst, sizeof(value));
+			if (!TryDeferLabel(dst_gpu_addr, value, sizeof(value), false, 0)) {
+				m_renderer.GetBufferCache().BeforeEmulatorWrite(op.dst, sizeof(value));
+				std::memcpy(dst_gpu_addr, &value, sizeof(value));
+				NoteCpWrite(op.dst, sizeof(value));
+			}
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
 			Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
@@ -3955,8 +4035,14 @@ CpSeq::Result CommandProcessor::Submit(CpSeq::OpKind kind, const void* payload,
                                        uint32_t payload_size, const void* data,
                                        uint32_t data_size) {
 	switch (m_front_mode) {
-		case FrontMode::Direct: return ExecuteOp(kind, payload, data);
-		case FrontMode::Inline: return SubmitInline(kind, payload, payload_size, data, data_size);
+		case FrontMode::Direct:
+		case FrontMode::Inline: {
+			const auto result = m_front_mode == FrontMode::Direct
+			    ? ExecuteOp(kind, payload, data)
+			    : SubmitInline(kind, payload, payload_size, data, data_size);
+			if (result.suspended && g_current_execution != nullptr) SuspendPm4();
+			return result;
+		}
 		case FrontMode::Reference: {
 			EXIT_IF(m_capture == nullptr || g_current_execution == nullptr);
 			return m_capture->Capture(kind, payload, payload_size, data, data_size,
@@ -3975,6 +4061,7 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
                                              uint32_t data_size) {
 	// An op's execution never emits another op (Exec* bodies call Exec*, not front methods).
 	EXIT_IF(m_executing);
+	if (DeferCoherenceReads(kind, payload)) return {true, 0};
 	if (m_ops == nullptr) {
 		m_ops.reset(new CpSeq::OpStream(OpRingBytes()));
 	}
@@ -4001,9 +4088,94 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 	return result;
 }
 
+
+bool CommandProcessor::DeferCoherenceReads(CpSeq::OpKind kind, const void* payload) {
+	if (!m_renderer.GetBufferCache().HasPendingBdaWrites() &&
+	    (!ShaderRecompiler::BdaWritesDeferredEnabled() || !m_renderer.HasGpu() ||
+	     !m_renderer.GetGpu().HasDeferredLabels())) return false;
+	using CpSeq::OpKind;
+	const auto pending = [this](uint64_t address, uint64_t size) {
+		return size != 0 && m_renderer.DeferGpuRead(address, size);
+	};
+	switch (kind) {
+		case OpKind::WaitRegMem: {
+			const auto& op = *static_cast<const CpSeq::WaitRegMemOp*>(payload);
+			return pending(op.addr, op.size);
+		}
+		case OpKind::CondExec:
+			return pending(static_cast<const CpSeq::CondExecOp*>(payload)->address, 4);
+		case OpKind::Branch:
+			return pending(static_cast<const CpSeq::BranchOp*>(payload)->compare_addr, 8);
+		case OpKind::LockstepRead: {
+			const auto& op = *static_cast<const CpSeq::LockstepReadOp*>(payload);
+			return pending(op.address, op.size);
+		}
+		case OpKind::Predication: {
+			const auto& op = *static_cast<const CpSeq::PredicationOp*>(payload);
+			return op.resolve == 0 && op.op != 0 && pending(op.address, op.op == 1 ? 256 : 8);
+		}
+		case OpKind::DispatchIndirect: {
+			const auto& op = *static_cast<const CpSeq::DispatchIndirectOp*>(payload);
+			return (op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0 &&
+			       pending(op.args_addr, sizeof(vk::DispatchIndirectCommand));
+		}
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti: {
+			const auto& op = *static_cast<const CpSeq::DrawIndirectOp*>(payload);
+			const uint64_t count = kind == OpKind::DrawIndirect ? 1 : op.max_count_or_count;
+			const uint64_t record = (op.flags & CpSeq::IndirectFlagIndexed) != 0
+			    ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+			return count != 0 &&
+			    ((op.count_addr != 0 && pending(op.count_addr, 4)) ||
+			     pending(op.args_base + op.data_offset, (count - 1) * op.stride + record));
+		}
+		case OpKind::DrawIndex:
+		case OpKind::DrawAuto: {
+			const auto flags = kind == OpKind::DrawIndex
+			    ? static_cast<const CpSeq::DrawIndexOp*>(payload)->flags
+			    : static_cast<const CpSeq::DrawAutoOp*>(payload)->flags;
+			if (kind == OpKind::DrawIndex) {
+				const auto& op = *static_cast<const CpSeq::DrawIndexOp*>(payload);
+				if (op.index_addr != 0 && pending(op.index_addr,
+				        uint64_t{op.index_count} * IndexElementSize(op.index_type_and_size))) return true;
+			}
+			if ((flags & CpSeq::DrawFlagInheritInstances) == 0) break;
+			for (const auto& source : m_pending_num_instances) {
+				if ((source.count_addr != 0 && pending(source.count_addr, 4)) ||
+				    (source.max_count != 0 && pending(source.args_addr,
+				        uint64_t{source.max_count - 1} * source.stride +
+				        IndirectInstanceCountOffset + 4))) return true;
+			}
+			break;
+		}
+		case OpKind::DmaData: {
+			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+			return (op.dst_sel != 1 && m_renderer.DeferGpuAccess(op.dst, op.num_bytes)) ||
+			    ((op.src_sel == 0 || op.src_sel == 3) &&
+			     m_renderer.DeferGpuAccess(op.src, op.num_bytes));
+		}
+		case OpKind::ReferenceClock: {
+			const auto& op = *static_cast<const CpSeq::ReferenceClockOp*>(payload);
+			return pending(op.dst, op.num_bytes);
+		}
+		case OpKind::DumpConstRam: {
+			const auto& op = *static_cast<const CpSeq::DumpConstRamOp*>(payload);
+			return pending(op.dst, uint64_t{op.dw_num} * 4);
+		}
+		default: break; // GPU-only accesses remain ordered on the native queue.
+	}
+	return false;
+}
+
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
+	m_coherence_suspended = false;
+	m_renderer.ClearDeferredGpuRead();
+	if (DeferCoherenceReads(kind, payload)) {
+		m_coherence_suspended = true;
+		return {true, 0};
+	}
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): every operation but a direct draw (whose commit keeps its
 	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
 	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
@@ -4073,6 +4245,10 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 		case OpKind::SkipSlots: EXIT("stream ops are consumed by ResolveSubmission\n"); break;
 		case OpKind::Count: EXIT("invalid op kind\n");
 	}
+	if (m_renderer.DeferredGpuRead()) {
+		m_coherence_suspended = true;
+		return {true, 0};
+	}
 	return {};
 }
 
@@ -4089,7 +4265,7 @@ bool CommandProcessor::CondExec(uint64_t address) {
 }
 
 CpSeq::Result CommandProcessor::ExecCondExec(const CpSeq::CondExecOp& op) {
-	return {false, *reinterpret_cast<const volatile uint32_t*>(op.address) != 0 ? 1u : 0u};
+	return {false, ReadGuestForCp<uint32_t>(op.address) != 0 ? 1u : 0u};
 }
 
 bool CommandProcessor::Branch(uint64_t compare_addr, uint64_t mask, uint64_t reference,
@@ -4129,6 +4305,10 @@ const uint32_t* CommandProcessor::ReadRegisterPairs(uint64_t address, uint32_t n
 			std::memset(m_register_pairs.data(), 0, bytes);
 		}
 	} else {
+		if (m_front_mode != FrontMode::Reference && m_renderer.DeferGpuRead(address, bytes)) {
+			SuspendPm4();
+			return nullptr;
+		}
 		ReadGuestForCp(address, bytes, m_register_pairs.data());
 	}
 	// P3c: the bytes a parse after a wait read are part of its draws' adoption key.
@@ -4449,7 +4629,13 @@ CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* pay
 	}
 	uint64_t begin = 0;
 	uint64_t end   = 0;
-	if (CpWriteRange(kind, payload, begin, end)) {
+	const bool unknown_dispatch = ShaderRecompiler::BdaWritesDeferredEnabled() &&
+	    (kind == CpSeq::OpKind::DispatchDirect || kind == CpSeq::OpKind::DispatchIndirect);
+	if (unknown_dispatch) {
+		begin = 0;
+		end = UINT64_MAX; // transient front dependency, never the sticky touched map
+	}
+	if (unknown_dispatch || CpWriteRange(kind, payload, begin, end)) {
 		if (kind == CpSeq::OpKind::EndOfPipe || kind == CpSeq::OpKind::ReleaseMem) {
 			m_last_label_begin = begin;
 			m_last_label_end   = end;
@@ -5408,7 +5594,7 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 		if (result.suspended) {
 			// A wait that has not passed: the op stays at the ring's head and is executed again
 			// in the next slice. Only lockstep ops suspend; they carry no snapshot.
-			EXIT_IF(snapshot != nullptr);
+			EXIT_IF(snapshot != nullptr && !m_coherence_suspended);
 			m_retry_op            = sequence + 1u;
 			execution.m_suspended = true;
 			return Pm4ProcessResult::Blocked;

@@ -319,6 +319,7 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepPrepare);
 	// Loaded before any read: every coherence transition after this point is newer.
 	prepared.coherence_generation  = Coherence::Generation();
+	prepared.unknown_write_epoch = LibKernel::Memory::UnknownGpuWriteEpoch();
 	prepared.shader_map_generation = ShaderMapGeneration();
 
 	const auto& ctx    = registers.context;
@@ -622,6 +623,9 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 	if (!prepared.ok) {
 		return fail(prepared.failure);
 	}
+	if (LibKernel::Memory::HasPendingGpuWrites() ||
+	    prepared.unknown_write_epoch != LibKernel::Memory::UnknownGpuWriteEpoch())
+		return fail(Failure::CertUnclean);
 	if (prepared.pixel_active != pixel_active ||
 	    !SameMapping(prepared.target_export_mapping, target_export_mapping)) {
 		return fail(Failure::Mismatch);
@@ -1102,6 +1106,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	auto& window = m_workers->window;
 	if (window.Full()) {
 		CommitHead();
+		if (m_renderer.DeferredGpuRead()) return true; // current packet retries
 	}
 	FillSlot(window.Reserve(), submit_id, index_args, auto_args, context, user_config, shaders);
 	window.Publish();
@@ -1256,7 +1261,7 @@ void Engine::CommitHead(const HeadPatch* patch) {
 		}
 	}
 	Commit(slot);
-	m_workers->window.Retire();
+	if (!m_renderer.DeferredGpuRead()) m_workers->window.Retire();
 }
 
 Engine::Slot& Engine::ReadyHead() {
@@ -1350,6 +1355,10 @@ Engine::Slot& Engine::ReadyHead() {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
 	}
+	// A self-claimed head may survive a deferred commit. Publish preparation
+	// completion so the next slice can reuse it instead of awaiting a worker
+	// that can no longer claim this slot.
+	if (!window.HeadDone()) window.Complete(window.Head());
 	return slot;
 }
 
@@ -1412,7 +1421,7 @@ void Engine::ExecuteIndirect(uint64_t position, const std::function<void()>& dra
 	}
 	executor.m_binding_plan        = nullptr;
 	executor.m_binding_plan_active = false;
-	m_workers->window.Retire();
+	if (!m_renderer.DeferredGpuRead()) m_workers->window.Retire();
 }
 
 void Engine::Drain() {
@@ -1423,6 +1432,7 @@ void Engine::Drain() {
 	g_totals.drains.fetch_add(1, std::memory_order_relaxed);
 	while (Pending()) {
 		CommitHead();
+		if (m_renderer.DeferredGpuRead()) break;
 	}
 }
 
@@ -1585,7 +1595,7 @@ void Engine::Commit(Slot& slot) {
 		RepeatTrace::OnDraw(record);
 	}
 	scheduler.RestoreRegisters(previous);
-	if (m_after_commit) {
+	if (m_after_commit && !m_renderer.DeferredGpuRead()) {
 		m_after_commit();
 	}
 	CommitStats::EndDraw();
