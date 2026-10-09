@@ -1850,6 +1850,9 @@ struct PipelineCache::ProgramCache {
 		key.bindless_samplers = bindless_samplers;
 		key.stage           = StageOf(input_info);
 		key.hash            = params.hash;
+		if (DeviceFaultDiagnosticsEnabled()) {
+			NoteDiagnosticProgram(params.Base(), params.hash); // names device-loss checkpoints
+		}
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);

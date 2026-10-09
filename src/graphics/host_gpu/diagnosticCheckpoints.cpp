@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -40,6 +41,19 @@ const char* OpName(uint32_t op) {
 	}
 }
 
+// NoteDiagnosticProgram: guest code address -> program hash (the latest seen).
+std::mutex                             g_program_mutex;
+std::unordered_map<uint64_t, uint64_t> g_program_hashes;
+
+uint64_t ProgramHash(uint64_t address) {
+	if (address == 0) {
+		return 0;
+	}
+	const std::lock_guard lock(g_program_mutex);
+	const auto            found = g_program_hashes.find(address);
+	return found != g_program_hashes.end() ? found->second : 0;
+}
+
 void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	std::printf("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64
 	            "\n",
@@ -50,6 +64,8 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	            checkpoint.tick, checkpoint.vs, checkpoint.ps, checkpoint.cs);
 	LOGF("    tick=%" PRIu64 " shader VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " CS=0x%016" PRIx64 "\n",
 	     checkpoint.tick, checkpoint.vs, checkpoint.ps, checkpoint.cs);
+	std::printf("    program hash VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " CS=0x%016" PRIx64 "\n",
+	            ProgramHash(checkpoint.vs), ProgramHash(checkpoint.ps), ProgramHash(checkpoint.cs));
 	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
@@ -154,6 +170,11 @@ void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer comma
 	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, markers.buffer, 0, sequence);
 	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, markers.buffer,
 	                             sizeof(uint32_t), sequence);
+}
+
+void NoteDiagnosticProgram(uint64_t address, uint64_t hash) {
+	const std::lock_guard lock(g_program_mutex);
+	g_program_hashes.insert_or_assign(address, hash);
 }
 
 bool DeviceFaultDiagnosticsEnabled() {
