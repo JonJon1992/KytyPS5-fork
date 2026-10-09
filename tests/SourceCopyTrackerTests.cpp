@@ -118,6 +118,27 @@ void TestBoundaryAndReuse() {
     Expect(sources.PendingValue(0x1000, 0x1000) == 3, "same address gets its new producer");
     Expect(sources.PendingValue(0x1000, 0) == 0, "zero-byte write has no dependency");
 }
+void TestPruneCompaction() {
+    std::atomic<uint64_t> completed {0};
+    SourceCopyTracker sources(completed);
+    // 200 producers, each a page; contiguous ranges of one producer stay one entry.
+    for (uint64_t value = 1; value <= 200; value++) {
+        sources.Track(0x100000 + value * 0x1000, 0x800, value);
+        sources.Track(0x100000 + value * 0x1000 + 0x800, 0x800, value);
+    }
+    Expect(sources.PendingValue(0x100000 + 7 * 0x1000 + 0x900, 4) == 7, "coalesced run keeps its producer");
+    completed.store(150, std::memory_order_release);
+    // The next Track prunes (and compacts) the completed prefix.
+    sources.Track(0x900000, 0x1000, 201);
+    Expect(sources.PendingValue(0x100000 + 100 * 0x1000, 0x1000) == 0, "completed producer is gone");
+    Expect(sources.PendingValue(0x100000 + 160 * 0x1000, 0x1000) == 160, "pending producer survives compaction");
+    Expect(sources.PendingValue(0x100000 + 150 * 0x1000, 0x2000) == 151, "overlap reports the newest pending producer");
+    Expect(sources.PendingValue(0x900000, 1) == 201, "new producer after compaction");
+    completed.store(201, std::memory_order_release);
+    Expect(sources.IsIdle() && sources.PendingValue(0x900000, 1) == 0, "everything complete");
+    sources.Track(0x1000, 0x1000, 202);
+    Expect(sources.PendingValue(0x1000, 1) == 202, "storage reused after a full prune");
+}
 } // namespace
 
 int main() {
@@ -126,6 +147,7 @@ int main() {
     TestOrderedSourceOverwrite();
     TestBoundaryAndReuse();
     TestCanonicalProjection();
+    TestPruneCompaction();
     std::printf("SourceCopyTracker: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

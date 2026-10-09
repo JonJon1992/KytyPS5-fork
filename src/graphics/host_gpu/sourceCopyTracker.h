@@ -2,13 +2,15 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_SOURCECOPYTRACKER_H_
 
 #include "common/assert.h"
-#include "graphics/host_gpu/writeTickMap.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -39,13 +41,20 @@ public:
 		std::scoped_lock lock(m_mutex);
 		const auto latest = m_latest.load(std::memory_order_relaxed);
 		EXIT_IF(value == 0 || value < latest);
-		const auto completed = m_completed.load(std::memory_order_acquire);
-		if (completed > m_pruned) {
-			m_sources.Prune(completed);
-			m_pruned = completed;
-		}
+		PruneLocked(m_completed.load(std::memory_order_acquire));
 		for (const auto& range: ranges) {
-			m_sources.Assign(address(range), range.size, value);
+			if (range.size == 0) {
+				continue;
+			}
+			const auto begin = address(range);
+			const auto end   = UINT64_MAX - begin < range.size ? UINT64_MAX : begin + range.size;
+			// A job's runs are mostly contiguous: one entry per run of the same producer.
+			if (m_head < m_sources.size() && m_sources.back().value == value &&
+			    m_sources.back().end == begin) {
+				m_sources.back().end = end;
+			} else {
+				m_sources.push_back({begin, end, value});
+			}
 		}
 		m_latest.store(value, std::memory_order_release);
 	}
@@ -58,9 +67,21 @@ public:
 		if (size == 0 || IsIdle()) {
 			return 0;
 		}
+		const auto end = UINT64_MAX - address < size ? UINT64_MAX : address + size;
 		std::scoped_lock lock(m_mutex);
-		const auto value = m_sources.MaxTick(address, size);
-		return m_completed.load(std::memory_order_acquire) >= value ? 0 : value;
+		const auto completed = m_completed.load(std::memory_order_acquire);
+		// Values never decrease in insertion order: the newest overlapping source is the maximum,
+		// and the scan ends at the first completed one (every older source is complete too).
+		for (auto index = m_sources.size(); index > m_head; --index) {
+			const auto& source = m_sources[index - 1];
+			if (source.value <= completed) {
+				break;
+			}
+			if (source.begin < end && address < source.end) {
+				return source.value;
+			}
+		}
+		return 0;
 	}
 
 	// PendingValue of the guest range [address, address + size), keyed as the sources are: by
@@ -112,12 +133,35 @@ private:
 		uint64_t guest_address;
 		uint64_t size;
 	};
+	// A tracked source interval and its producer value. Kept in insertion order, which is
+	// non-decreasing value order (Track refuses a smaller value): pruning drops a prefix and a
+	// query stops at the first completed entry, so neither allocates nor rebalances a tree.
+	struct Entry {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t value;
+	};
+
+	// Drops the completed prefix; compacts once it is at least half the storage (amortized O(1),
+	// the capacity is kept). m_mutex held.
+	void PruneLocked(uint64_t completed) {
+		while (m_head < m_sources.size() && m_sources[m_head].value <= completed) {
+			m_head++;
+		}
+		if (m_head == m_sources.size()) {
+			m_sources.clear();
+			m_head = 0;
+		} else if (m_head >= 64 && m_head * 2 >= m_sources.size()) {
+			m_sources.erase(m_sources.begin(), m_sources.begin() + static_cast<std::ptrdiff_t>(m_head));
+			m_head = 0;
+		}
+	}
 
 	std::atomic<uint64_t>& m_completed;
 	std::atomic<uint64_t> m_latest {0};
 	mutable std::mutex m_mutex;
-	WriteTickMap m_sources;
-	uint64_t m_pruned = 0; // protected by m_mutex
+	std::vector<Entry> m_sources; // protected by m_mutex
+	size_t m_head = 0;            // first entry not known complete; protected by m_mutex
 };
 
 } // namespace Libs::Graphics
