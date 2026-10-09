@@ -44,6 +44,10 @@ struct GraphicContext;
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 [[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
+// KYTY_DEVICE_FAULT_DIAGNOSTICS on AMD (VK_AMD_buffer_marker): writes `marker`'s sequence at the top
+// and at the bottom of the pipe into host-coherent memory; DumpDeviceLossDiagnostics then names the
+// work between the last completed and the last started checkpoint.
+void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer command, const void* marker);
 
 struct GraphicContext {
     bool bindless_supported = false;
@@ -61,6 +65,7 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
+	bool                               amd_buffer_markers_enabled            = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.

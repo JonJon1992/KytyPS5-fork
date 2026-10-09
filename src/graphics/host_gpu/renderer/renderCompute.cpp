@@ -422,7 +422,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<BdaWriteCandidates::Plan> candidate_plan;
 	const bool candidate_writes = program.info.bda_writes &&
 	    ShaderRecompiler::BdaWriteCandidatesApplies(program.shader_hash);
-	if (candidate_writes) candidate_plan.emplace();
+	if (candidate_writes) {
+		candidate_plan.emplace();
+		candidate_plan->cs_address = buffer.GetShaders().GetCs().cs_regs.data_addr;
+	}
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
 		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
@@ -552,7 +555,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<BdaWriteCandidates::Plan> candidate_plan;
 	const bool candidate_writes = program.info.bda_writes &&
 	    ShaderRecompiler::BdaWriteCandidatesApplies(program.shader_hash);
-	if (candidate_writes) candidate_plan.emplace();
+	if (candidate_writes) {
+		candidate_plan.emplace();
+		candidate_plan->cs_address = buffer.GetShaders().GetCs().cs_regs.data_addr;
+	}
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
 		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);

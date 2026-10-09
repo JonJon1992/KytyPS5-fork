@@ -2450,8 +2450,10 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
                                              BdaWriteCandidates::Plan& plan) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	using namespace BdaWriteCandidates;
+	const auto cs_address = plan.cs_address;
 	plan = {};
 	plan.shader_hash = shader_hash;
+	plan.cs_address  = cs_address;
 	const auto fail = [&](const char* why) {
 		plan.reject = why;
 		return false;
@@ -2553,8 +2555,8 @@ bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	NoteBdaCandidate(nullptr);
 	static uint32_t logs = 0;
 	if (logs++ < 32) {
-		LOGF("BDA candidates: shader=0x%016" PRIx64 " table=0x%016" PRIx64
-		     " bytes=%u ranges=%u verify=%u\n", plan.shader_hash, plan.table,
+		LOGF("BDA candidates: shader=0x%016" PRIx64 " CS=0x%016" PRIx64 " table=0x%016" PRIx64
+		     " bytes=%u ranges=%u verify=%u\n", plan.shader_hash, plan.cs_address, plan.table,
 		     plan.table_bytes, plan.range_count, ShaderRecompiler::BdaWriteCandidatesVerify() ? 1 : 0);
 	}
 	return true;

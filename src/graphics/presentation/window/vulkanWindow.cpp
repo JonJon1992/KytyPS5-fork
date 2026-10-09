@@ -1831,6 +1831,11 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 			}
+			// The AMD equivalent of the NV checkpoints: per-command markers (diagnosticCheckpoints).
+			if (HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+				graphic_ctx.amd_buffer_markers_enabled = true;
+			}
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,

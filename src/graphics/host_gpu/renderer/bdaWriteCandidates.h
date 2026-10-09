@@ -29,6 +29,8 @@ struct Plan {
     // mapping change elsewhere (a streaming game maps, protects and names memory constantly)
     // leaves the proof valid while these ranges keep their mapping (BufferCache rechecks them).
     uintptr_t table_alias = 0;
+    // The guest program address (COMPUTE_PGM), as device-loss checkpoints print it ("CS=").
+    uint64_t cs_address = 0;
     std::array<uintptr_t, MaxDescriptors> range_aliases {};
     std::array<uint32_t, MaxTableBytes / 4> words {};
     std::array<GuestRange, MaxDescriptors> ranges {};

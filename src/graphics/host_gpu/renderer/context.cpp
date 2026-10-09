@@ -872,7 +872,8 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
+	if ((m_graphics.diagnostic_checkpoints_enabled || m_graphics.amd_buffer_markers_enabled) &&
+	    m_buffer) {
 		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
 		                                                 .submit_id = submit_id,
 		                                                 .arg0      = arg0,
@@ -884,8 +885,11 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 		                                                 .vs = m_shaders != nullptr ? m_shaders->GetVs().es_regs.data_addr : 0,
 		                                                 .ps = m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0,
 		                                                 .cs = m_shaders != nullptr ? m_shaders->GetCs().cs_regs.data_addr : 0});
-		if (marker != nullptr) {
+		if (marker != nullptr && m_graphics.diagnostic_checkpoints_enabled) {
 			Handle().setCheckpointNV(marker);
+		}
+		if (marker != nullptr && m_graphics.amd_buffer_markers_enabled) {
+			WriteDiagnosticMarkersAMD(m_graphics, Handle(), marker);
 		}
 	}
 }

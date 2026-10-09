@@ -55,6 +55,105 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
 }
 
+// VK_AMD_buffer_marker: two host-coherent words, the sequence of the last checkpoint the GPU
+// reached at the top of the pipe and of the last one whose earlier work completed (bottom). Created
+// on the first marker (GPU thread), read after a loss; never freed (one per process).
+struct MarkerWordsAMD {
+	vk::Buffer                buffer;
+	vk::DeviceMemory          memory;
+	volatile const uint32_t*  words = nullptr;
+	bool                      failed = false;
+};
+MarkerWordsAMD g_markers_amd;
+
+bool CreateMarkersAMD(GraphicContext& graphics) {
+	auto& markers = g_markers_amd;
+	vk::BufferCreateInfo info {};
+	info.size        = 2 * sizeof(uint32_t);
+	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
+	info.sharingMode = vk::SharingMode::eExclusive;
+	if (graphics.device.createBuffer(&info, nullptr, &markers.buffer) != vk::Result::eSuccess) {
+		return false;
+	}
+	const auto requirements = graphics.device.getBufferMemoryRequirements(markers.buffer);
+	const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+	const auto& types = graphics.physical_device_memory_properties;
+	uint32_t type = UINT32_MAX;
+	for (uint32_t index = 0; index < types.memoryTypeCount; ++index) {
+		if ((requirements.memoryTypeBits & (1u << index)) != 0 &&
+		    (types.memoryTypes[index].propertyFlags & wanted) == wanted) {
+			type = index;
+			break;
+		}
+	}
+	vk::MemoryAllocateInfo allocate {};
+	allocate.allocationSize  = requirements.size;
+	allocate.memoryTypeIndex = type;
+	void* mapped = nullptr;
+	if (type == UINT32_MAX ||
+	    graphics.device.allocateMemory(&allocate, nullptr, &markers.memory) != vk::Result::eSuccess) {
+		return false;
+	}
+	if (graphics.device.bindBufferMemory(markers.buffer, markers.memory, 0) != vk::Result::eSuccess ||
+	    graphics.device.mapMemory(markers.memory, 0, VK_WHOLE_SIZE, {}, &mapped) != vk::Result::eSuccess) {
+		return false;
+	}
+	std::memset(mapped, 0, 2 * sizeof(uint32_t));
+	markers.words = static_cast<volatile const uint32_t*>(mapped);
+	return true;
+}
+
+void DumpMarkersAMD() {
+	const auto& markers = g_markers_amd;
+	if (markers.words == nullptr) {
+		std::printf("  AMD buffer markers: none written\n");
+		std::fflush(stdout);
+		return;
+	}
+	const uint64_t started   = markers.words[0];
+	const uint64_t completed = markers.words[1];
+	std::printf("--- AMD buffer markers: last started seq=%" PRIu64
+	            ", work before seq=%" PRIu64 " completed ---\n",
+	            started, completed);
+	LOGF("--- AMD buffer markers: last started seq=%" PRIu64 ", work before seq=%" PRIu64
+	     " completed ---\n",
+	     started, completed);
+	// The hung work began at or after `completed` and at or before `started` (32-bit sequences).
+	const uint64_t first = completed != 0 ? completed : started;
+	const uint64_t last  = std::max(first, started);
+	for (uint64_t sequence = first, shown = 0; sequence <= last && shown < 32; ++sequence, ++shown) {
+		DiagnosticCheckpoint checkpoint;
+		{
+			const std::lock_guard lock(g_checkpoint_mutex);
+			checkpoint = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];
+		}
+		if (static_cast<uint32_t>(checkpoint.sequence) != static_cast<uint32_t>(sequence)) {
+			std::printf("  seq=%" PRIu64 " retired from bounded history\n", sequence);
+			continue;
+		}
+		Print(sequence == first ? "in flight (first)" : "in flight", checkpoint);
+	}
+	std::fflush(stdout);
+}
+
+} // namespace
+
+void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer command, const void* marker) {
+	auto& markers = g_markers_amd;
+	if (markers.words == nullptr) {
+		if (markers.failed) {
+			return;
+		}
+		if (!CreateMarkersAMD(graphics)) {
+			markers.failed = true;
+			std::printf("AMD buffer markers: no host-coherent marker buffer; markers disabled\n");
+			return;
+		}
+	}
+	const auto sequence = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(marker));
+	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, markers.buffer, 0, sequence);
+	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, markers.buffer,
+	                             sizeof(uint32_t), sequence);
 }
 
 bool DeviceFaultDiagnosticsEnabled() {
@@ -142,6 +241,10 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool que
 	            tick, DeviceFaultDiagnosticsEnabled());
 	LOGF("--- Device loss: submission/wait tick=%" PRIu64 " ---\n", tick);
 	DumpDeviceFault(graphics);
+	if (graphics.amd_buffer_markers_enabled) {
+		DumpMarkersAMD();
+		return;
+	}
 	if (!graphics.diagnostic_checkpoints_enabled || graphics.queue == nullptr) {
 		std::printf("  NV checkpoints unavailable; enable KYTY_DEVICE_FAULT_DIAGNOSTICS=1 before launch for supported driver diagnostics.\n");
 		std::fflush(stdout);
