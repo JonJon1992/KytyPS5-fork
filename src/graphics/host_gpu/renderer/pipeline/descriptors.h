@@ -44,12 +44,11 @@ struct PreparedBindings {
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
     struct BindlessPatch { uint32_t offset, region, entries; };
+    // A heap's sampled image, made readable for the stage at commit (CommitBindings).
     struct BindlessTexture {
-        TextureBinding binding;
-        ShaderRecompiler::IR::ImageResource resource;
-        ShaderRecompiler::IR::DescriptorValue value;
-        uint32_t array = 0;
-        uint32_t slot = 0;
+        ImageId image_id;
+        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        ImageSubresourceRange range;
     };
     std::vector<BindlessPatch> bindless_patches;
     std::vector<BindlessTexture> bindless_textures;

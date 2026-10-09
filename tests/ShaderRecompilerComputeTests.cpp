@@ -45,6 +45,8 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -687,6 +689,11 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void PrepareBindlessHeaps(RenderExecutor &executor, const ShaderStageRuntime &runtime,
+                                   PreparedBindings &prepared) {
+    executor.BeginBindlessUpdate();
+    executor.PrepareBindlessHeaps(runtime, prepared);
+  }
   static uint32_t TextureMemoCapacity(const RenderExecutor &executor) {
     return executor.m_texture_memo.Capacity();
   }
@@ -15727,8 +15734,8 @@ public:
                 "an invalid override changed the capacity");
       }
     }
-    // The executor's capacity follows the device's bindless table, not the KYTY_BINDLESS request.
-    // This harness enables no bindless table, so KYTY_BINDLESS=1 alone keeps 4096 entries.
+    // The executor's capacity follows the device's bindless table, not the KYTY_BINDLESS request
+    // (with KYTY_BINDLESS=1 the harness enables the table when the device supports it).
     Require(name, "executor capacity",
             RenderExecutorTestAccess::TextureMemoCapacity(executor) ==
                 TextureBindingMemo::SelectCapacity(std::getenv("KYTY_TEXTURE_BINDING_MEMO_SLOTS"),
@@ -15773,6 +15780,154 @@ public:
             "the preparation worker indexed a different memo slot");
     scheduler.Finish();
     RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // PrepareBindlessHeaps across consumers (KYTY_BINDLESS=1). Every key is resolved again; a key
+  // whose T# still resolves to the view in its slot keeps its slot, translation and reference, a
+  // changed key moves, and a CPU write to a kept key's texture is still refreshed (keeping skips
+  // only the table bookkeeping, never the texture cache's work).
+  void CheckBindlessHeapRepeat() {
+    constexpr const char *name = "BindlessHeapRepeat";
+    constexpr uintptr_t base = 0x0000000207000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    constexpr uintptr_t heap_address = base + 0x100000;
+    EnsureRuntimeContext();
+    Require(name, "bindless device", m_runtime_context.bindless_supported,
+            "no bindless table on this device (the test needs KYTY_BINDLESS=1)");
+    Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    Require(name, "bindless table", context.GetBindlessTable().Enabled(),
+            "the bindless table was not created");
+    // Guest writes to tracked pages fault into this context (the production route).
+    LibKernel::Memory::InstallGpuResources(&context);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "bindless-heap direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, allocation_alignment) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bindless-heap fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      auto &table = context.GetBindlessTable();
+      context.MapMemory(base, allocation_size);
+      const auto texture = [&](uint64_t address) {
+        const ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        std::array<uint32_t, 8> words{};
+        std::copy_n(descriptor.fields, 8, words.begin());
+        return words;
+      };
+      const auto a = texture(base);
+      const auto b = texture(base + 0x20000);
+      const auto write_heap = [&](const std::array<std::array<uint32_t, 8>, 3> &keys) {
+        std::memcpy(reinterpret_cast<void *>(heap_address), keys.data(), sizeof(keys));
+      };
+      write_heap({a, b, a});
+
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Pixel;
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      resource.bindless = true;
+      program.info.images.push_back(resource);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      snapshot.bindless_heaps.push_back({.base = heap_address, .size = 3u * 32u});
+      const ShaderStageRuntime runtime{&program, &snapshot};
+      PreparedBindings prepared;
+      const auto kept = [] {
+        return Profiler::FrameEventTotal(Profiler::FrameEvent::BindlessHeapKeysKept);
+      };
+      // On the GPU thread, as the renderer (clean-backing reads of the heap are certified there).
+      const auto consume = [&] {
+        const auto before = kept();
+        OnGpuThread(context, [&] {
+          RenderExecutorTestAccess::PrepareBindlessHeaps(executor, runtime, prepared);
+        });
+        Require(name, "one heap", table.Heaps().size() == 1u,
+                "the consumer did not create exactly one heap");
+        return kept() - before;
+      };
+      const auto heap = [&]() -> const BindlessTable::Heap & {
+        return table.Heaps().front();
+      };
+
+      Require(name, "first consumer", consume() == 0u && prepared.bindless_textures.size() == 3u,
+              "the first consumer kept a key, or did not resolve all three");
+      const auto first_slots = heap().slots;
+      const auto first_images = heap().images;
+      Require(name, "slots", first_slots[0] != 0u && first_slots[1] != 0u &&
+                                 first_slots[0] != first_slots[1] && first_slots[2] == first_slots[0],
+              "the two textures did not take two slots (the shared view one)");
+
+      Require(name, "repeat keeps",
+              consume() == 3u && heap().slots == first_slots && heap().images == first_images &&
+                  prepared.bindless_textures.size() == 3u,
+              "an unchanged heap did not keep every key in its slot");
+
+      write_heap({a, a, a});
+      Require(name, "changed key moves",
+              consume() == 2u && heap().slots[1] == first_slots[0] &&
+                  heap().images[1] == first_images[0] && heap().slots[0] == first_slots[0],
+              "the rewritten key did not move to the other texture's slot");
+
+      // A guest write to A's texels (write-tracked once uploaded) makes it CPU-dirty.
+      *reinterpret_cast<volatile uint8_t *>(base + 64) = 0x11;
+      Require(name, "texture CPU-dirty", texture_cache.GetImage(first_images[0]).IsCpuDirty(),
+              "the guest write did not dirty the texture");
+      Require(name, "kept key refreshed",
+              consume() == 3u && !texture_cache.GetImage(first_images[0]).IsCpuDirty(),
+              "keeping the keys skipped the texture's refresh");
+
+      // The cache retires A: its keys may not keep the slot that now holds the placeholder.
+      OnGpuThread(context, [&] { TextureCacheTestAccess::FreeImage(texture_cache, first_images[0]); });
+      Require(name, "retired texture",
+              consume() == 0u && heap().images[0] && heap().images[0] != first_images[0] &&
+                  heap().slots[0] != 0u && heap().slots[0] != first_slots[0] &&
+                  heap().slots[1] == heap().slots[0] && heap().slots[2] == heap().slots[0] &&
+                  table.SlotView(BindlessTable::Images2D, heap().slots[0]) != nullptr &&
+                  table.SlotView(BindlessTable::Images2D, first_slots[0]) == nullptr,
+              "a key kept the slot of a retired texture");
+      OnGpuThread(context, [&] {
+        scheduler.Finish();
+        context.UnmapMemory(base, allocation_size);
+      });
+    }
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "bindless-heap unmap failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "bindless-heap direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -29683,6 +29838,16 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    if (m_bindless) {
+      vk::PhysicalDeviceVulkan12Properties properties12{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &properties12;
+      m_physical_device.getProperties2(&properties2);
+      const auto budget = CalculateBindlessBudget(properties12, properties2.properties.limits);
+      m_runtime_context.bindless_images_per_array = budget.images;
+      m_runtime_context.bindless_samplers_per_array = budget.samplers;
+      m_runtime_context.bindless_supported = budget.images >= 3u && budget.samplers != 0u;
+    }
     if (m_enable_subgroup_size_control) {
       vk::PhysicalDeviceSubgroupSizeControlProperties properties{};
       vk::PhysicalDeviceProperties2 properties2{};
@@ -30030,6 +30195,24 @@ private:
     // Optional, as in the emulator: S# FILTER_MODE min/max reduction.
     device_features12.samplerFilterMinmax = available_features12.samplerFilterMinmax;
     m_sampler_filter_minmax = available_features12.samplerFilterMinmax == VK_TRUE;
+    // KYTY_BINDLESS=1, as the emulator's window: the descriptor indexing the bindless table needs,
+    // when the device has it (EnsureRuntimeContext sizes the table, BindlessTable creates it).
+    {
+      const auto *bindless = std::getenv("KYTY_BINDLESS");
+      m_bindless = bindless != nullptr && bindless[0] == '1' &&
+                   available_features12.runtimeDescriptorArray &&
+                   available_features12.shaderSampledImageArrayNonUniformIndexing &&
+                   available_features12.descriptorBindingPartiallyBound &&
+                   available_features12.descriptorBindingSampledImageUpdateAfterBind &&
+                   available_features12.descriptorBindingUpdateUnusedWhilePending;
+      if (m_bindless) {
+        device_features12.runtimeDescriptorArray = true;
+        device_features12.shaderSampledImageArrayNonUniformIndexing = true;
+        device_features12.descriptorBindingPartiallyBound = true;
+        device_features12.descriptorBindingSampledImageUpdateAfterBind = true;
+        device_features12.descriptorBindingUpdateUnusedWhilePending = true;
+      }
+    }
     // Native 64-bit LDS atomics through typed views of shared memory (as the emulator).
     device_features12.shaderSharedInt64Atomics = true;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
@@ -30588,6 +30771,8 @@ private:
   GraphicContext m_runtime_context{};
   bool m_require_feedback_dynamic = true;
   bool m_enable_subgroup_size_control = false;
+  // KYTY_BINDLESS=1 on a device with descriptor indexing (the bindless table is created).
+  bool m_bindless = false;
   bool m_pipeline_library = false;
   bool m_storage_image_read_without_format = false;
   bool m_sampler_filter_minmax = false;
@@ -53780,6 +53965,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bindless-heap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindlessHeapRepeat();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-capacity-only") == 0) {

@@ -1578,6 +1578,8 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                                 static_cast<uint32_t>(count64)};
     }
+    // Every key's resolution writes the same binding (ResolveTexture resets the per-binding state).
+    TextureBinding binding;
     for (const auto& use: snapshot.bindless_heaps) {
         prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
         const uint64_t stride = use.record_stride;
@@ -1611,36 +1613,81 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         if (heap == nullptr) continue;
         prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                             static_cast<uint32_t>(count64)};
+        // Every key is resolved again (touch, residency, refresh). A key that still samples the
+        // same view through the same slot keeps its slot, translation and image reference: what
+        // releasing and settling it again would leave (FindSlot finds the view in that slot).
+        const auto expected_view = array == BindlessTable::Images3D ? vk::ImageViewType::e3D :
+            array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
+        auto& cache = m_context.GetTextureCache();
+        uint32_t kept = 0;
         for (uint32_t key = 0; key < count64; ++key) {
-            (void)table.ReleaseKey(*heap, key);
-            heap->settled[key] = 1;
-            heap->descriptors[key] = records[key];
-            table.SetTranslation(*heap, key, 0u);
+            const bool same_descriptor =
+                heap->settled[key] != 0 && heap->descriptors[key] == records[key];
+            auto& hint = heap->memo_hints[key];
+            // The key samples the placeholder: as a fresh release and settle leaves it.
+            const auto settle_placeholder = [&] {
+                (void)table.ReleaseKey(*heap, key);
+                heap->settled[key] = 1;
+                heap->descriptors[key] = records[key];
+                table.SetTranslation(*heap, key, 0u);
+            };
             ShaderRecompiler::IR::DescriptorValue value {.dwords = records[key], .dword_count = 8u};
             const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
             if (!BindlessCompatible(descriptor, array) ||
                 (descriptor.Type() == Prospero::ImageType::kCube && !resource.cube) ||
                 TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
-                    Prospero::BufferFormat::kInvalid) continue;
-            auto binding = ResolveTexture(resource, value);
-            const auto expected_view = array == BindlessTable::Images3D ? vk::ImageViewType::e3D :
-                array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
-            if (binding.desc.view_info.type != expected_view) continue;
-            auto& cache = m_context.GetTextureCache();
+                    Prospero::BufferFormat::kInvalid) {
+                hint = {};
+                settle_placeholder();
+                continue;
+            }
+            // The memo hints of the same T# (ResolveTexture checks them in verify modes).
+            if (!same_descriptor || hint.tag == 0) {
+                hint.hash = TextureBindingMemo::Hash(TextureBindingMemo::MakeKey(resource, descriptor.fields));
+                hint.tag  = 0;
+            }
+            ResolveTexture(resource, value, binding, &hint.hash, hint.tag);
+            hint.tag = binding.memo_tag;
+            if (binding.desc.view_info.type != expected_view) {
+                settle_placeholder();
+                continue;
+            }
             auto* image = cache.m_slot_images.try_get(binding.image_id);
-            if (image == nullptr || !image->registered || image->info.data.Empty()) continue;
+            if (image == nullptr || !image->registered || image->info.data.Empty()) {
+                settle_placeholder();
+                continue;
+            }
             BindImage(binding.image_id, false);
-            binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
+            // FindTexture, or its memoized answer when it would do nothing else (RebindImages).
+            if (!m_texture_memo.TryAcquireView(cache, binding)) {
+                binding.image_view = cache.FindTexture(binding.image_id, binding.desc);
+                m_texture_memo.RecordView(binding, binding.image_view);
+            }
             image = cache.m_slot_images.try_get(binding.image_id);
-            if (image == nullptr || !image->registered || !binding.image_view) continue;
+            if (image == nullptr || !image->registered || !binding.image_view) {
+                settle_placeholder();
+                continue;
+            }
             // Resolution may retire an older view and recycle its raw handle. Cache calls have
             // released their locks, and the producer phase has no pending table consumers.
             table.ApplyUnregistered();
+            binding.layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
+            const auto& view = binding.desc.view_info;
+            const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+                                               view.layer_count};
+            if (const auto slot = heap->slots[key]; slot != 0 && heap->images[key] == binding.image_id &&
+                table.SlotView(array, slot) == binding.image_view) {
+                heap->settled[key] = 1;
+                heap->descriptors[key] = records[key];
+                prepared.bindless_textures.push_back({binding.image_id, binding.layout, range});
+                kept++;
+                continue;
+            }
+            settle_placeholder();
             const auto old_slot = table.FindSlot(array, binding.image_view);
             const auto slot = old_slot != 0 ? old_slot : table.AllocateSlot(array);
             if (slot == 0) continue;
-            binding.layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
             if (old_slot == 0) {
                 table.WriteSlot(array, slot, binding.image_view, binding.layout);
                 table.AddSlotOwner(binding.image_id, array, slot);
@@ -1649,8 +1696,10 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             heap->images[key] = binding.image_id;
             table.AddImageReference(binding.image_id, *heap, key);
             table.SetTranslation(*heap, key, slot);
-            prepared.bindless_textures.push_back({binding, resource, value, array, slot});
+            prepared.bindless_textures.push_back({binding.image_id, binding.layout, range});
         }
+        Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
+        Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
     }
 }
 
@@ -2654,15 +2703,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
-        for (auto& texture: prepared->bindless_textures) {
-            auto& image = m_context.GetTextureCache().GetImage(texture.binding.image_id);
+        for (const auto& texture: prepared->bindless_textures) {
+            auto& image = m_context.GetTextureCache().GetImage(texture.image_id);
             // The sampled arrays have read-only layouts. Reject attachment/storage overlap
             // explicitly until a matching feedback/general-layout binding is implemented.
             EXIT_IF(!image.registered || image.binding.is_target || image.binding.force_general ||
                     image.binding.shader_write || image.binding.needs_rebind);
-            const auto& view = texture.binding.desc.view_info;
-            image.Transit(texture.binding.layout, vk::AccessFlagBits2::eShaderRead,
-                          ImageSubresourceRange {view.base_level, view.level_count, view.base_layer, view.layer_count},
+            image.Transit(texture.layout, vk::AccessFlagBits2::eShaderRead, texture.range,
                           vk_buffer, true);
             image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
             image.usage.texture = true;

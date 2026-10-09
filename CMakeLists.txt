@@ -1865,6 +1865,10 @@ if(BUILD_TESTING)
 	add_test(NAME texture_memo_capacity_bindless
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-capacity-only)
 	set_tests_properties(texture_memo_capacity_bindless PROPERTIES ENVIRONMENT "KYTY_BINDLESS=1")
+	# PrepareBindlessHeaps: keys kept across consumers, moved when rewritten, refreshed when dirty.
+	add_test(NAME bindless_heap_repeat
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bindless-heap-only)
+	set_tests_properties(bindless_heap_repeat PROPERTIES ENVIRONMENT "KYTY_BINDLESS=1")
 	add_test(NAME texture_memo_revalidate_large
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
 	set_tests_properties(texture_memo_revalidate_large PROPERTIES

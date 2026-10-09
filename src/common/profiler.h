@@ -1245,6 +1245,9 @@ enum class FrameEvent : uint32_t {
 	BdaCandidateRejects,
 	BdaCandidateMisses,
 	BdaCandidateDroppedWrites,
+	// PrepareBindlessHeaps: heap keys resolved per consumer, and those that kept their slot.
+	BindlessHeapKeys,
+	BindlessHeapKeysKept,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

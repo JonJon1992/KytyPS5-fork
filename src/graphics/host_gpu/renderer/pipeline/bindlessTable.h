@@ -81,7 +81,13 @@ public:
 		// Every consumer rereads the complete current heap from certified clean backing.
 		std::vector<std::array<uint32_t, 8>> descriptors;
 		std::vector<ImageId>                 images;
-
+		// Per key, the texture binding memo's hash and tag of its last resolution (tag 0: none).
+		// A consumer that finds the same T# passes them as hints: no hashing, no key comparison.
+		struct MemoHint {
+			uint64_t hash = 0;
+			uint64_t tag  = 0;
+		};
+		std::vector<MemoHint> memo_hints;
 	};
 
 	// The heap for (base, table offset, view binding, complete resource interpretation), created
@@ -139,6 +145,11 @@ public:
     void QueueUnregistered(ImageId id);
     void ApplyUnregistered();
     [[nodiscard]] uint32_t FindSlot(uint32_t binding, vk::ImageView view) const;
+    // The view image slot `slot` of `binding` holds (null: a placeholder or never written).
+    [[nodiscard]] vk::ImageView SlotView(uint32_t binding, uint32_t slot) const noexcept {
+        if (binding >= ImageArrays || slot >= m_slot_views[binding].size()) return {};
+        return m_slot_views[binding][slot];
+    }
     void MarkUsed() { m_used = true; }
     [[nodiscard]] bool Used() const { return m_used; }
     void ClearUsed() { m_used = false; }
