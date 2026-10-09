@@ -1628,6 +1628,9 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 	const auto frame     = m_memory_tracker.Frame();
 	const auto max_pages = m_memory_tracker.HotMax();
+	// KYTY_HOT_PAGE_MAX_LIVE=off: every hot page is uploaded as it is now and returns to fault
+	// tracking (its shadow goes with the demotion below), without comparing it first.
+	const bool retire_all = max_pages == 0;
 	// KYTY_HOT_PAGE_PRESSURE: while slots are short, unchanged pages give theirs back sooner.
 	const uint32_t check_limit =
 	    m_hot_pressure && m_hot_check_limit != 0 ? std::max(m_hot_check_limit / 4u, 1u)
@@ -1661,12 +1664,12 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			// (hot, hence never GPU-dirty and readable) page first and snapshot only one that
 			// differs. A write racing either compare is seen by the next upload, whose shadow still
 			// holds the old contents, exactly as a write landing right after a snapshot.
-			bool same = m_bda_hot_sync && unchanged(reinterpret_cast<const void*>(page));
+			bool same = !retire_all && m_bda_hot_sync && unchanged(reinterpret_cast<const void*>(page));
 			if (!same) {
 				// Snapshot the (writable) page once: the compare, the shadow and the upload all use
 				// this copy, so the shadow always equals what the buffer receives.
 				std::memcpy(snapshot, reinterpret_cast<const void*>(page), TRACKER_PAGE_SIZE);
-				same = unchanged(snapshot);
+				same = !retire_all && unchanged(snapshot);
 			}
 			if (same) {
 				skipped++;
@@ -1699,7 +1702,10 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				staged += TRACKER_PAGE_SIZE;
 				continue;
 			}
-			if (shadow == m_hot_shadows.end()) {
+			if (retire_all) {
+				demote.push_back(page);
+				shadow = m_hot_shadows.end();
+			} else if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
 					if (!m_hot_shadow_free.empty()) {

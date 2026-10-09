@@ -202,9 +202,9 @@ private:
 public:
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
-	// The hot page limit in effect: KYTY_HOT_PAGE_MAX_LIVE when a live change set it (1..65536),
-	// otherwise FaultPolicy::hot_max. Pages already hot above a lowered limit stay hot until they
-	// are demoted as usual.
+	// The hot page limit in effect: KYTY_HOT_PAGE_MAX_LIVE when a live change set it (1..65536, or
+	// 0 for "off"), otherwise FaultPolicy::hot_max. Pages already hot above a lowered limit stay hot
+	// until they are demoted as usual; with 0 the next collection of each demotes it.
 	[[nodiscard]] uint32_t HotMax() const noexcept;
 	// KYTY_FAULT_AHEAD_ADAPT (BufferCache): write faults use a fault-ahead window of at least this
 	// many pages (a power of two dividing TRACKER_REGION_PAGES; 0 or anything smaller than the

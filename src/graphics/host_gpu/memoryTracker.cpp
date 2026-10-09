@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 
+#include <cstring>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/liveSwitch.h"
@@ -11,8 +13,14 @@ namespace Libs::Graphics {
 namespace {
 
 // KYTY_HOT_PAGE_MAX_LIVE (default unset: KYTY_HOT_PAGE_MAX's startup value): a live hot page limit
-// for A/B runs, read at every write fault and hot page collection.
+// for A/B runs, read at every write fault and hot page collection. "off": no page becomes hot, and
+// the next collection of each hot page uploads it once more and returns it to fault tracking
+// (BufferCache::CollectHotPages) - with cheap write faults (KYTY_UFFD_WP) and small fault windows
+// the per-pass compare of unchanged hot pages can cost more than the faults it saves.
 Live::Switch g_hot_page_max_live("KYTY_HOT_PAGE_MAX_LIVE", [](const char* value) -> int64_t {
+	if (value != nullptr && std::strcmp(value, "off") == 0) {
+		return -1;
+	}
 	return value == nullptr ? 0
 	                        : static_cast<int64_t>(std::min<unsigned long long>(
 	                              std::strtoull(value, nullptr, 10), 65536));
@@ -22,6 +30,9 @@ Live::Switch g_hot_page_max_live("KYTY_HOT_PAGE_MAX_LIVE", [](const char* value)
 
 uint32_t MemoryTracker::HotMax() const noexcept {
 	const auto live = g_hot_page_max_live.Get();
+	if (live < 0) {
+		return 0;
+	}
 	return live > 0 ? static_cast<uint32_t>(live) : m_fault_policy.hot_max;
 }
 
