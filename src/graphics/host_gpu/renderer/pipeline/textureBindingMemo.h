@@ -18,9 +18,10 @@ namespace Libs::Graphics {
 struct TextureBinding;
 
 // Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, default on; =0 restores the full
-// resolution for every binding). Startup capacity: 4096 entries, or 65536 with
-// KYTY_BINDLESS=1; KYTY_TEXTURE_BINDING_MEMO_SLOTS overrides with a power of two
-// in [1024, 65536]. The capacity changes retention, never the validity checks.
+// resolution for every binding). Capacity, fixed at construction: 4096 entries, or 65536 when the
+// device runs the bindless table (GraphicContext::bindless_supported, not the KYTY_BINDLESS request
+// alone); KYTY_TEXTURE_BINDING_MEMO_SLOTS overrides with a power of two in [1024, 65536]. The
+// capacity changes retention, never the validity checks.
 //
 // RenderExecutor::ResolveTexture turns (T# dwords, shader image resource) into a texture-cache
 // image and a description, and RebindImages turns that into the sampled view. Both repeat for
@@ -88,12 +89,16 @@ public:
 		bool operator==(const Key&) const = default;
 	};
 
-	TextureBindingMemo();
+	// bindless: the device runs the bindless table (the larger default capacity).
+	explicit TextureBindingMemo(bool bindless = false);
 	~TextureBindingMemo();
 	TextureBindingMemo(const TextureBindingMemo&)            = delete;
 	TextureBindingMemo& operator=(const TextureBindingMemo&) = delete;
 
 	[[nodiscard]] static bool Enabled();
+	// The capacity for KYTY_TEXTURE_BINDING_MEMO_SLOTS `setting` (null: unset).
+	[[nodiscard]] static uint32_t SelectCapacity(const char* setting, bool bindless) noexcept;
+	[[nodiscard]] uint32_t        Capacity() const noexcept { return m_slot_mask + 1u; }
 
 	[[nodiscard]] static Key MakeKey(const ShaderRecompiler::IR::ImageResource& resource,
 	                                 const uint32_t (&words)[8]);
@@ -183,7 +188,10 @@ public:
 
 private:
 	struct Entry;
-	const uint32_t m_slot_mask; // immutable; capacity is a power of two
+	static constexpr uint32_t DefaultSlots = 4096;
+	static constexpr uint32_t MinSlots     = 1024;
+	static constexpr uint32_t MaxSlots     = 65536;
+	const uint32_t            m_slot_mask; // immutable; capacity is a power of two
 	static constexpr uint32_t KeyWords = 8;
 	using PackedKey                    = std::array<uint64_t, KeyWords>;
 

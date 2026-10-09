@@ -9,11 +9,11 @@
 #include <atomic>
 #include <bit>
 #include <charconv>
-#include <string_view>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string_view>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -81,22 +81,6 @@ int RevalidateVerifyMode() {
 	return mode;
 }
 
-// One-time selection, before publishing entries to DrawPrep readers. Bindless heaps can
-// cycle through tens of thousands of exact keys, evicting the small ordinary-draw memo.
-// Invalid overrides keep the default; no allocation or parsing occurs on lookup.
-uint32_t MemoCapacity() {
-	const auto* bindless = std::getenv("KYTY_BINDLESS");
-	const uint32_t fallback = bindless != nullptr && bindless[0] == '1' ? 65536u : 4096u;
-	const auto* setting = std::getenv("KYTY_TEXTURE_BINDING_MEMO_SLOTS");
-	if (setting == nullptr) return fallback;
-	const std::string_view text(setting);
-	uint32_t slots = 0;
-	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), slots);
-	if (error != std::errc {} || end != text.data() + text.size() ||
-	    slots < 1024u || slots > 65536u || !std::has_single_bit(slots)) return fallback;
-	return slots;
-}
-
 } // namespace
 
 bool TextureBindingMemo::HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
@@ -130,7 +114,26 @@ void TextureBindingMemo::ReportRevalidateMismatch() {
 	}
 }
 
-TextureBindingMemo::TextureBindingMemo() : m_slot_mask(MemoCapacity() - 1u) {}
+uint32_t TextureBindingMemo::SelectCapacity(const char* setting, bool bindless) noexcept {
+	// Bindless heaps cycle through tens of thousands of exact keys, which evict each other in the
+	// ordinary-draw capacity. An invalid override keeps the default.
+	const uint32_t fallback = bindless ? MaxSlots : DefaultSlots;
+	if (setting == nullptr) {
+		return fallback;
+	}
+	const std::string_view text(setting);
+	uint32_t               slots = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), slots);
+	if (error != std::errc {} || end != text.data() + text.size() || slots < MinSlots ||
+	    slots > MaxSlots || !std::has_single_bit(slots)) {
+		return fallback;
+	}
+	return slots;
+}
+
+// Selected once, before any entry is published to DrawPrep readers; lookups never parse.
+TextureBindingMemo::TextureBindingMemo(bool bindless)
+    : m_slot_mask(SelectCapacity(std::getenv("KYTY_TEXTURE_BINDING_MEMO_SLOTS"), bindless) - 1u) {}
 TextureBindingMemo::~TextureBindingMemo() = default;
 
 bool TextureBindingMemo::Enabled() {

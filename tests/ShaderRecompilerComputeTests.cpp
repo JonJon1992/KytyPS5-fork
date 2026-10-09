@@ -687,6 +687,9 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static uint32_t TextureMemoCapacity(const RenderExecutor &executor) {
+    return executor.m_texture_memo.Capacity();
+  }
   static void SnapshotRunCommand(RenderExecutor &executor, const CommandBuffer &command, ImageId id) {
     executor.m_run.command = command.Identity();
     executor.m_run.tick = executor.m_context.GetCommandScheduler().CurrentTick();
@@ -15705,7 +15708,36 @@ public:
     Require(name, "null image", binding.image_id && binding.desc.info.data.Empty(),
             "the null descriptor did not resolve to a permanent image");
 
-    TextureBindingMemo memo;
+    // Overrides: a power of two in [1024, 65536]; anything else keeps the default.
+    for (const bool bindless : {false, true}) {
+      const uint32_t fallback = bindless ? 65536u : 4096u;
+      Require(name, "default capacity",
+              TextureBindingMemo::SelectCapacity(nullptr, bindless) == fallback,
+              "the unset override did not select the default capacity");
+      for (const char *valid : {"1024", "8192", "65536"}) {
+        Require(name, "valid override",
+                TextureBindingMemo::SelectCapacity(valid, bindless) ==
+                    static_cast<uint32_t>(std::strtoul(valid, nullptr, 10)),
+                "a valid override was not applied");
+      }
+      for (const char *invalid : {"", "0", "512", "3000", "131072", "4096x", " 4096", "-4096",
+                                  "abc", "99999999999"}) {
+        Require(name, "invalid override",
+                TextureBindingMemo::SelectCapacity(invalid, bindless) == fallback,
+                "an invalid override changed the capacity");
+      }
+    }
+    // The executor's capacity follows the device's bindless table, not the KYTY_BINDLESS request.
+    // This harness enables no bindless table, so KYTY_BINDLESS=1 alone keeps 4096 entries.
+    Require(name, "executor capacity",
+            RenderExecutorTestAccess::TextureMemoCapacity(executor) ==
+                TextureBindingMemo::SelectCapacity(std::getenv("KYTY_TEXTURE_BINDING_MEMO_SLOTS"),
+                                                   context.GetGraphics().bindless_supported),
+            "the executor's memo capacity does not follow the device's bindless table");
+    // The fixture needs the enlarged memo a device running the bindless table gets.
+    TextureBindingMemo memo(true);
+    Require(name, "enlarged memo", memo.Capacity() == 65536u,
+            "the fixture needs the 65536-entry memo");
     uint32_t words[8]{};
     const auto first = TextureBindingMemo::MakeKey(resource, words);
     const auto hash_a = TextureBindingMemo::Hash(first);

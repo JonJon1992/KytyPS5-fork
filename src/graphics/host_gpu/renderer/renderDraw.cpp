@@ -907,6 +907,7 @@ struct DrawRenderState {
 
 RenderExecutor::RenderExecutor(RenderContext& context)
     : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()),
+      m_texture_memo(context.GetGraphics().bindless_supported),
       m_predicates(std::make_unique<GpuPredication::Predicates>(context)) {}
 
 RenderExecutor::~RenderExecutor() = default;
