@@ -2484,10 +2484,15 @@ bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
 		    BdaWriteCandidates::MaxTableBytes);
 	}
-	auto& table = m_slot_buffers[id];
-	m_bda_candidate_table_backup->CopyFrom(m_scheduler.Current(), table,
-	                                       table.Offset(plan.table), 0, plan.table_bytes);
-	WriteDataBuffer(table, plan.table, plan.words.data(), plan.table_bytes);
+	auto& table   = m_slot_buffers[id];
+	auto& command = m_scheduler.Current();
+	// Encoded copies: with KYTY_CP_RECORDER, no recorder drain before the dispatch.
+	m_bda_candidate_table_backup->CopyFromEncoded(command, table, table.Offset(plan.table), 0,
+	                                              plan.table_bytes);
+	static_assert(BdaWriteCandidates::MaxTableBytes <= 4096, "one staging copy holds the table");
+	const auto staged = m_staging_buffer.Copy(plan.words.data(), plan.table_bytes, 4);
+	table.CopyFromEncoded(command, m_staging_buffer, staged, table.Offset(plan.table),
+	                      plan.table_bytes, vk::AccessFlagBits::eHostWrite);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateDispatches);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRanges, plan.range_count);
 	static uint32_t logs = 0;
@@ -2499,14 +2504,19 @@ bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	return true;
 }
 
-void BufferCache::RestoreBdaWriteCandidateTable(const BdaWriteCandidates::Plan& plan) {
+void BufferCache::FinishBdaWriteCandidates(const BdaWriteCandidates::Plan& plan) {
 	EXIT_IF(!m_bda_candidate_table_backup || !GuestGpu::IsGpuThread());
 	const auto id = FindBuffer(plan.table, plan.table_bytes);
 	auto& table = m_slot_buffers[id];
-	// CopyFrom orders the dispatch's table reads before this write, and this write before the
+	// The copy orders the dispatch's table reads before this write, and this write before the
 	// next use of the shared backup. No CPU wait and no change to the table's ownership bits.
-	table.CopyFrom(m_scheduler.Current(), *m_bda_candidate_table_backup,
-	               0, table.Offset(plan.table), plan.table_bytes);
+	// Encoded: with KYTY_CP_RECORDER, no recorder drain after the dispatch.
+	table.CopyFromEncoded(m_scheduler.Current(), *m_bda_candidate_table_backup, 0,
+	                      table.Offset(plan.table), plan.table_bytes);
+	// The verify mode settles, which reads the dropped count; otherwise it is read asynchronously.
+	if (!ShaderRecompiler::BdaWriteCandidatesVerify()) {
+		m_fault_manager.QueueBdaDroppedCheck(plan.shader_hash);
+	}
 }
 
 void BufferCache::SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRange> candidates) {

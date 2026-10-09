@@ -268,6 +268,22 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
                       vk::AccessFlags destination_after) {
+	RecordCopy(command, false, source, source_offset, destination_offset, size, source_before,
+	           destination_before, source_after, destination_after);
+}
+
+void Buffer::CopyFromEncoded(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+                             uint64_t destination_offset, uint64_t size,
+                             vk::AccessFlags source_before) {
+	constexpr auto any = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	RecordCopy(command, true, source, source_offset, destination_offset, size, source_before, any,
+	           any, any);
+}
+
+void Buffer::RecordCopy(CommandBuffer& command, bool encoded, const Buffer& source,
+                        uint64_t source_offset, uint64_t destination_offset, uint64_t size,
+                        vk::AccessFlags source_before, vk::AccessFlags destination_before,
+                        vk::AccessFlags source_after, vk::AccessFlags destination_after) {
 	KYTY_GPU_OP_SITE("buffer.copy");
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
@@ -287,12 +303,6 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Handle();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
-	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
-	MarkContentWritten();
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
@@ -301,8 +311,20 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_after | destination_after) & host_access)) {
 		after_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	const auto record = [&](const auto& target) {
+		target.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
+		target.copyBuffer(source.Handle(), Handle(), 1, &copy);
+		target.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	};
+	if (encoded) {
+		record(command.Sink());
+	} else {
+		record(command.Handle());
+	}
+	MarkContentWritten();
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {

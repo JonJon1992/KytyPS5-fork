@@ -13,8 +13,10 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -378,6 +380,112 @@ void FaultManager::CollectBdaWrites(BdaWrites& result) {
 	result.pages    = count;
 	result.overflow = count > stored;
 	std::memcpy(&result.dropped, mapped + WrittenPageAreaSize, sizeof(result.dropped));
+}
+
+struct FaultManager::DroppedChecks {
+	static constexpr uint32_t Slots = 16;
+	std::unique_ptr<Buffer>                download;
+	std::array<std::atomic<bool>, Slots>   pending {};
+};
+
+void FaultManager::QueueBdaDroppedCheck(uint64_t shader_hash) {
+	KYTY_GPU_OP_SITE("fault.bda_dropped_check");
+	EXIT_IF(!m_bda_writes);
+	(void)GetFaultBuffer();
+	if (!m_dropped_checks) {
+		m_dropped_checks           = std::make_shared<DroppedChecks>();
+		m_dropped_checks->download = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags,
+		    std::max<uint64_t>(DroppedChecks::Slots * sizeof(uint32_t),
+		                       m_graphics.physical_device_properties.limits.nonCoherentAtomSize));
+	}
+	auto&      checks = *m_dropped_checks;
+	const auto slot   = m_dropped_check_next % DroppedChecks::Slots;
+	if (checks.pending[slot].load(std::memory_order_acquire)) {
+		return; // the count stays in the fault buffer for a later check (or a settle)
+	}
+	checks.pending[slot].store(true, std::memory_order_relaxed);
+	m_dropped_check_next++;
+
+	// Producers: the dispatch's atomic adds. Consumers: this copy, then the clear (write-after-read),
+	// then later dispatches' adds and the host read of the slot.
+	vk::BufferMemoryBarrier2 count_barrier {};
+	count_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	count_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	count_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	count_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	count_barrier.buffer = m_fault_buffer.Handle();
+	count_barrier.offset = BufferCache::BDA_DROPPED_WRITES_OFFSET;
+	count_barrier.size   = sizeof(uint32_t);
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &count_barrier;
+
+	m_scheduler.EndRendering();
+	// Encoded with KYTY_CP_RECORDER: no recorder drain after the dispatch.
+	const auto sink = m_scheduler.Current().Sink();
+	sink.pipelineBarrier2(dependency);
+	const vk::BufferCopy copy {BufferCache::BDA_DROPPED_WRITES_OFFSET, slot * sizeof(uint32_t),
+	                           sizeof(uint32_t)};
+	sink.copyBuffer(m_fault_buffer.Handle(), checks.download->Handle(), 1, &copy);
+	auto clear_barrier          = count_barrier;
+	clear_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	clear_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+	clear_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	dependency.pBufferMemoryBarriers = &clear_barrier;
+	sink.pipelineBarrier2(dependency);
+	sink.fillBuffer(m_fault_buffer.Handle(), BufferCache::BDA_DROPPED_WRITES_OFFSET,
+	                sizeof(uint32_t), 0);
+	m_fault_buffer.MarkContentWritten();
+	auto after_count          = count_barrier;
+	after_count.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	after_count.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after_count.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	after_count.dstAccessMask =
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	vk::BufferMemoryBarrier2 to_host {};
+	to_host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	to_host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	to_host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	to_host.buffer        = checks.download->Handle();
+	to_host.offset        = copy.dstOffset;
+	to_host.size          = sizeof(uint32_t);
+	const std::array after {after_count, to_host};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(after.size());
+	dependency.pBufferMemoryBarriers    = after.data();
+	sink.pipelineBarrier2(dependency);
+
+	m_scheduler.DeferOperation([state = m_dropped_checks, slot, shader_hash] {
+		auto& download = *state->download;
+		download.Invalidate(0, download.Size());
+		uint32_t dropped = 0;
+		std::memcpy(&dropped, download.Mapped().data() + slot * sizeof(uint32_t), sizeof(dropped));
+		state->pending[slot].store(false, std::memory_order_release);
+		if (dropped == 0) {
+			return;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateDroppedWrites, dropped);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("BDA candidates: shader=0x%016" PRIx64 " dropped %u writes to pages without a cache "
+			     "buffer\n",
+			     shader_hash, dropped);
+		}
+		// Parsed as SettleBdaWrites parses it: a whole decimal number.
+		static const bool verify = [] {
+			const auto* value = std::getenv("KYTY_BDA_WRITES_VERIFY");
+			char*       end   = nullptr;
+			return value != nullptr && std::strtoull(value, &end, 10) != 0 && end != value &&
+			       *end == '\0';
+		}();
+		if (verify) {
+			EXIT("KYTY_BDA_WRITES_VERIFY: candidate shader 0x%016" PRIx64 " dropped %u writes\n",
+			     shader_hash, dropped);
+		}
+	});
 }
 
 } // namespace Libs::Graphics

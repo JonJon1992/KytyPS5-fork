@@ -463,7 +463,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	if (candidate_writes) m_context.GetBufferCache().RestoreBdaWriteCandidateTable(*candidate_plan);
+	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -610,7 +610,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	if (candidate_writes) m_context.GetBufferCache().RestoreBdaWriteCandidateTable(*candidate_plan);
+	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	if (program.info.bda_writes &&

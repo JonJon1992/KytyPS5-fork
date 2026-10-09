@@ -1244,6 +1244,7 @@ enum class FrameEvent : uint32_t {
 	BdaCandidateRanges,
 	BdaCandidateRejects,
 	BdaCandidateMisses,
+	BdaCandidateDroppedWrites,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

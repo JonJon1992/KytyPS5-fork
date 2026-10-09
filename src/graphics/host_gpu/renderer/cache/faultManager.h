@@ -38,6 +38,12 @@ public:
 	// submits and waits for them (phase 0 of the BDA-writes design: a synchronous settle). GPU
 	// thread; only with KYTY_BDA_WRITES_SHADERS. `result` keeps its storage between calls.
 	void CollectBdaWrites(BdaWrites& result);
+	// KYTY_BDA_WRITES=candidates, which has no settle: after the dispatch, copies the count of
+	// writes dropped on pages without a cache buffer to a readback slot and clears it. The slot is
+	// read once the recording completes, with no wait; a nonzero count is reported
+	// (BdaCandidateDroppedWrites, a log line) and fatal with KYTY_BDA_WRITES_VERIFY. While every
+	// slot still waits for its recording, the count carries over to the next check.
+	void QueueBdaDroppedCheck(uint64_t shader_hash);
 
 private:
 	void CreateBdaWriteResources();
@@ -59,6 +65,10 @@ private:
 	// written-page bitmap and its host-visible result (page list, then the dropped count).
 	vk::Pipeline                               m_bda_write_pipeline = nullptr;
 	std::unique_ptr<Buffer>                    m_bda_write_download;
+	// QueueBdaDroppedCheck's readback slots, shared with the completion callbacks.
+	struct DroppedChecks;
+	std::shared_ptr<DroppedChecks>             m_dropped_checks;
+	uint32_t                                   m_dropped_check_next = 0;
 };
 
 } // namespace Libs::Graphics

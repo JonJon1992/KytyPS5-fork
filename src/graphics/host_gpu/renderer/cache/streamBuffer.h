@@ -78,6 +78,12 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// CopyFrom recorded through the command buffer's sink: with KYTY_CP_RECORDER it is encoded for
+	// the recorder thread instead of draining it (Handle()); the same commands in the same order.
+	// Every later access of either range is ordered after the copy.
+	void CopyFromEncoded(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+	                     uint64_t destination_offset, uint64_t size,
+	                     vk::AccessFlags source_before = vk::AccessFlagBits::eMemoryWrite);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
@@ -92,6 +98,10 @@ protected:
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
+	void RecordCopy(CommandBuffer& command, bool encoded, const Buffer& source,
+	                uint64_t source_offset, uint64_t destination_offset, uint64_t size,
+	                vk::AccessFlags source_before, vk::AccessFlags destination_before,
+	                vk::AccessFlags source_after, vk::AccessFlags destination_after);
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;

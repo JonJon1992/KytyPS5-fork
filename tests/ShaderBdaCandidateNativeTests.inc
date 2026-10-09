@@ -99,11 +99,18 @@ void CheckBdaWriteCandidates() {
       auto& buffer = cache.GetBuffer(cache.FindBuffer(range.address, range.size));
       buffer.Fill(buffer.Offset(range.address), range.size, 0xc0ffee00u + i);
     }
-    cache.RestoreBdaWriteCandidateTable(plan);
+    // Writes the dispatch dropped, stood in for by a count left in the fault buffer: reported once
+    // the recording completes, without a settle.
+    const auto dropped = Profiler::FrameEventTotal(Profiler::FrameEvent::BdaCandidateDroppedWrites);
+    cache.GetFaultBuffer()->Fill(BufferCache::BDA_DROPPED_WRITES_OFFSET, sizeof(u32), 7);
+    cache.FinishBdaWriteCandidates(plan);
     snapshot(restored);
     Require(name, "no settle", Profiler::FrameEventTotal(Profiler::FrameEvent::BdaSettles) == settles,
         "candidate preparation submitted a synchronous settle");
     scheduler.Finish();
+    Require(name, "dropped writes reported",
+        Profiler::FrameEventTotal(Profiler::FrameEvent::BdaCandidateDroppedWrites) == dropped + 7,
+        "a candidate dispatch's dropped writes were not reported after completion");
   });
   const auto frozen_words = ReadBuffer(name, frozen, table.size());
   const auto restored_words = ReadBuffer(name, restored, newer.size());

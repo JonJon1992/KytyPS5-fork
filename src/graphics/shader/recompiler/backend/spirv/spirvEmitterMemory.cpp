@@ -1097,12 +1097,13 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 				const auto host    = GetBdaPointer(ctx, guest);
 				const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), host,
 				                            ConstantDeviceAddress(state, 0));
+				// KYTY_BDA_WRITES=candidates: no written-page bitmap (the destinations were claimed
+				// before the dispatch), but a dropped write is still counted, and reported without a
+				// settle (FaultManager::QueueBdaDroppedCheck).
 				const bool candidates = BdaWriteCandidatesApplies(state.program.shader_hash) &&
 				                        !BdaWriteCandidatesVerify();
-				if (!candidates) {
-					EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
-					                [&]() { RecordBdaDroppedWrite(state); });
-				}
+				EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), present),
+				                [&]() { RecordBdaDroppedWrite(state); });
 				EmitIfCondition(state, present, [&]() {
 					if (!candidates) RecordBdaWrite(state, guest);
 					const auto pointer = state.builder.AllocateId();

@@ -252,15 +252,20 @@ void CandidateProofs() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
-TestCase CandidateStore(bool verify) {
+// dropped: the V# points at a page without a cache buffer, so every lane's write is dropped and
+// counted (also without the bitmap: the count is how a candidate dispatch reports a lost write).
+TestCase CandidateStore(bool verify, bool dropped = false) {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = verify ? "BdaCandidatesBitmapReference" : "BdaCandidatesWithoutBitmap";
+  test.name = dropped  ? "BdaCandidatesDroppedCounted"
+              : verify ? "BdaCandidatesBitmapReference"
+                       : "BdaCandidatesWithoutBitmap";
   test.shader_hash = ShaderRecompiler::BdaWaterLightingHash;
   test.initial.assign(2048, 0);
-  PutDescriptor(&test, 0, {static_cast<u32>(GuestBase + 4096), (4u << 16) | 1u, 64, 0x5204});
+  const auto destination = GuestBase + (dropped ? 0x40000u : 4096u);
+  PutDescriptor(&test, 0, {static_cast<u32>(destination), (4u << 16) | 1u, 64, 0x5204});
   test.expected = test.initial;
-  std::fill_n(test.expected.begin() + 1024, 64, 0xc0ffee42u);
+  if (!dropped) std::fill_n(test.expected.begin() + 1024, 64, 0xc0ffee42u);
   AppendSelectDescriptor(&test.code, 64, 1);
   AppendVMovU32(&test.code, 2, 0xc0ffee42u);
   while (test.code.size() * 4 < 0x530)
@@ -273,8 +278,9 @@ TestCase CandidateStore(bool verify) {
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = 64;
   test.has_compute_info = true;
-  test.bda_mappings = {{GuestBase, 0}};
-  test.expected_bda_dropped_writes = 0;
+  // Only the descriptor's page is mapped when the write must be dropped.
+  test.bda_mappings = {{GuestBase, 0, dropped ? 4096u : 0u}};
+  test.expected_bda_dropped_writes = dropped ? 64u : 0u;
   if (verify) {
     test.expected_bda_written_pages = {GuestPage};
     test.required_spirv = {"OpGroupNonUniformAllEqual"};
@@ -319,6 +325,7 @@ void RunCandidates() {
   CandidateProofs();
   VulkanHarness vulkan;
   RunCase(&vulkan, CandidateStore(false));
+  RunCase(&vulkan, CandidateStore(false, true));
   RunCase(&vulkan, CandidateTableCount());
   {
     auto verify = options;

@@ -175,7 +175,9 @@ public:
 	                                             std::span<const uint32_t> user_data,
 	                                             BdaWriteCandidates::Plan& plan);
 	[[nodiscard]] bool FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan);
-	void RestoreBdaWriteCandidateTable(const BdaWriteCandidates::Plan& plan);
+	// Right after the dispatch: restores the saved table version and, without the verify settle,
+	// queues the asynchronous dropped-write check (FaultManager::QueueBdaDroppedCheck).
+	void FinishBdaWriteCandidates(const BdaWriteCandidates::Plan& plan);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
