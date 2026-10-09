@@ -1851,7 +1851,7 @@ struct PipelineCache::ProgramCache {
 		key.stage           = StageOf(input_info);
 		key.hash            = params.hash;
 		if (DeviceFaultDiagnosticsEnabled()) {
-			NoteDiagnosticProgram(params.Base(), params.hash); // names device-loss checkpoints
+			NoteDiagnosticProgram(params.Base(), params.hash, params.code.size_bytes());
 		}
 		key.user_data_count = params.user_data_count;
 		key.code_size       = static_cast<uint32_t>(params.code.size());

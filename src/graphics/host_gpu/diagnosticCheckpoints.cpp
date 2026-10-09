@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
@@ -41,17 +42,49 @@ const char* OpName(uint32_t op) {
 	}
 }
 
-// NoteDiagnosticProgram: guest code address -> program hash (the latest seen).
-std::mutex                             g_program_mutex;
-std::unordered_map<uint64_t, uint64_t> g_program_hashes;
+// NoteDiagnosticProgram: guest code address -> program hash and code size (the latest seen).
+struct DiagnosticProgram {
+	uint64_t hash = 0;
+	uint64_t size = 0;
+};
+std::mutex                                      g_program_mutex;
+std::unordered_map<uint64_t, DiagnosticProgram> g_programs;
 
-uint64_t ProgramHash(uint64_t address) {
+DiagnosticProgram FindProgram(uint64_t address) {
 	if (address == 0) {
-		return 0;
+		return {};
 	}
 	const std::lock_guard lock(g_program_mutex);
-	const auto            found = g_program_hashes.find(address);
-	return found != g_program_hashes.end() ? found->second : 0;
+	const auto            found = g_programs.find(address);
+	return found != g_programs.end() ? found->second : DiagnosticProgram {};
+}
+
+uint64_t ProgramHash(uint64_t address) {
+	return FindProgram(address).hash;
+}
+
+// The guest code of the program at `address`, read from its backing (no fault), saved once per
+// hash as device-loss-<hash>.bin for offline disassembly (shader_cfg_tests --structurize-file).
+void SaveProgramCode(uint64_t address) {
+	static std::vector<uint64_t> saved;
+	const auto program = FindProgram(address);
+	if (program.hash == 0 || program.size == 0 || program.size > 1024u * 1024u ||
+	    std::ranges::find(saved, program.hash) != saved.end()) {
+		return;
+	}
+	saved.push_back(program.hash);
+	std::vector<uint8_t> code(static_cast<size_t>(program.size));
+	if (!LibKernel::Memory::TryReadBacking(address, code.data(), code.size())) {
+		std::printf("    program 0x%016" PRIx64 ": code not readable\n", program.hash);
+		return;
+	}
+	char name[64];
+	std::snprintf(name, sizeof(name), "device-loss-%016" PRIx64 ".bin", program.hash);
+	if (auto* file = std::fopen(name, "wb"); file != nullptr) {
+		std::fwrite(code.data(), 1, code.size(), file);
+		std::fclose(file);
+		std::printf("    saved %s (%" PRIu64 " bytes)\n", name, program.size);
+	}
 }
 
 void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
@@ -66,6 +99,9 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	     checkpoint.tick, checkpoint.vs, checkpoint.ps, checkpoint.cs);
 	std::printf("    program hash VS=0x%016" PRIx64 " PS=0x%016" PRIx64 " CS=0x%016" PRIx64 "\n",
 	            ProgramHash(checkpoint.vs), ProgramHash(checkpoint.ps), ProgramHash(checkpoint.cs));
+	for (const auto address: {checkpoint.vs, checkpoint.ps, checkpoint.cs}) {
+		SaveProgramCode(address);
+	}
 	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
@@ -172,9 +208,9 @@ void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer comma
 	                             sizeof(uint32_t), sequence);
 }
 
-void NoteDiagnosticProgram(uint64_t address, uint64_t hash) {
+void NoteDiagnosticProgram(uint64_t address, uint64_t hash, uint64_t size_bytes) {
 	const std::lock_guard lock(g_program_mutex);
-	g_program_hashes.insert_or_assign(address, hash);
+	g_programs.insert_or_assign(address, DiagnosticProgram {hash, size_bytes});
 }
 
 bool DeviceFaultDiagnosticsEnabled() {

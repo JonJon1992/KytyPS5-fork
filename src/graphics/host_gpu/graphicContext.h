@@ -48,9 +48,10 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool
 // and at the bottom of the pipe into host-coherent memory; DumpDeviceLossDiagnostics then names the
 // work between the last completed and the last started checkpoint.
 void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer command, const void* marker);
-// KYTY_DEVICE_FAULT_DIAGNOSTICS: the program hash of the guest code at `address` (the pipeline
-// cache's key), so a device-loss report names the programs of the work in flight.
-void NoteDiagnosticProgram(uint64_t address, uint64_t hash);
+// KYTY_DEVICE_FAULT_DIAGNOSTICS: the program hash and code size of the guest code at `address` (the
+// pipeline cache's key), so a device-loss report names the programs of the work in flight and
+// saves their code (device-loss-<hash>.bin in the working directory).
+void NoteDiagnosticProgram(uint64_t address, uint64_t hash, uint64_t size_bytes);
 
 struct GraphicContext {
     bool bindless_supported = false;
