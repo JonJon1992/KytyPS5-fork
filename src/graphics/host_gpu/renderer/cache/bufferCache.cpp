@@ -1579,6 +1579,34 @@ void BufferCache::LogHotPages() {
 	    frame - m_hot_log.frame, faults - m_hot_log.faults, m_memory_tracker.HotPageCount(),
 	    m_memory_tracker.HotMax(), refused - m_hot_log.refused));
 	m_hot_log = {now, faults, refused, frame};
+	if (auto& log = m_bda_candidate_log; log.admitted + log.skipped != 0) {
+		std::string reasons;
+		for (const auto& [reason, count]: log.reasons) {
+			if (reason != nullptr) {
+				reasons += fmt::format("{}{}={}", reasons.empty() ? " (" : ", ", reason, count);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format("BDA candidates {:.0f}s: {} admitted, {} skipped{}{}\n",
+		                                      seconds, log.admitted, log.skipped, reasons,
+		                                      reasons.empty() ? "" : ")"));
+		log = {};
+	}
+}
+
+void BufferCache::NoteBdaCandidate(const char* reject) noexcept {
+	auto& log = m_bda_candidate_log;
+	if (reject == nullptr) {
+		log.admitted++;
+		return;
+	}
+	log.skipped++;
+	for (auto& [reason, count]: log.reasons) {
+		if (reason == nullptr || reason == reject) {
+			reason = reject;
+			count++;
+			return;
+		}
+	}
 }
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
@@ -2394,6 +2422,29 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size, uint64_t
 	}
 }
 
+bool BufferCache::BdaCandidateMappingsHold(const BdaWriteCandidates::Plan& plan) {
+	if (LibKernel::Memory::VirtualRangesGeneration() == plan.vm_generation) {
+		return true;
+	}
+	// Some guest mapping changed since the proof: the plan still holds while the table and every
+	// destination are fully mapped to the backing they were proven with.
+	const auto same = [](uint64_t address, uint64_t size, uintptr_t alias) {
+		return alias != 0 && LibKernel::Memory::ClampRangeSizeQuiet(address, size) == size &&
+		       reinterpret_cast<uintptr_t>(LibKernel::Memory::GuestBackingAlias(address, size)) ==
+		           alias;
+	};
+	if (!same(plan.table, plan.table_bytes, plan.table_alias)) {
+		return false;
+	}
+	for (uint32_t index = 0; index < plan.range_count; ++index) {
+		const auto& range = plan.ranges[index];
+		if (!same(range.address, range.size, plan.range_aliases[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
                                              std::span<const uint32_t> user_data,
                                              BdaWriteCandidates::Plan& plan) {
@@ -2419,6 +2470,10 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	};
 	// TryReadBacking does not fault on stale GPU bytes: reject them explicitly before reading.
 	if (!readable(prefix)) return fail("table unmapped or GPU-modified");
+	// The table's backing before the read; a remap while reading changes it (checked after).
+	const auto alias_before = reinterpret_cast<uintptr_t>(
+	    LibKernel::Memory::GuestBackingAlias(plan.table, prefix));
+	if (alias_before == 0) return fail("table has no backing alias");
 	{
 		std::scoped_lock gate(m_source_write_mutex);
 		if (!LibKernel::Memory::TryReadBacking(plan.table, plan.words.data(), prefix))
@@ -2430,11 +2485,11 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 			return fail("table read failed");
 		if (!Resolve(plan)) return false;
 	}
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation)
-		return fail("guest mappings changed");
 	const auto table_alias = reinterpret_cast<uintptr_t>(
 	    LibKernel::Memory::GuestBackingAlias(plan.table, plan.table_bytes));
 	if (table_alias == 0) return fail("table has no backing alias");
+	if (table_alias != alias_before) return fail("table remapped while it was read");
+	plan.table_alias = table_alias;
 	// Claiming a destination makes whole tracker pages GPU-owned. A destination on a page of the
 	// table would make the table GPU-modified: Finalize would refuse after the claim, and so would
 	// every later dispatch while the page stays GPU-owned.
@@ -2448,14 +2503,14 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 		const auto alias = reinterpret_cast<uintptr_t>(
 		    LibKernel::Memory::GuestBackingAlias(range.address, range.size));
 		if (alias == 0) return fail("destination has no backing alias");
+		plan.range_aliases[static_cast<size_t>(&range - plan.ranges.data())] = alias;
 		if (alias < table_alias + plan.table_bytes && table_alias < alias + range.size)
 			return fail("destination aliases the table");
 		if (Common::AlignDown(range.address, TRACKER_PAGE_SIZE) < table_end &&
 		    table_first < Common::AlignUp(range.End(), TRACKER_PAGE_SIZE))
 			return fail("destination shares a tracked page with the table");
 	}
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation)
-		return fail("guest mappings changed");
+	if (!BdaCandidateMappingsHold(plan)) return fail("table or destination remapped");
 	(void)FindBuffer(plan.table, plan.table_bytes); // BDA table must cover the frozen table.
 	for (const auto& range: plan.Ranges()) {
 		(void)ObtainBuffer(range.address, range.size, true); // preserve image owners before writes
@@ -2465,8 +2520,8 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 
 bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
-	if (LibKernel::Memory::VirtualRangesGeneration() != plan.vm_generation) {
-		plan.reject = "guest mappings changed before the dispatch";
+	if (!BdaCandidateMappingsHold(plan)) {
+		plan.reject = "table or destination remapped before the dispatch";
 		return false;
 	}
 	if (m_memory_tracker.IsRegionGpuModified(plan.table, plan.table_bytes) ||
@@ -2495,6 +2550,7 @@ bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	                      plan.table_bytes, vk::AccessFlagBits::eHostWrite);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateDispatches);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRanges, plan.range_count);
+	NoteBdaCandidate(nullptr);
 	static uint32_t logs = 0;
 	if (logs++ < 32) {
 		LOGF("BDA candidates: shader=0x%016" PRIx64 " table=0x%016" PRIx64

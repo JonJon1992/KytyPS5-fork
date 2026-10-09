@@ -25,6 +25,11 @@ struct Plan {
     uint32_t range_count = 0;
     // Why the dispatch was refused (a string literal; null while the proof holds).
     const char* reject = nullptr;
+    // Canonical backing aliases of the table and of each range when Prepare proved them. A guest
+    // mapping change elsewhere (a streaming game maps, protects and names memory constantly)
+    // leaves the proof valid while these ranges keep their mapping (BufferCache rechecks them).
+    uintptr_t table_alias = 0;
+    std::array<uintptr_t, MaxDescriptors> range_aliases {};
     std::array<uint32_t, MaxTableBytes / 4> words {};
     std::array<GuestRange, MaxDescriptors> ranges {};
     [[nodiscard]] std::span<const GuestRange> Ranges() const {

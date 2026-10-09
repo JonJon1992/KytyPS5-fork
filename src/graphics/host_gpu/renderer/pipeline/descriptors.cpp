@@ -1700,6 +1700,21 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         }
         Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
         Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
+        m_bindless_log.keys += count64;
+        m_bindless_log.kept += kept;
+    }
+    // One console/log line every 10 s while heaps are consumed (as the hot-pages line).
+    m_bindless_log.consumers++;
+    const auto now = std::chrono::steady_clock::now();
+    if (m_bindless_log.time == std::chrono::steady_clock::time_point {}) {
+        m_bindless_log.time = now;
+    } else if (now - m_bindless_log.time >= std::chrono::seconds(10)) {
+        const auto& log = m_bindless_log;
+        Log::WriteToConsoleAndLog(fmt::format(
+            "Bindless heaps {:.0f}s: {} consumers, {} keys resolved, {} kept ({:.1f}%)\n",
+            std::chrono::duration<double>(now - log.time).count(), log.consumers, log.keys,
+            log.kept, log.keys != 0 ? 100.0 * static_cast<double>(log.kept) / static_cast<double>(log.keys) : 0.0));
+        m_bindless_log = {now, 0, 0, 0};
     }
 }
 

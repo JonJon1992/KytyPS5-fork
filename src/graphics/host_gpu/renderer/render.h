@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
@@ -1214,6 +1215,14 @@ private:
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
 	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
 	TextureBindingMemo m_texture_memo;
+	// PrepareBindlessHeaps' periodic line: heap keys resolved and kept since the last one.
+	struct BindlessLog {
+		std::chrono::steady_clock::time_point time;
+		uint64_t                              consumers = 0;
+		uint64_t                              keys      = 0;
+		uint64_t                              kept      = 0;
+	};
+	BindlessLog m_bindless_log;
 	// KYTY_DRAW_SEQUENCE_VERIFY: the views a repeated stage claimed (RebindImages).
 	std::vector<vk::ImageView> m_claimed_views;
 	// KYTY_DRAW_SEQUENCE_FAST outcomes, always counted (the DrawSequence* frame events need a

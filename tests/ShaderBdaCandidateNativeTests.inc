@@ -91,6 +91,23 @@ void CheckBdaWriteCandidates() {
     }
     SyncEpoch::Advance();
     context.PrepareBda();
+    // Another guest mapping changes meanwhile (a streaming game maps and unmaps constantly): the
+    // table's and destinations' own mappings are unchanged, so the proof still holds.
+    {
+      constexpr uintptr_t elsewhere = 0x0000000213000000ull;
+      int64_t other = -1;
+      void* other_mapped = reinterpret_cast<void*>(elsewhere);
+      const auto generation = LibKernel::Memory::VirtualRangesGeneration();
+      Require(name, "unrelated mapping",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), alignment, alignment, 0, &other) == 0 &&
+          LibKernel::Memory::KernelMapDirectMemory(&other_mapped, alignment, 0x3, 0x10, other,
+                                                   alignment) == 0 &&
+          LibKernel::Memory::KernelMunmap(elsewhere, alignment) == 0 &&
+          LibKernel::Memory::KernelReleaseDirectMemory(other, alignment) == 0 &&
+          LibKernel::Memory::VirtualRangesGeneration() != generation,
+          "the unrelated guest mapping did not change the virtual ranges");
+    }
     Require(name, "freeze", cache.FinalizeBdaWriteCandidates(plan), "finalization rejected");
     snapshot(frozen);
     // Native GPU writes; no known-fill shortcut for the guest readback below.

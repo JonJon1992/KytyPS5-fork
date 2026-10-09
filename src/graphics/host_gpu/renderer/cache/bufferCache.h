@@ -178,6 +178,11 @@ public:
 	// Right after the dispatch: restores the saved table version and, without the verify settle,
 	// queues the asynchronous dropped-write check (FaultManager::QueueBdaDroppedCheck).
 	void FinishBdaWriteCandidates(const BdaWriteCandidates::Plan& plan);
+	// A candidate dispatch admitted (null) or skipped for `reject` (renderCompute), for the
+	// periodic "BDA candidates" line.
+	void NoteBdaCandidate(const char* reject) noexcept;
+	// The guest mappings a candidate plan was proven with still hold (Prepare and Finalize).
+	[[nodiscard]] bool BdaCandidateMappingsHold(const BdaWriteCandidates::Plan& plan);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
@@ -893,6 +898,14 @@ private:
 		uint32_t                              frame   = 0;
 	};
 	HotLog m_hot_log;
+	// KYTY_BDA_WRITES=candidates since the last LogHotPages line (GPU thread): dispatches admitted
+	// and skipped, per reason (Plan::reject literals; the few distinct ones fit).
+	struct BdaCandidateLog {
+		uint64_t                                         admitted = 0;
+		uint64_t                                         skipped  = 0;
+		std::array<std::pair<const char*, uint64_t>, 16> reasons {};
+	};
+	BdaCandidateLog m_bda_candidate_log;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// Moves on every Register/Unregister and GPU mapping change (the binding memo's buffer
 	// structure guard). Equal to the BDA structure epoch's moves unless KYTY_BDA_NEW_BUFFER_SYNC.

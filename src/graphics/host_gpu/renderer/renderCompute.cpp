@@ -44,8 +44,9 @@
 
 namespace Libs::Graphics {
 // KYTY_BDA_WRITES=candidates: a dispatch skipped because its proof failed (GPU thread).
-static void RejectBdaWriteCandidates(const BdaWriteCandidates::Plan& plan) {
+static void RejectBdaWriteCandidates(BufferCache& cache, const BdaWriteCandidates::Plan& plan) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+	cache.NoteBdaCandidate(plan.reject != nullptr ? plan.reject : "no complete proof");
 	static uint32_t logged = 0;
 	if (logged++ < 32) {
 		LOGF("BDA candidates: shader=0x%016" PRIx64 " skipped: %s\n", plan.shader_hash,
@@ -424,7 +425,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes) candidate_plan.emplace();
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
-		RejectBdaWriteCandidates(*candidate_plan);
+		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -435,7 +436,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
-		RejectBdaWriteCandidates(*candidate_plan);
+		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -554,7 +555,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes) candidate_plan.emplace();
 	if (candidate_writes && !m_context.GetBufferCache().PrepareBdaWriteCandidates(
 	        program.shader_hash, input_info.stage.resources->user_data, *candidate_plan)) {
-		RejectBdaWriteCandidates(*candidate_plan);
+		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
 		ResetBindings();
 		return;
 	}
@@ -569,7 +570,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
-		RejectBdaWriteCandidates(*candidate_plan);
+		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
 		ResetBindings();
 		return;
 	}
