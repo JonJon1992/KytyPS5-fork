@@ -45,6 +45,9 @@ public:
 	// slot still waits for its recording, the count carries over to the next check.
 	void QueueBdaDroppedCheck(uint64_t shader_hash);
 	static constexpr uint32_t BdaWriteSlots = 8;
+	// CollectBdaWrites' own slot, past the deferred producers' ring: a synchronous settle (the
+	// fallback of KYTY_BDA_WRITES=deferred) never waits for or reuses a pending producer's slot.
+	static constexpr uint32_t BdaSyncSlot = BdaWriteSlots;
 	// Record belongs to the GPU owner; parse belongs to the native-completion
 	// runner. A slot is retained until the owner has applied its result.
 	[[nodiscard]] uint64_t RecordBdaWrites(uint32_t slot);
@@ -74,8 +77,8 @@ private:
 	struct DroppedChecks;
 	std::shared_ptr<DroppedChecks>             m_dropped_checks;
 	uint32_t                                   m_dropped_check_next = 0;
-	std::array<std::unique_ptr<Buffer>, BdaWriteSlots> m_bda_write_download;
-	std::array<uint64_t, BdaWriteSlots>              m_bda_write_ticks {};
+	std::array<std::unique_ptr<Buffer>, BdaWriteSlots + 1> m_bda_write_download;
+	std::array<uint64_t, BdaWriteSlots + 1>              m_bda_write_ticks {};
 };
 
 } // namespace Libs::Graphics

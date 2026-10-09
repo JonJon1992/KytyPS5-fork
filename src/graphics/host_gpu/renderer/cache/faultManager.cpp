@@ -265,7 +265,7 @@ void FaultManager::CreateBdaWriteResources() {
 uint64_t FaultManager::RecordBdaWrites(uint32_t slot) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	KYTY_GPU_OP_SITE("fault.bda_writes");
-	EXIT_IF(!m_bda_writes || slot >= BdaWriteSlots || m_bda_write_ticks[slot] != 0);
+	EXIT_IF(!m_bda_writes || slot > BdaSyncSlot || m_bda_write_ticks[slot] != 0);
 	(void)GetFaultBuffer();
 	if (m_bda_write_pipeline == nullptr) {
 		CreateBdaWriteResources();
@@ -375,7 +375,7 @@ uint64_t FaultManager::RecordBdaWrites(uint32_t slot) {
 }
 
 void FaultManager::ParseBdaWrites(uint32_t slot, BdaWrites& result) {
-	EXIT_IF(slot >= BdaWriteSlots || m_bda_write_ticks[slot] == 0);
+	EXIT_IF(slot > BdaSyncSlot || m_bda_write_ticks[slot] == 0);
 	// Its caller has already waited for the native timeline. No GPU-owned
 	// cache metadata is inspected or changed on the completion runner.
 	auto& download = *m_bda_write_download[slot];
@@ -503,18 +503,18 @@ void FaultManager::QueueBdaDroppedCheck(uint64_t shader_hash) {
 }
 
 void FaultManager::ReleaseBdaWrites(uint32_t slot) {
-	EXIT_IF(slot >= BdaWriteSlots || m_bda_write_ticks[slot] == 0);
+	EXIT_IF(slot > BdaSyncSlot || m_bda_write_ticks[slot] == 0);
 	m_bda_write_ticks[slot] = 0;
 }
 
 void FaultManager::CollectBdaWrites(BdaWrites& result) {
-	const auto tick = RecordBdaWrites(0);
+	const auto tick = RecordBdaWrites(BdaSyncSlot);
 	{
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::BdaSettle);
 		m_scheduler.Wait(tick);
 	}
-	ParseBdaWrites(0, result);
-	ReleaseBdaWrites(0);
+	ParseBdaWrites(BdaSyncSlot, result);
+	ReleaseBdaWrites(BdaSyncSlot);
 }
 
 } // namespace Libs::Graphics

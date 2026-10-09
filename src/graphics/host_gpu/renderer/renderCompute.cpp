@@ -433,6 +433,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	// KYTY_BDA_WRITES=deferred: the domain is reserved before PrepareBda and the rebinds, so the BDA
+	// page table and the bindings see every buffer the reservation creates or merges. Without an
+	// admission the writer settles synchronously after the dispatch, as in phase 0.
+	bool deferred_writes = program.info.bda_writes && !candidate_writes &&
+	                       ShaderRecompiler::BdaWritesDeferredEnabled();
+	if (deferred_writes &&
+	    !m_context.GetBufferCache().PrepareDeferredBdaWrite(program.shader_hash)) {
+		if (m_context.DeferredGpuRead()) {
+			ResetBindings();
+			return;
+		}
+		deferred_writes = false;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDeferredFallbacks);
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -446,17 +460,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	const bool deferred_writes = program.info.bda_writes && !candidate_writes &&
-	    ShaderRecompiler::BdaWritesDeferredEnabled();
-	if (deferred_writes && !m_context.GetBufferCache().PrepareDeferredBdaWrite()) {
-		static uint32_t rejected = 0;
-		if (!m_context.DeferredGpuRead() && rejected++ < 32)
-			LOGF("BDA deferred: shader=0x%016" PRIx64
-			     " rejected: destination or physical alias lacks a protection proof\n",
-			     program.shader_hash);
-		ResetBindings();
-		return;
-	}
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
 	// is alive. Binding commits and the barrier requests below record state commands only (image
@@ -477,8 +480,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-    const auto deferred_ticket = deferred_writes
-	    ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
+	const auto deferred_ticket =
+	    deferred_writes ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
@@ -527,8 +530,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	ResetBindings();
-	// Phase 0: the written pages are settled before the command processor goes on.
-    if (deferred_ticket != 0) {
+	// Phase 0 (and a deferred writer's fallback): the written pages are settled before the command
+	// processor goes on.
+	if (deferred_ticket != 0) {
 		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);
 	} else if (program.info.bda_writes &&
 	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {
@@ -583,6 +587,20 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	// KYTY_BDA_WRITES=deferred: the domain is reserved before PrepareBda and the rebinds, so the BDA
+	// page table and the bindings see every buffer the reservation creates or merges. Without an
+	// admission the writer settles synchronously after the dispatch, as in phase 0.
+	bool deferred_writes = program.info.bda_writes && !candidate_writes &&
+	                       ShaderRecompiler::BdaWritesDeferredEnabled();
+	if (deferred_writes &&
+	    !m_context.GetBufferCache().PrepareDeferredBdaWrite(program.shader_hash)) {
+		if (m_context.DeferredGpuRead()) {
+			ResetBindings();
+			return;
+		}
+		deferred_writes = false;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDeferredFallbacks);
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -596,17 +614,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
 		RejectBdaWriteCandidates(m_context.GetBufferCache(), *candidate_plan);
-		ResetBindings();
-		return;
-	}
-	const bool deferred_writes = program.info.bda_writes && !candidate_writes &&
-	    ShaderRecompiler::BdaWritesDeferredEnabled();
-	if (deferred_writes && !m_context.GetBufferCache().PrepareDeferredBdaWrite()) {
-		static uint32_t rejected = 0;
-		if (!m_context.DeferredGpuRead() && rejected++ < 32)
-			LOGF("BDA deferred: shader=0x%016" PRIx64
-			     " rejected: destination or physical alias lacks a protection proof\n",
-			     program.shader_hash);
 		ResetBindings();
 		return;
 	}
@@ -644,15 +651,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier,
 		                                0, nullptr, 0, nullptr);
 	}
-    const auto deferred_ticket = deferred_writes
-	    ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
+	const auto deferred_ticket =
+	    deferred_writes ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-    if (deferred_ticket != 0) {
+	if (deferred_ticket != 0) {
 		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);
 	} else if (program.info.bda_writes &&
 	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {

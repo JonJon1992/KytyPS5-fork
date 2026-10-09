@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/bdaWriteLedger.h"
 #include <array>
 #include <cstdio>
+#include <span>
 
 using Libs::Graphics::BdaWriteLedger;
 using Libs::Graphics::GuestRange;
@@ -66,11 +67,23 @@ void TestCapacityAndReuse() {
     Expect(ledger.PendingForRange(0x8000, 0) == 0, "empty read has no dependency");
     Expect(ledger.Apply(next), "reused slot is independently applicable");
 }
+void TestEmptyDomain() {
+    BdaWriteLedger ledger;
+    const std::array domain {GuestRange{0x1000, 0x1000}};
+    const auto a = ledger.Open(40, 9, std::span<const GuestRange> {});
+    const auto b = ledger.Open(41, 9, domain);
+    Expect(a != 0 && b > a, "a writer with an empty history is admitted");
+    Expect(ledger.PendingForRange(0, UINT64_MAX >> 1) == b, "an empty domain holds no reader");
+    Expect(ledger.Apply(b) && ledger.AppliedPrefix() == 0, "an empty producer still gates publications");
+    Expect(ledger.Apply(a) && ledger.AppliedPrefix() == b && !ledger.HasPending(),
+           "applying the empty producer releases the prefix");
+}
 }
 int main() {
     TestOverlappingWriters();
     TestIndependentRangesAndPrefix();
     TestCapacityAndReuse();
+    TestEmptyDomain();
     std::printf("BdaWriteLedger: %d failures\n", failures);
     return failures != 0;
 }

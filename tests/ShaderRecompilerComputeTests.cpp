@@ -53413,6 +53413,7 @@ int main(int argc, char **argv) {
     SetEnvironment("KYTY_BDA_WRITES_SHADERS", "1234");
     VulkanHarness vulkan;
     vulkan.CheckDeferredBdaWrites();
+    vulkan.CheckDeferredBdaHistory();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {

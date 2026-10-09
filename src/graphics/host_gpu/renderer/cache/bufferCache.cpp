@@ -2599,15 +2599,35 @@ void BufferCache::FinishBdaWriteCandidates(const BdaWriteCandidates::Plan& plan)
 	}
 }
 
-bool BufferCache::PrepareDeferredBdaWrite() {
+bool BufferCache::PrepareDeferredBdaWrite(uint64_t shader_hash) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
+	auto& domain = m_deferred_bda_domain;
+	domain.clear();
+	m_deferred_bda_prepared = false;
+	const auto found = m_bda_write_history.find(shader_hash);
+	if (found == m_bda_write_history.end()) {
+		return false;
+	}
+	// A reference survives the rehash an applied result's history insertion may cause.
+	auto& history = found->second;
 	ServiceDeferredBdaWrites();
+	if (!history.Admits()) {
+		return false;
+	}
 	// Bounded backpressure occurs before preparing this writer. Older results
 	// can apply while waiting; neither slots nor native storage are reused early.
-	if (m_bda_write_ledger.LastTicket() - m_bda_write_ledger.AppliedPrefix() ==
-	    BdaWriteLedger::Capacity) {
+	const auto ring_full = [this] {
+		return m_bda_write_ledger.LastTicket() - m_bda_write_ledger.AppliedPrefix() ==
+		       BdaWriteLedger::Capacity;
+	};
+	if (ring_full()) {
 		m_scheduler.Finish();
 		m_scheduler.DrainPriorityOperations();
+		ServiceDeferredBdaWrites();
+		// An applied miss of this shader may have demoted it.
+		if (ring_full() || !history.Admits()) {
+			return false;
+		}
 	}
 	if (!m_deferred_bda_hooks) {
 		m_scheduler.SetCoherenceHooks(
@@ -2615,47 +2635,50 @@ bool BufferCache::PrepareDeferredBdaWrite() {
 		    [](void* p) { static_cast<BufferCache*>(p)->ServiceDeferredBdaWrites(); }, this);
 		m_deferred_bda_hooks = true;
 	}
-	// A preservation copy can merge buffers. Capture again if registration
-	// changed, retaining vector capacity and bounding retries before admission.
-	for (uint32_t attempt = 0; attempt < 4; ++attempt) {
-		auto& domain = m_deferred_bda_domain;
-		domain.clear();
-		for (const auto& [address, id] : m_buffers) {
-			const auto size = m_slot_buffers[id].Size();
-			if (!m_scheduler.Context().IsMapped(address, size) ||
-			    !LibKernel::Memory::HasUniqueGuestBackingView(address, size)) return false;
-			domain.push_back({address, size});
+	history.pages.ForEach([&](uint64_t begin, uint64_t end) { domain.push_back({begin, end - begin}); });
+	auto& context = m_scheduler.Context();
+	for (const auto range: domain) {
+		if (!context.IsMapped(range.address, range.size)) {
+			// Pages the shader wrote are gone: what remains of the history is confirmed again.
+			history.Forget(range.address, range.size);
+			domain.clear();
+			return false;
 		}
-		if (domain.empty()) return false;
-		// A previously queued host label must land before a later native writer
-		// can overwrite the same bytes. Suspend admission; the owner services it.
-		for (const auto range : domain) {
-			if (m_scheduler.Context().GetGpu().DeferredLabelTick(range.address, range.size) != 0) {
-				m_scheduler.Context().RequestDeferredGpuRead();
-				return false;
-			}
-		}
-		const auto registry = m_buffer_registry_epoch.load(std::memory_order_acquire);
-		// No unknown ticket exists yet: preparation may submit or retire native
-		// utility work without waiting for the writer it has not emitted.
-		for (const auto range : domain) {
-			const auto [buffer, offset] = ObtainBuffer(range.address, range.size, true, true);
-			(void)buffer;
-			(void)offset;
-			m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
-			m_deferred_bda_reserved.Add(range.address, range.size);
-		}
-		if (registry == m_buffer_registry_epoch.load(std::memory_order_acquire)) {
-			m_deferred_bda_registry = registry;
-			return true;
+		// A physical alias would not see the native writes before a publication.
+		if (!LibKernel::Memory::HasUniqueGuestBackingView(range.address, range.size)) {
+			domain.clear();
+			return false;
 		}
 	}
-	return false;
+	// A previously queued host label must land before a later native writer
+	// can overwrite the same bytes. Suspend admission; the owner services it.
+	for (const auto range: domain) {
+		if (context.GetGpu().DeferredLabelTick(range.address, range.size) != 0) {
+			context.RequestDeferredGpuRead();
+			domain.clear();
+			return false;
+		}
+	}
+	// No unknown ticket exists yet: preparation may submit or retire native
+	// utility work without waiting for the writer it has not emitted.
+	for (const auto range: domain) {
+		(void)ObtainBuffer(range.address, range.size, true, true);
+		m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
+		m_deferred_bda_reserved.Add(range.address, range.size);
+	}
+	if (!history.announced) {
+		history.announced = true;
+		LOGF("BDA deferred: shader=0x%016" PRIx64 " admitted after %u confirmations, domain "
+		     "runs=%zu bytes=0x%" PRIx64 " misses=%u\n",
+		     shader_hash, history.confirmations, domain.size(), history.bytes, history.misses);
+	}
+	m_deferred_bda_prepared = true;
+	return true;
 }
 
 uint64_t BufferCache::BeginDeferredBdaWrite(uint64_t shader_hash) {
-	EXIT_IF(!GuestGpu::IsGpuThread() || m_deferred_bda_domain.empty() ||
-	        m_deferred_bda_registry != m_buffer_registry_epoch.load(std::memory_order_acquire));
+	EXIT_IF(!GuestGpu::IsGpuThread() || !m_deferred_bda_prepared);
+	m_deferred_bda_prepared = false;
 	const auto tick = m_scheduler.CurrentTick();
 	const auto ticket = m_bda_write_ledger.Open(
 	    tick, LibKernel::Memory::VirtualRangesGeneration(), m_deferred_bda_domain);
@@ -2672,10 +2695,13 @@ uint64_t BufferCache::BeginDeferredBdaWrite(uint64_t shader_hash) {
 	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_scheduler.SetCoherencePrefix(ticket);
 	m_deferred_bda_domain.clear();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDeferredDispatches);
 	return ticket;
 }
 
 void BufferCache::QueueDeferredBdaWrite(uint64_t ticket) {
+	// A producer's result slot is its ledger ring slot; the synchronous settle has its own.
+	static_assert(BdaWriteLedger::Capacity <= FaultManager::BdaWriteSlots);
 	EXIT_IF(!GuestGpu::IsGpuThread());
 	const auto slot = static_cast<uint32_t>((ticket - 1) % BdaWriteLedger::Capacity);
 	const auto* producer = m_bda_write_ledger.Get(ticket);
@@ -2693,46 +2719,144 @@ void BufferCache::QueueDeferredBdaWrite(uint64_t ticket) {
 }
 
 void BufferCache::ServiceDeferredBdaWrites() {
-	if (!m_bda_write_ledger.HasPending()) return;
+	// Applying a result settles pages, which never services again; a nested call would apply the
+	// same result twice.
+	if (!m_bda_write_ledger.HasPending() || m_deferred_bda_applying) return;
 	EXIT_IF(!GuestGpu::IsGpuThread());
+	m_deferred_bda_applying = true;
 	bool changed = false;
 	for (uint32_t slot = 0; slot < BdaWriteLedger::Capacity; ++slot) {
 		auto& result = m_deferred_bda_results[slot];
 		if (!result.ready.load(std::memory_order_acquire)) continue;
 		const auto* producer = m_bda_write_ledger.Get(result.ticket);
 		EXIT_IF(producer == nullptr || producer->applied);
-		const auto& writes = result.writes;
-		if (writes.dropped != 0)
-			EXIT("BDA deferred coverage failure: shader=0x%016" PRIx64
-			     " ticket=%" PRIu64 " dropped=%u\n",
-			     result.shader_hash, result.ticket, writes.dropped);
-		writes.written.ForEach([&](uint64_t begin, uint64_t end) {
-			auto cursor = begin;
-			// Domains are sorted and disjoint: skip earlier buffers in logarithmic time.
-			auto it = std::lower_bound(producer->domain.begin(), producer->domain.end(), cursor,
-			    [](GuestRange range, uint64_t address) { return range.End() <= address; });
-			for (; it != producer->domain.end() && it->address <= cursor; ++it) {
-				cursor = std::min(end, it->End());
-				if (cursor == end) break;
-			}
-			if (cursor != end)
-				EXIT("BDA deferred coverage failure: ticket=%" PRIu64
-				     " page=0x%016" PRIx64 " outside retained domain\n", result.ticket, cursor);
-		});
-		// Overflow keeps the entire captured domain GPU-owned. No late cache
-		// traversal, upload, image preservation or ownership transition is needed.
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
+		// Without misses or an overflow, nothing moves: the domain stays GPU-owned, with no late
+		// cache traversal, upload, image preservation or ownership transition.
+		ApplyDeferredBdaWrite(result.shader_hash, result.writes, producer->domain);
 		EXIT_IF(!m_bda_write_ledger.Apply(result.ticket));
 		m_fault_manager.ReleaseBdaWrites(slot);
 		result.ready.store(false, std::memory_order_release);
 		changed = true;
 	}
+	m_deferred_bda_applying = false;
 	if (changed) {
 		CleanVerdict::Invalidate(0, UINT64_MAX, Coherence::Source::ContentRevisions);
 		m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_scheduler.NotifyCoherenceApplied();
 		m_deferred_bda_available.notify_all();
+	}
+}
+
+void BufferCache::ApplyDeferredBdaWrite(uint64_t shader_hash, const FaultManager::BdaWrites& writes,
+                                        std::span<const GuestRange> domain) {
+	static const bool verify = ParseEnvU64("KYTY_BDA_WRITES_VERIFY", 0) != 0;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
+	if (verify && writes.dropped != 0) {
+		EXIT("KYTY_BDA_WRITES_VERIFY: deferred shader 0x%016" PRIx64 " dropped %u BDA writes to "
+		     "pages without a cache buffer\n",
+		     shader_hash, writes.dropped);
+	}
+	auto& history = m_bda_write_history[shader_hash];
+	auto& outside = m_deferred_bda_outside;
+	outside.Clear();
+	if (writes.overflow) {
+		// The page list is partial: as phase 0, every cache buffer may hold written pages.
+		EXIT_IF(verify);
+		for (const auto& [address, id]: m_buffers) {
+			outside.Add(address, m_slot_buffers[id].Size());
+		}
+		history.MakeSynchronous();
+	} else {
+		writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+			// The domain is sorted and disjoint: skip earlier ranges in logarithmic time.
+			auto it = std::lower_bound(domain.begin(), domain.end(), begin,
+			                           [](GuestRange range, uint64_t address) { return range.End() <= address; });
+			auto cursor = begin;
+			for (; cursor < end && it != domain.end() && it->address < end; ++it) {
+				if (it->address > cursor) {
+					outside.Add(cursor, it->address - cursor);
+				}
+				cursor = std::max(cursor, it->End());
+			}
+			if (cursor < end) {
+				outside.Add(cursor, end - cursor);
+			}
+		});
+	}
+	if (outside.Empty()) {
+		return;
+	}
+	uint64_t pages = 0;
+	uint64_t lost  = 0;
+	outside.ForEach([&](uint64_t begin, uint64_t end) { pages += (end - begin) >> CACHING_PAGEBITS; });
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDeferredMissPages, pages);
+	if (verify) {
+		EXIT("KYTY_BDA_WRITES_VERIFY: deferred shader 0x%016" PRIx64 " wrote %" PRIu64
+		     " pages outside its history domain\n",
+		     shader_hash, pages);
+	}
+	// Settled now, as phase 0 would have right after the writer: readers in between saw the old
+	// bytes. A page whose buffer is gone since (garbage collection) lost the writes.
+	outside.ForEach([&](uint64_t begin, uint64_t end) {
+		uint64_t run = begin;
+		const auto settle = [&](uint64_t until) {
+			if (until > run) {
+				SettleBdaWrittenRange(run, until - run, 0, verify);
+			}
+		};
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			const auto* owner = m_page_table.Find(page >> CACHING_PAGEBITS);
+			if (owner == nullptr || !*owner) {
+				settle(page);
+				run = page + CACHING_PAGESIZE;
+				lost++;
+			}
+		}
+		settle(end);
+	});
+	if (!writes.overflow) {
+		history.misses++;
+		if (!history.Grow(outside) || history.misses > BdaWriteHistory::MaxMisses) {
+			history.MakeSynchronous();
+		}
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		uint64_t first = 0;
+		outside.ForEach([&](uint64_t begin, uint64_t) {
+			if (first == 0) first = begin;
+		});
+		LOGF("BDA deferred: shader=0x%016" PRIx64 " wrote %" PRIu64 " pages outside its domain "
+		     "(first 0x%" PRIx64 ", %" PRIu64 " without a buffer, overflow=%u); misses=%u%s\n",
+		     shader_hash, pages, first, lost, writes.overflow ? 1u : 0u, history.misses,
+		     history.synchronous ? ", synchronous from now on" : "");
+	}
+}
+
+void BufferCache::NoteBdaWriteHistory(uint64_t shader_hash, const FaultManager::BdaWrites& writes) {
+	auto& history = m_bda_write_history[shader_hash];
+	if (history.synchronous) {
+		return;
+	}
+	if (writes.overflow) {
+		history.MakeSynchronous();
+		LOGF("BDA deferred: shader=0x%016" PRIx64 " overflowed the written-page list; "
+		     "synchronous from now on\n",
+		     shader_hash);
+		return;
+	}
+	bool known = true;
+	writes.written.ForEach([&](uint64_t begin, uint64_t end) {
+		known = known && history.pages.Contains(begin, end - begin);
+	});
+	if (known) {
+		history.confirmations = std::min(history.confirmations + 1, history.ConfirmationsNeeded());
+	} else if (!history.Grow(writes.written)) {
+		LOGF("BDA deferred: shader=0x%016" PRIx64 " write history past %u runs or 0x%" PRIx64
+		     " bytes; synchronous from now on\n",
+		     shader_hash, BdaWriteHistory::MaxRuns, BdaWriteHistory::MaxBytes);
 	}
 }
 
@@ -2785,6 +2909,11 @@ void BufferCache::SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRan
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, writes.pages);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
+	// KYTY_BDA_WRITES=deferred: the synchronous settles build and confirm the shader's history.
+	if (ShaderRecompiler::BdaWritesDeferredEnabled() &&
+	    !ShaderRecompiler::BdaWriteCandidatesApplies(shader_hash)) {
+		NoteBdaWriteHistory(shader_hash, writes);
+	}
 	const bool verify_candidates = ShaderRecompiler::BdaWriteCandidatesApplies(shader_hash) &&
 	                               ShaderRecompiler::BdaWriteCandidatesVerify();
 	if (verify_candidates) {

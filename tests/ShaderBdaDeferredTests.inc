@@ -129,9 +129,18 @@ void CheckDeferredBdaWrites() {
   std::atomic<uint32_t> labels{0};
   uint64_t a = 0, b = 0, a_tick = 0, b_tick = 0;
   const auto shader_hash = uint64_t{0x1234};
+  // Admission needs a confirmed write history: synchronous settles of the same page.
+  OnGpuThread(context, [&] {
+    for (int settle = 0; settle < 3; ++settle) {
+      Require(name, "history", !cache.PrepareDeferredBdaWrite(shader_hash),
+              "a writer was admitted before its write history was confirmed");
+      write(0x5a5a5a5a);
+      cache.SettleBdaWrites(shader_hash);
+    }
+  });
   const auto start = std::chrono::steady_clock::now();
   OnGpuThread(context, [&] {
-    Require(name, "prepare A", cache.PrepareDeferredBdaWrite(), "destination proof was refused");
+    Require(name, "prepare A", cache.PrepareDeferredBdaWrite(shader_hash), "destination proof was refused");
     a = cache.BeginDeferredBdaWrite(shader_hash);
     write(0xa5a5a5a5);
     cache.QueueDeferredBdaWrite(a);
@@ -161,7 +170,7 @@ void CheckDeferredBdaWrites() {
         !cache.KnownFill(base + bytes * 2, 4);
   });
   OnGpuThread(context, [&] {
-    Require(name, "prepare B", cache.PrepareDeferredBdaWrite(), "overlapping destination proof was refused");
+    Require(name, "prepare B", cache.PrepareDeferredBdaWrite(shader_hash), "overlapping destination proof was refused");
     b = cache.BeginDeferredBdaWrite(shader_hash);
     write(0xb6b6b6b6);
     cache.QueueDeferredBdaWrite(b);
@@ -400,7 +409,7 @@ void CheckDeferredBdaWrites() {
       "new alias did not drain and publish retained physical bytes");
   const auto alias_value = *static_cast<const uint32_t*>(alias);
   const bool alias_refused = OnGpuThread(context, [&] {
-    return !cache.PrepareDeferredBdaWrite();
+    return !cache.PrepareDeferredBdaWrite(shader_hash);
   });
   Require(name, "unmap alias", LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(alias), allocation) == 0,
           "alias unmap failed");
@@ -461,5 +470,129 @@ void CheckDeferredBdaWrites() {
           "CPU or new physical alias observed stale native buffer bytes");
   Require(name, "alias admission proof", alias_refused,
           "an unprotected physical alias was admitted as a deferred write destination");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// KYTY_BDA_WRITES=deferred admission by write history. A writer settles synchronously until its
+// history is confirmed; an admitted execution that writes outside the history is settled when it
+// applies (the counted race window), grows the history and demotes the shader until the grown
+// history is confirmed again (twice as many settles). A synchronous settle while a deferred
+// producer holds result slot 0 uses its own slot. A writer that never writes is admitted with an
+// empty domain.
+void CheckDeferredBdaHistory() {
+  constexpr const char* name = "DeferredBdaHistory";
+  constexpr uint64_t base = 0x0000000213000000ull;
+  constexpr uint64_t allocation = 0x20000, bytes = BufferCache::CACHING_PAGESIZE;
+  constexpr uint64_t page_a = base, page_b = base + bytes * 2, page_c = base + bytes * 4;
+  auto owner = MakeRenderContext();
+  auto& context = *owner;
+  auto& cache = context.GetBufferCache();
+  auto& scheduler = context.GetCommandScheduler();
+  context.InitializeGpu(nullptr);
+  LibKernel::Memory::InstallGpuResources(&context);
+  std::unique_ptr<CommandProcessor> processor; // its BufferInit activates recording
+  OnGpuThread(context, [&] {
+    processor = std::make_unique<CommandProcessor>(context, 0);
+    processor->BufferInit();
+  });
+  int64_t offset = -1;
+  Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+      0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation, allocation, 0, &offset) == 0,
+      "direct allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+      &mapped, allocation, 0x3, 0x10, offset, allocation) == 0, "direct mapping failed");
+  std::memset(mapped, 0x19, allocation);
+  OnGpuThread(context, [&] {
+    context.MapMemory(base, allocation);
+    for (const auto page : {page_a, page_b, page_c}) (void)cache.FindBuffer(page, bytes);
+    context.PrepareBda();
+    scheduler.Finish();
+  });
+  // A shader's writes: the bytes and its written-page bitmap bit, as the emitter records them.
+  const auto write = [&](uint64_t page_address, uint32_t value) {
+    auto& command = scheduler.Current();
+    const auto& buffer = cache.GetBuffer(cache.FindBuffer(page_address, bytes));
+    command.Sink().fillBuffer(buffer.Handle(), buffer.Offset(page_address), bytes, value);
+    const auto page = page_address / bytes;
+    command.Sink().fillBuffer(cache.GetFaultBuffer()->Handle(),
+        BufferCache::BDA_WRITE_BITMAP_OFFSET + (page / 32) * sizeof(uint32_t),
+        sizeof(uint32_t), 1u << (page % 32));
+    vk::MemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    command.Sink().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+  };
+  constexpr uint64_t writer = 0x5678, other = 0x9abc, silent = 0xdef0;
+  OnGpuThread(context, [&] {
+    for (int settle = 0; settle < 3; ++settle) {
+      Require(name, "unconfirmed", !cache.PrepareDeferredBdaWrite(writer),
+              "a writer was admitted before its history was confirmed");
+      write(page_a, 0x11111111);
+      cache.SettleBdaWrites(writer);
+    }
+    Require(name, "confirmed", cache.PrepareDeferredBdaWrite(writer),
+            "two settles inside the history did not admit the writer");
+    const auto ticket = cache.BeginDeferredBdaWrite(writer);
+    write(page_a, 0x22222222);
+    write(page_b, 0x33333333); // outside the history
+    cache.QueueDeferredBdaWrite(ticket);
+    Require(name, "domain", cache.PendingBdaWrite(page_a, 4) == ticket &&
+            cache.PendingBdaWrite(page_b, 4) == 0 && !cache.HasGpuDirtyBytes(page_b, 4),
+            "the domain is not the history (or a page outside it was claimed before the result)");
+    // Phase 0 for another writer while the deferred result still holds slot 0.
+    write(page_c, 0x44444444);
+    cache.SettleBdaWrites(other);
+    Require(name, "sync slot", cache.HasGpuDirtyBytes(page_c, 4),
+            "a synchronous settle did not settle its page beside a pending producer");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    cache.ServiceDeferredBdaWrites();
+    Require(name, "applied", !cache.HasPendingBdaWrites(), "the deferred result was not applied");
+    Require(name, "miss settled", cache.HasGpuDirtyBytes(page_b, 4),
+            "a page written outside the domain was not settled when the result applied");
+    // The grown history needs four confirmations now.
+    for (int settle = 0; settle < 4; ++settle) {
+      Require(name, "demoted", !cache.PrepareDeferredBdaWrite(writer),
+              "a writer that missed its domain was admitted before the grown history was confirmed");
+      write(page_a, 0x55555555);
+      write(page_b, 0x66666666);
+      cache.SettleBdaWrites(writer);
+    }
+    Require(name, "readmitted", cache.PrepareDeferredBdaWrite(writer),
+            "the confirmed grown history did not admit the writer again");
+    // A writer that never writes: admitted with an empty domain, its producer only gates labels.
+    for (int settle = 0; settle < 2; ++settle) {
+      Require(name, "silent unconfirmed", !cache.PrepareDeferredBdaWrite(silent),
+              "a silent writer was admitted before its empty history was confirmed");
+      cache.SettleBdaWrites(silent);
+    }
+    Require(name, "silent admitted", cache.PrepareDeferredBdaWrite(silent),
+            "a confirmed empty history did not admit the writer");
+    const auto empty = cache.BeginDeferredBdaWrite(silent);
+    cache.QueueDeferredBdaWrite(empty);
+    Require(name, "empty domain", empty != 0 && cache.PendingBdaWrite(base, allocation) == 0,
+            "an empty domain held a reader");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    cache.ServiceDeferredBdaWrites();
+    Require(name, "empty applied", !cache.HasPendingBdaWrites(), "the empty producer was not applied");
+  });
+  // The settled miss reaches the CPU through the production fault path.
+  uint32_t miss_value = 0, value_c = 0;
+  std::memcpy(&miss_value, reinterpret_cast<const void*>(page_b), sizeof(miss_value));
+  std::memcpy(&value_c, reinterpret_cast<const void*>(page_c), sizeof(value_c));
+  Require(name, "CPU values", miss_value == 0x66666666u && value_c == 0x44444444u,
+          "the CPU read stale bytes of a settled page");
+  OnGpuThread(context, [&] {
+    scheduler.Finish();
+    processor.reset();
+  });
+  Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation) == 0, "unmap failed");
+  Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(offset, allocation) == 0,
+          "direct release failed");
+  context.ShutdownGpu();
+  LibKernel::Memory::InstallGpuResources(nullptr);
   std::printf("[host]    %-32s ok\n", name);
 }

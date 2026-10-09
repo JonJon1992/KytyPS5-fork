@@ -25,6 +25,7 @@
 #include <optional>
 #include <source_location>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -170,9 +171,15 @@ public:
 	// KYTY_BDA_WRITES_VERIFY=1, as are dropped writes and written pages under a GPU-modified image).
 	// GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRange> candidates = {});
-	// Reserve a proved, protected domain before emission; open its producer
-	// after the last binding commit so its native tick is final.
-	[[nodiscard]] bool PrepareDeferredBdaWrite();
+	// KYTY_BDA_WRITES=deferred, before PrepareBda and the rebinds (a reservation can create or
+	// merge buffers): reserves the shader's write history (the caching pages its earlier
+	// executions wrote, BdaWriteHistory) as the writer's domain, GPU-owned before the dispatch.
+	// false without a reservation when the shader has no confirmed history, or a domain page is
+	// unmapped or physically aliased: the dispatch settles synchronously (SettleBdaWrites), which
+	// also builds the history. false with RenderContext::DeferredGpuRead set when a pending label
+	// covers the domain: the dispatch retries. Open the producer after the last binding commit so
+	// its native tick is final.
+	[[nodiscard]] bool PrepareDeferredBdaWrite(uint64_t shader_hash);
 	[[nodiscard]] uint64_t BeginDeferredBdaWrite(uint64_t shader_hash);
 	void QueueDeferredBdaWrite(uint64_t ticket);
 	void ServiceDeferredBdaWrites();
@@ -663,6 +670,15 @@ private:
 	// SettleBdaWrites for one run of written caching pages; `writer_tick` recorded the writer.
 	std::unique_ptr<Buffer> m_bda_candidate_table_backup;
 	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t writer_tick, bool verify);
+	// KYTY_BDA_WRITES=deferred (GPU thread). A synchronous settle's pages: a settle that wrote only
+	// pages the history holds confirms it, any other grows it and starts the confirmations over.
+	void NoteBdaWriteHistory(uint64_t shader_hash, const FaultManager::BdaWrites& writes);
+	// An applied deferred result: written pages outside the producer's domain are settled as
+	// phase 0 would have settled them right after the writer (counted, BdaDeferredMissPages; fatal
+	// with KYTY_BDA_WRITES_VERIFY), join the history and demote the shader to synchronous settles
+	// until the grown history is confirmed again.
+	void ApplyDeferredBdaWrite(uint64_t shader_hash, const FaultManager::BdaWrites& writes,
+	                           std::span<const GuestRange> domain);
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,
@@ -695,9 +711,58 @@ private:
 		uint64_t ticket = 0, shader_hash = 0;
 	};
 	std::array<DeferredBdaResult, BdaWriteLedger::Capacity> m_deferred_bda_results;
+	// KYTY_BDA_WRITES=deferred: what each writer shader wrote before (GPU thread). The domain of a
+	// deferred execution is its history: the pages its synchronous settles and applied results
+	// listed. A shader is admitted once ConfirmationsNeeded synchronous settles in a row wrote only
+	// pages the history held (empty included: a shader that never writes); every execution that
+	// writes outside it doubles that count. Overflowing the written-page list, the run/byte
+	// bounds or MaxMisses makes the shader synchronous for good.
+	struct BdaWriteHistory {
+		static constexpr uint32_t MaxRuns  = 64;
+		static constexpr uint64_t MaxBytes = uint64_t {64} << 20u;
+		static constexpr uint32_t MaxMisses = 6;
+		RangeSet pages;
+		uint64_t bytes         = 0;
+		uint32_t confirmations = 0;
+		uint32_t misses        = 0;
+		bool     synchronous   = false;
+		bool     announced     = false; // admission logged
+		[[nodiscard]] uint32_t ConfirmationsNeeded() const noexcept { return 2u << misses; }
+		[[nodiscard]] bool Admits() const noexcept {
+			return !synchronous && confirmations >= ConfirmationsNeeded();
+		}
+		// Adds `written` and starts the confirmations over; false (synchronous for good) past
+		// the run or byte bounds.
+		bool Grow(const RangeSet& written) {
+			written.ForEach([this](uint64_t begin, uint64_t end) { pages.Add(begin, end - begin); });
+			return Recount();
+		}
+		// Drops a run that is no longer mapped; what remains is confirmed again.
+		void Forget(uint64_t address, uint64_t size) {
+			pages.Subtract(address, size);
+			(void)Recount();
+		}
+		void MakeSynchronous() noexcept {
+			synchronous   = true;
+			confirmations = 0;
+			bytes         = 0;
+			pages.Clear();
+		}
+		bool Recount() {
+			bytes = 0;
+			pages.ForEach([this](uint64_t begin, uint64_t end) { bytes += end - begin; });
+			confirmations = 0;
+			if (pages.Size() <= MaxRuns && bytes <= MaxBytes) return true;
+			MakeSynchronous();
+			return false;
+		}
+	};
+	std::unordered_map<uint64_t, BdaWriteHistory>     m_bda_write_history;
+	RangeSet                                          m_deferred_bda_outside; // scratch
 	std::vector<GuestRange>                           m_deferred_bda_domain;
 	RangeSet                                          m_deferred_bda_reserved;
-	uint64_t                                          m_deferred_bda_registry = 0;
+	bool                                              m_deferred_bda_prepared = false;
+	bool                                              m_deferred_bda_applying = false;
 	bool                                              m_deferred_bda_hooks = false;
 	std::mutex                                        m_deferred_bda_mutex;
 	std::condition_variable                           m_deferred_bda_available;

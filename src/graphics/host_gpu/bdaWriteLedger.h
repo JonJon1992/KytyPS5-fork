@@ -26,9 +26,10 @@ public:
     };
 
     // Admission fails before recording if retained slots are full or the domain
-    // is not a sorted, disjoint, nonempty set. No allocation on range queries.
+    // is not a sorted, disjoint set. An empty domain (a writer whose history holds
+    // no page) holds no reader, only publications. No allocation on range queries.
     Ticket Open(uint64_t tick, uint64_t generation, std::span<const GuestRange> domain) {
-        if (tick == 0 || domain.empty() || m_last - AppliedPrefix() == Capacity ||
+        if (tick == 0 || m_last - AppliedPrefix() == Capacity ||
             m_last == std::numeric_limits<Ticket>::max()) return 0;
         uint64_t end = 0;
         for (const auto range : domain) {

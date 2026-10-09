@@ -1245,6 +1245,13 @@ enum class FrameEvent : uint32_t {
 	BdaCandidateRejects,
 	BdaCandidateMisses,
 	BdaCandidateDroppedWrites,
+	// KYTY_BDA_WRITES=deferred: writer dispatches settled after the fact (their domain is the shader's
+	// write history), writer dispatches settled synchronously instead (no confirmed history, a
+	// physical alias or an unmapped page in it), and caching pages written outside the reserved
+	// domain (settled when the result applies: the race window the history accepts).
+	BdaDeferredDispatches,
+	BdaDeferredFallbacks,
+	BdaDeferredMissPages,
 	// PrepareBindlessHeaps: heap keys resolved per consumer, and those that kept their slot.
 	BindlessHeapKeys,
 	BindlessHeapKeysKept,
