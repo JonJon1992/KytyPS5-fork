@@ -7,6 +7,9 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include <atomic>
+#include <bit>
+#include <charconv>
+#include <string_view>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +81,22 @@ int RevalidateVerifyMode() {
 	return mode;
 }
 
+// One-time selection, before publishing entries to DrawPrep readers. Bindless heaps can
+// cycle through tens of thousands of exact keys, evicting the small ordinary-draw memo.
+// Invalid overrides keep the default; no allocation or parsing occurs on lookup.
+uint32_t MemoCapacity() {
+	const auto* bindless = std::getenv("KYTY_BINDLESS");
+	const uint32_t fallback = bindless != nullptr && bindless[0] == '1' ? 65536u : 4096u;
+	const auto* setting = std::getenv("KYTY_TEXTURE_BINDING_MEMO_SLOTS");
+	if (setting == nullptr) return fallback;
+	const std::string_view text(setting);
+	uint32_t slots = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), slots);
+	if (error != std::errc {} || end != text.data() + text.size() ||
+	    slots < 1024u || slots > 65536u || !std::has_single_bit(slots)) return fallback;
+	return slots;
+}
+
 } // namespace
 
 bool TextureBindingMemo::HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
@@ -111,7 +130,7 @@ void TextureBindingMemo::ReportRevalidateMismatch() {
 	}
 }
 
-TextureBindingMemo::TextureBindingMemo() = default;
+TextureBindingMemo::TextureBindingMemo() : m_slot_mask(MemoCapacity() - 1u) {}
 TextureBindingMemo::~TextureBindingMemo() = default;
 
 bool TextureBindingMemo::Enabled() {
@@ -214,7 +233,7 @@ bool TextureBindingMemo::FindHint(const Key& key, uint64_t hash, uint64_t& tag) 
 	if (entries == nullptr) {
 		return false;
 	}
-	const auto& entry  = entries[hash % Slots];
+	const auto& entry  = entries[hash & m_slot_mask];
 	const auto  packed = PackKey(key);
 	const auto  before = entry.seq.load(std::memory_order_acquire);
 	if ((before & 1u) != 0) {
@@ -270,7 +289,7 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 	std::scoped_lock lock {cache.m_lock};
 	const auto       tick = cache.m_scheduler.CurrentTick();
 	for (; hits < bindings.size(); hits++) {
-		const auto slot  = static_cast<uint32_t>(hashes[hits] % Slots);
+		const auto slot  = static_cast<uint32_t>(hashes[hits] & m_slot_mask);
 		auto&      entry = m_entries[slot];
 		if (tags[hits] == 0 || entry.tag != tags[hits]) {
 			break;
@@ -306,7 +325,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
 	}
-	const auto slot  = static_cast<uint32_t>(hash % Slots);
+	const auto slot  = static_cast<uint32_t>(hash & m_slot_mask);
 	auto&      entry = m_entries[slot];
 	// A hint naming this entry's tag proves the key (FindHint); otherwise compare it.
 	const bool hinted = tag_hint != 0 && entry.tag == tag_hint;
@@ -431,10 +450,10 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 		}
 	}
 	if (!m_entries) {
-		m_entries = std::make_unique<Entry[]>(Slots);
+		m_entries = std::make_unique<Entry[]>(m_slot_mask + 1u);
 		m_published.store(m_entries.get(), std::memory_order_release);
 	}
-	const auto slot  = static_cast<uint32_t>(hash % Slots);
+	const auto slot  = static_cast<uint32_t>(hash & m_slot_mask);
 	auto&      entry = m_entries[slot];
 	// FindHint's readers: odd while the key and tag change (the fence orders the odd value before
 	// the new words), even again once both are stored (release).
@@ -473,7 +492,7 @@ const TextureBindingMemo::Entry* TextureBindingMemo::ViewEntry(const TextureBind
 	    binding.desc.type != TextureCache::BindingType::Texture) {
 		return nullptr;
 	}
-	const auto& entry = m_entries[binding.memo_slot % Slots];
+	const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 	if (entry.tag != binding.memo_tag || entry.image != binding.image_id || entry.view == nullptr) {
 		return nullptr;
 	}
@@ -543,7 +562,7 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 	}
 	// KYTY_CP_COMMIT=texdcc: DCC certificates first, outside the lock (as TryResolve checks them).
 	for (const auto& binding: bindings) {
-		const auto& entry = m_entries[binding.memo_slot % Slots];
+		const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 		if (binding.memo_tag != 0 && entry.tag == binding.memo_tag && entry.dcc &&
 		    !DccStateHolds(cache, entry)) {
 			return false;
@@ -551,7 +570,7 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 	}
 	std::scoped_lock lock {cache.m_lock};
 	for (const auto& binding: bindings) {
-		const auto& entry = m_entries[binding.memo_slot % Slots];
+		const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 		if (binding.memo_tag == 0 || entry.tag != binding.memo_tag || entry.image != binding.image_id) {
 			return false;
 		}
@@ -573,7 +592,7 @@ bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<Texture
 	}
 	const auto tick = cache.m_scheduler.CurrentTick();
 	for (const auto& binding: bindings) {
-		const auto& entry = m_entries[binding.memo_slot % Slots];
+		const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 		if (!entry.null_image) {
 			auto& image              = cache.m_slot_images[entry.image];
 			image.tick_accessed_last = tick;
@@ -597,7 +616,7 @@ bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBi
 	}
 	std::scoped_lock lock {cache.m_lock};
 	for (const auto& binding: bindings) {
-		const auto& entry = m_entries[binding.memo_slot % Slots];
+		const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 		if (binding.memo_tag == 0 || binding.desc.type != TextureCache::BindingType::Texture ||
 		    entry.tag != binding.memo_tag || entry.image != binding.image_id ||
 		    entry.view == nullptr) {
@@ -620,7 +639,7 @@ bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBi
 		return true;
 	}
 	for (auto& binding: bindings) {
-		const auto& entry = m_entries[binding.memo_slot % Slots];
+		const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 		cache.TouchImage(cache.m_slot_images[binding.image_id]);
 		binding.image_view = entry.view;
 	}
@@ -632,7 +651,7 @@ vk::ImageView TextureBindingMemo::EntryView(const TextureBinding& binding) const
 	if (!m_entries || binding.memo_tag == 0) {
 		return nullptr;
 	}
-	const auto& entry = m_entries[binding.memo_slot % Slots];
+	const auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 	return entry.tag == binding.memo_tag ? entry.view : nullptr;
 }
 
@@ -641,7 +660,7 @@ void TextureBindingMemo::RecordView(const TextureBinding& binding, vk::ImageView
 	    binding.desc.type != TextureCache::BindingType::Texture) {
 		return;
 	}
-	auto& entry = m_entries[binding.memo_slot % Slots];
+	auto& entry = m_entries[binding.memo_slot & m_slot_mask];
 	if (entry.tag == binding.memo_tag && entry.image == binding.image_id) {
 		entry.view = view;
 	}

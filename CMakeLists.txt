@@ -1846,6 +1846,18 @@ if(BUILD_TESTING)
 	add_test(NAME set_reuse_fresh_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --set-reuse-fresh-only)
 	set_tests_properties(set_reuse_fresh_verify PROPERTIES ENVIRONMENT "KYTY_SET_REUSE_FRESH=verify")
+	# Enlarged memo: identities colliding at 4096 slots and preparation-hint indexing.
+	add_test(NAME texture_memo_capacity
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-capacity-only)
+	set_tests_properties(texture_memo_capacity PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_BINDING_MEMO_SLOTS=65536")
+	add_test(NAME texture_memo_capacity_bindless
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-capacity-only)
+	set_tests_properties(texture_memo_capacity_bindless PROPERTIES ENVIRONMENT "KYTY_BINDLESS=1")
+	add_test(NAME texture_memo_revalidate_large
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	set_tests_properties(texture_memo_revalidate_large PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_BINDING_MEMO_SLOTS=65536;KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY=exit")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)

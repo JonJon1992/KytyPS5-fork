@@ -15679,6 +15679,71 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // More than 4096 descriptor identities need independent memo slots with bindless.
+  // Use two true hashes sharing their low 12 bits but differing at the enlarged capacity.
+  void CheckTextureMemoCapacity() {
+    constexpr const char *name = "TextureMemoCapacity";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &executor = context.GetRenderExecutor();
+    auto &cache = context.GetTextureCache();
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    auto binding = RenderExecutorTestAccess::ResolveTextureFull(executor, resource, value);
+    Require(name, "null image", binding.image_id && binding.desc.info.data.Empty(),
+            "the null descriptor did not resolve to a permanent image");
+
+    TextureBindingMemo memo;
+    uint32_t words[8]{};
+    const auto first = TextureBindingMemo::MakeKey(resource, words);
+    const auto hash_a = TextureBindingMemo::Hash(first);
+    auto second = first;
+    uint64_t hash_b = 0;
+    bool found = false;
+    for (uint32_t i = 1; i < (1u << 20u); ++i) {
+      second.words[7] = i;
+      hash_b = TextureBindingMemo::Hash(second);
+      if ((hash_a & 4095u) == (hash_b & 4095u) &&
+          (hash_a & 65535u) != (hash_b & 65535u)) {
+        found = true;
+        break;
+      }
+    }
+    Require(name, "collision fixture", found,
+            "no pair sharing the legacy slot was found");
+    auto a = binding;
+    auto b = binding;
+    memo.Record(cache, first, hash_a, a, binding.image_id, false, false);
+    memo.Record(cache, second, hash_b, b, binding.image_id, false, false);
+    TextureBinding recovered;
+    Require(name, "retain first descriptor",
+            memo.TryResolve(cache, first, hash_a, recovered) &&
+                recovered.image_id == binding.image_id,
+            "the enlarged memo still evicted a descriptor at the legacy 4096-slot boundary");
+    Require(name, "retain second descriptor",
+            memo.TryResolve(cache, second, hash_b, recovered) &&
+                recovered.image_id == binding.image_id,
+            "the second descriptor was not retained");
+    uint64_t tag = 0;
+    Require(name, "worker hint", memo.FindHint(first, hash_a, tag) && tag == a.memo_tag,
+            "the preparation worker indexed a different memo slot");
+    scheduler.Finish();
+    RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_TEXTURE_MEMO_REVALIDATE: a texture binding memo entry whose first 1 MiB page gets a new
   // owner (another image registered on it) is revalidated with FindImage's own lookup and stays
   // usable, same entry and view, while that lookup still returns the recorded image; the answer
@@ -53683,6 +53748,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-memo-capacity-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureMemoCapacity();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {

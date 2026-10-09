@@ -18,7 +18,9 @@ namespace Libs::Graphics {
 struct TextureBinding;
 
 // Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, default on; =0 restores the full
-// resolution for every binding).
+// resolution for every binding). Startup capacity: 4096 entries, or 65536 with
+// KYTY_BINDLESS=1; KYTY_TEXTURE_BINDING_MEMO_SLOTS overrides with a power of two
+// in [1024, 65536]. The capacity changes retention, never the validity checks.
 //
 // RenderExecutor::ResolveTexture turns (T# dwords, shader image resource) into a texture-cache
 // image and a description, and RebindImages turns that into the sampled view. Both repeat for
@@ -181,7 +183,7 @@ public:
 
 private:
 	struct Entry;
-	static constexpr uint32_t Slots    = 4096;
+	const uint32_t m_slot_mask; // immutable; capacity is a power of two
 	static constexpr uint32_t KeyWords = 8;
 	using PackedKey                    = std::array<uint64_t, KeyWords>;
 

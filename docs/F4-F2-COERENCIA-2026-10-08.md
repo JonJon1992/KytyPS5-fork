@@ -135,3 +135,46 @@ Artefatos da reprodução em
 /home/jonathanbraga/KytyPS5-fork/_Build/coherence-f1/validation/live-yotei-20261008/:
 descriptor-6a835f.json, stage2_6a835f5fe4a5a4ac.bin,
 stage2_6a835f5fe4a5a4ac.bin.rdna2, bindless-off.log e bindless-on.log.
+
+## Yōtei com bindless: perfil nativo e ajuste do memo
+
+A captura de 0,9 FPS é com bindless ligado. A direção de log Silent suprime
+a inicialização da tabela; sua ausência no console não prova que ela está
+desligada. O program cache e os recursos do dispositivo confirmaram a ativação.
+
+Perf anexado ao processo real, câmera parada: 12 s, 4.118 amostras, zero perdas.
+4.071 entradas foram analisadas, incluindo 1.020 do Thread_Gpu; o binário
+stripped foi simbolizado pelo mapa LLD da mesma compilação.
+
+| Função / operação | Amostras do Thread_Gpu |
+| --- | --- |
+| FindImageWithSameBacking | 14,90% |
+| FindOnFirstPage em SyncAliasFromOwner | 11,57% |
+| SlotVector<Image>::try_get | 9,02% |
+| SameBacking | 6,18% |
+| BindlessTable::FindSlot | 5,69% |
+| BindlessTable::ReleaseKey | 4,80% |
+| TextureBindingMemo::TryResolve | 3,92% |
+
+A captura do HUD registra 43.890 imagens, contra 4.096 posições do memo.
+Hipótese: colisões aumentam as buscas completas. O ajuste usa 65.536 posições
+quando KYTY_BINDLESS=1, mantendo todos os critérios de validade, tags,
+gerações de imagem, parceiros, DCC, dirty bits e publicação para DrawPrep.
+Fora do bindless, o padrão permanece 4.096. A capacidade é imutável por instância;
+KYTY_TEXTURE_BINDING_MEMO_SLOTS aceita potências de dois entre 1.024 e 65.536.
+
+Custo medido de estrutura: sizeof(Entry)=992 bytes; 65.536 posições usam
+62 MiB, contra 3,875 MiB antes. A alocação é lazy no primeiro Record, podendo
+causar um pico inicial. Isso precisa ser excluído da janela aquecida do A/B.
+
+Teste vermelho: dois hashes reais colidem nas 4.096 posições e ocupam posições
+diferentes em 65.536; antes do ajuste, o primeiro descritor era perdido.
+Depois do ajuste, seis testes Vulkan passaram: capacidade por override e por
+bindless, mais invalidação nos modos padrão, verify, off e no memo ampliado.
+O teste de FindHint confirma a indexação; não mede concorrência.
+
+**Ganho de FPS ainda não confirmado.** Compare o mesmo executável e a mesma
+cena/câmera/caches, mantendo todas as opções iguais e alterando somente
+KYTY_TEXTURE_BINDING_MEMO_SLOTS=4096 / =65536 como argumento do run-u59.sh.
+Artefatos: validation/live-yotei-20261008/bindless-cpu.perf,
+perf-map-summary.json, memo-red-test.log e memo-green-tests.log.
