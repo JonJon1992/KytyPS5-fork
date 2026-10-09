@@ -1,0 +1,17 @@
+{
+  "name": "Astro's Playroom",
+  "title_ids": [
+    "PPSA01325"
+  ],
+  "folder_names": [
+    "PPSA01325",
+    "AstrosPlayroom"
+  ],
+  "notes": "Hub a 60 fps (limite do vsync), 1% low 58,4, com o preset padrão depois das correções do Playroom (2026-10-07). KYTY_READONLY_BUFFERS fica ligado: desligado, a primeira medição caiu de 35,4 para 25,6 fps. KYTY_AUDIO_STEREO_DOWNMIX fica desligado: deixa o som ~13 dB mais alto e pode clipar. Rastreamento de escrita igual ao do Crash.",
+  "environment": {
+    "KYTY_BDA_BATCH_PROTECT": "1",
+    "KYTY_UFFD_WP": "1",
+    "KYTY_READONLY_BUFFERS": "1",
+    "KYTY_AUDIO_STEREO_DOWNMIX": "0"
+  }
+}

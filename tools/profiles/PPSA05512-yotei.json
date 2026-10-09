@@ -1,0 +1,15 @@
+{
+  "name": "Ghost of Yotei",
+  "title_ids": ["PPSA05512"],
+  "folder_names": ["Yotei"],
+  "game_patch": "_Patches/PPSA05512.json",
+  "notes": "Modo Performance sem RTGI pelo patch PPSA05512 (a cópia extraída não tem param.json, por isso o perfil também casa pelo nome da pasta). Medido: ~16-20 fps sem bindless; com KYTY_BINDLESS=1 caiu para 0,9-5 fps, então fica desligado. F4/F5 (KYTY_BDA_WRITES) desligadas: com a F4 admitida houve timeout no anel de gráficos. F1 desligada: device lost na 2a janela do A/B.",
+  "environment": {
+    "KYTY_BDA_BATCH_PROTECT": "1",
+    "KYTY_UFFD_WP": "1",
+    "KYTY_BINDLESS": "0",
+    "KYTY_BDA_WRITES": "off",
+    "KYTY_COHERENCE_COPY": "0",
+    "KYTY_COHERENCE_PROTECT": "0"
+  }
+}

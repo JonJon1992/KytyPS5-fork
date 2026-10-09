@@ -6,6 +6,7 @@
 #include "controllerLightbar.h"
 #include "gameContent.h"
 #include "patchesDialog.h"
+#include "performanceProfile.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -312,12 +313,15 @@ static QString BashQuote(QString value) {
 }
 
 static bool CreateBashScript(const QString& interpreter, const QStringList& args,
-                             const QString& file_name) {
+                             const QString& file_name, const QStringList& banner) {
 	QFile file(file_name);
 	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
 		QTextStream s(&file);
 
 		s << "#!/bin/bash\n";
+		for (const auto& line: banner) {
+			s << "echo " << BashQuote(line) << "\n";
+		}
 		s << BashQuote(interpreter);
 		for (const auto& arg: args) {
 			s << " " << BashQuote(arg);
@@ -424,9 +428,34 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		return;
 	}
 
+	// The game's performance profile (profiles/*.json): its switches go over the bundled preset,
+	// and its patch plan serves a title without _Patches/<TITLE_ID>.json.
+	const auto* profile = PerformanceProfiles::Resolve(info);
+	QStringList banner;
+	if (profile != nullptr) {
+		banner << QStringLiteral("Kyty performance profile: %1 (profiles/%2.json)")
+		              .arg(profile->name, profile->id);
+		for (const auto& [key, value]: profile->environment) {
+			banner << QStringLiteral("  %1=%2").arg(key, value);
+		}
+		if (!profile->game_patch.isEmpty() && !args.contains(QStringLiteral("--game-patch"))) {
+			if (QFileInfo::exists(profile->game_patch)) {
+				args << "--game-patch" << profile->game_patch;
+				banner << QStringLiteral("  --game-patch %1").arg(profile->game_patch);
+			} else {
+				banner << QStringLiteral("  game patch not found: %1").arg(profile->game_patch);
+			}
+		}
+	} else {
+		banner << QStringLiteral("Kyty performance profile: none");
+	}
+	for (const auto& line: banner) {
+		qInfo("%s", qUtf8Printable(line));
+	}
+
 #ifdef __linux__
 	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
+	if (!CreateBashScript(interpreter, args, bash_file_name, banner)) {
 		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
 		QApplication::quit();
 		return;
@@ -463,6 +492,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		return value ? QStringLiteral("1") : QStringLiteral("0");
 	};
 	auto environment = QProcessEnvironment::systemEnvironment();
+	if (profile != nullptr) {
+		for (const auto& [key, value]: profile->environment) {
+			environment.insert(key, value);
+		}
+	}
 	environment.insert(QStringLiteral("KYTY_DCC_GPU"), enabled_flag(info.dcc_gpu_clear_enabled));
 	environment.insert(QStringLiteral("KYTY_PROGRAM_CACHE"),
 	                   enabled_flag(info.program_cache_enabled));

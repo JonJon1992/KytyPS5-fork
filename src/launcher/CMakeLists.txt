@@ -94,6 +94,17 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
+# Per-game performance profiles (include/performanceProfile.h), read from profiles/ next to the
+# launcher executable.
+if(APPLE)
+	set(kyty_profiles_destination "KytyPS5.app/Contents/MacOS/profiles")
+else()
+	set(kyty_profiles_destination "profiles")
+endif()
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/tools/profiles/"
+	DESTINATION "${kyty_profiles_destination}"
+	FILES_MATCHING PATTERN "*.json")
+
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")

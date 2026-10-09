@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
+#include "performanceProfile.h"
 #include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
@@ -161,6 +162,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	});
 	setMinimumWidth(width());
 	InitGameDirectories();
+	InitPerformanceProfile();
 	m_ui->controller_group->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
@@ -355,6 +357,39 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+	SelectPerformanceProfile(info.performance_profile);
+}
+
+// profiles/*.json next to the launcher (performanceProfile.h): Automatic picks one by the game's
+// title id or folder name at launch, None applies none.
+void ConfigurationEditDialog::InitPerformanceProfile() {
+	m_profile_combo = new QComboBox(this);
+	m_profile_combo->addItem(tr("Automatic (by game)"), QString::fromLatin1(PerformanceProfiles::AUTOMATIC));
+	m_profile_combo->addItem(tr("None"), QString::fromLatin1(PerformanceProfiles::NONE));
+	for (const auto& profile: PerformanceProfiles::All()) {
+		m_profile_combo->addItem(profile.name, profile.id);
+		m_profile_combo->setItemData(m_profile_combo->count() - 1, profile.notes, Qt::ToolTipRole);
+	}
+	const auto update_tooltip = [this](int index) {
+		const auto notes = m_profile_combo->itemData(index, Qt::ToolTipRole).toString();
+		m_profile_combo->setToolTip(
+		    !notes.isEmpty() ? notes
+		                     : tr("Emulator switches applied over the bundled preset when the game "
+		                          "launches (profiles folder next to the launcher)"));
+	};
+	connect(m_profile_combo, &QComboBox::currentIndexChanged, this, update_tooltip);
+	m_ui->graphicsLayout->insertRow(0, tr("Performance profile:"), m_profile_combo);
+	update_tooltip(0);
+}
+
+void ConfigurationEditDialog::SelectPerformanceProfile(const QString& value) {
+	auto index = m_profile_combo->findData(value);
+	if (index < 0) {
+		// A profile file that is gone: kept, so saving does not change the choice silently.
+		m_profile_combo->addItem(tr("%1 (missing)").arg(value), value);
+		index = m_profile_combo->count() - 1;
+	}
+	m_profile_combo->setCurrentIndex(index);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -530,6 +565,7 @@ void ConfigurationEditDialog::save() {
 	}
 
 	UpdateInfo(m_info, *m_ui, m_global_settings);
+	m_info.performance_profile = m_profile_combo->currentData().toString();
 
 	emit accept();
 }

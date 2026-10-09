@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 class QByteArray;
+class QComboBox;
 class QGroupBox;
 class QListWidget;
 class QMoveEvent;
@@ -40,11 +41,14 @@ private:
 	QGroupBox*                   m_game_dirs_group        = nullptr;
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
+	QComboBox*                   m_profile_combo          = nullptr;
 	bool                         m_global_settings        = false;
 
 protected:
 	void Init(const Configuration& info);
 	void InitGameDirectories();
+	void InitPerformanceProfile();
+	void SelectPerformanceProfile(const QString& value);
 	void AddGameDirectoryItem(const QString& dir);
 
 	void moveEvent(QMoveEvent* event) override;

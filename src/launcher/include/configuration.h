@@ -180,6 +180,8 @@ public:
 	bool                   program_cache_enabled       = false;
 	bool                   pipeline_library_enabled    = false;
 	bool                   gpu_fault_report_enabled = false;
+	// PerformanceProfiles::AUTOMATIC, NONE or a profile id (profiles/<id>.json).
+	QString                performance_profile = QStringLiteral("auto");
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -218,6 +220,7 @@ public:
 		program_cache_enabled       = other.program_cache_enabled;
 		pipeline_library_enabled    = other.pipeline_library_enabled;
 		gpu_fault_report_enabled = other.gpu_fault_report_enabled;
+		performance_profile      = other.performance_profile;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -271,6 +274,7 @@ public:
 		KYTY_CFG_SET(program_cache_enabled);
 		KYTY_CFG_SET(pipeline_library_enabled);
 		KYTY_CFG_SET(gpu_fault_report_enabled);
+		KYTY_CFG_SET(performance_profile);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -323,6 +327,11 @@ public:
 		program_cache_enabled = s->value("program_cache_enabled", false).toBool();
 		pipeline_library_enabled = s->value("pipeline_library_enabled", false).toBool();
 		gpu_fault_report_enabled = s->value("gpu_fault_report_enabled", false).toBool();
+		performance_profile =
+		    s->value("performance_profile", QStringLiteral("auto")).toString().trimmed();
+		if (performance_profile.isEmpty()) {
+			performance_profile = QStringLiteral("auto");
+		}
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
