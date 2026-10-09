@@ -31,6 +31,8 @@ struct Plan {
     uintptr_t table_alias = 0;
     // The guest program address (COMPUTE_PGM), as device-loss checkpoints print it ("CS=").
     uint64_t cs_address = 0;
+    // User data s2, the M0 of their DS_APPENDs: GDS base (bits 16..31) and size (diagnostics).
+    uint32_t gds = 0;
     std::array<uintptr_t, MaxDescriptors> range_aliases {};
     std::array<uint32_t, MaxTableBytes / 4> words {};
     std::array<GuestRange, MaxDescriptors> ranges {};

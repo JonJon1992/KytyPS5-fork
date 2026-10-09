@@ -1221,8 +1221,14 @@ private:
 		uint64_t                              consumers = 0;
 		uint64_t                              keys      = 0;
 		uint64_t                              kept      = 0;
+		uint64_t                              repeated  = 0; // heaps repeated whole
 	};
 	BindlessLog m_bindless_log;
+	// PrepareBindlessHeaps scratch, kept across consumers: the heap's T# records (and the raw
+	// span of strided records), and the keys of a heap repeat (TextureBindingMemo::TryRepeatKeys).
+	std::vector<std::array<uint32_t, 8>>        m_bindless_records;
+	std::vector<uint32_t>                       m_bindless_words;
+	std::vector<TextureBindingMemo::RepeatKey>  m_bindless_repeat_keys;
 	// KYTY_DRAW_SEQUENCE_VERIFY: the views a repeated stage claimed (RebindImages).
 	std::vector<vk::ImageView> m_claimed_views;
 	// KYTY_DRAW_SEQUENCE_FAST outcomes, always counted (the DrawSequence* frame events need a

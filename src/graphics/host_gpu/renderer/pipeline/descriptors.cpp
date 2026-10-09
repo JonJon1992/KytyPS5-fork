@@ -1580,6 +1580,51 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     }
     // Every key's resolution writes the same binding (ResolveTexture resets the per-binding state).
     TextureBinding binding;
+    // A consumer of a heap whose T#s are those every key was settled from. When each resolved
+    // key's memo entry would still answer TryResolve and TryAcquireView with the same image and
+    // view (checked under one lock) and the other keys are placeholders their T# alone decides,
+    // resolving every key again would leave each slot, translation and reference as it is. The
+    // images get the lookups' access bookkeeping (TryRepeatKeys) and this draw's binding, and the
+    // stage commit the same textures. Anything else resolves the keys one by one.
+    const auto repeat_heap = [&](BindlessTable::Heap& heap,
+                                 std::span<const std::array<uint32_t, 8>> keys_records,
+                                 uint32_t array) {
+        table.ApplyUnregistered(); // a retired image resets its keys first
+        if (keys_records.size() > heap.entries ||
+            !std::equal(keys_records.begin(), keys_records.end(), heap.descriptors.begin())) {
+            return false;
+        }
+        auto& keys = m_bindless_repeat_keys;
+        keys.clear();
+        for (size_t key = 0; key < keys_records.size(); ++key) {
+            if (heap.settled[key] == 0) {
+                return false;
+            }
+            if (heap.slots[key] == 0) {
+                if (heap.fixed_placeholder[key] == 0) {
+                    return false;
+                }
+                continue;
+            }
+            const auto& hint = heap.memo_hints[key];
+            const auto  view = table.SlotView(array, heap.slots[key]);
+            if (hint.tag == 0 || view == nullptr) {
+                return false;
+            }
+            keys.push_back({hint.hash, hint.tag, heap.images[key], view});
+        }
+        if (!m_texture_memo.TryRepeatKeys(m_context.GetTextureCache(), keys)) {
+            return false;
+        }
+        for (size_t key = 0; key < keys_records.size(); ++key) {
+            if (heap.slots[key] != 0) {
+                BindImage(heap.images[key], false);
+                prepared.bindless_textures.push_back(
+                    {heap.images[key], heap.layouts[key], heap.ranges[key]});
+            }
+        }
+        return true;
+    };
     for (const auto& use: snapshot.bindless_heaps) {
         prepared.bindless_patches.push_back({use.mapping_offset, 0, 0});
         const uint64_t stride = use.record_stride;
@@ -1593,14 +1638,16 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         if (count64 == 0 || count64 >= BindlessTable::TranslationEntries) continue;
         // ponytail: reread and resolve the bounded heap on every consumer; precise content
         // revisions can avoid this O(heap size) work without weakening first-use residency.
-        std::vector<std::array<uint32_t, 8>> records(static_cast<size_t>(count64));
+        auto& records = m_bindless_records;
+        records.assign(static_cast<size_t>(count64), {});
         if (stride == 32u && t_sharp_bytes == 32u) {
             if (!read(use.base + use.table_offset, records.data(), count64 * 32u)) continue;
         } else {
             // Records holding the T# (Ghost of Yotei: 440-byte materials, 872-byte lights): read
             // the span once and keep each key's T#.
             const auto span = (count64 - 1u) * stride + t_sharp_bytes;
-            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            auto& words = m_bindless_words;
+            words.resize(static_cast<size_t>((span + 3u) / 4u));
             if (!read(use.base + use.table_offset, words.data(), span)) continue;
             for (uint64_t key = 0; key < count64; ++key) {
                 std::memcpy(records[key].data(), words.data() + key * stride / 4u, t_sharp_bytes);
@@ -1613,22 +1660,34 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         if (heap == nullptr) continue;
         prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                             static_cast<uint32_t>(count64)};
+        auto& cache = m_context.GetTextureCache();
+        if (repeat_heap(*heap, std::span<const std::array<uint32_t, 8>>(records), array)) {
+            const auto kept = m_bindless_repeat_keys.size(); // the resolved keys
+            Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
+            Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
+            Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapsRepeated);
+            m_bindless_log.keys += count64;
+            m_bindless_log.kept += kept;
+            m_bindless_log.repeated++;
+            continue;
+        }
         // Every key is resolved again (touch, residency, refresh). A key that still samples the
         // same view through the same slot keeps its slot, translation and image reference: what
         // releasing and settling it again would leave (FindSlot finds the view in that slot).
         const auto expected_view = array == BindlessTable::Images3D ? vk::ImageViewType::e3D :
             array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
-        auto& cache = m_context.GetTextureCache();
         uint32_t kept = 0;
         for (uint32_t key = 0; key < count64; ++key) {
             const bool same_descriptor =
                 heap->settled[key] != 0 && heap->descriptors[key] == records[key];
             auto& hint = heap->memo_hints[key];
-            // The key samples the placeholder: as a fresh release and settle leaves it.
-            const auto settle_placeholder = [&] {
+            // The key samples the placeholder: as a fresh release and settle leaves it. `fixed`:
+            // its T# (with the heap's resource) alone decides so, whatever the texture cache holds.
+            const auto settle_placeholder = [&](bool fixed) {
                 (void)table.ReleaseKey(*heap, key);
                 heap->settled[key] = 1;
                 heap->descriptors[key] = records[key];
+                heap->fixed_placeholder[key] = fixed ? 1u : 0u;
                 table.SetTranslation(*heap, key, 0u);
             };
             ShaderRecompiler::IR::DescriptorValue value {.dwords = records[key], .dword_count = 8u};
@@ -1638,7 +1697,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                 TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
                     Prospero::BufferFormat::kInvalid) {
                 hint = {};
-                settle_placeholder();
+                settle_placeholder(true);
                 continue;
             }
             // The memo hints of the same T# (ResolveTexture checks them in verify modes).
@@ -1649,12 +1708,13 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             ResolveTexture(resource, value, binding, &hint.hash, hint.tag);
             hint.tag = binding.memo_tag;
             if (binding.desc.view_info.type != expected_view) {
-                settle_placeholder();
+                settle_placeholder(true);
                 continue;
             }
             auto* image = cache.m_slot_images.try_get(binding.image_id);
             if (image == nullptr || !image->registered || image->info.data.Empty()) {
-                settle_placeholder();
+                // A null descriptor resolves to the permanent null image (empty data).
+                settle_placeholder(image != nullptr && image->info.data.Empty());
                 continue;
             }
             BindImage(binding.image_id, false);
@@ -1665,7 +1725,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             }
             image = cache.m_slot_images.try_get(binding.image_id);
             if (image == nullptr || !image->registered || !binding.image_view) {
-                settle_placeholder();
+                settle_placeholder(false);
                 continue;
             }
             // Resolution may retire an older view and recycle its raw handle. Cache calls have
@@ -1676,15 +1736,18 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             const auto& view = binding.desc.view_info;
             const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
                                                view.layer_count};
+            heap->layouts[key] = binding.layout;
+            heap->ranges[key]  = range;
             if (const auto slot = heap->slots[key]; slot != 0 && heap->images[key] == binding.image_id &&
                 table.SlotView(array, slot) == binding.image_view) {
                 heap->settled[key] = 1;
                 heap->descriptors[key] = records[key];
+                heap->fixed_placeholder[key] = 0u;
                 prepared.bindless_textures.push_back({binding.image_id, binding.layout, range});
                 kept++;
                 continue;
             }
-            settle_placeholder();
+            settle_placeholder(false);
             const auto old_slot = table.FindSlot(array, binding.image_view);
             const auto slot = old_slot != 0 ? old_slot : table.AllocateSlot(array);
             if (slot == 0) continue;
@@ -1711,10 +1774,12 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     } else if (now - m_bindless_log.time >= std::chrono::seconds(10)) {
         const auto& log = m_bindless_log;
         Log::WriteToConsoleAndLog(fmt::format(
-            "Bindless heaps {:.0f}s: {} consumers, {} keys resolved, {} kept ({:.1f}%)\n",
+            "Bindless heaps {:.0f}s: {} consumers, {} keys resolved, {} kept ({:.1f}%), {} heaps "
+            "repeated whole\n",
             std::chrono::duration<double>(now - log.time).count(), log.consumers, log.keys,
-            log.kept, log.keys != 0 ? 100.0 * static_cast<double>(log.kept) / static_cast<double>(log.keys) : 0.0));
-        m_bindless_log = {now, 0, 0, 0};
+            log.kept, log.keys != 0 ? 100.0 * static_cast<double>(log.kept) / static_cast<double>(log.keys) : 0.0,
+            log.repeated));
+        m_bindless_log = {now, 0, 0, 0, 0};
     }
 }
 

@@ -650,6 +650,37 @@ bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBi
 	return true;
 }
 
+bool TextureBindingMemo::TryRepeatKeys(TextureCache& cache, std::span<const RepeatKey> keys) {
+	if (keys.empty()) {
+		return true;
+	}
+	if (!m_entries) {
+		return false;
+	}
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto& key: keys) {
+		const auto& entry = m_entries[key.hash & m_slot_mask];
+		// TryResolve checks a DCC entry's certificate outside the lock: left to it.
+		if (key.tag == 0 || entry.tag != key.tag || entry.image != key.image || entry.dcc ||
+		    entry.null_image || entry.view == nullptr || entry.view != key.view) {
+			return false;
+		}
+		const auto* image = HitImage(cache, entry);
+		if (image == nullptr || !ViewImageReady(entry, *image)) {
+			return false;
+		}
+	}
+	const auto tick = cache.m_scheduler.CurrentTick();
+	for (const auto& key: keys) {
+		auto& image              = cache.m_slot_images[key.image];
+		image.tick_accessed_last = tick;
+		cache.TouchImage(image);
+	}
+	m_totals.hits += keys.size();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits, keys.size());
+	return true;
+}
+
 vk::ImageView TextureBindingMemo::EntryView(const TextureBinding& binding) const {
 	if (!m_entries || binding.memo_tag == 0) {
 		return nullptr;

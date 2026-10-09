@@ -88,6 +88,13 @@ public:
 			uint64_t tag  = 0;
 		};
 		std::vector<MemoHint> memo_hints;
+		// Per settled key: a placeholder its T# alone decides (incompatible or null descriptor,
+		// another view type), and, for a resolved key, the layout and subresource range the stage
+		// commit makes readable. A consumer that finds the heap unchanged repeats them
+		// (RenderExecutor::RepeatBindlessHeap).
+		std::vector<uint8_t>               fixed_placeholder;
+		std::vector<vk::ImageLayout>       layouts;
+		std::vector<ImageSubresourceRange> ranges;
 	};
 
 	// The heap for (base, table offset, view binding, complete resource interpretation), created

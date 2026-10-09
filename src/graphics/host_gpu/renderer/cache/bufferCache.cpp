@@ -2461,6 +2461,7 @@ bool BufferCache::PrepareBdaWriteCandidates(uint64_t shader_hash,
 	const auto prefix = PrefixBytes(shader_hash);
 	if (prefix == 0 || user_data.size() < 2) return fail("no table in the user data");
 	plan.table = uint64_t(user_data[0]) | (uint64_t(user_data[1]) << 32);
+	plan.gds   = user_data.size() > 2 ? user_data[2] : 0u;
 	// ScalarAddress loads mask the low two bits; a raw unaligned snapshot is a different table.
 	if ((plan.table & 3u) != 0) return fail("unaligned table");
 	plan.vm_generation = LibKernel::Memory::VirtualRangesGeneration();
@@ -2556,8 +2557,9 @@ bool BufferCache::FinalizeBdaWriteCandidates(BdaWriteCandidates::Plan& plan) {
 	static uint32_t logs = 0;
 	if (logs++ < 32) {
 		LOGF("BDA candidates: shader=0x%016" PRIx64 " CS=0x%016" PRIx64 " table=0x%016" PRIx64
-		     " bytes=%u ranges=%u verify=%u\n", plan.shader_hash, plan.cs_address, plan.table,
-		     plan.table_bytes, plan.range_count, ShaderRecompiler::BdaWriteCandidatesVerify() ? 1 : 0);
+		     " bytes=%u ranges=%u gds_m0=0x%08x verify=%u\n", plan.shader_hash, plan.cs_address,
+		     plan.table, plan.table_bytes, plan.range_count, plan.gds,
+		     ShaderRecompiler::BdaWriteCandidatesVerify() ? 1 : 0);
 	}
 	return true;
 }

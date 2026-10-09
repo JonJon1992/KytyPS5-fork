@@ -15845,10 +15845,14 @@ public:
       };
       const auto a = texture(base);
       const auto b = texture(base + 0x20000);
-      const auto write_heap = [&](const std::array<std::array<uint32_t, 8>, 3> &keys) {
+      // A 3D T# in the 2D heap: a placeholder its T# alone decides.
+      auto volume = texture(base + 0x40000);
+      volume[3] = (volume[3] & 0x0fffffffu) |
+                  (static_cast<uint32_t>(Prospero::ImageType::kColor3D) << 28u);
+      const auto write_heap = [&](const std::array<std::array<uint32_t, 8>, 4> &keys) {
         std::memcpy(reinterpret_cast<void *>(heap_address), keys.data(), sizeof(keys));
       };
-      write_heap({a, b, a});
+      write_heap({a, b, a, volume});
 
       ShaderRecompiler::IR::CompiledShaderInfo program{};
       program.stage = ShaderType::Pixel;
@@ -15860,11 +15864,14 @@ public:
       resource.bindless = true;
       program.info.images.push_back(resource);
       ShaderRecompiler::IR::ResourceSnapshot snapshot{};
-      snapshot.bindless_heaps.push_back({.base = heap_address, .size = 3u * 32u});
+      snapshot.bindless_heaps.push_back({.base = heap_address, .size = 4u * 32u});
       const ShaderStageRuntime runtime{&program, &snapshot};
       PreparedBindings prepared;
       const auto kept = [] {
         return Profiler::FrameEventTotal(Profiler::FrameEvent::BindlessHeapKeysKept);
+      };
+      const auto repeated = [] {
+        return Profiler::FrameEventTotal(Profiler::FrameEvent::BindlessHeapsRepeated);
       };
       // On the GPU thread, as the renderer (clean-backing reads of the heap are certified there).
       const auto consume = [&] {
@@ -15882,30 +15889,37 @@ public:
 
       Require(name, "first consumer", consume() == 0u && prepared.bindless_textures.size() == 3u,
               "the first consumer kept a key, or did not resolve all three");
+      Require(name, "fixed placeholder", heap().slots[3] == 0u && heap().fixed_placeholder[3] != 0u,
+              "the 3D T# in a 2D heap did not settle as a fixed placeholder");
       const auto first_slots = heap().slots;
       const auto first_images = heap().images;
       Require(name, "slots", first_slots[0] != 0u && first_slots[1] != 0u &&
                                  first_slots[0] != first_slots[1] && first_slots[2] == first_slots[0],
               "the two textures did not take two slots (the shared view one)");
 
+      auto repeats = repeated();
       Require(name, "repeat keeps",
               consume() == 3u && heap().slots == first_slots && heap().images == first_images &&
-                  prepared.bindless_textures.size() == 3u,
-              "an unchanged heap did not keep every key in its slot");
+                  prepared.bindless_textures.size() == 3u && repeated() == repeats + 1u,
+              "an unchanged heap was not repeated whole with every key in its slot");
 
-      write_heap({a, a, a});
+      write_heap({a, a, a, volume});
+      repeats = repeated();
       Require(name, "changed key moves",
               consume() == 2u && heap().slots[1] == first_slots[0] &&
-                  heap().images[1] == first_images[0] && heap().slots[0] == first_slots[0],
+                  heap().images[1] == first_images[0] && heap().slots[0] == first_slots[0] &&
+                  repeated() == repeats,
               "the rewritten key did not move to the other texture's slot");
 
       // A guest write to A's texels (write-tracked once uploaded) makes it CPU-dirty.
       *reinterpret_cast<volatile uint8_t *>(base + 64) = 0x11;
       Require(name, "texture CPU-dirty", texture_cache.GetImage(first_images[0]).IsCpuDirty(),
               "the guest write did not dirty the texture");
+      repeats = repeated();
       Require(name, "kept key refreshed",
-              consume() == 3u && !texture_cache.GetImage(first_images[0]).IsCpuDirty(),
-              "keeping the keys skipped the texture's refresh");
+              consume() == 3u && !texture_cache.GetImage(first_images[0]).IsCpuDirty() &&
+                  repeated() == repeats,
+              "keeping the keys (or repeating the heap) skipped the texture's refresh");
 
       // The cache retires A: its keys may not keep the slot that now holds the placeholder.
       OnGpuThread(context, [&] { TextureCacheTestAccess::FreeImage(texture_cache, first_images[0]); });

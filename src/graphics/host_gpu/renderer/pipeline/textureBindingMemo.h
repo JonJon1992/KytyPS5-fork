@@ -165,6 +165,19 @@ public:
 	// `apply` each hit's touch and view, in binding order.
 	[[nodiscard]] bool TryRepeatViews(TextureCache& cache, std::span<TextureBinding> bindings,
 	                                  bool apply);
+	// A bindless heap key resolved before (PrepareBindlessHeaps): its memo hash and tag, and the
+	// image and view it resolved to.
+	struct RepeatKey {
+		uint64_t      hash = 0;
+		uint64_t      tag  = 0;
+		ImageId       image;
+		vk::ImageView view = nullptr;
+	};
+	// True when, for every key, TryResolve would hit its entry without revalidation and
+	// TryAcquireView would then hit too (same tag, image and view; no DCC certificate to check),
+	// checked under one texture-cache lock. Each image then gets their access bookkeeping (the
+	// tick and the LRU touch), in key order. False changes nothing.
+	[[nodiscard]] bool TryRepeatKeys(TextureCache& cache, std::span<const RepeatKey> keys);
 	// The view recorded for the entry describing `binding` (verify mode, after TryRepeatViews).
 	[[nodiscard]] vk::ImageView EntryView(const TextureBinding& binding) const;
 
