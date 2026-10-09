@@ -1248,6 +1248,8 @@ enum class FrameEvent : uint32_t {
 	// PrepareBindlessHeaps: heap keys resolved per consumer, and those that kept their slot.
 	BindlessHeapKeys,
 	BindlessHeapKeysKept,
+	// Emulator writes that waited for an upload DMA host copy of their bytes.
+	UploadDmaGuardWaits,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

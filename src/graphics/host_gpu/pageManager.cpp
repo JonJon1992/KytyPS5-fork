@@ -744,8 +744,8 @@ struct PageManager::Impl {
 				{
 					SpinGuard host(region.host_lock);
 					SpinGuard counts(region.lock);
-					UpdateCountsLocked<track, is_read, masked, true>(region, base_addr, first, last, mask,
-					                                                 &runs);
+					UpdateCountsLocked<track, is_read, masked>(region, base_addr, first, last, mask,
+					                                           &runs);
 				}
 				for (size_t index = 0; index < runs.count; index++) {
 					t_protect_batch.spans.push_back(
@@ -769,7 +769,7 @@ struct PageManager::Impl {
 	// Caller holds both locks: updates the counts of the selected pages and protects the pages
 	// whose protection this changes. With `runs` the host calls are collected for after `lock`
 	// (a full list falls back to calling here); without, they are made here, as always before.
-	template <bool track, bool is_read, bool masked, bool defer_protect = false>
+	template <bool track, bool is_read, bool masked>
 	void UpdateCountsLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                        const RegionBits* mask, RunList* runs) {
 		const bool reuse_applied = track && !is_read && ReuseAppliedProtection();
@@ -813,9 +813,11 @@ struct PageManager::Impl {
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
 			// A detached F3 batch may already own a watch whose host call is pending.
-			// A new synchronous consumer must be protected even on the 1 -> 2 count edge.
-			// Both locks are held; deferred collectors leave this work to their batch.
-			const bool unapplied_watch = track && !is_read && !defer_protect &&
+			// A new consumer must be protected even on the 1 -> 2 count edge: a synchronous one
+			// now, a deferred one by its own batch, whose scope may end synchronously before the
+			// detached batch runs (applying a level already applied is a no-op). Both locks are
+			// held.
+			const bool unapplied_watch = track && !is_read &&
 			                              region.applied[page_index] < ToLevel(new_perms);
 			if ((watcher_edge && old_perms != new_perms) || unapplied_watch) {
 				// A deferred write release may still have the host read-only when an upload

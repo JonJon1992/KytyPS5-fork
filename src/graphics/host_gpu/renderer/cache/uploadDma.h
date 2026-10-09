@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/sourceCopyTracker.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
@@ -68,7 +69,7 @@ struct UploadHostCopy {
 	uint8_t*       destination = nullptr;
 	const uint8_t* source      = nullptr;
 	uint64_t       size        = 0;
-	uint64_t       guest_address = 0; // F1 source guard, unused by UploadDma
+	uint64_t       guest_address = 0; // F1 source guard (UploadDma keys its guard by `source`)
 };
 
 class UploadDma final: public SubmitDependency {
@@ -94,6 +95,17 @@ public:
 	[[nodiscard]] uint64_t HostCopyBytesQueued() const noexcept { return m_host_bytes_queued; }
 	[[nodiscard]] uint64_t HostCopyBytesDone() const noexcept {
 		return m_host_bytes_done.load(std::memory_order_acquire);
+	}
+	// Emulator writes into guest memory (BufferCache::BeforeEmulatorWrite/AcquireEmulatorWrite):
+	// the job whose host copies still read a canonical backing byte of [address, address + size)
+	// (0: none), and the wait for the worker to have copied it. As for the coherence copier, a
+	// command-processor write after the protection must not reach a draw recorded before it.
+	[[nodiscard]] uint64_t PendingSourceValue(uint64_t address, uint64_t size) const {
+		return m_sources.PendingGuestValue(address, size);
+	}
+	void WaitSource(uint64_t value) const;
+	void BeforeEmulatorWrite(uint64_t address, uint64_t size) const {
+		WaitSource(PendingSourceValue(address, size));
 	}
 	// Tests: while held, the worker leaves queued jobs (host copies and transfers) alone. The
 	// thread submitting a batch that depends on them would wait until the hold ends.
@@ -166,6 +178,9 @@ private:
 	std::vector<Batch>      m_batches;
 	size_t                  m_next_batch = 0;
 	std::atomic<uint64_t>   m_host_bytes_done {0};
+	// Newest job value whose host copies are done (jobs run in order); the guard's sources.
+	std::atomic<uint64_t>   m_host_copied {0};
+	SourceCopyTracker       m_sources {m_host_copied};
 	// Newest value whose transfer vkQueueSubmit2 has returned for (written by the worker).
 	std::atomic<uint64_t>   m_submitted {0};
 	// Shared.

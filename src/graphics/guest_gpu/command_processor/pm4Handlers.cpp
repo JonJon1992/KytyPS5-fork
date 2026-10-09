@@ -2812,6 +2812,9 @@ void CommandProcessor::ExecLodStats(const CpSeq::LodStatsOp& op) {
 	if (lod_mode == 4) {
 		ReportLodStats(reinterpret_cast<uint64_t>(dst), buffer_size, body[3]);
 	} else if (dst != nullptr && buffer_size != 0 && lod_mode != 2) {
+		// As every CP write into guest memory: an in-flight coherence copy of these bytes
+		// (KYTY_COHERENCE_COPY) reads them first.
+		m_renderer.GetBufferCache().BeforeEmulatorWrite(reinterpret_cast<uint64_t>(dst), buffer_size);
 		memset(dst, lod_mode == 3 ? 0xff : 0, buffer_size);
 		if ((lod_mode == 0 || lod_mode == 3) && buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);

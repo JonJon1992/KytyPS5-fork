@@ -65,6 +65,8 @@ public:
 	// F3: one protection prefix per BDA pass; all its copy jobs follow on the same worker.
 	[[nodiscard]] PageManager::ProtectBatch AcquireProtection();
 	[[nodiscard]] uint64_t EnqueueProtection(PageManager::ProtectBatch batch);
+	// An acquired batch the pass did not use (nothing to detach): its storage goes back to the pool.
+	void ReleaseProtection(PageManager::ProtectBatch batch);
 
 	// Recording thread only: no new job can be admitted between this guard and its write.
 	void BeforeEmulatorWrite(uint64_t address, uint64_t size);
@@ -110,6 +112,10 @@ private:
 	static constexpr size_t MaxRetainedProtectSpans = 4096; // at most 4 MiB of spans
 	std::vector<PageManager::ProtectBatch> m_protect_pool; // protected by m_mutex
 	uint64_t                m_enqueued = 0; // recording thread
+	// Set while Enqueue/EnqueueProtection run. Their tickets are assigned and their sources
+	// published outside m_mutex, which is only correct for one producer at a time (the recording
+	// thread); a second one is fatal instead of reordering the FIFO tickets.
+	std::atomic<bool>       m_producing {false};
 	std::atomic<uint64_t>   m_completed {0};
 	SourceCopyTracker       m_sources {m_completed};
 	bool                    m_stopping = false;

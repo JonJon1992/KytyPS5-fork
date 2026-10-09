@@ -192,6 +192,9 @@ std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offs
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaHostCopyBytes, bytes);
 		copies.swap(*host_copies);
 	}
+	// The guard's sources are published before the worker can see (and finish) the job.
+	m_sources.Track(std::span<const UploadHostCopy>(copies), m_enqueued + 1,
+	                [](const UploadHostCopy& copy) { return reinterpret_cast<uint64_t>(copy.source); });
 	{
 		std::scoped_lock lock(m_mutex);
 		EXIT_IF(m_stopping);
@@ -219,6 +222,19 @@ uint64_t UploadDma::PendingValue() {
 	// The submission containing the graphics copies waits for the transfer on the device.
 	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaSubmitWaits);
 	return m_stage_value;
+}
+
+void UploadDma::WaitSource(uint64_t value) const {
+	auto copied = m_host_copied.load(std::memory_order_acquire);
+	if (copied >= value) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaGuardWaits);
+	Profiler::ScopedFrameWait timing(Profiler::FrameWait::CoherenceCopyGuard);
+	while (copied < value) {
+		m_host_copied.wait(copied, std::memory_order_acquire);
+		copied = m_host_copied.load(std::memory_order_acquire);
+	}
 }
 
 void UploadDma::WaitSubmittable(uint64_t value) {
@@ -359,6 +375,9 @@ void UploadDma::Worker(std::stop_token stop) {
 		if (copied != 0) {
 			m_host_bytes_done.fetch_add(copied, std::memory_order_release);
 		}
+		// Emulator writes waiting for these sources may go on (WaitSource).
+		m_host_copied.store(jobs.back().value, std::memory_order_release);
+		m_host_copied.notify_all();
 		SubmitBatch(jobs);
 		jobs.clear();
 	}

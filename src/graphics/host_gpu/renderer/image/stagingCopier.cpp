@@ -67,11 +67,30 @@ std::vector<StagingCopier::Range> StagingCopier::AcquireRanges(size_t minimum) {
 	return ranges;
 }
 
+namespace {
+
+// StagingCopier::m_producing for the duration of one admission.
+class ProducerScope {
+public:
+	explicit ProducerScope(std::atomic<bool>& producing) noexcept: m_producing(producing) {
+		EXIT_IF(m_producing.exchange(true, std::memory_order_acquire));
+	}
+	~ProducerScope() { m_producing.store(false, std::memory_order_release); }
+	ProducerScope(const ProducerScope&)            = delete;
+	ProducerScope& operator=(const ProducerScope&) = delete;
+
+private:
+	std::atomic<bool>& m_producing;
+};
+
+} // namespace
+
 void StagingCopier::Enqueue(std::vector<Range> ranges, Buffer* flush_buffer, uint64_t flush_offset,
                             uint64_t flush_size, std::shared_ptr<Verification> verification) {
 	if (ranges.empty()) {
 		return;
 	}
+	const ProducerScope producer(m_producing);
 	const bool coherence = ranges.front().backing_source != nullptr;
 	uint64_t bytes = 0;
 	for (const auto& range: ranges) {
@@ -106,16 +125,27 @@ void StagingCopier::Enqueue(std::vector<Range> ranges, Buffer* flush_buffer, uin
 }
 
 PageManager::ProtectBatch StagingCopier::AcquireProtection() {
+	// CoherenceProtectReuses is counted by the caller once the storage is used (DetachTo).
 	std::scoped_lock lock(m_mutex);
 	if (m_protect_pool.empty()) return {};
 	auto batch = std::move(m_protect_pool.back());
 	m_protect_pool.pop_back();
-	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectReuses);
 	return batch;
+}
+
+void StagingCopier::ReleaseProtection(PageManager::ProtectBatch batch) {
+	if (!batch.Empty() || batch.Capacity() == 0 || batch.Capacity() > MaxRetainedProtectSpans) {
+		return; // nothing worth keeping (a non-empty batch applies itself when destroyed)
+	}
+	std::scoped_lock lock(m_mutex);
+	if (m_protect_pool.size() < MaxProtectBatches) {
+		m_protect_pool.push_back(std::move(batch));
+	}
 }
 
 uint64_t StagingCopier::EnqueueProtection(PageManager::ProtectBatch batch) {
 	if (batch.Empty()) return 0;
+	const ProducerScope producer(m_producing);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectJobs);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectSpans, batch.Size());
 	Job job;
@@ -142,33 +172,7 @@ uint64_t StagingCopier::PendingSourceValue(uint64_t address, uint64_t size) cons
 	const auto start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	Profiler::ScopedFrameWait timing(Profiler::FrameWait::CoherenceCopyGuardLookup);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceCopyGuardQueries);
-	const auto value = [&] {
-		EXIT_IF(UINT64_MAX - address < size);
-		if (const auto* source = LibKernel::Memory::GuestBackingAlias(address, size); source != nullptr) {
-			return m_sources.PendingValue(reinterpret_cast<uint64_t>(source), size);
-		}
-		// A write may span guest mappings, including noncontiguous views of the same direct backing.
-		// Guest maps are host-page aligned. Coalesce adjacent canonical aliases before querying the map.
-		constexpr uint64_t Page = 4096;
-		uint64_t value = 0, run = 0, run_size = 0;
-		for (uint64_t done = 0; done < size;) {
-			const auto current = address + done;
-			const auto bytes = std::min(size - done, Page - (current & (Page - 1)));
-			const auto alias = reinterpret_cast<uint64_t>(LibKernel::Memory::GuestBackingAlias(current, bytes));
-			if (run_size != 0 && (alias == 0 || alias != run + run_size)) {
-				value = std::max(value, m_sources.PendingValue(run, run_size));
-				run_size = 0;
-			}
-			if (alias != 0) {
-				if (run_size == 0) {
-					run = alias;
-				}
-				run_size += bytes;
-			}
-			done += bytes;
-		}
-		return run_size == 0 ? value : std::max(value, m_sources.PendingValue(run, run_size));
-	}();
+	const auto value = m_sources.PendingGuestValue(address, size);
 	if (trace) {
 		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		    std::chrono::steady_clock::now() - start).count();

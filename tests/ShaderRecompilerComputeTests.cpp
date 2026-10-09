@@ -22211,7 +22211,17 @@ public:
       (void)cache.ObtainBuffer(base, upload_size, true, false);
       const bool gpu_owned = Libs::LibKernel::Memory::GuestBackingAlias(base, 16) != nullptr &&
                              cache.HasGpuDirtyBytes(base, upload_size);
+      // An emulator write into bytes the held worker still has to copy (a CP label, WRITE_DATA)
+      // waits for that copy: the upload recorded before the write must not see it.
+      const bool source_pending = dma->PendingSourceValue(base + 64, 4) != 0;
+      auto writer = std::async(std::launch::async, [&] { cache.BeforeEmulatorWrite(base + 64, 4); });
+      const bool write_waited =
+          writer.wait_for(std::chrono::milliseconds(25)) == std::future_status::timeout;
       dma->HoldWorkerForTest(false);
+      writer.wait();
+      Require(name, "emulator write waits for the host copy",
+              source_pending && write_waited && dma->PendingSourceValue(base + 64, 4) == 0,
+              "an emulator write did not wait for the DMA worker's copy of its bytes");
       Require(name, "second upload left to the worker", left >= upload_size && gpu_owned,
               "the re-dirtied range was not staged for the worker, or not made GPU-owned");
       const auto second = read_back(again->Handle(), again_offset, upload_size);
@@ -53557,15 +53567,16 @@ int main(int argc, char **argv) {
     vulkan.CheckTilerImageDirect();
     return 0;
   }
+  // Upload DMA needs only a transfer-only queue family (RADV has one): every platform.
+  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUploadDma();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-keep-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDepthFeedbackKeep();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckUploadDma();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-layout-stable-only") == 0) {

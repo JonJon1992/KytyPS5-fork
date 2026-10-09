@@ -3352,6 +3352,10 @@ void BufferCache::BeforeEmulatorWrite(uint64_t address, uint64_t size) {
 	if (auto* copier = m_coherence_copier.load(std::memory_order_acquire); copier != nullptr) {
 		copier->BeforeEmulatorWrite(address, size);
 	}
+	// KYTY_UPLOAD_DMA_HOST_COPY: read uploads whose guest bytes the DMA worker still copies.
+	if (m_upload_dma != nullptr) {
+		m_upload_dma->BeforeEmulatorWrite(address, size);
+	}
 }
 
 std::unique_lock<std::mutex> BufferCache::AcquireEmulatorWrite(uint64_t address, uint64_t size) {
@@ -3359,11 +3363,19 @@ std::unique_lock<std::mutex> BufferCache::AcquireEmulatorWrite(uint64_t address,
 	for (;;) {
 		auto* copier = m_coherence_copier.load(std::memory_order_acquire);
 		const auto value = copier != nullptr ? copier->PendingSourceValue(address, size) : 0;
-		if (value == 0) {
+		// Upload DMA host copies are admitted under the same gate (StageUploadDma).
+		const auto dma_value =
+		    m_upload_dma != nullptr ? m_upload_dma->PendingSourceValue(address, size) : 0;
+		if (value == 0 && dma_value == 0) {
 			return gate;
 		}
 		gate.unlock();
-		copier->WaitSource(value);
+		if (value != 0) {
+			copier->WaitSource(value);
+		}
+		if (dma_value != 0) {
+			m_upload_dma->WaitSource(dma_value);
+		}
 		gate.lock(); // Recheck: recording may have admitted another overlapping source meanwhile.
 	}
 }
@@ -3470,6 +3482,16 @@ bool BufferCache::TryCoherenceUpload(Buffer& buffer, vk::Buffer source,
 		std::scoped_lock gate(m_source_write_mutex);
 		SetCoherenceCopier(&copier);
 		if (verification) {
+			// Without KYTY_BDA_INCREMENTAL_SYNC the tracker does not advance its CPU-mutation
+			// epoch, so a changed source cannot be told from a missing write guard: every change
+			// counts as a redirty, and the verify mode only checks the transfer (GPU readback).
+			if (!m_bda_incremental_sync) {
+				static std::atomic<bool> warned {false};
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Coherence copy verify: KYTY_BDA_INCREMENTAL_SYNC=0, source changes are not "
+					     "classified (write-guard misses are not detected)\n");
+				}
+			}
 			verification->fault_epoch = m_bda_incremental_sync
 			                                ? m_memory_tracker.FaultMutationEpoch() : UINT64_MAX;
 			uint64_t offset = 0;
@@ -3567,7 +3589,15 @@ vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCo
 		end   = std::max(end, copy.srcOffset + copy.size);
 	}
 	const auto size        = end - begin;
-	const auto ring_offset = m_upload_dma->Stage(source, begin, size, host_copies);
+	std::optional<uint64_t> ring_offset;
+	if (host_copies != nullptr && !host_copies->empty()) {
+		// As TryCoherenceUpload: a foreign publication holds this gate from its final dependency
+		// check through its write, so the worker never copies bytes being written.
+		std::scoped_lock gate(m_source_write_mutex);
+		ring_offset = m_upload_dma->Stage(source, begin, size, host_copies);
+	} else {
+		ring_offset = m_upload_dma->Stage(source, begin, size, host_copies);
+	}
 	if (!ring_offset.has_value()) {
 		write_host_copies();
 		return source;
@@ -5010,9 +5040,17 @@ void BufferCache::RunBdaPass(Collect&& collect) {
 		if (asynchronous && bytes >= uint64_t(g_coherence_copy_min_kb.Get()) * 1024) {
 			auto& copier = m_texture_cache.EnsureStagingCopier();
 			auto protection = copier.AcquireProtection();
+			const bool reused = protection.Capacity() != 0;
 			if (defer_protect.DetachTo(protection)) {
+				if (reused) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::CoherenceProtectReuses);
+				}
 				protection_value = copier.EnqueueProtection(std::move(protection));
 				protection_copier = &copier;
+			} else {
+				// Nothing to detach (every collected page already had its protection): the
+				// pooled storage serves a later pass instead of being freed here.
+				copier.ReleaseProtection(std::move(protection));
 			}
 		}
 	}
