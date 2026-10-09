@@ -67,40 +67,84 @@ As correções estão no branch coherence-review-fixes, sobre 57f0d977 (F3).
   do worker. No modo sem batching, as barreiras equivalem às do caminho
   síncrono.
 
-## Pendências (sem mudança neste branch)
+## Itens pendentes da primeira rodada, agora corrigidos
 
-- **Escritas perdidas sem aviso no modo candidates.** O emitter tira
-  `RecordBdaDroppedWrite`. Se uma página de destino ficasse sem entrada na
-  tabela BDA, a escrita sumiria com a página marcada como da GPU. Pela
-  construção (ObtainBuffer registra o buffer), isso não deve ocorrer; só o
-  modo `candidates-verify` detecta.
-- **Duas drenagens do recorder por dispatch candidato** (Finalize e
-  Restore usam `Handle()`). Custo só nos dois shaders.
-- **TryResolve em 19,62% do Thread_Gpu com 65.536 posições** (3,92% antes).
-  Entradas de 992 B espalhadas por 62 MiB sugerem faltas de cache/TLB, mas o
-  custo também pode estar no lock, no `PageVersion` ou no `try_get` da imagem.
-  Antes de mudar o layout (índice compacto separado ou associatividade), fazer
-  um histograma de IPs dentro do TryResolve com o mesmo binário da captura.
-- **Causa principal do Yōtei com bindless.** `PrepareBindlessHeaps` relê e
-  resolve o heap inteiro a cada consumidor (comentário "ponytail" em
-  descriptors.cpp). FindSlot e ReleaseKey são os próximos no perfil.
-- **A/B controlado.** As capturas de 4.096 e 65.536 posições não têm a
-  mesma configuração: só a segunda tem as threads `CP recorder` e
-  `Host staging copier`. Os 3 FPS são observação, não A/B.
-- **Program cache.** O layout da chave subiu de 4 para 5 (e já tinha subido
-  de 3 para 4 na fase 0): o primeiro run de cada jogo recompila tudo. Não
-  medir FPS nesse run.
+- **Escritas perdidas sem aviso no modo candidates** (5c961460). O contador
+  continua no shader. Depois de cada dispatch candidato,
+  `FaultManager::QueueBdaDroppedCheck` copia o contador para um slot de readback e o
+  zera, sem espera. O valor é lido quando a gravação termina: conta
+  `BdaCandidateDroppedWrites`, gera log e é fatal com `KYTY_BDA_WRITES_VERIFY`.
+  Teste: `BdaCandidatesDroppedCounted` (64 escritas numa página sem buffer).
+- **Drenagens do recorder** (5c961460). `Buffer::CopyFromEncoded` grava as mesmas
+  barreiras e a mesma cópia pelo `Sink()`. Salvar, congelar e restaurar a tabela não
+  drenam mais o CP recorder.
+- **PrepareBindlessHeaps e TryResolve** (89585371). Toda chave continua sendo
+  resolvida (touch, residência, refresh). Uma chave cujo slot ainda guarda a view
+  resolvida da mesma imagem mantém slot, tradução e referência. Isso elimina o
+  `ReleaseKey`, as duas escritas de tradução, o `FindSlot` e o `AddImageReference`
+  (≈15% do Thread_Gpu no perfil). Também:
+  - o memo recebe o hash e a tag do mesmo T# como dica (sem hash nem comparação de
+    chave);
+  - o `FindTexture` vira `TryAcquireView`;
+  - o `BindlessTexture` guarda só imagem, layout e faixa da view.
+  Contadores: `BindlessHeapKeys` e `BindlessHeapKeysKept`.
+  Teste novo: `bindless_heap_repeat`. Com `KYTY_BINDLESS=1` o harness agora liga a
+  tabela bindless.
+
+## Revisão de F1, F3 e da integração da fase 0
+
+- **Integração da fase 0 (4c63d476):** os 54 trechos foram reaplicados idênticos.
+  O settle não escreve memória do guest, e a espera dele já inclui a dependência do
+  copier. Sem defeito.
+- **F1 (9956c566):** sem defeito confirmado. Corrigido em 8d1d74e1:
+  - as cópias em host do UploadDma ficavam fora do guard de escrita do emulador. É
+    uma lacuna anterior à F1. O UploadDma agora rastreia as fontes num
+    `SourceCopyTracker`, os dois guards consultam os dois copiadores, e a admissão
+    usa o mesmo gate da F1. No RADV da RX 9070 XT não há fila só de transferência,
+    então o UploadDma não roda aqui (o teste reporta "skipped");
+  - os modos de diagnóstico do `GET_LOD_STATS` escreviam sem `BeforeEmulatorWrite`;
+  - dois produtores simultâneos no `StagingCopier` agora são fatais (flag
+    atômica), em vez de embaralhar os tickets;
+  - o verify avisa quando não classifica mudanças de fonte (sem
+    `KYTY_BDA_INCREMENTAL_SYNC`).
+- **F3 (57f0d977):** sem defeito de corretude atingível. Corrigido em 8d1d74e1:
+  - o lote do pool se perdia quando o `DetachTo` não tinha o que destacar, e o
+    reuso era contado mesmo assim;
+  - um coletor adiado agora emite a faixa de um watch ainda não aplicado (antes,
+    um escopo que terminasse de forma síncrona podia copiar uma página ainda sem
+    proteção).
+
+## Pendências
+
+- **Teste nativo de F2 + F3 juntas.** Com `COPY=read` e `PROTECT=1`, o fixture só
+  usa o caminho BDA. A prontidão de um consumidor síncrono durante a janela é
+  coberta só no PageManager (`page_manager_protect_readiness`).
+- **Fila FIFO da F3.** O prefixo de proteção espera jobs de textura e de F1/F2 já
+  enfileirados. Medir `CoherenceProtectWait` e `CoherenceCopyGuard` no A/B antes de
+  pensar em prioridade.
+- **Diagnóstico.** `BeginProtectProbe`/`EndProtectProbe` contam só as chamadas da
+  thread que chamou, e as do worker da F3 não aparecem.
+- **TryResolve com 65.536 posições.** O caminho bindless agora chama o memo com
+  dicas e sem `FindView`. A próxima captura do Yōtei diz quanto do custo
+  sobrou e se ainda vale mudar o layout da tabela.
+- **A/B controlado e program cache:** como antes.
 
 ## Validação
 
 Build Release (clang, `_Build/rf` do worktree kyty-review-fixes) de
-`kyty_emulator`, `shader_recompiler_compute_tests` e `shader_cfg_tests`, sem
-warnings novos. Testes rodados um por vez (limite de 12 GB), todos passando:
+`kyty_emulator`, `shader_recompiler_compute_tests`, `shader_cfg_tests`,
+`page_manager_tests` e `source_copy_tracker_tests`, sem warnings novos. Testes
+rodados um por vez (limite de 12 GB), todos passando:
 
 - memo: `texture_memo_capacity`, `texture_memo_capacity_bindless`,
   `texture_memo_revalidate`, `_verify`, `_off` e `_large`;
 - F4 e fase 0: `bda_candidates_cp0`, `bda_candidates_cp1` e `bda_writes`;
-- F2: `coherence_copy_tex0_read` e `coherence_copy_read_unbatched`.
+- F2: `coherence_copy_tex0_read` e `coherence_copy_read_unbatched`;
+- F4 (segunda rodada): `bda_candidates_cp0/1` com `BdaCandidatesDroppedCounted`;
+- bindless: `bindless_heap_repeat`;
+- F1/F3: `source_copy_tracker`, `page_manager*`,
+  `coherence_protect_{1,read}_rec{0,1}`,
+  `coherence_copy_tex{0_1,1_read,0_verify}` e `coherence_copy_read_unbatched`.
 
 No harness, `KYTY_BINDLESS=1` não ativa a tabela bindless. O teste
 `texture_memo_capacity_bindless` confirma o caso corrigido: só o pedido, sem a
