@@ -1578,6 +1578,12 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                                 static_cast<uint32_t>(count64)};
     }
+    // KYTY_BINDLESS_KEEP (default on; =0, for A/B and diagnosis: every key released and settled
+    // again on every consumer, as before keys were kept and heaps repeated).
+    static const bool keep_keys = [] {
+        const auto* value = std::getenv("KYTY_BINDLESS_KEEP");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
     // Every key's resolution writes the same binding (ResolveTexture resets the per-binding state).
     TextureBinding binding;
     // A consumer of a heap whose T#s are those every key was settled from. When each resolved
@@ -1661,7 +1667,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
                                             static_cast<uint32_t>(count64)};
         auto& cache = m_context.GetTextureCache();
-        if (repeat_heap(*heap, std::span<const std::array<uint32_t, 8>>(records), array)) {
+        if (keep_keys && repeat_heap(*heap, std::span<const std::array<uint32_t, 8>>(records), array)) {
             const auto kept = m_bindless_repeat_keys.size(); // the resolved keys
             Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
             Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
@@ -1678,6 +1684,49 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
         uint32_t kept = 0;
         for (uint32_t key = 0; key < count64; ++key) {
+            if (!keep_keys) {
+                // KYTY_BINDLESS_KEEP=0: the original release and settle of the key.
+                (void)table.ReleaseKey(*heap, key);
+                heap->settled[key] = 1;
+                heap->descriptors[key] = records[key];
+                heap->fixed_placeholder[key] = 0u;
+                heap->memo_hints[key] = {};
+                table.SetTranslation(*heap, key, 0u);
+                ShaderRecompiler::IR::DescriptorValue value {.dwords = records[key], .dword_count = 8u};
+                const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+                if (!BindlessCompatible(descriptor, array) ||
+                    (descriptor.Type() == Prospero::ImageType::kCube && !resource.cube) ||
+                    TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
+                        Prospero::BufferFormat::kInvalid) continue;
+                auto fresh = ResolveTexture(resource, value);
+                if (fresh.desc.view_info.type != expected_view) continue;
+                auto* image = cache.m_slot_images.try_get(fresh.image_id);
+                if (image == nullptr || !image->registered || image->info.data.Empty()) continue;
+                BindImage(fresh.image_id, false);
+                fresh.image_view = cache.FindTexture(fresh.image_id, fresh.desc);
+                image = cache.m_slot_images.try_get(fresh.image_id);
+                if (image == nullptr || !image->registered || !fresh.image_view) continue;
+                table.ApplyUnregistered();
+                const auto old_slot = table.FindSlot(array, fresh.image_view);
+                const auto slot = old_slot != 0 ? old_slot : table.AllocateSlot(array);
+                if (slot == 0) continue;
+                fresh.layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                   : vk::ImageLayout::eShaderReadOnlyOptimal;
+                if (old_slot == 0) {
+                    table.WriteSlot(array, slot, fresh.image_view, fresh.layout);
+                    table.AddSlotOwner(fresh.image_id, array, slot);
+                }
+                heap->slots[key] = slot;
+                heap->images[key] = fresh.image_id;
+                table.AddImageReference(fresh.image_id, *heap, key);
+                table.SetTranslation(*heap, key, slot);
+                const auto& view = fresh.desc.view_info;
+                prepared.bindless_textures.push_back(
+                    {fresh.image_id, fresh.layout,
+                     ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+                                            view.layer_count}});
+                continue;
+            }
             const bool same_descriptor =
                 heap->settled[key] != 0 && heap->descriptors[key] == records[key];
             auto& hint = heap->memo_hints[key];
