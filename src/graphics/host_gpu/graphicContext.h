@@ -52,6 +52,14 @@ void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer comma
 // pipeline cache's key), so a device-loss report names the programs of the work in flight and
 // saves their code (device-loss-<hash>.bin in the working directory).
 void NoteDiagnosticProgram(uint64_t address, uint64_t hash, uint64_t size_bytes);
+// KYTY_DEVICE_FAULT_DIAGNOSTICS with buffer markers: copies an indirect draw's first argument
+// record (and its count, if any) as the GPU reads them into host-coherent memory, keyed by the
+// latest checkpoint, so a device-loss report prints the arguments of the draws in flight. Recorded
+// outside a rendering instance, right before the draw.
+[[nodiscard]] bool DiagnosticIndirectCaptureEnabled(const GraphicContext& graphics);
+void CaptureDiagnosticIndirectArgs(GraphicContext& graphics, vk::CommandBuffer command, vk::Buffer args,
+                                   uint64_t args_offset, uint32_t args_bytes, vk::Buffer count,
+                                   uint64_t count_offset);
 
 struct GraphicContext {
     bool bindless_supported = false;

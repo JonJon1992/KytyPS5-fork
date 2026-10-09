@@ -118,16 +118,17 @@ struct MarkerWordsAMD {
 };
 MarkerWordsAMD g_markers_amd;
 
-bool CreateMarkersAMD(GraphicContext& graphics) {
-	auto& markers = g_markers_amd;
+// A host-coherent, persistently mapped transfer destination of `size` bytes, zeroed (never freed).
+void* CreateHostCoherentBuffer(GraphicContext& graphics, uint64_t size, vk::Buffer& buffer,
+                               vk::DeviceMemory& memory) {
 	vk::BufferCreateInfo info {};
-	info.size        = 2 * sizeof(uint32_t);
+	info.size        = size;
 	info.usage       = vk::BufferUsageFlagBits::eTransferDst;
 	info.sharingMode = vk::SharingMode::eExclusive;
-	if (graphics.device.createBuffer(&info, nullptr, &markers.buffer) != vk::Result::eSuccess) {
-		return false;
+	if (graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+		return nullptr;
 	}
-	const auto requirements = graphics.device.getBufferMemoryRequirements(markers.buffer);
+	const auto requirements = graphics.device.getBufferMemoryRequirements(buffer);
 	const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
 	const auto& types = graphics.physical_device_memory_properties;
 	uint32_t type = UINT32_MAX;
@@ -143,16 +144,50 @@ bool CreateMarkersAMD(GraphicContext& graphics) {
 	allocate.memoryTypeIndex = type;
 	void* mapped = nullptr;
 	if (type == UINT32_MAX ||
-	    graphics.device.allocateMemory(&allocate, nullptr, &markers.memory) != vk::Result::eSuccess) {
-		return false;
+	    graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess) {
+		return nullptr;
 	}
-	if (graphics.device.bindBufferMemory(markers.buffer, markers.memory, 0) != vk::Result::eSuccess ||
-	    graphics.device.mapMemory(markers.memory, 0, VK_WHOLE_SIZE, {}, &mapped) != vk::Result::eSuccess) {
-		return false;
+	if (graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess ||
+	    graphics.device.mapMemory(memory, 0, VK_WHOLE_SIZE, {}, &mapped) != vk::Result::eSuccess) {
+		return nullptr;
 	}
-	std::memset(mapped, 0, 2 * sizeof(uint32_t));
+	std::memset(mapped, 0, static_cast<size_t>(size));
+	return mapped;
+}
+
+bool CreateMarkersAMD(GraphicContext& graphics) {
+	auto&      markers = g_markers_amd;
+	auto* const mapped  = CreateHostCoherentBuffer(graphics, 2 * sizeof(uint32_t), markers.buffer,
+	                                                markers.memory);
 	markers.words = static_cast<volatile const uint32_t*>(mapped);
-	return true;
+	return mapped != nullptr;
+}
+
+// CaptureDiagnosticIndirectArgs: a ring of argument records, one slot per captured draw, keyed by
+// its checkpoint sequence (GPU thread writes the keys, the device-loss dump reads them).
+struct IndirectCapture {
+	static constexpr uint32_t Slots     = 4096;
+	static constexpr uint32_t SlotBytes = 32; // up to 5 argument dwords, then the count dword
+	vk::Buffer                buffer;
+	vk::DeviceMemory          memory;
+	volatile const uint32_t*  words = nullptr;
+	bool                      failed = false;
+	std::array<uint64_t, Slots> sequences {};
+};
+IndirectCapture g_indirect;
+
+void PrintIndirectArgs(uint64_t sequence) {
+	const auto& capture = g_indirect;
+	if (capture.words == nullptr) {
+		return;
+	}
+	const auto slot = static_cast<uint32_t>(sequence % IndirectCapture::Slots);
+	if (capture.sequences[slot] != sequence) {
+		return;
+	}
+	const auto* words = capture.words + slot * (IndirectCapture::SlotBytes / sizeof(uint32_t));
+	std::printf("    indirect args (as the GPU read them): %u %u %u %u %u count=%u\n", words[0],
+	            words[1], words[2], words[3], words[4], words[7]);
 }
 
 void DumpMarkersAMD() {
@@ -184,6 +219,7 @@ void DumpMarkersAMD() {
 			continue;
 		}
 		Print(sequence == first ? "in flight (first)" : "in flight", checkpoint);
+		PrintIndirectArgs(sequence);
 	}
 	std::fflush(stdout);
 }
@@ -206,6 +242,56 @@ void WriteDiagnosticMarkersAMD(GraphicContext& graphics, vk::CommandBuffer comma
 	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, markers.buffer, 0, sequence);
 	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, markers.buffer,
 	                             sizeof(uint32_t), sequence);
+}
+
+bool DiagnosticIndirectCaptureEnabled(const GraphicContext& graphics) {
+	return graphics.amd_buffer_markers_enabled && !g_indirect.failed;
+}
+
+void CaptureDiagnosticIndirectArgs(GraphicContext& graphics, vk::CommandBuffer command, vk::Buffer args,
+                                   uint64_t args_offset, uint32_t args_bytes, vk::Buffer count,
+                                   uint64_t count_offset) {
+	auto& capture = g_indirect;
+	if (capture.words == nullptr) {
+		if (capture.failed) {
+			return;
+		}
+		auto* const mapped = CreateHostCoherentBuffer(
+		    graphics, uint64_t {IndirectCapture::Slots} * IndirectCapture::SlotBytes, capture.buffer,
+		    capture.memory);
+		if (mapped == nullptr) {
+			capture.failed = true;
+			std::printf("Indirect argument capture: no host-coherent buffer; disabled\n");
+			return;
+		}
+		capture.words = static_cast<volatile const uint32_t*>(mapped);
+	}
+	uint64_t sequence = 0;
+	{
+		const std::lock_guard lock(g_checkpoint_mutex);
+		sequence = g_checkpoint_sequence; // the draw's own checkpoint (SetDebugInfo came first)
+	}
+	const auto slot   = static_cast<uint32_t>(sequence % IndirectCapture::Slots);
+	const auto offset = uint64_t {slot} * IndirectCapture::SlotBytes;
+	capture.sequences[slot] = sequence;
+	// The producers' writes (any stage) before the copies, and earlier copies into the slot.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                        nullptr);
+	const vk::BufferCopy record {args_offset, offset, std::min<uint32_t>(args_bytes, 20u)};
+	command.copyBuffer(args, capture.buffer, 1, &record);
+	if (count) {
+		const vk::BufferCopy count_copy {count_offset, offset + 28u, sizeof(uint32_t)};
+		command.copyBuffer(count, capture.buffer, 1, &count_copy);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 1, &after, 0, nullptr, 0, nullptr);
 }
 
 void NoteDiagnosticProgram(uint64_t address, uint64_t hash, uint64_t size_bytes) {

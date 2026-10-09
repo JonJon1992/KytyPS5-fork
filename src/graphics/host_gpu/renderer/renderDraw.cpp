@@ -3676,13 +3676,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
 		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
 		// begun right after the previous barrier needs no new one while it remains active.
-		const auto active = buffer.ActiveRenderingSerial();
-		if (active == 0 || active != m_indirect_barrier_rendering) {
+		// KYTY_DEVICE_FAULT_DIAGNOSTICS: every indirect draw also copies its arguments for the
+		// device-loss report, outside rendering.
+		auto&      graphics = m_context.GetGraphics();
+		const bool capture  = DiagnosticIndirectCaptureEnabled(graphics);
+		const auto active   = buffer.ActiveRenderingSerial();
+		if (capture || active == 0 || active != m_indirect_barrier_rendering) {
 			{
 				KYTY_GPU_OP_SITE("draw.indirect_args");
 				m_context.GetCommandScheduler().EndRendering();
 			}
 			IndirectArgumentsBarrier(buffer, vk_buffer);
+			if (capture) {
+				CaptureDiagnosticIndirectArgs(graphics, buffer.Handle(), indirect_buffers.args,
+				                              indirect_buffers.args_offset, indirect->RecordSize(),
+				                              indirect_buffers.count, indirect_buffers.count_offset);
+			}
 		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
