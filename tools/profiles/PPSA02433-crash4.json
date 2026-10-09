@@ -1,12 +1,17 @@
 {
   "name": "Crash Bandicoot 4",
-  "title_ids": ["PPSA02433"],
-  "folder_names": ["PPSA02433"],
-  "notes": "Medido em 2026-10-09 (A/B ao vivo, mesmo ponto, build 897dc5c): F1+F2+F3 (KYTY_COHERENCE_COPY=read, KYTY_COHERENCE_PROTECT=1) deram +6% a +12% de FPS contra as janelas desligadas vizinhas (24,7 -> 26,2/27,8 fps) e 2-4 ms a menos de Thread_Gpu por quadro, que é o caminho crítico (tempo de quadro ~= tempo ocupado do Thread_Gpu). Antes, em 2026-10-08: proteção BDA agrupada +6% de FPS; userfaultfd corta a falha de escrita de 119 para 35-40 us. A janela de falha fica no padrão adaptativo (512 KiB com userfaultfd neste PC). O patch _Patches/PPSA02433.json (1080p) é aplicado pelo title id.",
+  "title_ids": [
+    "PPSA02433"
+  ],
+  "folder_names": [
+    "PPSA02433"
+  ],
+  "notes": "Medido em 2026-10-09 com A/B ao vivo no mesmo ponto (build 897dc5c). Janela de fault de escrita (KYTY_FAULT_AHEAD_ADAPT): o automático escolhe 512 KiB com userfaultfd e é o pior caso: 16,4/17,9 fps, 85 MB de upload por quadro; 64 KiB deu 23,6 fps (+32% a +44%), 37 MB por quadro, ~40 ms de Thread_Gpu por quadro; 32-128 KiB ficam no mesmo patamar, 64 com menos faults que 32. F1+F2+F3 (KYTY_COHERENCE_COPY=read, KYTY_COHERENCE_PROTECT=1): +6% a +12% de FPS. Tempo de quadro ~= tempo ocupado do Thread_Gpu (caminho crítico). Antes, em 2026-10-08: proteção BDA agrupada +6%; userfaultfd corta a falha de escrita de 119 para 35-40 us. O patch _Patches/PPSA02433.json (1080p) é aplicado pelo title id.",
   "environment": {
     "KYTY_BDA_BATCH_PROTECT": "1",
     "KYTY_UFFD_WP": "1",
     "KYTY_COHERENCE_COPY": "read",
-    "KYTY_COHERENCE_PROTECT": "1"
+    "KYTY_COHERENCE_PROTECT": "1",
+    "KYTY_FAULT_AHEAD_ADAPT": "64"
   }
 }
