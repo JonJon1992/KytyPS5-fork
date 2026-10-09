@@ -23,6 +23,14 @@ and this switch participate in the persistent cache identity; optimized words ar
 reloaded without another optimizer run. Changing the switch invalidates incompatible cached
 programs automatically.
 
+`KYTY_SPIRV_OPT_EXTENDED=1` enables an experimental additional recipe: scalar replacement of
+function-local aggregates with a 64-member limit, access-chain conversion, local SSA and
+redundancy elimination. It is **off by default** and has its own cache fingerprint field.
+It preserves the same contracts and fallback, without inlining, loop unrolling, CCP or
+algebraic simplification. `KYTY_SPIRV_OPT=0` bypasses both recipes. See the
+[AnyPS5 integration measurements](PORT-ANYPS5-2026-10-09.md): smaller modules came with
+additional optimizer CPU time, and no game FPS improvement has been established.
+
 The shader log reports the original/final word counts and optimization time in microseconds
 (`SPIR-V optimize`). A smaller module is not evidence of higher FPS; compare cold compilation,
 warm-cache behavior, GPU time and rendered output on the same workload and device.

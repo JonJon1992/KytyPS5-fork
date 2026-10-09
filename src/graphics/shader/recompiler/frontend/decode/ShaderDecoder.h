@@ -715,6 +715,13 @@ enum class Opcode {
 	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
+	V_MIN3_I16,
+	V_MIN3_U16,
+	V_MAX3_I16,
+	V_MAX3_U16,
+	V_MED3_U16,
+	V_MUL_HI_I32_I24,
+	V_MUL_HI_U32_U24,
 	COUNT
 };
 

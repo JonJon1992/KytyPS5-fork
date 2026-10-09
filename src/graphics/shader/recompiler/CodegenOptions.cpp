@@ -84,6 +84,8 @@ CodegenOptions FromEnvironment() {
 	options.ir_linear_uses    = EnvFlag("KYTY_IR_LINEAR_USES", options.ir_linear_uses);
 	options.fold_lane_masks   = EnvFlag("KYTY_FOLD_LANE_MASKS", options.fold_lane_masks);
 	options.spirv_optimize    = EnvFlag("KYTY_SPIRV_OPT", options.spirv_optimize);
+	options.spirv_optimize_extended =
+	    EnvFlag("KYTY_SPIRV_OPT_EXTENDED", options.spirv_optimize_extended);
 	if (const auto* cap = std::getenv("KYTY_DISPATCHER_CAP"); cap != nullptr && cap[0] != '\0') {
 		options.dispatcher_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 0));
 	}

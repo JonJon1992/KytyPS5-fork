@@ -207,6 +207,10 @@ struct CodegenOptions {
 	// interfaces, memory effects and precise float arithmetic are preserved, and a failed or
 	// invalid optimization keeps the original module. The persistent cache fingerprints this flag.
 	bool spirv_optimize = true;
+	// KYTY_SPIRV_OPT_EXTENDED=1: also scalarize small function-local aggregates, convert
+	// local memory to SSA and eliminate redundant expressions. Experimental, default off.
+	// No inlining, unrolling or algebraic floating-point simplification. Ignored when OPT=0.
+	bool spirv_optimize_extended = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

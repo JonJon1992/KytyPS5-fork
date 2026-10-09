@@ -31,6 +31,16 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
+// AnyPS5 72cf6c3c5a299f645f74a13945670ba4fb8b3cb8 integer16Ternary;
+// AMD RDNA ISA integer min3/max3/median semantics, with native VOP3 half selectors.
+void Translator::Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                  bool sign) {
+	const auto result = IR::U32(ir.Emit(
+	    opcode, {ReadU16AsU32(inst.src0, sign), ReadU16AsU32(inst.src1, sign),
+	             ReadU16AsU32(inst.src2, sign)}));
+	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+}
+
 void Translator::V_MED3_I16(const Decoder::Instruction& inst) {
 	const auto result = IR::U32(ir.Emit(
 	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),
@@ -253,7 +263,7 @@ void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend) {
+void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high) {
 	const auto extract24 = [&](IR::U32 value) {
 		return IR::U32(
 		    ir.Emit(sign ? IR::ValueOpcode::BitFieldSExtract : IR::ValueOpcode::BitFieldUExtract,
@@ -261,7 +271,11 @@ void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool add
 	};
 	const auto lhs    = extract24(ReadU32(inst.src0));
 	const auto rhs    = extract24(ReadU32(inst.src1));
-	auto       result = ir.IMul(lhs, rhs);
+	// AnyPS5 72cf6c3c5a299f645f74a13945670ba4fb8b3cb8: the high product uses
+	// the sign/zero-extended 24-bit operands, as specified by AMD RDNA MUL_HI_*24.
+	auto result = high ? IR::U32(ir.Emit(sign ? IR::ValueOpcode::SMulHi : IR::ValueOpcode::UMulHi,
+	                                    {lhs, rhs}))
+	                   : ir.IMul(lhs, rhs);
 	if (addend) {
 		result = ir.IAdd(result, ReadU32(inst.src2));
 	}

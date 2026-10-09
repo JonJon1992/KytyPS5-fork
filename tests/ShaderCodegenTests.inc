@@ -2226,10 +2226,14 @@ void CheckSpirvOptimization(VulkanHarness *vulkan) {
   constexpr const char *name = "CodegenSpirvOptimization";
   auto enabled = GetCodegenOptions();
   enabled.spirv_optimize = true;
+  enabled.spirv_optimize_extended = false;
+  auto extended = enabled;
+  extended.spirv_optimize_extended = true;
   auto disabled = enabled;
   disabled.spirv_optimize = false;
   size_t original_words = 0;
   size_t optimized_words = 0;
+  size_t extended_words = 0;
   size_t cases = 0;
   for (const auto &test : {IntegerAddSubMul(), BitwiseOps(), Shifts(),
                            VectorFloatArithmeticOps(), VectorFloatControlContractPreservesInfNan(),
@@ -2237,7 +2241,8 @@ void CheckSpirvOptimization(VulkanHarness *vulkan) {
                            BufferAtomicVariants(), BufferAtomicCmpSwapExactRaw(),
                            LdsWaitcntOrdersIntraWaveExchange(), ScalarSubvectorLoops(32),
                            Wave64CrossHalfLaneAndLds()}) {
-    std::vector<u32> original_spirv, optimized_spirv, original_values, optimized_values;
+    std::vector<u32> original_spirv, optimized_spirv, extended_spirv;
+    std::vector<u32> original_values, optimized_values, extended_values;
     {
       ScopedCodegenOptions scope(disabled);
       original_values = RunCollect(vulkan, test, test.expected.size(), &original_spirv);
@@ -2247,14 +2252,20 @@ void CheckSpirvOptimization(VulkanHarness *vulkan) {
       optimized_values = RunCollect(vulkan, test, test.expected.size(), &optimized_spirv);
     }
     RequireEqualWords(test.name, "SPIR-V optimization readback", original_values, optimized_values);
+    {
+      ScopedCodegenOptions scope(extended);
+      extended_values = RunCollect(vulkan, test, test.expected.size(), &extended_spirv);
+    }
+    RequireEqualWords(test.name, "extended SPIR-V optimization readback", original_values, extended_values);
     original_words += original_spirv.size();
     optimized_words += optimized_spirv.size();
+    extended_words += extended_spirv.size();
     ++cases;
   }
   Require(name, "production path", optimized_words < original_words,
           "CompileProgram did not reduce the emitted SPIR-V");
-  std::printf("[codegen] %-32s ok (%zu GPU readbacks, SPIR-V %zu -> %zu words)\n",
-              name, cases, original_words, optimized_words);
+  std::printf("[codegen] %-32s ok (%zu cases, three GPU readbacks each, SPIR-V raw/basic/extended %zu/%zu/%zu words)\n",
+              name, cases, original_words, optimized_words, extended_words);
 }
 
 void RunAll(VulkanHarness *vulkan) {

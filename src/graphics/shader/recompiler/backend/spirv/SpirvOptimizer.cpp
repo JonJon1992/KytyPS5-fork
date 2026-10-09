@@ -31,6 +31,20 @@ bool OptimizeProgram(std::vector<uint32_t>& code, std::string& diagnostic) {
 	optimizer.RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
 	optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
 	optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
+	if (GetCodegenOptions().spirv_optimize_extended) {
+		// Study reference: AnyPS5 72cf6c3, SpirvBackend/src/SpirvOptimizer.cpp.
+		// Keep the existing cleanup as the baseline. Scalarization enables local load/store
+		// forwarding and SSA across blocks. Bound individual aggregate expansion, keep helper
+		// calls intact and avoid CCP/Simplification (storage-only narrow types and float rules).
+		optimizer.RegisterPass(spvtools::CreateScalarReplacementPass(64));
+		optimizer.RegisterPass(spvtools::CreateLocalAccessChainConvertPass());
+		optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass());
+		optimizer.RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
+		optimizer.RegisterPass(spvtools::CreateLocalMultiStoreElimPass());
+		optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
+		optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
+		optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
+	}
 	optimizer.RegisterPass(spvtools::CreateCFGCleanupPass());
 	optimizer.RegisterPass(spvtools::CreateBlockMergePass());
 	optimizer.RegisterPass(spvtools::CreateUnifyConstantPass());

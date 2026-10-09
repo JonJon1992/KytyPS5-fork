@@ -7,7 +7,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-// Conservative Vulkan 1.3 cleanup, controlled by CodegenOptions::spirv_optimize. Preserves the
+// Vulkan 1.3 cleanup, controlled by CodegenOptions::spirv_optimize. Conservative by default;
+// spirv_optimize_extended additionally scalarizes small locals and removes redundant values.
+// Preserves the
 // entry-point interface, memory side effects and floating-point precision decorations. Returns
 // false with a diagnostic on failure, leaving the original words intact. Disabled is a no-op.
 [[nodiscard]] bool OptimizeProgram(std::vector<uint32_t>& code, std::string& diagnostic);

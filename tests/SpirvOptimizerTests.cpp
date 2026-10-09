@@ -236,10 +236,143 @@ void TestDisabledIsIdentical() {
 	Recompiler::SetCodegenOptions(saved);
 }
 
+void TestExtendedCleanup() {
+	auto code = Assemble(Module(R"(
+%slot = OpAccessChain %ptr_uint %buffer %zero
+%input = OpLoad %uint %slot Volatile
+%first = OpIMul %uint %input %seven
+%second = OpIMul %uint %input %seven
+%sum = OpIAdd %uint %first %second
+OpStore %slot %sum
+)"));
+	std::string diagnostic;
+	Expect(Recompiler::Spirv::OptimizeProgram(code, diagnostic), "extended cleanup succeeds");
+	auto text = Disassemble(code);
+	Expect(Count(text, "OpIMul") == 1, "extended cleanup eliminates repeated arithmetic");
+	Expect(Count(text, "OpLoad") == 1 && Count(text, "Volatile") == 1,
+	       "extended cleanup preserves observable input");
+
+	code = Assemble(Module(R"(
+%local = OpVariable %ptr_array Function
+%element = OpAccessChain %ptr_local %local %zero
+OpStore %element %seven
+%slot = OpAccessChain %ptr_uint %buffer %zero
+%input = OpLoad %uint %slot Volatile
+%condition = OpIEqual %bool %input %zero
+OpSelectionMerge %merge None
+OpBranchConditional %condition %then %merge
+%then = OpLabel
+OpStore %element %two
+OpBranch %merge
+%merge = OpLabel
+%value = OpLoad %uint %element
+OpStore %slot %value
+)", "%array = OpTypeArray %uint %two\n%ptr_array = OpTypePointer Function %array\n"));
+	Expect(Recompiler::Spirv::OptimizeProgram(code, diagnostic), "aggregate cleanup succeeds");
+	text = Disassemble(code);
+	Expect(text.find("OpVariable %_ptr_Function") == std::string::npos,
+	       "extended cleanup eliminates scalarizable local array");
+	Expect(Count(text, "OpLoad") == 1 && Count(text, "OpStore") == 1,
+	       "only observable buffer load/store remain after local SSA conversion");
+	Expect(Count(text, "OpPhi") == 1, "branch-dependent local value becomes SSA phi");
+}
+
+void TestLargeAggregateRemainsBounded() {
+	auto code = Assemble(Module(R"(
+%local = OpVariable %ptr_array Function
+%element = OpAccessChain %ptr_local %local %zero
+OpStore %element %seven
+%slot = OpAccessChain %ptr_uint %buffer %zero
+%input = OpLoad %uint %slot Volatile
+%condition = OpIEqual %bool %input %zero
+OpSelectionMerge %merge None
+OpBranchConditional %condition %then %merge
+%then = OpLabel
+OpStore %element %two
+OpBranch %merge
+%merge = OpLabel
+%value = OpLoad %uint %element
+OpStore %slot %value
+)", "%length = OpConstant %uint 65\n%array = OpTypeArray %uint %length\n"
+     "%ptr_array = OpTypePointer Function %array\n"));
+	std::string diagnostic;
+	Expect(Recompiler::Spirv::OptimizeProgram(code, diagnostic), "large aggregate cleanup succeeds");
+	const auto text = Disassemble(code);
+	Expect(Count(text, "OpTypeArray") == 1, "large array is not expanded into scalars");
+	Expect(Count(text, "OpBranchConditional") == 1, "dynamic branch is preserved");
+}
+
+void TestStorageOnlyNarrowTypes() {
+	auto source = Module(R"(
+%slot = OpAccessChain %ptr_short %buffer %zero
+%input = OpLoad %ushort %slot
+%wide = OpUConvert %uint %input
+%value = OpIMul %uint %wide %seven
+%narrow = OpUConvert %ushort %value
+OpStore %slot %narrow
+)", "%ptr_short = OpTypePointer StorageBuffer %ushort\n");
+	source.insert(source.find("OpMemoryModel"), "OpCapability StorageBuffer16BitAccess\n");
+	source.insert(source.find("%block = OpTypeStruct"), "%ushort = OpTypeInt 16 0\n");
+	source.replace(source.find("%block = OpTypeStruct %uint"),
+	               std::strlen("%block = OpTypeStruct %uint"), "%block = OpTypeStruct %ushort");
+	auto code = Assemble(source);
+	std::string diagnostic;
+	Expect(Recompiler::Spirv::OptimizeProgram(code, diagnostic), "storage-only 16-bit types remain valid");
+	const auto text = Disassemble(code);
+	Expect(text.find("OpCapability Int16") == std::string::npos,
+	       "cleanup does not require 16-bit arithmetic support");
+	Expect(Count(text, "OpStore") == 1 && Count(text, "OpUConvert") == 2,
+	       "narrow load/store conversions remain");
+}
+
+void TestHelpersAreNotInlined() {
+	auto code = Assemble(Module(R"(
+%slot = OpAccessChain %ptr_uint %buffer %zero
+%input = OpLoad %uint %slot Volatile
+%first = OpFunctionCall %uint %helper %input
+%second = OpFunctionCall %uint %helper %first
+OpStore %slot %second
+)", "%helper_type = OpTypeFunction %uint %uint\n") + R"(
+%helper = OpFunction %uint None %helper_type
+%argument = OpFunctionParameter %uint
+%helper_entry = OpLabel
+%value = OpIMul %uint %argument %seven
+OpReturnValue %value
+OpFunctionEnd
+)");
+	std::string diagnostic;
+	Expect(Recompiler::Spirv::OptimizeProgram(code, diagnostic), "helper cleanup succeeds");
+	const auto text = Disassemble(code);
+	Expect(Count(text, "OpFunctionCall") == 2 && Count(text, "OpIMul") == 1,
+	       "helper body is not duplicated at call sites");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-	if (argc == 2) {
+	if (argc == 2 && std::strcmp(argv[1], "--extended") == 0) {
+		auto options = Recompiler::GetCodegenOptions();
+		options.spirv_optimize = true;
+		options.spirv_optimize_extended = true;
+		Recompiler::SetCodegenOptions(options);
+		TestExtendedCleanup();
+		TestLargeAggregateRemainsBounded();
+		TestStorageOnlyNarrowTypes();
+		TestHelpersAreNotInlined();
+		TestCleanupAndInterface();
+		TestMemoryEffectsAndPreciseFloats();
+		TestSpirv13Bindings();
+		TestDivisionIsNotReassociated();
+		TestUnusedSpecializationIsPreserved();
+		TestSpecializationIsNotFrozen();
+		TestFailureKeepsOriginal();
+		TestDisabledIsIdentical();
+	} else if (argc == 2 && (std::strcmp(argv[1], "--expect-extended") == 0 ||
+	                         std::strcmp(argv[1], "--expect-conservative") == 0)) {
+		Expect(Recompiler::GetCodegenOptions().spirv_optimize_extended ==
+		           (std::strcmp(argv[1], "--expect-extended") == 0),
+		       "environment controls extended cleanup");
+	} else if (argc == 2) {
 		const bool enabled = std::strcmp(argv[1], "--expect-disabled") != 0;
 		Expect(Recompiler::GetCodegenOptions().spirv_optimize == enabled, "environment controls optimization");
 	} else {

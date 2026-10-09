@@ -34444,6 +34444,9 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   return test;
 }
 
+#include "ShaderInteger16TernaryTests.inc"
+#include "ShaderMulHi24Tests.inc"
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -53700,6 +53703,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--integer16-ternary-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 operation = 0; operation < 6; ++operation) {
+      RunCase(&vulkan, Integer16TernarySelectors(operation));
+    }
+    RunCase(&vulkan, Vop3Med3I16Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mul-hi-24-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, MulHi24CapturedAndEdges(true));
+    RunCase(&vulkan, MulHi24CapturedAndEdges(false));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
