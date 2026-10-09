@@ -4,7 +4,7 @@ Data: 2026-10-08. Autor: sessão Claude Code (mesmo usuário). Base: `guest-sync
 **Estado atualizado:** fase 0 runtime e F1/F2/F4 integradas; F3 implementada e validada
 no worktree cpu-coherence-service. F5 concluída em opt-in e revisada: build Release
 aprovado, 53/54 testes passaram; a falha FMASK também ocorre na base F3. As seções
-iniciais registram o desenho histórico; os contratos corrigidos estão na seção 9 e as entregas nas seções 12–13.
+iniciais registram o desenho histórico; os contratos corrigidos estão na seção 9 e as entregas nas seções 12–13. A proposta de RT por hardware está na seção 14.
 
 **Regra do usuário:** as nossas otimizações ficam. Nada pode substituir ou reverter:
 
@@ -857,3 +857,77 @@ aguardam GPU. Hashes com prova F4 continuam no caminho de candidatos.
 Contrato, limites, métricas e artefatos:
 [F5-COERENCIA-2026-10-08.md](F5-COERENCIA-2026-10-08.md).
 Não há A/B de FPS da F5 no jogo.
+
+---
+
+## 14. RT por hardware sobre a arquitetura F5 — 2026-10-09
+
+**Estado:** avaliação técnica e proposta; backend RT por hardware ainda não
+implementado. A F5 foi entregue no commit `f676e669` do worktree
+`cpu-coherence-service`.
+
+**Conclusão:** a F5 oferece uma base adequada para integrar aceleração RT por
+hardware nos caminhos cujo comportamento guest puder ser preservado. O controle
+de produtores, versões e tempo de vida dos buffers ajuda a organizar as
+dependências sem uma espera da CPU imediatamente após cada dispatch. Isso não
+comprova ainda compatibilidade ou ganho de desempenho de um kernel RT real.
+
+### O que a F5 já fornece
+
+- Produtores com domínio retido, Native tick e geração de mapeamento.
+- Separação entre conclusão GPU (Native) e aplicação de metadados CPU (Applied).
+- Retenção de recursos e controle das publicações observáveis pelo guest.
+- Unknown-write epoch que invalida provas antigas durante escritas pendentes.
+
+O cache de estruturas de aceleração ainda precisa ser implementado: a F5 não
+constrói nem atualiza BLAS/TLAS automaticamente.
+
+### Integração necessária
+
+1. **Conversão da cena e construção das estruturas.** Extrair geometria e
+   instâncias do formato PS5 e construir BLAS/TLAS com
+   `VK_KHR_acceleration_structure`. Preservar identificadores, transformações e
+   máscaras esperados pelo guest. Não reinterpretar os bytes do BVH PS5 como uma
+   estrutura Vulkan. Preferir extração/conversão e build na GPU, evitando ler a
+   hierarquia inteira pela CPU a cada frame.
+2. **Tradução dos trechos de travessia compatíveis.** Usar `VK_KHR_ray_query` nos
+   shaders existentes, depois de verificar as features e dependências do
+   dispositivo. Provar equivalência dos resultados e manter o caminho em software
+   para formas não cobertas pela prova.
+3. **Cache, sincronização e lifetime.** Invalidar ou atualizar as estruturas quando
+   os dados de origem ou a geração do mapping mudarem. Ordenar escrita, conversão,
+   build e consulta com dependências GPU específicas. Reter geometria, instâncias,
+   scratch e estruturas até a conclusão do último uso GPU. O consumidor GPU deve
+   usar as dependências Native e as barreiras Vulkan; o gate Applied continua
+   protegendo a coerência CPU e as publicações ao guest.
+
+Fluxo proposto na GPU:
+
+~~~text
+escritas guest → conversão de geometria/instâncias → build BLAS/TLAS → Ray Query
+~~~
+
+### Limite de compatibilidade e prova
+
+Uma instrução BVH do PS5 testa um nó e pode devolver resultados intermediários
+para uma travessia controlada pelo guest. Ray Query percorre uma estrutura Vulkan
+e devolve candidatos/resultados de interseção. Portanto, trocar cada instrução
+BVH isolada por uma consulta não demonstra equivalência. É necessário reconhecer
+os trechos compatíveis e verificar identidade do hit, atributos, ordenação
+observável e eventuais efeitos durante a travessia.
+
+No código atual, a forma BVH comum em float completo é emulada por shader na GPU;
+BVH64 e A16 continuam sem suporte e os shaders afetados são pulados. A F5 não
+alterou esse suporte de instruções. O diagnóstico do Yōtei aponta um kernel BVH64
+no modo RT; o modo RT completo desse jogo permanece pendente.
+
+A próxima prova deve usar um kernel real, comparar os resultados com a referência
+e medir o custo de conversão/build/consulta sob o mesmo trabalho. Os testes da F5
+validam os caminhos de coerência exercitados, não RT por hardware. Não há ganho de
+FPS de RT medido nesta entrega.
+
+Referências oficiais consultadas via Context7 e documentação Khronos:
+
+- [VK_KHR_acceleration_structure](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_acceleration_structure.html).
+- [VK_KHR_ray_query](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_ray_query.html).
+- [Regras de travessia](https://docs.vulkan.org/spec/latest/chapters/raytraversal.html).
