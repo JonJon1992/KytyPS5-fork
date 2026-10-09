@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -52,6 +54,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -9199,6 +9202,21 @@ int StructurizeFiles(std::span<char *const> paths) {
       if (stage == ShaderType::Compute) options.input_info.compute = &compute;
       options.bindless_images = options.bindless_samplers =
           std::getenv("KYTY_STRUCTURIZE_FILE_BINDLESS") != nullptr;
+      // A file named after its program-cache hash ("<16 hex digits>.bin", optionally after the
+      // stage prefix) is translated as that shader, so per-hash options (KYTY_BDA_WRITES=
+      // candidates, KYTY_BDA_WRITES_SHADERS, loop guards) apply as they do in the emulator.
+      {
+        const std::string stem = std::filesystem::path(path).stem().string();
+        const std::string_view digits =
+            std::string_view(stem).substr(stem.size() >= 16 ? stem.size() - 16 : 0);
+        uint64_t hash = 0;
+        const auto [end, error] =
+            std::from_chars(digits.data(), digits.data() + digits.size(), hash, 16);
+        if (digits.size() == 16 && error == std::errc{} && end == digits.data() + digits.size()) {
+          options.shader_hash = hash;
+          std::printf("%s: shader hash 0x%016" PRIx64 "\n", path, hash);
+        }
+      }
       const auto translated = ShaderRecompiler::TranslateProgram(words, options);
       uint32_t bindless = 0;
       for (const auto &image : translated.program.info.images) bindless += image.bindless ? 1u : 0u;
