@@ -443,11 +443,14 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 
 	auto  read_desc  = MakeDepthTargetDesc(buffer, z);
 	auto  write_desc = MakeDepthTargetDesc(buffer, z, true);
+	if (m_context.DeferGpuAccess(read_desc.info.data.address, read_desc.info.data.size) ||
+	    m_context.DeferGpuAccess(write_desc.info.data.address, write_desc.info.data.size)) return true;
 	auto& cache      = m_context.GetTextureCache();
 	const auto read_id = cache.FindImage(read_desc);
 	BindRenderTarget(read_id);
 	const auto write_id = cache.FindImage(write_desc);
 	BindRenderTarget(write_id);
+	if (m_context.DeferredGpuRead()) return true;
 	cache.UpdateImage(read_id);
 	cache.UpdateImage(write_id);
 	cache.MarkGpuWritten(write_id);

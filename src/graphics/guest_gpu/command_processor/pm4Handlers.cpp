@@ -2043,6 +2043,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (indirect_buffer == nullptr) return KYTY_PM4_LEN(cmd_id) - 1u;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2121,6 +2122,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (indirect_buffer == nullptr) return KYTY_PM4_LEN(cmd_id) - 1u;
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2193,6 +2195,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	indirect_buffer = ReadIndirectRegisterPairs(cp, indirect_buffer, indirect_num_dw);
+	if (indirect_buffer == nullptr) return KYTY_PM4_LEN(cmd_id) - 1u;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

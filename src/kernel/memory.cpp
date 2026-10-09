@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "kernel/memory.h"
 
 #include "common/assert.h"
@@ -1102,10 +1103,43 @@ const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
+bool HasUniqueGuestBackingView(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->HasUniqueBackingView(vaddr, size);
+}
+
+bool HasPendingGpuWrites() noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->GetBufferCache().HasPendingBdaWrites();
+}
+
+uint64_t UnknownGpuWriteEpoch() noexcept {
+	return g_gpu_resources != nullptr ? g_gpu_resources->GetBufferCache().UnknownWriteEpoch() : 0;
+}
+
+bool DeferGpuBackingRead(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       g_gpu_resources->DeferGpuRead(vaddr, size);
+}
+
+bool GpuBackingReadDeferred() noexcept {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       g_gpu_resources->DeferredGpuRead();
+}
+
+bool HasPendingGpuLabels() noexcept {
+	return g_gpu_resources != nullptr && Graphics::ShaderRecompiler::BdaWritesDeferredEnabled() &&
+	       g_gpu_resources->HasGpu() && g_gpu_resources->GetGpu().HasDeferredLabels();
+}
+
+static bool HasPendingGpuLabel(uint64_t vaddr, uint64_t size) {
+	return HasPendingGpuLabels() && g_gpu_resources->GetGpu().DeferredLabelTick(vaddr, size) != 0;
+}
+
 // The exact GPU-ownership predicates of a clean backing read. GPU thread only.
 static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
 	auto& resources = GetGpuResources();
-	return !resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	return resources.GetBufferCache().PendingBdaWrite(vaddr, size) == 0 &&
+	       !resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
 	       !resources.GetBufferCache().HasPendingBackingPublication(vaddr, size) &&
 	       !resources.GetTextureCache().IsRegionGpuModified(vaddr, size);
 }
@@ -1114,7 +1148,9 @@ static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
 // active GpuReadDelegate scope.
 static bool QueryGpuCleanVerdict(uint64_t vaddr, uint64_t size) {
 	namespace CleanVerdict = Graphics::CleanVerdict;
-	if (!CleanVerdict::Enabled()) {
+	// Pending labels precede verdict-cache lookup, including log certificate validation.
+	if (HasPendingGpuLabel(vaddr, size)) return false;
+	if (HasPendingGpuWrites() || !CleanVerdict::Enabled()) {
 		return IsGpuRangeCleanForBackingRead(vaddr, size);
 	}
 	// Only the ownership verdict is cached; bytes are always read fresh by the callers.
@@ -1140,7 +1176,7 @@ static bool GpuCleanGate(uint64_t vaddr, uint64_t size) {
 			return false;
 		}
 	}
-	return true;
+	return !HasPendingGpuLabel(vaddr, size);
 }
 
 static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
@@ -1296,6 +1332,10 @@ static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Re
 		                    size, caller);
 		return ReadFailure::Unclean;
 	}
+	if (HasPendingGpuLabel(vaddr, size)) {
+		NoteDrawPrepUnclean(Event::DrawPrepUncleanHintPublication, "hint-label", vaddr, size, caller);
+		return ReadFailure::Unclean;
+	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (GpuDirtyHint(buffers, vaddr, size)) {
@@ -1428,7 +1468,7 @@ bool IsGpuMapped(uint64_t vaddr, uint64_t size) {
 
 bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
-		return true;
+		return !HasPendingGpuLabel(vaddr, size);
 	}
 	if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
 		return false;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -223,6 +224,7 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	scheduler.DeferPriorityOperation(
 	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); },
 	    CommandScheduler::PriorityOperationKind::EopInterrupt);
+	if (ShaderRecompiler::BdaWritesDeferredEnabled()) scheduler.Flush();
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

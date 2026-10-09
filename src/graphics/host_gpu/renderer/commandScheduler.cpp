@@ -314,7 +314,76 @@ bool CommandScheduler::PriorityDoneLocked(uint64_t tick) const noexcept {
 	const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 	const bool queued_before_or_at =
 	    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
-	return !active_before_or_at && !queued_before_or_at;
+	const bool collection_before_or_at =
+	    (m_collection_active && m_collection_active_tick <= tick) ||
+	    (!m_collection_operations.empty() && m_collection_operations.front().tick <= tick);
+	return !active_before_or_at && !queued_before_or_at && !collection_before_or_at &&
+	       CoherenceDoneLocked(tick);
+}
+
+
+void CommandScheduler::SetCoherenceHooks(AppliedHook applied, ServiceHook service, void* context) {
+	std::lock_guard lock(m_operation_mutex);
+	EXIT_IF((applied == nullptr) != (service == nullptr));
+	m_coherence_applied = applied;
+	m_coherence_service = service;
+	m_coherence_context = context;
+	m_coherence_owner = std::this_thread::get_id();
+}
+
+void CommandScheduler::ServiceCoherence() {
+	if (m_coherence_service == nullptr || m_servicing_coherence ||
+	    m_coherence_owner != std::this_thread::get_id()) return;
+	m_servicing_coherence = true;
+	m_coherence_service(m_coherence_context);
+	m_servicing_coherence = false;
+}
+
+void CommandScheduler::SetCoherencePrefix(uint64_t ticket) {
+	std::lock_guard lock(m_operation_mutex);
+	EXIT_IF(m_coherence_applied == nullptr || ticket < m_coherence_prefix);
+	m_coherence_prefix = ticket;
+	const auto applied = m_coherence_applied(m_coherence_context);
+	std::erase_if(m_coherence_frontiers, [applied](const auto& frontier) {
+		return frontier.prefix <= applied;
+	});
+	if (!m_coherence_frontiers.empty() && m_coherence_frontiers.back().tick == CurrentTick())
+		m_coherence_frontiers.back().prefix = ticket;
+	else
+		m_coherence_frontiers.push_back({CurrentTick(), ticket});
+}
+
+void CommandScheduler::NotifyCoherenceApplied() {
+	m_operation_available.notify_all();
+	m_priority_available.notify_one();
+}
+
+bool CommandScheduler::CoherenceDoneLocked(uint64_t tick) const noexcept {
+	if (m_coherence_applied == nullptr) return true;
+	const auto applied = m_coherence_applied(m_coherence_context);
+	for (const auto& frontier : m_coherence_frontiers)
+		if (frontier.tick <= tick && frontier.prefix > applied) return false;
+	return true;
+}
+
+bool CommandScheduler::PublicationReadyLocked() const noexcept {
+	return !m_priority_operations.empty() &&
+	       (m_coherence_applied == nullptr ||
+	        m_priority_operations.front().coherence_prefix <=
+	            m_coherence_applied(m_coherence_context));
+}
+
+void CommandScheduler::DeferCollectionOperation(Common::UniqueFunction<void>&& operation,
+                                                uint64_t tick) {
+	CheckActive();
+	EXIT_IF(!operation || tick != CurrentTick());
+	{
+		std::lock_guard lock(m_operation_mutex);
+		EXIT_IF(m_operation_state != OperationState::Open);
+		m_preserve_current_completion = true;
+		m_collection_operations.push({std::move(operation), tick});
+	}
+	m_priority_available.notify_one();
 }
 
 // KYTY_PENDING_REFRESH_US=<n> (default 0: off; BryanKAdams/KytyPS5 e4a7551): the non-waiting pop
@@ -332,6 +401,7 @@ static uint64_t PendingRefreshIntervalNs() {
 }
 
 void CommandScheduler::PopOperations(bool wait_for_priority) {
+	ServiceCoherence();
 	if (Common::RendererBatchEnabled()) {
 		uint64_t first_tick = 0;
 		{
@@ -429,7 +499,8 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 		}
 		const bool was_empty = m_priority_operations.empty();
 		m_priority_operations.push({std::move(operation), CurrentTick(), caller, kind,
-		                            HangTrace::g_sync_resource.address, HangTrace::g_sync_resource.size});
+		                            HangTrace::g_sync_resource.address, HangTrace::g_sync_resource.size,
+		                            m_coherence_prefix});
 		lock.unlock();
 		if (!PriorityWakeupsBatched()) {
 			m_operation_available.notify_one();
@@ -467,79 +538,78 @@ void CommandScheduler::SetProgressHook(ProgressHook hook, void* context) {
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GPU completion");
-	// It blocks on the operation queue and on the timeline semaphore; the CP waits for it
-	// (WaitPriorityOperations) and so does the guest (end-of-pipe interrupts, flips, readbacks).
 	Common::RaiseServiceThreadPriority();
-	const bool batched         = PriorityWakeupsBatched();
-	bool       has_previous    = false;
-	uint64_t   previous_tick   = 0;
-	uint32_t   placement_count = 0; // placement samples (common/cpuPlacement.h), every 16th
+	uint32_t placement_count = 0;
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
-		ProgressHook     hook         = nullptr;
-		void*            hook_context = nullptr;
+		ProgressHook hook = nullptr;
+		void* hook_context = nullptr;
+		bool collection = false;
 		{
 			std::unique_lock lock(m_operation_mutex);
-			if (has_previous) {
-				has_previous           = false;
-				m_priority_active      = false;
-				m_priority_active_tick = 0;
-				// After the state change, under the lock: a spinning waiter that sees the new
-				// value and then takes the lock finds the operation finished.
-				m_priority_progress.fetch_add(1, std::memory_order_release);
-				// Waiters need every operation of their tick done. Wake them when the next queued
-				// operation belongs to a later tick or the queue is empty, and only if any wait.
-				const bool tick_done = m_priority_operations.empty() ||
-				                       m_priority_operations.front().tick != previous_tick;
-				if (!batched || (m_priority_waiters != 0 && tick_done)) {
-					m_operation_available.notify_all();
-					if (batched) {
-						Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityWaiterWakeups);
-					}
+			m_priority_available.wait(lock, [this, &stop] {
+				return stop.stop_requested() || !m_collection_operations.empty() ||
+				       PublicationReadyLocked();
+			});
+			if (stop.stop_requested()) return;
+			if (!m_collection_operations.empty() &&
+			    !m_master.IsFree(m_collection_operations.front().tick)) {
+				lock.unlock();
+				m_master.Refresh();
+				lock.lock();
+				if (!PublicationReadyLocked() &&
+				    !m_master.IsFree(m_collection_operations.front().tick)) {
+					m_priority_available.wait_for(lock, std::chrono::microseconds(250));
+					continue;
 				}
 			}
-			m_priority_available.wait(lock, [this, &stop] {
-				return stop.stop_requested() || !m_priority_operations.empty();
-			});
-			if (stop.stop_requested()) {
-				return;
+			// A gated label never takes the runner. Collections can therefore advance
+			// and wake their GPU owner without a dependency on CPU application.
+			collection = !PublicationReadyLocked() ||
+			    (!m_collection_operations.empty() && m_master.IsFree(m_collection_operations.front().tick) &&
+			     m_collection_operations.front().tick <= m_priority_operations.front().tick);
+			auto& queue = collection ? m_collection_operations : m_priority_operations;
+			operation = std::move(queue.front());
+			queue.pop();
+			if (collection) {
+				m_collection_active = true;
+				m_collection_active_tick = operation.tick;
+			} else {
+				m_priority_active = true;
+				m_priority_active_tick = operation.tick;
 			}
-			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active      = true;
-			m_priority_active_tick = operation.tick;
-			hook                   = m_progress_hook;
-			hook_context           = m_progress_hook_context;
+			hook = m_progress_hook;
+			hook_context = m_progress_hook_context;
 		}
-		// The waiting runner is the consumer of a callback's completion dependency. Attribute
-		// its native wait to the operation's producer, not just to this common loop.
 		HangTrace::SyncResource resource(operation.trace_address, operation.trace_size);
 		m_master.Wait(operation.tick, operation.caller,
+		              collection ? "coherence-collection" :
 		              operation.kind == PriorityOperationKind::EopInterrupt
 		                  ? "eop-interrupt" : "resource-publication");
-		if (!stop.stop_requested()) {
-			RunOperation(std::move(operation.callback));
-			Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityOperationsRun);
-			if ((++placement_count & 15u) == 0u) {
-				Common::SamplePlacement(Common::ThreadRole::Host);
-			}
-			// Still marked active: an owner clearing the hook and then draining this runner
-			// never races with this call.
-			if (hook != nullptr) {
-				hook(hook_context);
-			}
-		}
-		has_previous  = true;
-		previous_tick = operation.tick;
-	}
-	if (has_previous) {
+		RunOperation(std::move(operation.callback));
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityOperationsRun);
+		if ((++placement_count & 15u) == 0u)
+			Common::SamplePlacement(Common::ThreadRole::Host);
+		if (hook != nullptr) hook(hook_context);
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active      = false;
-			m_priority_active_tick = 0;
+			if (collection) {
+				m_collection_active = false;
+				m_collection_active_tick = 0;
+			} else {
+				m_priority_active = false;
+				m_priority_active_tick = 0;
+			}
 			m_priority_progress.fetch_add(1, std::memory_order_release);
+			const bool tick_done =
+			    (m_priority_operations.empty() || m_priority_operations.front().tick != operation.tick) &&
+			    (m_collection_operations.empty() || m_collection_operations.front().tick != operation.tick);
+			if (!PriorityWakeupsBatched() || (m_priority_waiters != 0 && tick_done)) {
+				m_operation_available.notify_all();
+				if (PriorityWakeupsBatched())
+					Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityWaiterWakeups);
+			}
 		}
-		m_operation_available.notify_all();
 	}
 }
 
@@ -548,8 +618,19 @@ void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	++m_priority_waiters;
-	m_operation_available.wait(
-	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
+	for (;;) {
+		lock.unlock();
+		ServiceCoherence();
+		NotifyCoherenceApplied();
+		lock.lock();
+		if (m_priority_operations.empty() && !m_priority_active &&
+		    m_collection_operations.empty() && !m_collection_active &&
+		    CoherenceDoneLocked(UINT64_MAX)) break;
+		if (m_coherence_service != nullptr && m_coherence_owner == std::this_thread::get_id())
+			m_operation_available.wait_for(lock, std::chrono::microseconds(250));
+		else
+			m_operation_available.wait(lock);
+	}
 	--m_priority_waiters;
 }
 
@@ -573,6 +654,7 @@ static void PriorityWaitRelax() {
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick, std::source_location caller) {
+	ServiceCoherence();
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	if (PriorityDoneLocked(tick)) {
@@ -608,7 +690,18 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick, std::source_locatio
 	}
 	++m_priority_waiters;
 	const auto publication_wait_begin = std::chrono::steady_clock::now();
-	m_operation_available.wait(lock, [this, tick] { return PriorityDoneLocked(tick); });
+	while (!PriorityDoneLocked(tick)) {
+		if (m_coherence_service != nullptr && m_coherence_owner == std::this_thread::get_id()) {
+			lock.unlock();
+			ServiceCoherence();
+			NotifyCoherenceApplied();
+			lock.lock();
+			if (!PriorityDoneLocked(tick))
+				m_operation_available.wait_for(lock, std::chrono::microseconds(250));
+		} else {
+			m_operation_available.wait(lock);
+		}
+	}
 	--m_priority_waiters;
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuPublicationWaits);
 	const auto publication_wait_ns = static_cast<uint64_t>(

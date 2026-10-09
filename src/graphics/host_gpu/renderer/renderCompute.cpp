@@ -404,6 +404,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (m_context.DeferredGpuRead()) { ResetBindings(); return; }
 	// The native dispatch size bounds workgroup ids for write-range proofs.
 	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
 	bindings.has_dispatch_groups = true;
@@ -427,6 +428,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
+	if (m_context.DeferredGpuRead()) { ResetBindings(); return; }
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
@@ -434,6 +436,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	const bool deferred_writes = program.info.bda_writes && !candidate_writes &&
+	    ShaderRecompiler::BdaWritesDeferredEnabled();
+	if (deferred_writes && !m_context.GetBufferCache().PrepareDeferredBdaWrite()) {
+		static uint32_t rejected = 0;
+		if (!m_context.DeferredGpuRead() && rejected++ < 32)
+			LOGF("BDA deferred: shader=0x%016" PRIx64
+			     " rejected: destination or physical alias lacks a protection proof\n",
+			     program.shader_hash);
+		ResetBindings();
+		return;
+	}
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
 	// is alive. Binding commits and the barrier requests below record state commands only (image
@@ -454,6 +467,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+    const auto deferred_ticket = deferred_writes
+	    ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
@@ -503,7 +518,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ResetBindings();
 	// Phase 0: the written pages are settled before the command processor goes on.
-	if (program.info.bda_writes &&
+    if (deferred_ticket != 0) {
+		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);
+	} else if (program.info.bda_writes &&
 	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash,
 		    candidate_plan ? candidate_plan->Ranges() : std::span<const GuestRange>{});
@@ -538,6 +555,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	if (m_context.DeferredGpuRead()) { ResetBindings(); return; }
 	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
 	bindings.has_dispatch_groups = false;
 	const auto& program = *input_info.stage.program;
@@ -565,9 +583,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	if (m_context.DeferredGpuRead()) { ResetBindings(); return; }
 	if (candidate_writes &&
 	    !m_context.GetBufferCache().FinalizeBdaWriteCandidates(*candidate_plan)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
+		ResetBindings();
+		return;
+	}
+	const bool deferred_writes = program.info.bda_writes && !candidate_writes &&
+	    ShaderRecompiler::BdaWritesDeferredEnabled();
+	if (deferred_writes && !m_context.GetBufferCache().PrepareDeferredBdaWrite()) {
+		static uint32_t rejected = 0;
+		if (!m_context.DeferredGpuRead() && rejected++ < 32)
+			LOGF("BDA deferred: shader=0x%016" PRIx64
+			     " rejected: destination or physical alias lacks a protection proof\n",
+			     program.shader_hash);
 		ResetBindings();
 		return;
 	}
@@ -605,13 +635,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier,
 		                                0, nullptr, 0, nullptr);
 	}
+    const auto deferred_ticket = deferred_writes
+	    ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (candidate_writes) m_context.GetBufferCache().RestoreBdaWriteCandidateTable(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (program.info.bda_writes &&
+    if (deferred_ticket != 0) {
+		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);
+	} else if (program.info.bda_writes &&
 	    (!candidate_writes || ShaderRecompiler::BdaWriteCandidatesVerify())) {
 		m_context.GetBufferCache().SettleBdaWrites(program.shader_hash,
 		    candidate_plan ? candidate_plan->Ranges() : std::span<const GuestRange>{});

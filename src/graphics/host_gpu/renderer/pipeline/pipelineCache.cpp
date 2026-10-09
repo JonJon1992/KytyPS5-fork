@@ -484,6 +484,13 @@ struct ShaderReadAttempt {
 		else overflow = true;
 	}
 
+	bool Deferred() const {
+		for (size_t i = 0; i < count; ++i)
+			if (LibKernel::Memory::DeferGpuBackingRead(missing[i].address, missing[i].size))
+				return true;
+		return false;
+	}
+
 	bool Synchronize() const {
 		KYTY_PROFILER_DETAIL_BLOCK("SRT::ReadinessWait");
 		HangTrace::SyncWait sync_wait("shader-readiness", "GPU-written-shader-or-descriptor");
@@ -5675,6 +5682,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
     GraphicsStagePreps& stage_preps) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	if (ShaderDeferPendingReads(vertex_regs.es_regs.data_addr) ||
+	    ShaderDeferPendingReads(vertex_regs.gs_regs.data_addr) ||
+	    (TessellationActive(user_config) &&
+	     (ShaderDeferPendingReads(vertex_regs.ls_regs.data_addr) ||
+	      ShaderDeferPendingReads(vertex_regs.hs_regs.data_addr))) ||
+	    (pixel_active && ShaderDeferPendingReads(pixel_regs.ps_regs.data_addr))) return {};
 	const bool tess_active = TessellationActive(user_config);
 	std::array<ShaderParams, 3> vertex_params;
 	// Static stage information (shader map, headers, vertex tables); ended before
@@ -5687,6 +5700,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+	if (LibKernel::Memory::GpuBackingReadDeferred()) return {};
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		FinishMeshStage(m_graphics, vertex_info[0]);
@@ -5727,7 +5741,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			if (!read_attempt.materialization_failed) return result;
 			// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
 			// Restart all stages before final bindings/uploads, including their SRT refresh.
-			EXIT_IF(!read_attempt.Synchronize());
+			if (read_attempt.Deferred()) return {};
+		EXIT_IF(!read_attempt.Synchronize());
 		}
 		EXIT("graphics resource readiness did not converge after 64 attempts\n");
 	};
@@ -5797,6 +5812,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
                                                StagePrep&                   stage_prep) {
+	if (ShaderDeferPendingReads(regs.cs_regs.data_addr)) return {};
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	// Use one effective size for the cache key, LDS declaration, and access bounds.
@@ -5821,6 +5837,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		const auto result = m_program_cache->Get(params, input_info, stage_prep, push_data_cursor,
 		                                         read_attempt, scratch, evaluation);
 		if (!read_attempt.materialization_failed) return result;
+		if (read_attempt.Deferred()) return {};
 		EXIT_IF(!read_attempt.Synchronize());
 	}
 	// Every synchronization reported progress, yet the same reads failed again. With

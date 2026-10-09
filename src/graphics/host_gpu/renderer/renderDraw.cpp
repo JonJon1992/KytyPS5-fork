@@ -3289,6 +3289,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			descriptor_stages[stage_count++] = &*bindings.pixel;
 		}
 	}
+	if (m_context.DeferredGpuRead()) return;
 	CommitStats::Mark(CommitStats::Phase::PrepareBindings);
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	{
@@ -3296,6 +3297,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
 	}
+	if (m_context.DeferredGpuRead()) return;
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -3359,6 +3361,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			PrepareBindings(state.ps_input_info.stage, *bindings.pixel, nullptr);
 		}
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+		if (m_context.DeferredGpuRead()) return;
 		// The repeated binding work may merge/retire cache buffers or restart the command buffer.
 		// Reacquire the per-draw vertex/index reservations after it, just as on the normal path,
 		// into fresh bindings: the first acquisition above filled them (AcquireVertexBuffersInto
@@ -3608,6 +3611,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
+		if (m_context.DeferredGpuRead()) return;
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
 	}
 	if (run_verify_push) {
@@ -3990,6 +3994,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	// Direct, DrawPrep and CPU indirect callers all reach the actual index range here.
+	if (m_context.DeferGpuRead(index_source.address, index_source.size)) {
+		ResetBindings();
+		return;
+	}
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	// The member state is reused; the render mutex held above makes it exclusive to this draw.
@@ -4372,6 +4381,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
+	if (m_context.DeferredGpuRead()) return false;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectNative);
 	return true;
 }
@@ -4392,6 +4402,7 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	RenderColorInfo dst {};
 	ResolveRenderColorTarget(buffer, src, render_target_slice_offset, 0, true, true);
 	ResolveRenderColorTarget(buffer, dst, render_target_slice_offset, 1, true, true);
+	if (m_context.DeferredGpuRead()) return true;
 	if (!src.image_id || !dst.image_id) {
 		return false;
 	}

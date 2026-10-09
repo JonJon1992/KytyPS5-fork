@@ -40,6 +40,13 @@ public:
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
+	[[nodiscard]] bool HasGpu() const noexcept { return m_gpu != nullptr; }
+	// Renderer preparation requests a retry before emitting its guest draw/dispatch.
+	[[nodiscard]] bool DeferGpuRead(uint64_t address, uint64_t size);
+	[[nodiscard]] bool DeferGpuAccess(uint64_t address, uint64_t size);
+	void RequestDeferredGpuRead() noexcept { m_deferred_gpu_read = true; }
+	void ClearDeferredGpuRead() noexcept { m_deferred_gpu_read = false; }
+	[[nodiscard]] bool DeferredGpuRead() const noexcept { return m_deferred_gpu_read; }
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	// Wakes guest queues suspended on external progress (e.g. a completed flip). Any thread;
 	// a no-op before InitializeGpu and after ShutdownGpu has begun.
@@ -104,6 +111,7 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	bool m_deferred_gpu_read = false;
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

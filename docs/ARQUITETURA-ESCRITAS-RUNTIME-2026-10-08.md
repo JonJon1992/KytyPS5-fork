@@ -2,8 +2,9 @@
 
 Data: 2026-10-08. Autor: sessão Claude Code (mesmo usuário). Base: `guest-sync-release-mem` em `192afd16`.
 **Estado atualizado:** fase 0 runtime e F1/F2/F4 integradas; F3 implementada e validada
-no worktree cpu-coherence-service. F5 ainda não implementada. As seções iniciais registram
-o desenho histórico; os contratos corrigidos estão na seção 9 e as entregas nas seções 12–13.
+no worktree cpu-coherence-service. F5 concluída em opt-in e revisada: build Release
+aprovado, 53/54 testes passaram; a falha FMASK também ocorre na base F3. As seções
+iniciais registram o desenho histórico; os contratos corrigidos estão na seção 9 e as entregas nas seções 12–13.
 
 **Regra do usuário:** as nossas otimizações ficam. Nada pode substituir ou reverter:
 
@@ -825,7 +826,7 @@ Implementação, limites da prova, correções da revisão e artefatos:
 
 ---
 
-## 13. F3 implementada pelo Codex; F5 pendente — 2026-10-08
+## 13. F3 e F5 pelo Codex — 2026-10-08
 
 Pedido atual do usuário: Codex segue com F3 e F5. Essa atribuição atualiza a
 divisão histórica de arquivos da seção 10. O worktree continua
@@ -843,10 +844,16 @@ shutdown e a regressão de readiness (vermelho antes, verde após a correção).
 Ainda não há A/B da F3 no jogo. Implementação, limites e comando:
 [F3-COERENCIA-2026-10-08.md](F3-COERENCIA-2026-10-08.md).
 
-F5: o levantamento dos contratos está feito; não há código de settle adiado.
-A implementação precisa preservar os gates obrigatórios da seção 9:
-domínio protegido antes do writer, geração de mapping e recursos retidos,
-leitores CP suspensíveis, progresso de outras filas, publicação após Applied
-e fault por página. A fila FIFO de cópia não pode receber um job bloqueado
-esperando um native tick que dependa de cópias posteriores da mesma fila.
-Uma coleta independente é necessária para evitar esse ciclo.
+F5: concluída em opt-in `KYTY_BDA_WRITES=deferred`, com whitelist explícita
+de shaders. Build Release aprovado e 53/54 testes passaram em 26,89 s; a
+falha de `resource_tracking`/FMASK foi reproduzida na base F3 `57f0d97`.
+Todas as variantes nativas F5 passaram e a revisão fresca foi encerrada.
+Ledger de oito produtores, domínio registrado e protegido antes
+do writer, slots de readback retidos, collector separado e aplicação no
+Thread_Gpu. Publicações capturam Applied; leitores CP suspendem antes dos
+raw reads e retomam o registro ainda não emitido. A F1 não recebe jobs que
+aguardam GPU. Hashes com prova F4 continuam no caminho de candidatos.
+
+Contrato, limites, métricas e artefatos:
+[F5-COERENCIA-2026-10-08.md](F5-COERENCIA-2026-10-08.md).
+Não há A/B de FPS da F5 no jogo.

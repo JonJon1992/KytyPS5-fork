@@ -521,6 +521,34 @@ public:
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
 	}
 
+	bool HasUniqueView(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || size > UINT64_MAX - vaddr) return false;
+		std::lock_guard lock(m_mutex);
+		MapEntry entry {};
+		if (!FindContainingUnlocked(vaddr, 1, &entry) ||
+		    size > entry.size - (vaddr - entry.vaddr)) return false;
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if (!RangeOk(offset, size)) return false;
+		for (const auto& [address, view] : m_maps) {
+			if (address == entry.vaddr) continue;
+			if (view.backing_offset < offset + size &&
+			    offset < view.backing_offset + view.size) return false;
+		}
+		return true;
+	}
+
+	std::vector<Graphics::GuestRange> ViewsOfBacking(uint64_t offset, uint64_t size) {
+		std::vector<Graphics::GuestRange> result;
+		if (!RangeOk(offset, size)) return result;
+		std::lock_guard lock(m_mutex);
+		for (const auto& [address, view] : m_maps) {
+			const auto start = std::max(offset, view.backing_offset);
+			const auto end = std::min(offset + size, view.backing_offset + view.size);
+			if (start < end) result.push_back({address + start - view.backing_offset, end - start});
+		}
+		return result;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -1223,6 +1251,10 @@ public:
 		return m_backing->BackingAlias(vaddr, size);
 	}
 
+	bool HasUniqueBackingView(uint64_t vaddr, uint64_t size) {
+		return m_backing->HasUniqueView(vaddr, size);
+	}
+
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1250,7 +1282,24 @@ public:
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
-	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		if (g_gpu_resources != nullptr && g_gpu_resources->HasGpu() &&
+		    Graphics::ShaderRecompiler::BdaWritesDeferredEnabled()) {
+			auto& gpu = g_gpu_resources->GetGpu();
+			if (!Graphics::GuestGpu::IsGpuThread()) {
+				if (gpu.IsStopping()) return false;
+				bool result = false;
+				// Mapping and coherence admission share the GPU owner. The host
+				// mapping is made in this service, closing the drain-to-map race.
+				gpu.SendCommandSync([&] {
+					result = MapBacking(vaddr, size, backing_offset, mode, failure_reason);
+				});
+				return result;
+			}
+			const auto views = m_backing->ViewsOfBacking(backing_offset, size);
+			for (const auto view : views)
+				g_gpu_resources->GetBufferCache().SynchronizeDeferredBdaAlias(view.address, view.size);
+		}
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			if (failure_reason != nullptr) {

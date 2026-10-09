@@ -29618,6 +29618,7 @@ public:
 #include "ShaderBufferUploadCoalesceTests.inc"
 #include "ShaderCoherenceCopyTests.inc"
 #include "ShaderBdaCandidateNativeTests.inc"
+#include "ShaderBdaDeferredTests.inc"
 
 private:
   RenderContext &Renderer() {
@@ -53167,6 +53168,12 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-deferred-only") == 0) {
+    SetEnvironment("KYTY_BDA_WRITES_SHADERS", "1234");
+    VulkanHarness vulkan;
+    vulkan.CheckDeferredBdaWrites();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -53176,6 +53183,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-publication-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerPriorityPublication();
+    vulkan.CheckDeferredCoherenceScheduler();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-only") == 0) {

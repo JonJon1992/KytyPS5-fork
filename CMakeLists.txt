@@ -824,6 +824,10 @@ add_executable(bda_hot_ranges_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaHotRa
 target_link_libraries(bda_hot_ranges_tests common)
 target_include_directories(bda_hot_ranges_tests PRIVATE ${inc_headers})
 
+add_executable(bda_write_ledger_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BdaWriteLedgerTests.cpp")
+target_link_libraries(bda_write_ledger_tests common)
+target_include_directories(bda_write_ledger_tests PRIVATE ${inc_headers})
+
 add_executable(source_copy_tracker_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceCopyTrackerTests.cpp")
 target_link_libraries(source_copy_tracker_tests common Threads::Threads)
 target_include_directories(source_copy_tracker_tests PRIVATE ${inc_headers})
@@ -1394,6 +1398,7 @@ if(BUILD_TESTING)
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME bda_hot_ranges COMMAND $<TARGET_FILE:bda_hot_ranges_tests>)
+	add_test(NAME bda_write_ledger COMMAND $<TARGET_FILE:bda_write_ledger_tests>)
 	add_test(NAME source_copy_tracker COMMAND $<TARGET_FILE:source_copy_tracker_tests>)
 	set_tests_properties(source_copy_tracker PROPERTIES TIMEOUT 10)
 	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
@@ -1470,6 +1475,24 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_CLAMP_RANGE_MEMO=0")
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	foreach(recorder IN ITEMS 0 1)
+		add_test(NAME bda_deferred_native_recorder${recorder}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-deferred-only)
+		set_tests_properties(bda_deferred_native_recorder${recorder} PROPERTIES TIMEOUT 45
+			ENVIRONMENT "KYTY_CP_RECORDER=${recorder};KYTY_BDA_WRITES=deferred")
+	endforeach()
+	foreach(seq IN ITEMS inline 1)
+		add_test(NAME bda_deferred_cp_${seq}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-deferred-only)
+		set_tests_properties(bda_deferred_cp_${seq} PROPERTIES TIMEOUT 45
+			ENVIRONMENT "KYTY_BDA_WRITES=deferred;KYTY_CP_SEQ=${seq};KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_SPIN_US=0")
+	endforeach()
+	foreach(recorder IN ITEMS 0 1)
+		add_test(NAME bda_deferred_scheduler_recorder${recorder}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-publication-only)
+		set_tests_properties(bda_deferred_scheduler_recorder${recorder} PROPERTIES TIMEOUT 30
+			ENVIRONMENT "KYTY_CP_RECORDER=${recorder}")
+	endforeach()
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	# Draw-path pops that wait for the priority runner again, and the runner wait's spin.

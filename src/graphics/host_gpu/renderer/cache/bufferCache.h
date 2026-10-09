@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
+#include "graphics/host_gpu/bdaWriteLedger.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/hangTrace.h"
@@ -16,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -168,6 +170,24 @@ public:
 	// KYTY_BDA_WRITES_VERIFY=1, as are dropped writes and written pages under a GPU-modified image).
 	// GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash, std::span<const GuestRange> candidates = {});
+	// Reserve a proved, protected domain before emission; open its producer
+	// after the last binding commit so its native tick is final.
+	[[nodiscard]] bool PrepareDeferredBdaWrite();
+	[[nodiscard]] uint64_t BeginDeferredBdaWrite(uint64_t shader_hash);
+	void QueueDeferredBdaWrite(uint64_t ticket);
+	void ServiceDeferredBdaWrites();
+	void WaitBdaWritesForRange(uint64_t address, uint64_t size);
+	[[nodiscard]] uint64_t PendingBdaWrite(uint64_t address, uint64_t size) const {
+		return m_bda_write_ledger.PendingForRange(address, size);
+	}
+	[[nodiscard]] uint64_t PendingBdaWriteTick(uint64_t address, uint64_t size) const {
+		const auto* producer = m_bda_write_ledger.Get(PendingBdaWrite(address, size));
+		return producer != nullptr && !producer->applied ? producer->tick : 0;
+	}
+	[[nodiscard]] bool HasPendingBdaWrites() const { return m_bda_write_ledger.HasPending(); }
+	[[nodiscard]] uint64_t UnknownWriteEpoch() const { return m_bda_write_ledger.UnknownWriteEpoch(); }
+	// Called on the GPU owner before a new physical view is mapped.
+	void SynchronizeDeferredBdaAlias(uint64_t address, uint64_t size);
 	// GPU preparation: CPU-owned descriptor table -> finite writable buffers. Finalize after
 	// the last PrepareBda/RebindBuffers, before emission, to freeze exactly this table version.
 	[[nodiscard]] bool PrepareBdaWriteCandidates(uint64_t shader_hash,
@@ -660,6 +680,19 @@ private:
 	// KYTY_BDA_WRITES_SHADERS: the last collection, kept to reuse its storage (GPU thread).
 	FaultManager::BdaWrites                           m_bda_writes;
 	uint64_t                                          m_bda_settle_logs = 0;
+	BdaWriteLedger                                    m_bda_write_ledger;
+	struct DeferredBdaResult {
+		FaultManager::BdaWrites writes;
+		std::atomic<bool> ready {false};
+		uint64_t ticket = 0, shader_hash = 0;
+	};
+	std::array<DeferredBdaResult, BdaWriteLedger::Capacity> m_deferred_bda_results;
+	std::vector<GuestRange>                           m_deferred_bda_domain;
+	RangeSet                                          m_deferred_bda_reserved;
+	uint64_t                                          m_deferred_bda_registry = 0;
+	bool                                              m_deferred_bda_hooks = false;
+	std::mutex                                        m_deferred_bda_mutex;
+	std::condition_variable                           m_deferred_bda_available;
 	// KYTY_BDA_PAGETABLE_SPARSE (GraphicContext::sparse_residency_buffer_enabled): the BDA page
 	// table is a sparse residency buffer. Its blocks get zeroed memory, bound before any entry in
 	// them is written (EnsureBdaTableResident, before ChangeRegister's write); an unbound block
