@@ -113,6 +113,9 @@ void ProgramDiskCache::BuildSourceKey(const SourceKeyInputs& inputs, SourceKey& 
 	Put<uint8_t>(bytes, inputs.bindless_strided_compute ? 1u : 0u);
 	Put<uint8_t>(bytes, inputs.bda_writes ? 1u : 0u);
 	Put<uint8_t>(bytes, inputs.bda_write_mode);
+	if (inputs.srt_runtime_data_reads) {
+		Put<uint8_t>(bytes, 0x5d); // marker: the shader's data reads stay in the shader
+	}
 	PutWords(bytes, inputs.code);
 	PutWords(bytes, inputs.back_code);
 	const auto digest = XXH3_128bits(bytes.data(), bytes.size());

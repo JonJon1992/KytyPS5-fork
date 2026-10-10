@@ -2044,6 +2044,7 @@ struct PipelineCache::ProgramCache {
 		read_attempt.count = 0;
 		read_attempt.materialization_failed = false;
 		read_attempt.overflow = false;
+		const HangTrace::ScopedHostShaderContext shader_context(source.resource_plan.shader_hash);
 		if (ResourceReuseEnabled() ? MaterializeReusing(source, runtime, evaluation, scratch, prep)
 		                           : MaterializeStage(source, runtime, evaluation, prep)) {
 			return true;
@@ -2292,6 +2293,7 @@ struct PipelineCache::ProgramCache {
 		                   ShaderRecompiler::BdaWritesApplies(key.hash),
 		     .bda_write_mode = ShaderRecompiler::BdaWriteCandidatesApplies(key.hash)
 		         ? static_cast<uint8_t>(ShaderRecompiler::GetCodegenOptions().bda_write_mode) : uint8_t{0},
+		     .srt_runtime_data_reads  = ShaderRecompiler::SrtRuntimeDataReadsApplies(key.hash),
 		     .code                    = code_words,
 		     .back_code               = back_code_words},
 		    disk_key);

@@ -93,6 +93,9 @@ public:
 		// (skipped, or without the written-page bitmap) and changing the list only moves those.
 		bool bda_writes = false;
 		uint8_t bda_write_mode = 0; // only for one of the two candidate shaders
+		// KYTY_SRT_RUNTIME_DATA_READS lists this shader (ShaderRecompiler::SrtRuntimeDataReadsApplies).
+		// Keyed only when set, so the keys of every other shader stay unchanged.
+		bool srt_runtime_data_reads = false;
 		std::span<const uint32_t> code;
 		std::span<const uint32_t> back_code;
 	};

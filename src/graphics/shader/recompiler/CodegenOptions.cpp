@@ -71,6 +71,7 @@ CodegenOptions FromEnvironment() {
 	ParseHashList(std::getenv("KYTY_BINDLESS_STRIDED_COMPUTE_SHADERS"),
 	              options.bindless_strided_compute_shaders);
 	ParseHashList(std::getenv("KYTY_BDA_WRITES_SHADERS"), options.bda_writes_shaders);
+	ParseHashList(std::getenv("KYTY_SRT_RUNTIME_DATA_READS"), options.srt_runtime_data_read_shaders);
 	if (const auto* mode = std::getenv("KYTY_BDA_WRITES"); mode != nullptr) {
 		options.bda_write_mode = std::strcmp(mode, "candidates") == 0 ? BdaWriteMode::Candidates
 		    : std::strcmp(mode, "candidates-verify") == 0 ? BdaWriteMode::CandidatesVerify
@@ -161,6 +162,11 @@ bool BdaWritesApplies(uint64_t shader_hash) {
 	return BdaWriteCandidatesApplies(shader_hash) ||
 	       std::ranges::find(options.bda_writes_shaders, shader_hash) !=
 	       options.bda_writes_shaders.end();
+}
+
+bool SrtRuntimeDataReadsApplies(uint64_t shader_hash) {
+	const auto& shaders = Storage().srt_runtime_data_read_shaders;
+	return std::ranges::find(shaders, shader_hash) != shaders.end();
 }
 
 bool BdaWritesEnabled() {

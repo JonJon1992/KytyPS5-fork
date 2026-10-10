@@ -327,7 +327,8 @@ class PlanBuilder {
 public:
 	PlanBuilder(Program& program, bool variant_reads)
 	    : m_program(program), m_variant_reads(variant_reads),
-	      m_candidate_table_reads(BdaWriteCandidatesApplies(program.shader_hash)) {}
+	      m_candidate_table_reads(BdaWriteCandidatesApplies(program.shader_hash)),
+	      m_runtime_data_reads(SrtRuntimeDataReadsApplies(program.shader_hash)) {}
 
 	void Run() {
 		m_program.srt_reads.clear();
@@ -357,7 +358,12 @@ public:
 				}
 			}
 		}
+		// The remaining raw reads feed no descriptor: hoisted into flat slots for speed, unless
+		// KYTY_SRT_RUNTIME_DATA_READS keeps them in the shader (BDA loads, read in GPU order).
 		for (auto* block: m_program.blocks) {
+			if (m_runtime_data_reads) {
+				break;
+			}
 			for (auto& inst: *block) {
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
 				    inst.Arg(1).Resolve().IsImmediate() &&
@@ -499,6 +505,7 @@ private:
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
 	bool               m_candidate_table_reads = false;
+	bool               m_runtime_data_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
 };
 

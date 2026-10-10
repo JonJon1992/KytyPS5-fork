@@ -170,6 +170,11 @@ struct CodegenOptions {
 	// opt-in per shader, the correctness reference for the deferred designs. Requires
 	// KYTY_SRT_VARIANT_READS (the V# is a runtime read).
 	std::vector<uint64_t> bda_writes_shaders;
+	// KYTY_SRT_RUNTIME_DATA_READS=<hex hash>,...: these shaders' scalar data reads (raw reads
+	// that feed no descriptor) stay in the shader as BDA loads instead of becoming flat SRT slots
+	// the CPU reads before the dispatch. For data an earlier dispatch writes (Ghost of Yotei's
+	// GPU-produced counts): the CPU read waited for the GPU, the shader reads it in order.
+	std::vector<uint64_t> srt_runtime_data_read_shaders;
 	// KYTY_BDA_WRITES=candidates|candidates-verify: finite destinations of the two audited
 	// Yotei shaders, reserved before dispatch. Verify retains phase 0's bitmap and settle.
 	BdaWriteMode bda_write_mode = BdaWriteMode::Off;
@@ -243,6 +248,8 @@ struct CodegenOptions {
 bool BindlessStridedComputeApplies(uint64_t shader_hash);
 // The compute shader is listed in KYTY_BDA_WRITES_SHADERS.
 [[nodiscard]] bool BdaWritesApplies(uint64_t shader_hash);
+// The shader is listed in KYTY_SRT_RUNTIME_DATA_READS.
+[[nodiscard]] bool SrtRuntimeDataReadsApplies(uint64_t shader_hash);
 // KYTY_BDA_WRITES_SHADERS lists a shader: the fault buffer carries the written-page bitmap.
 [[nodiscard]] bool BdaWritesEnabled();
 [[nodiscard]] bool BvhCaptureApplies(uint64_t shader_hash);
