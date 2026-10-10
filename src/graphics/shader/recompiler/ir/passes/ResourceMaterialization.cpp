@@ -1503,8 +1503,7 @@ void WriteBufferStrides(const BindingLayout& layout, std::span<const BufferResou
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
-	EXIT_IF(program.info.buffers.size() != specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
+	EXIT_IF(!SpecializationFits(program.info, specialization));
 
 	auto buffers = program.info.buffers;
 	for (size_t index = 0; index < buffers.size(); index++) {

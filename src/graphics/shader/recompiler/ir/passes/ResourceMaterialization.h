@@ -66,6 +66,16 @@ void WriteBufferStrides(const BindingLayout& layout, std::span<const BufferResou
                         std::span<const DescriptorValue> descriptors,
                         std::span<uint32_t>              shader_data);
 
+// Whether `specialization` has the shape ApplyResourceSpecialization requires of a program whose
+// resources are `info`: one entry per buffer and at least one per image. A specialization
+// materialized from the program's own plan always fits; a stored one (the shader journal) may
+// come from another translator.
+[[nodiscard]] inline bool SpecializationFits(const ShaderInfo&             info,
+                                             const ResourceSpecialization& specialization) {
+	return info.buffers.size() == specialization.buffers.size() &&
+	       info.images.size() <= specialization.images.size();
+}
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

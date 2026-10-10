@@ -3292,6 +3292,17 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		};
 
+		// A replayed specialization comes from the journal, which records inputs whatever
+		// translator ran: one whose shape does not fit this source's plan (another translator's
+		// resource list) cannot be emitted, and no draw of this build would ask for it. The
+		// precompile counts the entry as skipped.
+		if (replay && !ShaderRecompiler::IR::SpecializationFits(source->resource_plan.info,
+		                                                       prep.specialization)) {
+			lock.lock();
+			FinishInFlight(record);
+			return nullptr;
+		}
+
 		// The permutation: stored, or emitted from a translation.
 		std::optional<Permutation>                         compiled;
 		std::optional<ProgramDiskCache::PermutationRecord> reloaded; // from_disk
