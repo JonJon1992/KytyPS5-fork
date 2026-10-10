@@ -1,4 +1,6 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/rt/astroBvh.h"
+#include "graphics/shader/recompiler/AstroNativeBinding.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
@@ -1881,6 +1883,8 @@ struct TestCase {
   u32 bvh_capture_pc_filter = 0;
   bool bvh_capture_enabled = true;
   std::function<void(std::span<const u32>)> check_bvh_capture;
+  std::function<void(std::span<const u32>)> check_bvh_scenes;
+  std::vector<u32> astro_native_binding;
   std::function<void(const ShaderTrapRecord&)> check_shader_trap;
 };
 
@@ -26796,6 +26800,17 @@ public:
       cmd.fillBuffer(m_bda_pagetable_buffer.buffer, 0,
                      m_bda_pagetable_buffer.size, 0);
       cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      if (!test.astro_native_binding.empty()) {
+        Require(test.name,"native binding size",test.astro_native_binding.size()==512,
+                "invalid native Astro binding");
+        vk::MemoryBarrier order{};
+        order.srcAccessMask=order.dstAccessMask=vk::AccessFlagBits::eTransferWrite;
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,vk::PipelineStageFlagBits::eTransfer,
+                            {},1,&order,0,nullptr,0,nullptr);
+        cmd.updateBuffer(m_fault_buffer.buffer,
+          BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE+ShaderRecompiler::BvhCapture::Bytes,
+          test.astro_native_binding.size()*4,test.astro_native_binding.data());
+      }
       if (test.bvh_capture_capacity != 0) {
         namespace Capture = ShaderRecompiler::BvhCapture;
         Require(test.name, "capture allocation",
@@ -26822,6 +26837,10 @@ public:
         cmd.updateBuffer(m_fault_buffer.buffer,
                          BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::PcFilter * 4,
                          sizeof(u32), &test.bvh_capture_pc_filter);
+        const u32 scenes = test.check_bvh_scenes ? 1u : 0u;
+        cmd.updateBuffer(m_fault_buffer.buffer,
+                         BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::SceneEnabled * 4,
+                         sizeof(u32), &scenes);
         cmd.fillBuffer(m_fault_buffer.buffer, BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE +
                          (Capture::HeaderWords + test.bvh_capture_capacity * Capture::RecordWords) * 4,
                          Capture::RecordWords * 4, 0xc5a17e5u);
@@ -26992,7 +27011,7 @@ public:
     if (test.check_bvh_capture) {
       namespace Capture = ShaderRecompiler::BvhCapture;
       const auto bytes = (Capture::HeaderWords + (test.bvh_capture_capacity + 1) * Capture::RecordWords) * 4;
-      bvh_readback = CreateHostBuffer(test.name, bytes,
+      bvh_readback = CreateHostBuffer(test.name, bytes + (test.check_bvh_scenes ? Capture::SceneBytes : 0),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
       vk::BufferMemoryBarrier2 barrier{};
       barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
@@ -27009,12 +27028,20 @@ public:
       cmd.pipelineBarrier2(dep);
       cmd.copyBuffer(m_fault_buffer.buffer, bvh_readback.buffer,
                       vk::BufferCopy{barrier.offset, 0, bytes});
+      if (test.check_bvh_scenes) {
+        barrier.offset = BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + uint64_t(Capture::SceneOffset) * 4;
+        barrier.size = Capture::SceneBytes;
+        cmd.pipelineBarrier2(dep);
+        cmd.copyBuffer(m_fault_buffer.buffer, bvh_readback.buffer,
+                        vk::BufferCopy{barrier.offset, bytes, Capture::SceneBytes});
+      }
       barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
       barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
       barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
       barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
       barrier.buffer = bvh_readback.buffer;
       barrier.offset = 0;
+      barrier.size = bvh_readback.size;
       cmd.pipelineBarrier2(dep);
     }
     Buffer trap_readback;
@@ -27054,11 +27081,14 @@ public:
     }
     if (test.check_bvh_capture) {
       auto capture = ReadBuffer(test.name, bvh_readback, bvh_readback.size / 4);
+      const auto main_words = ShaderRecompiler::BvhCapture::HeaderWords +
+          (test.bvh_capture_capacity + 1) * ShaderRecompiler::BvhCapture::RecordWords;
       Require(test.name, "capture bounds", std::ranges::all_of(
-                  std::span<const u32>(capture).last(ShaderRecompiler::BvhCapture::RecordWords),
+                  std::span<const u32>(capture).first(main_words).last(ShaderRecompiler::BvhCapture::RecordWords),
                   [](u32 word) { return word == 0xc5a17e5u; }),
               "capture wrote past its capacity");
-      test.check_bvh_capture(capture);
+      test.check_bvh_capture(std::span<const u32>(capture).first(main_words));
+      if (test.check_bvh_scenes) test.check_bvh_scenes(std::span<const u32>(capture).subspan(main_words));
       DestroyBuffer(&bvh_readback);
     }
     if (check_bda_writes) {
@@ -31390,6 +31420,8 @@ private:
     // dropped-write count (BufferCache's fault buffer layout), read back after the dispatch.
     m_fault_buffer = CreateDeviceBuffer(
         shader_name,
+        ShaderRecompiler::GetCodegenOptions().astro_hardware_rt
+            ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE+ShaderRecompiler::BvhCapture::Bytes+512*4 :
         ShaderRecompiler::GetCodegenOptions().bvh_capture_shader != 0
             ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + ShaderRecompiler::BvhCapture::Bytes :
         ShaderRecompiler::BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
@@ -53882,6 +53914,7 @@ void CheckReadOnlyBufferBindingsGpu() {
 #include "ShaderBdaWritesTests.inc"
 #include "BvhCaptureTests.inc"
 #include "BvhCaptureReplayTests.inc"
+#include "AstroSceneReplayTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -55363,6 +55396,26 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-capture-reader-only") == 0) {
     BvhCaptureReplay::CheckReader();
     return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--astro-hook-replay") == 0) {
+    SetEnvironment("KYTY_HW_RT_BACKEND", "1");
+    VulkanHarness vulkan(false);
+    if (!vulkan.RuntimeContext().hardware_rt_enabled) return 77;
+    AstroSceneReplay::CheckHookGpu(vulkan,argv[2],argv[3]);
+    AstroSceneReplay::CheckHookGpu(vulkan,argv[2],argv[3],64);return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--astro-hook-only") == 0) {
+    SetEnvironment("KYTY_HW_RT_BACKEND", "1");
+    VulkanHarness vulkan(false);
+    if (!vulkan.RuntimeContext().hardware_rt_enabled) return 77;
+    AstroSceneReplay::CheckHookTranslation(vulkan);
+    AstroSceneReplay::CheckHookTranslation(vulkan,64);return 0;
+  }
+  if (argc == 5 && std::strcmp(argv[1], "--astro-scene-replay") == 0) {
+    SetEnvironment("KYTY_HW_RT_BACKEND", "1");
+    VulkanHarness vulkan(false);
+    if (!vulkan.RuntimeContext().hardware_rt_enabled) return 77;
+    return AstroSceneReplay::Run(vulkan, argv[2], argv[3], argv[4]);
   }
   if ((argc == 4 && std::strcmp(argv[1], "--bvh-capture-replay") == 0) ||
       (argc == 2 && std::strcmp(argv[1], "--bvh-capture-replay-fixture") == 0)) {

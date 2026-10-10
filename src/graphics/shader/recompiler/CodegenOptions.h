@@ -236,6 +236,8 @@ struct CodegenOptions {
 	// Diagnostic only; empty captures can retry up to 16 dispatches.
 	// Zero (default) emits no capture code and allocates no capture storage.
 	uint64_t bvh_capture_shader = 0;
+	// Experimental Astro BLAS replacement; also requires an RT-capable device.
+	bool astro_hardware_rt = false;
 	// Diagnostic only: capture an invalid indirect scalar read at selected PCs
 	// and leave through existing loop exits in barrier-free native-wave compute.
 	uint64_t scalar_read_probe_shader = 0;

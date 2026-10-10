@@ -672,3 +672,139 @@ sob `_Build/rt-integration-20261010/`.
 auditor continua separado da execução do Astro, que usa travessia por
 software. Ainda faltam snapshot coerente da árvore completa, instâncias
 e política de aceitação para substituí-la. O teste não mede desempenho.
+
+## BLAS completa e política do Astro — captura GPU de 13:52
+
+Em `astro-full-scene/bvh-20261010-135259-GAUmwo/`, sob
+`_Build/rt-integration-20261010/`, a captura de `0x520` salvou 64 registros
+residentes e 64 sidecars completos. Cada sidecar contém os 928 bytes da
+BLAS (incluindo a lista final) e os 160 bytes da instância, lidos pela GPU
+através da tabela de páginas no mesmo dispatch. A fixture atravessa páginas
+com backing não contíguo e rejeita explicitamente uma página ausente.
+
+A BLAS tem raiz 37 e 12 folhas na ordem:
+`72,64,74,73,80,83,65,66,88,67,81,75`. Os IDs são `0x40000000` até
+`0x4000000a`, e `0xc000000b` na última entrada. O bit de término do ID é
+preservado no resultado; o teste desse triângulo ocorre antes de sair da lista.
+
+SHA-256 do arquivo principal:
+`eeb919c512ab132bdfc7a2d9e63d6fee43b416776f125cfd76fa98aac6a214cd`.
+SHA-256 do sidecar:
+`d9c080b1f08ac896003eb17a13424c051328225d558d371a6c638c19891fe6b9`.
+
+O novo seletor `--astro-scene-replay <principal> <sidecar> <csv>` valida o
+pareamento (shader, tick, dimensões e contexto) antes de importar uma cena.
+Seu oráculo executa o opcode BVH de produção na GPU, incluindo a caixa raiz,
+e aplica a ordem da lista e as regras de face/extent do shader. A comparação
+com a AS nativa inteira na RX 9070 XT retornou 0: **64 raios, 25 acertos e 39
+raios sem acerto, zero divergências de acerto, nó, ID ou distância**.
+Tolerância relativa de distância `2e-5`; maior diferença absoluta observada
+`3,9e-6`. CSV: `astro-full-scene/full-blas-parity.csv`; log original:
+`/tmp/astro-full-blas-replay.log`. A validação foi repetida com a variável
+correta do harness, `KYTY_TEST_VULKAN_VALIDATION=full`: zero erros/avisos,
+retorno 0, log `/tmp/astro-full-blas-validation.log` e CSV
+`astro-full-scene/full-blas-parity-validated.csv`. A primeira execução usou
+`KYTY_VULKAN_VALIDATION`, que não ativa as camadas nesse harness.
+
+Isso valida a BLAS e a política para esses raios, ainda em replay offline.
+O shader ao vivo continua por software. O snapshot histórico só pode alimentar
+uma substituição futura se os bytes atuais forem novamente conferidos na GPU.
+Empates, bordas e cobertura de outras geometrias precisam de fallback explícito;
+nenhum ganho de FPS foi medido nesta etapa.
+
+## Substituição experimental no shader ao vivo
+
+O hook `AstroTrace` reconhece apenas o shader `7d6ab87e6c984bb7`, compute,
+PC `0x4a0`, wave32/wave64. O código conserva a TLAS do jogo e a transformação
+atual da instância; os raios chegam à AS nativa no espaço local da BLAS.
+A ligação é privada ao renderer, por endereço da AS, sem acrescentar bindings
+ao layout dos shaders do jogo. A cena permanece viva até a conclusão GPU.
+
+O caminho atual admite uma BLAS capturada de até 1024 bytes, uma caixa raiz e
+uma lista ordenada com até 64 folhas. Antes de usar o hardware, a GPU compara
+descritor, raiz e todos os bytes atuais com o snapshot. Geometria alterada,
+página ausente, outra BLAS, raio sem acerto, borda próxima ou regra não coberta
+mantêm a travessia original por software. A opção fica desligada por padrão;
+exige `KYTY_HW_RT_BACKEND=1`, `KYTY_HW_RT_ASTRO=1` e os dois arquivos
+`KYTY_HW_RT_ASTRO_NODES`/`KYTY_HW_RT_ASTRO_SCENES`.
+
+Os candidatos não opacos usam a aritmética de triângulo do opcode de produção
+para preservar a regra de face, o extent e os IDs do jogo. Candidatos nativos
+não são confirmados: um empate é resolvido pela última entrada da lista,
+incluindo o ID com bit de término. Lanes concluídas pelo hardware saem da
+travessia BLAS; as demais continuam por software, e o EXEC da instância é
+restaurado pelo shader original em `0x9c0`.
+
+`--astro-hook-replay <principal> <sidecar>` verifica os registros vivos de
+saída, a pilha e o EXEC com raios capturados, lista alterada, página ausente,
+cena indisponível e doze triângulos coincidentes. A primeira execução wave32
+passou sob validação `full` (zero erros/avisos) e `sync` (zero erros; um aviso
+de configuração por validação de shaders desligada nesse modo).
+
+A execução de gameplay `runs/20261010-142203` abriu sem patch e a imagem foi
+confirmada normal pelo usuário. O binário SHA-256
+`45005797aa1312ced1a68cc3055e149df1c5f16ffbf46593384b0d3031d3bbc8`
+vinculou as 12 folhas, mas reportou **zero raios nativos e zero fallbacks**.
+Isso não comprova execução do hook. A investigação do journal real encontrou
+wave64, enquanto o primeiro guard do hook admitia somente wave32. A fixture
+wave64 reproduziu `AstroTrace count=0, expected=1` antes da correção.
+A captura de tela do usuário às 14:27 mostra 3,5 FPS com diagnóstico/validação;
+esse resultado não é uma comparação de desempenho. A nova validação wave64
+e o teste ao vivo devem confirmar contadores positivos antes de afirmar RT
+por hardware no jogo. Ainda não há substituição geral de todas as BVHs/TLAS
+nem ganho de FPS comprovado.
+
+A correção passou em `--astro-hook-replay` para **wave32 e wave64**: 25
+acertos reais por modo, zero acertos nativos nos três casos de fallback e
+64 acertos com o último ID no empate. Validação `full`: zero erros/avisos;
+`sync`: zero erros e o mesmo aviso de configuração do harness. A suíte CTest
+pertinente passou **7/7** (captura GPU/reader/replay, conversão BVH, Astro,
+backend RT ativo e desligado). Logs:
+`/tmp/astro-wave64-green-full.log`, `/tmp/astro-wave64-green-sync.log`,
+`/tmp/astro-integration-final-ctest.log`; cópias em
+`_Build/rt-integration-20261010/astro-native-wave64-run/`.
+
+O build corrigido, SHA-256
+`9a4d164292def729dab20356ce60de5dcc33631ff930e58776110e69386e88bf`,
+foi reaberto sem patch em `runs/20261010-143051`. O usuário confirmou imagem
+normal na floresta e depois de caminhar pelo trecho. O journal registrou a
+compilação da pipeline compute do shader alvo em `t_ms=185157`; a cena nativa
+foi vinculada. A primeira leitura GPU retornou contadores zerados. A aceitação
+de gameplay nessa primeira leitura ainda dependia de contadores positivos e estabilidade; pré-compilar
+um shader e vincular a cena não comprovam o uso nativo dos raios.
+
+## Resultado do teste ao vivo com wave64
+
+Na mesma execução, leituras posteriores concluídas pela GPU reportaram:
+
+| Resultados nativos | Fallbacks por software |
+| ---: | ---: |
+| 10.402.461 | 237.533.458 |
+| 15.121.147 | 315.361.701 |
+| 19.880.685 | 393.759.997 |
+
+São contadores cumulativos de entradas no helper BLAS, **não raios únicos**
+nem cobertura percentual do RT inteiro do jogo. Um raio pode entrar no helper
+várias vezes; consultas nativas sem acerto também continuam por software.
+O crescimento de resultados usados pelo shader confirma execução nativa no
+gameplay, além da simples disponibilidade das extensões Vulkan.
+
+Às 14:37:08, a instância continuava ativa, mais de três minutos após a ativação
+da pipeline alvo. Não apareceram VUIDs, erros de validação ou perda do device
+nos dois logs da execução. Depois de caminhar pelo trecho, o usuário confirmou
+que a imagem continuava normal, sem novas manchas, partes pretas ou travamentos.
+Evidência: `astro-native-wave64-run/runtime-verification.json`, manifesto,
+logs e SHA-256 do executável lido diretamente de `/proc/137133/exe`.
+
+A regressão wave64 foi registrada no CTest como `astro_hardware_rt_hook`;
+a suíte final pertinente passou **8/8**. O replay do hook continua disponível
+para validação GPU dos registros de saída com os arquivos reais capturados.
+
+O protótipo está integrado e foi exercitado no Astro, mas ainda cobre somente
+a BLAS importada. **A maior parte das entradas continua por software**.
+Para RT geral ainda faltam importação coerente dinâmica de outras BLAS,
+árvores/listas maiores com ordem de empate dependente do raio, outros shaders
+e substituição da TLAS. Ganho de FPS permanece **não medido**; a sessão usa
+validação Vulkan e diagnóstico escalar, inclusive o modo de continuação.
+Não houve trap escalar registrado nesta execução. A opção continua desligada
+por padrão e esse build não deve ser tratado como benchmark de desempenho.

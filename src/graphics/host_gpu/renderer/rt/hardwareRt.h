@@ -7,6 +7,7 @@
 
 namespace Libs::Graphics {
 class RenderContext;
+class Buffer;
 namespace RT {
 
 // Enables the native backend only; it does not authorize replacing guest code.
@@ -32,6 +33,12 @@ struct Hit {
 };
 static_assert(sizeof(Ray) == 32 && sizeof(Hit) == 16);
 
+struct RayPolicy {
+	enum class Mode : uint32_t { AllTriangles, AstroFacing };
+	Mode mode = Mode::AllTriangles;
+	uint32_t instance_flags = 0; // Shader s19: bit 2 two-sided, bit 3 numerator sign.
+};
+
 // All calls and lease destruction belong to the renderer recording thread.
 // Leases must be released before RenderContext destruction. The scheduler also
 // retains every GPU-used resource until its submission has completed.
@@ -48,10 +55,16 @@ public:
 	// Requires coherent bytes as documented by BvhSnapshot. Never reads live guest backing.
 	// Invalid input retires the cache; existing leases remain valid for older submissions.
 	SceneLease Prepare(BvhSnapshot snapshot);
-	QueryLease Trace(const SceneLease& scene, std::span<const Ray> rays);
+	QueryLease Trace(const SceneLease& scene, std::span<const Ray> rays, RayPolicy policy = {});
 	// Nonblocking. Empty until the scheduler has retired the query's completion callback.
 	std::span<const Hit> Read(const QueryLease& query);
 	std::span<const Primitive> Primitives(const SceneLease& scene) const;
+	// Device address plus a scheduler lease for shader-side ray queries.
+	uint64_t SceneAddress(const SceneLease& scene);
+	// Experimental source files are checked and bound once. The shader must
+	// still compare every current guest byte before using this historical AS.
+	bool BindAstroCapture(Buffer& private_fault_buffer);
+	void ReportAstroDispatch(Buffer& private_fault_buffer);
 	void Clear();
 	struct Statistics { uint64_t builds = 0, reuses = 0, queries = 0, rejected = 0; };
 	Statistics Stats() const;

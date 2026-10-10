@@ -90,6 +90,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ShaderTrap:
+		case ValueOpcode::AstroTrace:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:

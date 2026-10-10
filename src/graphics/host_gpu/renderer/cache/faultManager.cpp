@@ -48,6 +48,8 @@ size_t DownloadAreaSize(const GraphicContext& graphics) {
 }
 
 uint64_t FaultBufferSize(bool bda_writes) {
+	if (ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)
+		return BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + ShaderRecompiler::BvhCapture::Bytes + 512*4;
 	if (ShaderRecompiler::GetCodegenOptions().bvh_capture_shader != 0)
 		return BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + ShaderRecompiler::BvhCapture::Bytes;
 	return bda_writes ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
@@ -185,7 +187,8 @@ bool FaultManager::BeginBvhCapture(uint64_t shader_hash, uint32_t x, uint32_t y,
 	m_bvh_capture_shaders[m_bvh_capture_attempts++] = shader_hash;
 	const auto capacity = CaptureValue("KYTY_BVH_CAPTURE_RECORDS", 4096, 1, MaxRecords);
 	const auto sample_mask = CaptureValue("KYTY_BVH_CAPTURE_SAMPLE_MASK", 4095, 0, MaxRecords - 1);
-	const auto download_bytes = uint64_t(HeaderWords + capacity * RecordWords) * 4;
+	const bool scenes = shader_hash == AstroShader && CaptureValue("KYTY_BVH_CAPTURE_SCENE",0,0,1) == 1;
+	const auto download_bytes = uint64_t(HeaderWords + capacity * RecordWords) * 4 + (scenes ? SceneBytes : 0);
 	m_bvh_capture_download = std::make_shared<Buffer>(
 	    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, download_bytes);
 	SetVulkanObjectNameF(m_graphics.device, m_bvh_capture_download->Handle(), "BVH Capture Readback");
@@ -197,6 +200,7 @@ bool FaultManager::BeginBvhCapture(uint64_t shader_hash, uint32_t x, uint32_t y,
 	header[Capacity] = capacity;
 	header[SampleMask] = sample_mask;
 	header[PcFilter] = CaptureValue("KYTY_BVH_CAPTURE_PC", 0, 0, UINT32_MAX);
+	header[SceneEnabled] = scenes;
 	header[ShaderLow] = static_cast<uint32_t>(shader_hash);
 	header[ShaderHigh] = static_cast<uint32_t>(shader_hash >> 32);
 	header[GroupsX] = x; header[GroupsY] = y; header[GroupsZ] = z; header[Mode] = mode;
@@ -238,9 +242,15 @@ bool FaultManager::BeginBvhCapture(uint64_t shader_hash, uint32_t x, uint32_t y,
 void FaultManager::EndBvhCapture(uint64_t shader_hash) {
 	using namespace ShaderRecompiler::BvhCapture;
 	EXIT_IF(!m_bvh_capture_download);
+	const auto capacity = CaptureValue("KYTY_BVH_CAPTURE_RECORDS",4096,1,MaxRecords);
+	const uint64_t main_bytes = uint64_t(HeaderWords + capacity * RecordWords) * 4;
+	const bool scenes = m_bvh_capture_download->Size() > main_bytes;
 	auto& command = m_scheduler.Current();
 	m_bvh_capture_download->CopyFrom(command, m_fault_buffer,
-	    BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE, 0, m_bvh_capture_download->Size(),
+	    BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE, 0, main_bytes,
+	    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+	if (scenes) m_bvh_capture_download->CopyFrom(command,m_fault_buffer,
+	    BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + uint64_t(SceneOffset)*4,main_bytes,SceneBytes,
 	    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
 	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eTransfer,
 	    vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
@@ -252,11 +262,10 @@ void FaultManager::EndBvhCapture(uint64_t shader_hash) {
 	const auto* folder = std::getenv("KYTY_BVH_CAPTURE_DIR");
 	const std::filesystem::path directory = folder && folder[0] ? folder : "_RTCapture";
 	m_scheduler.DeferOperation([download = std::move(m_bvh_capture_download),
-	                           outcome = m_bvh_capture_outcome, shader_hash, tick, directory] {
+	                           outcome = m_bvh_capture_outcome, shader_hash, tick, directory,capacity,main_bytes,scenes] {
 		download->Invalidate(0, download->Size());
 		std::array<uint32_t, HeaderWords> header{};
 		std::memcpy(header.data(), download->Mapped().data(), sizeof(header));
-		const auto capacity = static_cast<uint32_t>((download->Size() - HeaderWords * 4) / (RecordWords * 4));
 		const auto count = std::min(header[Count], capacity);
 		outcome->store(count == 0 ? 2u : 1u, std::memory_order_release);
 		std::error_code error;
@@ -271,6 +280,17 @@ void FaultManager::EndBvhCapture(uint64_t shader_hash) {
 		}
 		std::fprintf(stderr, "BVH capture saved: %s records=%u%s\n", path.string().c_str(), count,
 		             count == capacity ? " (capacity reached; partial dispatch)" : "");
+		if (scenes) {
+			header[FileMagic] = 0x43535642; // "BVSC", coherent BLAS/instance sidecar.
+			header[FileVersion] = 1;header[Stride] = SceneWords;
+			header[Count] = std::min(count,MaxScenes);header[Capacity] = MaxScenes;
+			const auto scene_path = directory / ("astro-scenes-" + std::to_string(shader_hash) + "-" + std::to_string(tick) + ".bin");
+			std::ofstream scene_file(scene_path,std::ios::binary);
+			scene_file.write(reinterpret_cast<const char*>(header.data()),sizeof(header));
+			scene_file.write(reinterpret_cast<const char*>(download->Mapped().data()+main_bytes),uint64_t(header[Count])*SceneWords*4);
+			std::fprintf(stderr,"Astro scene capture %s: %s slots=%u\n",scene_file?"saved":"failed",
+			             scene_path.string().c_str(),header[Count]);
+		}
 	});
 }
 

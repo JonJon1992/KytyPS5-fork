@@ -1081,6 +1081,13 @@ add_executable(guest_bvh_conversion_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(guest_bvh_conversion_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(astro_bvh_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AstroBvhTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/rt/astroBvh.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/rt/guestBvh.cpp"
+)
+target_include_directories(astro_bvh_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
@@ -1367,10 +1374,14 @@ if(BUILD_TESTING)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME guest_bvh_conversion COMMAND $<TARGET_FILE:guest_bvh_conversion_tests>)
+	add_test(NAME astro_bvh COMMAND $<TARGET_FILE:astro_bvh_tests>)
 	add_test(NAME hardware_rt_backend_gpu
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hardware-rt-only)
 	add_test(NAME hardware_rt_backend_off
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hardware-rt-disabled-only)
+	add_test(NAME astro_hardware_rt_hook
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --astro-hook-only)
+	set_tests_properties(astro_hardware_rt_hook PROPERTIES LABELS "gpu;hardware-rt" SKIP_RETURN_CODE 77)
 	set_tests_properties(hardware_rt_backend_gpu hardware_rt_backend_off PROPERTIES LABELS "gpu;hardware-rt")
 	set_tests_properties(hardware_rt_backend_gpu PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)

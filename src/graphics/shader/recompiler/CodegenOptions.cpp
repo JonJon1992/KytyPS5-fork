@@ -112,6 +112,7 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.function_lds_compact = EnvFlag("KYTY_FUNCTION_LDS_COMPACT", options.function_lds_compact);
+	options.astro_hardware_rt = EnvFlag("KYTY_HW_RT_ASTRO", false) && EnvFlag("KYTY_HW_RT_BACKEND", false);
 	if (const auto* hash = std::getenv("KYTY_BVH_CAPTURE_SHADER"); hash != nullptr) {
 		if (std::strcmp(hash, "all") == 0) options.bvh_capture_shader = UINT64_MAX;
 		else {

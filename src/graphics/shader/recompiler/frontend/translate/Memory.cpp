@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
@@ -1176,8 +1177,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			std::array<IR::Value,4> context {IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u)};
+			if (program.shader_hash == BvhCapture::AstroShader && inst.pc == 0x520 &&
+			    BvhCaptureApplies(program.shader_hash))
+				context = {ReadScalarCode(46),ReadScalarCode(47),ReadScalarCode(35),ReadScalarCode(19)};
+			const auto capture_context = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+			    {context[0],context[1],context[2],context[3]});
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()}, inst.pc);
+			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec(), capture_context}, inst.pc);
 			for (uint32_t component = 0; component < 4; ++component) {
 				WriteOperand(OffsetOperand(inst.dst, component),
 				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));

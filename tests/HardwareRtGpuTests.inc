@@ -63,6 +63,25 @@ void CheckHardwareRtBackend(bool enabled) {
   Require(name, "metadata reuse", backend.Stats().builds == 2, "flags rebuilt geometry");
   // Both old and new AS remain live through several queries in the same recording.
   auto c = backend.Trace(first, rays);
+  // A nearest-hit-only query is wrong when the game's face rule rejects that
+  // hit. The farther, oppositely wound triangle must remain a candidate.
+  auto facing = fixture(2);
+  auto fword = [&](size_t index, float value) {
+    u32 bits=std::bit_cast<u32>(value);
+    std::memcpy(facing.bytes.data()+index*4,&bits,4);
+  };
+  const RT::Vertex farther[3] {{0,0,4},{0,1,4},{1,0,4}};
+  constexpr unsigned far_map[3] {1,3,2};
+  for(unsigned j=0;j<3;j++) {
+    const auto offset=3*16+far_map[j]*3;
+    fword(offset,farther[j].x);fword(offset+1,farther[j].y);fword(offset+2,farther[j].z);
+  }
+  auto faces=backend.Prepare(facing);
+  std::array<RT::Ray,2> face_rays{{{{.25f,.25f,0},0,{0,0,1},10},
+                                 {{.25f,.25f,6},0,{0,0,-1},10}}};
+  auto rejected_near=backend.Trace(faces,face_rays,{RT::RayPolicy::Mode::AstroFacing,0});
+  auto accepted_near=backend.Trace(faces,face_rays,{RT::RayPolicy::Mode::AstroFacing,8});
+  auto two_sided=backend.Trace(faces,face_rays,{RT::RayPolicy::Mode::AstroFacing,4});
   backend.Trace(metadata, rays).reset(); // Caller releases early; completion still owns it.
   backend.Clear();
   scheduler.Finish();
@@ -78,6 +97,15 @@ void CheckHardwareRtBackend(bool enabled) {
     }
   };
   check(a, 2); check(b, 3); check(c, 2);
+  for(unsigned i=0;i<2;i++) {
+    const auto farther_hit=backend.Read(rejected_near)[i];
+    Require(name,"rejected nearest candidate",farther_hit.primitive==(i==0?1u:0u) &&
+            std::abs(farther_hit.t-4.f)<1e-5f,"face rejection hid the farther valid hit");
+    Require(name,"accepted facing",backend.Read(accepted_near)[i].primitive==(i==0?0u:1u) &&
+            std::abs(backend.Read(accepted_near)[i].t-2.f)<1e-5f,"wrong numerator-sign face selection");
+    Require(name,"two sided",std::abs(backend.Read(two_sided)[i].t-2.f)<1e-5f,
+            "two-sided rule rejected a face");
+  }
   for (unsigned i = 0; i < 4; ++i)
     Require(name, "guest remapping", backend.Primitives(first)[i].node == (((2+i)<<3)|i), "lost guest pointer");
   auto invalid = rays;
@@ -87,7 +115,7 @@ void CheckHardwareRtBackend(bool enabled) {
   Require(name, "unsupported fallback", !backend.Prepare(bad), "instance accepted as triangle subtree");
   Require(name, "existing lease after rejection", bool(backend.Trace(first, rays)), "old valid lease invalidated");
   scheduler.Finish();
-  Require(name, "new build after clear", bool(backend.Prepare(fixture(2))) && backend.Stats().builds == 3,
+  Require(name, "new build after clear", bool(backend.Prepare(fixture(2))) && backend.Stats().builds == 4,
           "rejected snapshot reused stale entry");
   scheduler.Finish();
   backend.Clear();

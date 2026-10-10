@@ -19,6 +19,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rt/hardwareRt.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -482,6 +484,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	PreparedBindings* descriptor_stage = &bindings;
+	if (program.shader_hash == ShaderRecompiler::BvhCapture::AstroShader &&
+	    ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)
+		m_context.GetHardwareRt().BindAstroCapture(*m_context.GetBufferCache().GetFaultBuffer());
 	const bool bvh_capture = program.info.uses_bvh && m_context.GetBufferCache().BeginBvhCapture(
 	    program.shader_hash, thread_group_x, thread_group_y, thread_group_z, mode);
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
@@ -515,6 +520,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (bvh_capture) m_context.GetBufferCache().EndBvhCapture(program.shader_hash);
+	if (program.shader_hash == ShaderRecompiler::BvhCapture::AstroShader &&
+	    ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)
+		m_context.GetHardwareRt().ReportAstroDispatch(*m_context.GetBufferCache().GetFaultBuffer());
 	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
 	// it lets consumers skip reading the range back while nothing else writes it. Resolved once,
 	// from the guest dispatch dimensions, for the record and the profiler message below.
@@ -645,6 +653,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
+	if (program.shader_hash == ShaderRecompiler::BvhCapture::AstroShader &&
+	    ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)
+		m_context.GetHardwareRt().BindAstroCapture(*m_context.GetBufferCache().GetFaultBuffer());
 	const bool bvh_capture = program.info.uses_bvh && m_context.GetBufferCache().BeginBvhCapture(
 	    program.shader_hash, 0, 0, 0, mode, args_buffer, args_offset);
 	buffer.BeginEmission();
@@ -690,6 +701,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	if (bvh_capture) m_context.GetBufferCache().EndBvhCapture(program.shader_hash);
+	if (program.shader_hash == ShaderRecompiler::BvhCapture::AstroShader &&
+	    ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)
+		m_context.GetHardwareRt().ReportAstroDispatch(*m_context.GetBufferCache().GetFaultBuffer());
 	ResetBindings();
 	if (deferred_ticket != 0) {
 		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);

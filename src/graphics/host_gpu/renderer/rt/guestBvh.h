@@ -9,6 +9,8 @@
 
 namespace Libs::Graphics::RT {
 
+enum class BvhFormat { DirectNodes, AstroLeafLists };
+
 // An immutable, coherent copy made AFTER all CPU/GPU writers have completed.
 // A raw guest pointer or a CPU copy of GPU-dirty backing is not a snapshot.
 struct BvhSnapshot {
@@ -16,6 +18,7 @@ struct BvhSnapshot {
 	uint32_t root = 0;
 	uint64_t address = 0;
 	std::vector<std::byte> bytes;
+	BvhFormat format = BvhFormat::DirectNodes;
 	bool operator==(const BvhSnapshot&) const = default;
 };
 struct Vertex {
@@ -25,6 +28,7 @@ struct Vertex {
 struct Primitive {
 	uint32_t node; // Full BVH32 pointer, including triangle kind, for hit remapping.
 	uint32_t flags;
+	uint32_t leaf_id = ~0u; // Astro list ID, including its signed terminator bit.
 	bool operator==(const Primitive&) const = default;
 };
 struct Geometry {

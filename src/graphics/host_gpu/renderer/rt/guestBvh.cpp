@@ -37,22 +37,65 @@ Conversion Convert(const BvhSnapshot& snapshot, size_t max_nodes) {
 		return Conversion {reason, {}, node};
 	};
 	const auto& d = snapshot.descriptor;
+	if (snapshot.format != BvhFormat::DirectNodes && snapshot.format != BvhFormat::AstroLeafLists)
+		return fail(Reject::Descriptor);
 	if ((d[3] >> 28) != 8 || (d[1] & 0x007fff00u) || (d[3] & 0x0efffc00u))
 		return fail(Reject::Descriptor);
 	if (snapshot.address >= Aperture || snapshot.bytes.size() > Aperture - snapshot.address)
 		return fail(Reject::SnapshotRange);
 	const uint64_t base = (uint64_t(d[0]) | (uint64_t(d[1] & 0xff) << 32)) << 8;
 	const uint64_t last = uint64_t(d[2]) | (uint64_t(d[3] & 0x3ff) << 32);
-	std::vector<uint32_t> pending {snapshot.root};
+	const bool lists = snapshot.format == BvhFormat::AstroLeafLists;
+	uint64_t geometry_bytes = 0, total_bytes = 0;
+	if (lists) {
+		if (base != snapshot.address || snapshot.bytes.size() < 96) return fail(Reject::Unmapped);
+		if (Word(snapshot, 0) != 0x5f525350 || Word(snapshot, 4) != 0x4c485642)
+			return fail(Reject::Descriptor);
+		const uint64_t blocks = Word(snapshot, 80) | (uint64_t(Word(snapshot, 84)) << 32);
+		const uint64_t records = Word(snapshot, 88) | (uint64_t(Word(snapshot, 92)) << 32);
+		geometry_bytes = Word(snapshot, 32) | (uint64_t(Word(snapshot, 36)) << 32);
+		total_bytes = Word(snapshot, 16) | (uint64_t(Word(snapshot, 20)) << 32);
+		if (!blocks || blocks != last + 1 || blocks > Aperture / 64 ||
+		    geometry_bytes != blocks * 64 || records > Aperture / 8 ||
+		    total_bytes != records * 8 || total_bytes < geometry_bytes)
+			return fail(Reject::Descriptor);
+		if (total_bytes > snapshot.bytes.size()) return fail(Reject::Unmapped);
+	}
+	struct Entry { uint32_t node; uint32_t leaf_id = ~0u; bool triangle = false; };
+	std::vector<Entry> pending {{snapshot.root}};
 	std::unordered_set<uint32_t> seen;
+	size_t work = 0;
 	while (!pending.empty()) {
-		const uint32_t node = pending.back();
+		const auto entry = pending.back();
+		const uint32_t node = entry.node;
 		pending.pop_back();
 		if (node == ~0u) continue;
-		if (seen.size() >= max_nodes) return fail(Reject::Budget, node);
-		if (!seen.insert(node).second) return fail(Reject::CycleOrSharedNode, node);
+		if (work++ >= max_nodes) return fail(Reject::Budget, node);
+		// Astro may reference the same triangle with different list IDs. Boxes
+		// and list heads still cannot be shared or cyclic in this supported subset.
+		if (!entry.triangle && !seen.insert(node).second) return fail(Reject::CycleOrSharedNode, node);
 		const uint32_t kind = node & 7;
 		if (kind > 5) return fail(Reject::UnsupportedNode, node);
+		if (lists && kind < 4 && !entry.triangle) {
+			// The shader's first node read uses pointer & ~4, ID uses
+			// (pointer & ~6)+4. Only aligned list pointers are proven here.
+			if (kind != 0) return fail(Reject::UnsupportedNode, node);
+			if (node < geometry_bytes || node >= total_bytes) return fail(Reject::NodeBounds, node);
+			std::vector<Entry> leaves;
+			for (uint64_t at = node;; at += 8) {
+				if (at > total_bytes || 8 > total_bytes - at) return fail(Reject::NodeBounds, node);
+				if (work++ >= max_nodes) return fail(Reject::Budget, node);
+				const auto pointer = Word(snapshot, size_t(at));
+				const auto id = Word(snapshot, size_t(at + 4));
+				if (leaves.empty() && (pointer & 7) == 7) break;
+				if ((pointer & 7) >= 4) return fail(Reject::UnsupportedNode, pointer);
+				leaves.push_back({pointer, id, true});
+				// The terminator itself is tested and its raw ID is a valid hit ID.
+				if (id & 0x80000000u) break;
+			}
+			for (auto it = leaves.rbegin(); it != leaves.rend(); ++it) pending.push_back(*it);
+			continue;
+		}
 		const uint64_t index = node >> 3;
 		const size_t length = kind == 5 ? 128 : 64;
 		if (index + (kind == 5 ? 1 : 0) > last) return fail(Reject::NodeBounds, node);
@@ -74,7 +117,7 @@ Conversion Convert(const BvhSnapshot& snapshot, size_t max_nodes) {
 					return fail(Reject::NonFinite, node);
 				result.geometry.vertices.push_back(position);
 			}
-			result.geometry.primitives.push_back({node, Word(snapshot, offset + 60)});
+			result.geometry.primitives.push_back({node, Word(snapshot, offset + 60), entry.leaf_id});
 		} else {
 			std::array<uint32_t, 5> topology {node};
 			for (unsigned child = 0; child < 4; ++child) {
@@ -95,7 +138,7 @@ Conversion Convert(const BvhSnapshot& snapshot, size_t max_nodes) {
 			result.geometry.topology.push_back(topology);
 			// Reverse insertion preserves the guest's child order in the flattened IDs.
 			for (unsigned i = 4; i > 0; --i)
-				if (topology[i] != ~0u) pending.push_back(topology[i]);
+				if (topology[i] != ~0u) pending.push_back({topology[i]});
 		}
 	}
 	if (result.geometry.primitives.empty()) return fail(Reject::Empty);
@@ -115,7 +158,8 @@ Prepared PreparationCache::Prepare(BvhSnapshot snapshot) {
 	}
 	auto change = Change::Rebuild;
 	if (m_geometry && snapshot.descriptor == m_snapshot.descriptor && snapshot.root == m_snapshot.root &&
-	    snapshot.address == m_snapshot.address && converted.geometry.topology == m_geometry->topology &&
+	    snapshot.address == m_snapshot.address && snapshot.format == m_snapshot.format &&
+	    converted.geometry.topology == m_geometry->topology &&
 	    converted.geometry.primitives.size() == m_geometry->primitives.size()) {
 		bool same_ids = true;
 		for (size_t i = 0; i < m_geometry->primitives.size(); ++i)

@@ -377,7 +377,73 @@ void CheckAllShadersRotation(VulkanHarness& vulkan) {
   std::puts("PASS BvhCaptureAllShaders: skip completed empty shaders and stop on records");
 }
 
+void CheckAstroScene(VulkanHarness& vulkan, bool missing) {
+  const auto saved=ShaderRecompiler::GetCodegenOptions();
+  auto options=saved;options.bvh_capture_shader=Capture::AstroShader;
+  ShaderRecompiler::SetCodegenOptions(options);
+  TestCase test;
+  test.name = missing ? "AstroSceneMissingPage" : "AstroSceneCrossPage";
+  test.shader_hash = Capture::AstroShader;
+  test.initial.resize(0x7000/4);
+  test.bvh_capture_capacity = 32;
+  constexpr u32 base=0x13f00, instance=0x20000;
+  std::array<u32,232> blas{};
+  for(u32 i=0;i<blas.size();++i)blas[i]=0xa1000000+i;
+  blas[0]=0x5f525350;blas[1]=0x4c485642;
+  blas[4]=928;blas[5]=0;blas[8]=768;blas[9]=0;
+  blas[20]=12;blas[21]=0;blas[22]=116;blas[23]=0;
+  constexpr std::array<float,15> vertices{-1,-1,2, 1,-1,2, 0,1,2, 2,1,2, 0,3,2};
+  for(u32 i=0;i<vertices.size();++i)blas[32+i]=std::bit_cast<u32>(vertices[i]);
+  blas[47]=0x04040404;
+  for(u32 i=0;i<blas.size();++i)test.initial[(i<64?0x4000/4:0x6000/4-64)+i]=blas[i];
+  auto inst=std::span(test.initial).subspan(0x5000/4,40);
+  inst[0]=0x104;inst[2]=base;inst[4]=inst[9]=inst[14]=0x3f800000;inst[38]=37;
+  test.expected=test.initial;
+  constexpr std::array<u32,4> output{0xc1000000,0xc0800000,0xbf800000,0xbf800000};
+  for(u32 i=0;i<32;++i)std::copy(output.begin(),output.end(),test.expected.begin()+i*4);
+  auto& code=test.code;
+  AppendSMovLiteral(&code,8,base>>8);AppendSMovLiteral(&code,9,0x80000000);
+  AppendSMovLiteral(&code,10,11);AppendSMovLiteral(&code,11,0x81000000);
+  AppendSMovLiteral(&code,46,instance);AppendSMovLiteral(&code,47,0);
+  AppendSMovLiteral(&code,35,0x80000049);AppendSMovLiteral(&code,19,4);
+  code.push_back(EncodeVop2(0x1a,2,InlineU32(2),0));
+  constexpr std::array<u32,11> ray{16,0x41200000,0,0,0,0,0,0x3f800000,
+                                  0x7f800000,0x7f800000,0x3f800000};
+  for(u32 i=0;i<ray.size();++i)AppendVMovLiteral(&code,4+i,ray[i]);
+  while(code.size()*4<0x520)code.push_back(EncodeSopp(0));
+  code.insert(code.end(),{EncodeMimg0(0xe6,15,0,false,0,true),EncodeMimg1(20,4,2)});
+  for(u32 i=0;i<4;++i)AppendStoreVgprAtLaneDwordOffset(&code,20+i,2,i);
+  AppendEnd(&code);
+  test.bda_mappings={{base,0x4000,256},{instance,0x5000,160}};
+  if(!missing)test.bda_mappings.push_back({0x14000,0x6000,672});
+  test.compute_info.wave_size=32;test.compute_info.threads_num[0]=32;
+  test.compute_info.threads_num[1]=test.compute_info.threads_num[2]=1;
+  test.compute_info.thread_ids_num=1;test.has_compute_info=true;
+  test.check_bvh_capture=[&](std::span<const u32> words) {
+    Require(test.name,"record count",words[Capture::Count]==32,"lost BVH records");
+  };
+  test.check_bvh_scenes=[&](std::span<const u32> words) {
+    for(u32 i=0;i<32;++i) {
+      auto scene=words.subspan(i*Capture::SceneWords,Capture::SceneWords);
+      Require(test.name,"coherent scene status",scene[Capture::SceneStatus]==
+              (missing?Capture::MissingScene:Capture::CompleteScene),"scene was not captured or incomplete scene accepted");
+      Require(test.name,"scene identity",scene[Capture::BlasLow]==base &&
+              scene[Capture::BlasBytes]==928 && scene[Capture::SceneInstanceLow]==instance &&
+              scene[Capture::SceneLeafId]==0x80000049 && scene[Capture::SceneFlags]==4,
+              "lost BLAS, instance or acceptance context");
+      if(!missing)Require(test.name,"complete noncontiguous bytes",
+              std::equal(blas.begin(),blas.end(),scene.begin()+Capture::BlasData) &&
+              std::equal(inst.begin(),inst.end(),scene.begin()+Capture::InstanceData),
+              "GPU scene copy did not follow each mapped page");
+    }
+  };
+  RunCase(&vulkan,test);
+  ShaderRecompiler::SetCodegenOptions(saved);
+}
+
 void Run(VulkanHarness& vulkan) {
+  CheckAstroScene(vulkan,false);
+  CheckAstroScene(vulkan,true);
   for (bool node64 : {false, true}) for (bool a16 : {false, true}) CheckFixture(vulkan, node64, a16);
   for (u32 wave : {32u, 64u}) for (bool xy : {false, true}) CheckInvocations(vulkan, wave, xy);
   CheckInvocations(vulkan, 64, true, true);

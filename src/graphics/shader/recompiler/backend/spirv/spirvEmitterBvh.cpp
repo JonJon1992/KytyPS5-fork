@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/BvhCapture.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/AstroNativeBinding.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -35,10 +36,13 @@ bool CaptureApplies(const EmitterState& s) {
 	return s.program.stage == ShaderType::Compute && BvhCaptureApplies(s.program.shader_hash);
 }
 
+#include "spirvEmitterAstroCapture.inc"
+
 // Records executed calls under guest EXEC, including rejected inputs. Node
 // bytes are loaded only after the original bounds/mapping guards succeeded.
 void CaptureNode(EmitterState& s, std::span<const uint32_t> args, uint32_t pc, uint32_t invocation,
-                 uint32_t first, uint32_t second, uint32_t full, uint32_t status, uint32_t result) {
+                 uint32_t first, uint32_t second, uint32_t full, uint32_t status, uint32_t result,
+                 uint32_t context) {
 	namespace C = BvhCapture;
 	const auto u = TypeU32(s), b = TypeBool(s);
 	const auto resident = Binary(s, spv::OpIEqual, b, status, ConstantU32(s, C::Resident));
@@ -121,6 +125,7 @@ void CaptureNode(EmitterState& s, std::span<const uint32_t> args, uint32_t pc, u
 					store(C::NodeWords, Select(s, u, resident,
 					    Select(s, u, full, ConstantU32(s, 32), ConstantU32(s, 16)), ConstantU32(s, 0)));
 					store(C::Status, status);
+					for (uint32_t i = 0; i < 4; ++i) store(C::InstanceLow + i, Extract(s,u,context,i));
 					for (uint32_t i = 0; i < 4; ++i) {
 						store(C::Descriptor + i, Extract(s, u, args[0], i));
 						store(C::Result + i, Extract(s, u, result, i));
@@ -139,6 +144,16 @@ void CaptureNode(EmitterState& s, std::span<const uint32_t> args, uint32_t pc, u
 						return ConstantU32(s, 0);
 					});
 					for (uint32_t i = 0; i < 3; ++i) store(C::Invocation + i, Extract(s, u, invocation, i));
+					if (s.program.shader_hash == C::AstroShader) {
+						const auto enabled = Binary(s,spv::OpIEqual,b,load(field(C::SceneEnabled),false),ConstantU32(s,1));
+						const auto selected = Binary(s,spv::OpLogicalAnd,b,enabled,
+						    Binary(s,spv::OpIEqual,b,pc,ConstantU32(s,0x520)));
+						const auto ready = Binary(s,spv::OpLogicalAnd,b,selected,resident);
+						(void)EmitValueOrDefaultIfCondition(s,ready,u,ConstantU32(s,0),[&] {
+							CaptureAstroScene(s,args[0],context,slot,pc);
+							return ConstantU32(s,0);
+						});
+					}
 					return ConstantU32(s, 0);
 				});
 				return ConstantU32(s, 0);
@@ -349,7 +364,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
 	const bool capture = CaptureApplies(s);
 	const auto signature = capture
-	    ? s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3, u, TypeU32Vector(s, 3))
+	    ? s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3, u, TypeU32Vector(s, 3), vec4)
 	    : s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
 	s.bvh_intersect_function = s.builder.AllocateId();
 	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
@@ -361,12 +376,14 @@ void DefineBvhIntersect(EmitterState& s) {
 		args[i] = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionParameter, types[i], args[i]);
 	}
-	uint32_t pc = 0, invocation = 0;
+	uint32_t pc = 0, invocation = 0, context = 0;
 	if (capture) {
 		pc = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionParameter, u, pc);
 		invocation = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionParameter, TypeU32Vector(s, 3), invocation);
+		context = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpFunctionParameter, vec4, context);
 	}
 	EmitLabel(s, s.builder.AllocateId());
 	const auto descriptor = args[0], node = args[1], extent = args[2];
@@ -463,11 +480,13 @@ void DefineBvhIntersect(EmitterState& s) {
 	if (capture) {
 		const auto value = Extract(s, vec4, result, 0);
 		CaptureNode(s, args, pc, invocation, Extract(s, wide, result, 1), Extract(s, wide, result, 2),
-		    full, Extract(s, u, result, 3), value);
+		    full, Extract(s, u, result, 3), value, context);
 		s.builder.AddFunction(spv::OpReturnValue, value);
 	} else s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
+
+#include "spirvEmitterAstroRt.inc"
 
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
@@ -509,7 +528,7 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 			    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse,
-			    ConstantU32(s, inst.Flags<uint32_t>()), Vector(s, TypeU32Vector(s, 3), ids));
+			    ConstantU32(s, inst.Flags<uint32_t>()), Vector(s, TypeU32Vector(s, 3), ids), ctx.Arg(inst,3));
 		}
 		else s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);

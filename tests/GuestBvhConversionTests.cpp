@@ -18,7 +18,50 @@ BvhSnapshot Fixture() {
   Word(s,4+c*6+a,std::bit_cast<uint32_t>(a<3?-4.f:4.f));
  return s;
 }
+void CheckAstroLists() {
+ auto s=Fixture();
+ s.format=BvhFormat::AstroLeafLists;
+ s.bytes.resize(384);
+ // A BLAS header, root FP32 box, triangle block and an eight-byte leaf list.
+ s.root=29; s.descriptor[2]=4;
+ Word(s,0,0x5f525350); Word(s,1,0x4c485642);
+ Word(s,4,384); Word(s,5,0); Word(s,8,320); Word(s,9,0);
+ Word(s,20,5); Word(s,21,0);
+ Word(s,22,48); Word(s,23,0);
+ for(unsigned i=0;i<32;i++) Word(s,48+i,0);
+ Word(s,48,352); for(unsigned c=1;c<4;c++)Word(s,48+c,~0u);
+ for(unsigned a=0;a<6;a++)Word(s,52+a,std::bit_cast<uint32_t>(a<3?-4.f:4.f));
+ Word(s,88,16); Word(s,89,71); Word(s,90,19); Word(s,91,0x80000049);
+ auto converted=Convert(s);
+ Check(bool(converted),"Astro box points to leaf list, not direct triangle");
+ Check(converted.geometry.primitives.size()==2,"Astro signed terminator is an intersected leaf");
+ Check(converted.geometry.primitives[0].node==16 && converted.geometry.primitives[0].leaf_id==71 &&
+       converted.geometry.primitives[1].node==19 && converted.geometry.primitives[1].leaf_id==0x80000049,
+       "Astro preserves node pointer and raw signed leaf ID");
+ auto cut=s;cut.bytes.resize(360);
+ Check(Convert(cut).reject==Reject::Unmapped,"Astro requires complete declared snapshot");
+ auto endless=s;Word(endless,91,73);Word(endless,92,16);Word(endless,93,74);
+ Word(endless,94,17);Word(endless,95,75);
+ Check(!Convert(endless),"Astro rejects list without signed terminator");
+ auto bad=s;Word(bad,0,0);
+ Check(Convert(bad).reject==Reject::Descriptor,"Astro header signature checked");
+ auto alias=s;Word(alias,90,16);
+ auto duplicate=Convert(alias);
+ Check(duplicate && duplicate.geometry.primitives.size()==2 &&
+       duplicate.geometry.primitives[0].leaf_id!=duplicate.geometry.primitives[1].leaf_id,
+       "Astro repeated triangle may carry distinct list IDs");
+ auto unsupported=s;Word(unsupported,48,353);
+ Check(Convert(unsupported).reject==Reject::UnsupportedNode,"unaligned list pointer falls back");
+ auto bad_format=s;bad_format.format=static_cast<BvhFormat>(99);
+ Check(Convert(bad_format).reject==Reject::Descriptor,"unknown layout cannot select direct conversion");
+ PreparationCache cache;
+ Check(cache.Prepare(s).change==Change::Rebuild,"Astro first preparation");
+ Word(s,89,72);
+ Check(cache.Prepare(s).change==Change::Metadata,"Astro list ID updates immutable remapping");
+ Check(Convert(s,2).reject==Reject::Budget,"Astro list entries consume traversal budget");
+}
 int main() {
+ CheckAstroLists();
  auto s=Fixture(); auto a=Convert(s);
  Check(bool(a),"box32 with four triangle kinds");
  Check(a.geometry.primitives.size()==4 && a.geometry.vertices.size()==12,"primitive count");

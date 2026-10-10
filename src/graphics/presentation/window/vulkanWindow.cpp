@@ -1341,9 +1341,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	hardware_rt.Enable(physical_device, rt_extensions, RT::BackendRequested());
 	create_info.pNext = hardware_rt.Chain(create_info.pNext);
 	graphics.hardware_rt_enabled = hardware_rt.enabled;
+	if (!hardware_rt.enabled) {
+		auto codegen = ShaderRecompiler::GetCodegenOptions();
+		codegen.astro_hardware_rt = false;
+		ShaderRecompiler::SetCodegenOptions(codegen);
+	}
 	graphics.hardware_rt_properties = hardware_rt.properties;
-	std::printf("Kyty hardware RT backend: %s; guest traversal remains software\n",
-	            hardware_rt.enabled ? "available (experimental)" : "off/unavailable");
+	std::printf("Kyty hardware RT backend: %s; %s\n",
+	            hardware_rt.enabled ? "available (experimental)" : "off/unavailable",
+	            ShaderRecompiler::GetCodegenOptions().astro_hardware_rt
+	                ? "bounded Astro replacement requested, unsupported rays use software"
+	                : "guest traversal remains software");
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(rt_extensions.size());
 	create_info.ppEnabledExtensionNames = rt_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;

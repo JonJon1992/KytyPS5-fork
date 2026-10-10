@@ -61,6 +61,7 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct SpirvRequirements {
 	bool bvh = false;
+	bool astro_rt = false;
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
@@ -136,6 +137,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bvh_intersect_function = 0;
+	uint32_t                                         astro_trace_function = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	std::array<uint32_t, 3>                          bda_scalar_load_functions {};
 	std::array<uint32_t, 3>                          bda_wide_load_functions {};
@@ -657,6 +659,7 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineBvhIntersect(EmitterState& state);
+void DefineAstroTrace(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.

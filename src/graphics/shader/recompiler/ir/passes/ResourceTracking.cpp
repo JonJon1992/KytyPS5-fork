@@ -1764,9 +1764,9 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::AstroTrace || op == ValueOpcode::ShaderTrap) {
 			m_info.uses_dma = true;
-			m_info.uses_bvh |= op == ValueOpcode::BvhIntersect;
+			m_info.uses_bvh |= op == ValueOpcode::BvhIntersect || op == ValueOpcode::AstroTrace;
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);

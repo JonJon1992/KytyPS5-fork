@@ -6,7 +6,7 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 struct Ray { vec3 origin; float minT; vec3 direction; float maxT; };
 layout(std430, set = 0, binding = 1) readonly buffer Rays { Ray rays[]; };
 layout(std430, set = 0, binding = 2) writeonly buffer Hits { vec4 hits[]; };
-layout(push_constant) uniform Params { uint count; } params;
+layout(push_constant) uniform Params { uint count; uint policy; uint instanceFlags; } params;
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
@@ -14,9 +14,19 @@ void main() {
     Ray ray = rays[id];
     // Inputs are checked on the host too. Keep invalid rays away from RayQuery.
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 255,
+    // Non-opaque traversal lets the application's shader reject a candidate
+    // without losing farther intersections. Opaque closest-hit cannot do this.
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, 255,
                           ray.origin, ray.minT, ray.direction, ray.maxT);
-    while (rayQueryProceedEXT(query)) {}
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        bool accept = true;
+        if (params.policy == 1 && (params.instanceFlags & 4u) == 0) {
+            uint numeratorSign = rayQueryGetIntersectionFrontFaceEXT(query, false) ? 0u : 1u;
+            accept = numeratorSign == ((params.instanceFlags >> 3) & 1u);
+        }
+        if (accept) rayQueryConfirmIntersectionEXT(query);
+    }
     vec4 result = vec4(0, 0, 0, uintBitsToFloat(0xffffffffu));
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
         vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);

@@ -1,4 +1,9 @@
 #include "graphics/host_gpu/renderer/rt/hardwareRt.h"
+#include "graphics/host_gpu/renderer/rt/astroBvh.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
+#include "graphics/shader/recompiler/AstroNativeBinding.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -146,6 +151,9 @@ struct HardwareBackend::Impl {
 	RenderContext& context;
 	PreparationCache preparation;
 	SceneLease cached;
+	SceneLease astro_scene;
+	bool astro_attempted = false;
+	uint64_t astro_dispatches = 0;
 	Statistics stats;
 	vk::DescriptorSetLayout descriptors = nullptr;
 	vk::PipelineLayout layout = nullptr;
@@ -170,7 +178,7 @@ struct HardwareBackend::Impl {
 		info.bindingCount = uint32_t(bindings.size());
 		info.pBindings = bindings.data();
 		RequireVulkanSuccess(device.createDescriptorSetLayout(&info, nullptr, &descriptors), "hardware RT descriptors");
-		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)};
+		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 3 * sizeof(uint32_t)};
 		vk::PipelineLayoutCreateInfo pipeline_layout {};
 		pipeline_layout.setLayoutCount = 1;
 		pipeline_layout.pSetLayouts = &descriptors;
@@ -262,11 +270,12 @@ HardwareBackend::SceneLease HardwareBackend::Prepare(BvhSnapshot snapshot) {
 	return scene;
 }
 
-HardwareBackend::QueryLease HardwareBackend::Trace(const SceneLease& scene, std::span<const Ray> rays) {
+HardwareBackend::QueryLease HardwareBackend::Trace(const SceneLease& scene, std::span<const Ray> rays, RayPolicy policy) {
 	auto& self = *m_impl;
 	auto& graphics = self.context.GetGraphics();
 	if (!Enabled() || !self.context.GetCommandScheduler().Active() || !scene || scene->owner != &self || rays.empty() || rays.size() > (1u << 20) ||
 	    (rays.size() + 63) / 64 > graphics.physical_device_properties.limits.maxComputeWorkGroupCount[0]) return {};
+	if (policy.mode != RayPolicy::Mode::AllTriangles && policy.mode != RayPolicy::Mode::AstroFacing) return {};
 	for (const auto& ray: rays) {
 		if (!std::isfinite(ray.min_t) || !std::isfinite(ray.max_t) || ray.min_t < 0 || ray.max_t < ray.min_t ||
 		    (ray.direction[0] == 0 && ray.direction[1] == 0 && ray.direction[2] == 0)) return {};
@@ -307,7 +316,8 @@ HardwareBackend::QueryLease HardwareBackend::Trace(const SceneLease& scene, std:
 	command.InvalidateDescriptors(vk::PipelineBindPoint::eCompute);
 	handle.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, self.layout, 0, uint32_t(writes.size()), writes.data());
 	const uint32_t count = uint32_t(rays.size());
-	handle.pushConstants(self.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count), &count);
+	const std::array<uint32_t, 3> params {count, uint32_t(policy.mode), policy.instance_flags & 12u};
+	handle.pushConstants(self.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), params.data());
 	handle.dispatch((count + 63) / 64, 1, 1);
 	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
 	                             vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead, BarrierOrigin::ShaderAccess);
@@ -327,5 +337,66 @@ std::span<const Hit> HardwareBackend::Read(const QueryLease& query) {
 std::span<const Primitive> HardwareBackend::Primitives(const SceneLease& scene) const {
 	if (!scene || scene->owner != m_impl.get()) return {};
 	return scene->geometry->primitives;
+}
+uint64_t HardwareBackend::SceneAddress(const SceneLease& scene) {
+	if(!Enabled() || !m_impl->context.GetCommandScheduler().Active() || !scene || scene->owner!=m_impl.get())return 0;
+	vk::AccelerationStructureDeviceAddressInfoKHR info{};info.accelerationStructure=scene->storage->tlas.handle;
+	m_impl->context.GetCommandScheduler().DeferOperation([scene]{});
+	return m_impl->context.GetGraphics().device.getAccelerationStructureAddressKHR(&info);
+}
+bool HardwareBackend::BindAstroCapture(Buffer& target) {
+	if(!Enabled() || !ShaderRecompiler::GetCodegenOptions().astro_hardware_rt)return false;
+	auto& self=*m_impl;
+	if(self.astro_scene)return SceneAddress(self.astro_scene)!=0;
+	if(self.astro_attempted)return false;
+	self.astro_attempted=true;
+	const auto* nodes=std::getenv("KYTY_HW_RT_ASTRO_NODES");
+	const auto* scenes=std::getenv("KYTY_HW_RT_ASTRO_SCENES");
+	if(!nodes || !scenes)return false;
+	auto captured=ReadAstroCapture(nodes,scenes);
+	if(!captured){std::puts("Astro hardware RT: source capture rejected; software fallback");return false;}
+	// Validate the supported topology before allocating a native AS.
+	if(!MakeAstroNativeBinding(captured->bvh,1))return false;
+	auto scene=Prepare(captured->bvh);
+	if(!scene)return false;
+	auto words=MakeAstroNativeBinding(captured->bvh,SceneAddress(scene));
+	constexpr auto offset=BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE+ShaderRecompiler::BvhCapture::Bytes;
+	if(!words || target.Size()<offset+sizeof(*words))return false;
+	auto& command=self.context.GetCommandScheduler().Current();command.EndRendering();
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllCommands,
+	    vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
+	    vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,BarrierOrigin::ShaderAccess);
+	command.Handle().updateBuffer(target.Handle(),offset,sizeof(*words),words->data());
+	target.MarkContentWritten();
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferWrite,
+	    vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderStorageRead|vk::AccessFlagBits2::eShaderStorageWrite,BarrierOrigin::ShaderAccess);
+	self.astro_scene=scene;
+	std::printf("Astro hardware RT: bound %zu primitives; current GPU bytes and unsupported rays require fallback\n",Primitives(scene).size());
+	return true;
+}
+void HardwareBackend::ReportAstroDispatch(Buffer& target) {
+	auto& self=*m_impl;
+	if(!self.astro_scene)return;
+	const auto dispatch=++self.astro_dispatches;
+	if(dispatch!=1 && dispatch%256!=0)return;
+	auto download=std::make_shared<Buffer>(self.context.GetGraphics(),self.context.GetCommandScheduler(),
+	    MemoryUsage::Download,0,vk::BufferUsageFlagBits::eTransferDst,8);
+	auto& command=self.context.GetCommandScheduler().Current();command.EndRendering();
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderStorageWrite,
+	    vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferRead,BarrierOrigin::ShaderAccess);
+	constexpr auto offset=BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE+ShaderRecompiler::BvhCapture::Bytes+
+	    ShaderRecompiler::AstroNativeBinding::UsedRays*4;
+	command.Handle().copyBuffer(target.Handle(),download->Handle(),vk::BufferCopy{offset,0,8});
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferWrite,
+	    vk::PipelineStageFlagBits2::eHost,vk::AccessFlagBits2::eHostRead,BarrierOrigin::ShaderAccess);
+	// Order this diagnostic read before the next shader's atomic counter writes.
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eCopy,vk::AccessFlagBits2::eTransferRead,
+	    vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderStorageWrite,BarrierOrigin::ShaderAccess);
+	self.context.GetCommandScheduler().DeferOperation([download] {
+		download->Invalidate(0,8);std::array<uint32_t,2> counts{};
+		std::memcpy(counts.data(),download->Mapped().data(),8);
+		std::printf("Astro hardware RT executed: native_rays=%u software_fallback=%u\n",counts[0],counts[1]);
+		std::fflush(stdout);
+	});
 }
 } // namespace Libs::Graphics::RT

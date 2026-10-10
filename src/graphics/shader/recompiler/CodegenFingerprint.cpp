@@ -104,6 +104,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.spirv_optimize_extended ? 1u : 0u);
 	b.U8(options.function_lds_compact ? 1u : 0u);
 	b.U64(options.bvh_capture_shader);
+	b.U8(options.astro_hardware_rt ? 1u : 0u);
 	b.U64(options.scalar_read_probe_shader);
 	b.U32(static_cast<uint32_t>(options.scalar_read_probe_pcs.size()));
 	for (const auto pc: options.scalar_read_probe_pcs) b.U32(pc);
