@@ -178,6 +178,11 @@ public:
 	// checked under one texture-cache lock. Each image then gets their access bookkeeping (the
 	// tick and the LRU touch), in key order. False changes nothing.
 	[[nodiscard]] bool TryRepeatKeys(TextureCache& cache, std::span<const RepeatKey> keys);
+	// Which TryRepeatKeys check `key` fails (KYTY_BINDLESS_TICK_REPEAT_VERIFY diagnosis): MemoEntry
+	// when its memo slot no longer holds the entry it was resolved through (overwritten, or its
+	// view or DCC state changed), Image when the image or its page's structure fails.
+	enum class RepeatCheck : uint8_t { Pass, MemoEntry, Image };
+	[[nodiscard]] RepeatCheck ClassifyRepeat(TextureCache& cache, const RepeatKey& key);
 	// TryRepeatKeys key by key, under one texture-cache lock: repeated[i] = 1 for every key that
 	// passes the same checks (those images get their access bookkeeping), 0 for the others, which
 	// the caller resolves. Returns the number repeated.

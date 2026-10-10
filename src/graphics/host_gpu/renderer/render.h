@@ -1235,6 +1235,11 @@ private:
 		uint64_t pending_waits = 0; // pending placeholders left until their retry time
 		uint64_t commit_textures = 0; // bindless textures the stage commits made readable
 		uint64_t commit_dups     = 0; // of those, repeats within one commit (skipped)
+		// KYTY_BINDLESS_TICK_REPEAT: keys and whole heaps whose memo checks were skipped, stamp
+		// sets cleared by a newer binding-state generation, and verify-mode results.
+		uint64_t tick_keys = 0, tick_heaps = 0, tick_resets = 0;
+		uint64_t tick_verify_checks = 0, tick_verify_mismatches = 0;
+		uint64_t tick_mismatch_memo = 0, tick_mismatch_image = 0; // ClassifyRepeat
 	};
 	BindlessLog m_bindless_log;
 	// PrepareBindlessHeaps scratch, kept across consumers: the heap's T# records (and the raw
@@ -1243,6 +1248,10 @@ private:
 	std::vector<uint32_t>                       m_bindless_words;
 	std::vector<std::array<uint32_t, 4>>        m_bindless_sampler_records;
 	std::vector<TextureBindingMemo::RepeatKey>  m_bindless_repeat_keys;
+	// KYTY_BINDLESS_TICK_REPEAT_VERIFY: the skipped keys a heap repeat checks anyway; and the
+	// resolved keys of the last whole-heap repeat.
+	std::vector<TextureBindingMemo::RepeatKey>  m_bindless_repeat_verified;
+	uint32_t                                    m_bindless_repeat_kept = 0;
 	// KYTY_BINDLESS_KEY_REPEAT scratch: the heap key of each repeat candidate, whether it passed,
 	// and per heap key whether it was repeated.
 	std::vector<uint32_t>                       m_bindless_repeat_index;

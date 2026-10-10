@@ -744,6 +744,7 @@ private:
 		for (auto page = pages.first; page < pages.last_exclusive; ++page) {
 			++m_page_versions[page];
 		}
+		Image::NoteBindingStateChange(Image::BindingChange::Structure);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCacheStructureChanges);
 	}
 	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {

@@ -1547,6 +1547,17 @@ static Live::Switch g_bindless_commit_dedup("KYTY_BINDLESS_COMMIT_DEDUP", Live::
 // yet) are resolved, instead of every key of the heap on every consumer.
 static Live::Switch g_bindless_key_repeat("KYTY_BINDLESS_KEY_REPEAT", Live::ParseDefaultOn);
 
+// KYTY_BINDLESS_TICK_REPEAT (default on; =0 off, live): a resolved key whose memo repeat checks
+// passed earlier in this scheduler tick, with no image binding-state change since (Image::
+// BindingStateGeneration: dirtiness, registration, rebind, residency, tracking, structure),
+// skips them: they would pass again, and its LRU touch is per tick already. Ghost of Yotei
+// revalidated about 140 thousand keys per frame, most of them more than once per tick.
+// KYTY_BINDLESS_TICK_REPEAT_VERIFY=1 (live): such keys are checked anyway, and a key that fails
+// is counted (and resolved as without the skip).
+static Live::Switch g_bindless_tick_repeat("KYTY_BINDLESS_TICK_REPEAT", Live::ParseDefaultOn);
+static Live::Switch g_bindless_tick_repeat_verify("KYTY_BINDLESS_TICK_REPEAT_VERIFY",
+                                                  Live::ParseDefaultOff);
+
 // KYTY_BINDLESS_PENDING_RETRY_MS (default 250, live; 0: every consumer, as before): a key whose T#
 // resolved to no usable texture (a pending placeholder: no registered image with data, or no view)
 // and whose T# has not changed is resolved again only once this long has passed since it settled.
@@ -1645,6 +1656,34 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     // resolving every key again would leave each slot, translation and reference as it is. The
     // images get the lookups' access bookkeeping (TryRepeatKeys) and this draw's binding, and the
     // stage commit the same textures. Anything else resolves the keys one by one.
+    // KYTY_BINDLESS_TICK_REPEAT: whether a key's memo repeat checks already passed in this tick at
+    // this binding-state generation, and the stamp after they pass (the heap's stamps belong to
+    // one generation: a newer one clears them first).
+    const auto tick_now          = m_context.GetCommandScheduler().CurrentTick();
+    const auto tick_repeat       = g_bindless_tick_repeat.On();
+    const auto tick_verify       = tick_repeat && g_bindless_tick_repeat_verify.On();
+    const auto tick_validated = [&](const BindlessTable::Heap& heap, uint32_t key,
+                                    uint64_t generation) {
+        return tick_repeat && heap.validated_generation == generation &&
+               heap.key_validated[key] == tick_now;
+    };
+    // KYTY_BINDLESS_TICK_REPEAT_VERIFY: why a skipped key failed its checks anyway.
+    const auto note_mismatch = [&](const TextureBindingMemo::RepeatKey& key) {
+        switch (m_texture_memo.ClassifyRepeat(m_context.GetTextureCache(), key)) {
+            case TextureBindingMemo::RepeatCheck::MemoEntry: m_bindless_log.tick_mismatch_memo++; break;
+            case TextureBindingMemo::RepeatCheck::Image: m_bindless_log.tick_mismatch_image++; break;
+            case TextureBindingMemo::RepeatCheck::Pass: break;
+        }
+    };
+    const auto stamp_validated = [&](BindlessTable::Heap& heap, uint32_t key,
+                                     uint64_t generation) {
+        if (heap.validated_generation != generation) {
+            std::ranges::fill(heap.key_validated, uint64_t {0});
+            heap.validated_generation = generation;
+            m_bindless_log.tick_resets++;
+        }
+        heap.key_validated[key] = tick_now;
+    };
     const auto repeat_heap = [&](BindlessTable::Heap& heap,
                                  std::span<const std::array<uint32_t, 8>> keys_records,
                                  uint32_t array) {
@@ -1653,8 +1692,15 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             !std::equal(keys_records.begin(), keys_records.end(), heap.descriptors.begin())) {
             return false;
         }
-        auto& keys = m_bindless_repeat_keys;
+        // Read before the checks: a change during them leaves the stamps of an older generation.
+        const auto generation = Image::BindingStateGeneration();
+        auto& keys     = m_bindless_repeat_keys;
+        auto& index    = m_bindless_repeat_index;
+        auto& verified = m_bindless_repeat_verified;
         keys.clear();
+        index.clear();
+        verified.clear();
+        uint32_t resolved = 0;
         for (size_t key = 0; key < keys_records.size(); ++key) {
             if (heap.settled[key] == 0) {
                 return false;
@@ -1665,16 +1711,43 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                 }
                 continue;
             }
+            resolved++;
             const auto& hint = heap.memo_hints[key];
             const auto  view = table.SlotView(array, heap.slots[key]);
             if (hint.tag == 0 || view == nullptr) {
                 return false;
             }
+            const auto key32 = static_cast<uint32_t>(key);
+            if (tick_validated(heap, key32, generation)) {
+                if (tick_verify) {
+                    verified.push_back({hint.hash, hint.tag, heap.images[key], view});
+                }
+                continue;
+            }
             keys.push_back({hint.hash, hint.tag, heap.images[key], view});
+            index.push_back(key32);
+        }
+        if (!verified.empty()) {
+            m_bindless_log.tick_verify_checks += verified.size();
+            if (!m_texture_memo.TryRepeatKeys(m_context.GetTextureCache(), verified)) {
+                m_bindless_log.tick_verify_mismatches++;
+                for (const auto& key: verified) {
+                    note_mismatch(key);
+                }
+                return false;
+            }
         }
         if (!m_texture_memo.TryRepeatKeys(m_context.GetTextureCache(), keys)) {
             return false;
         }
+        m_bindless_log.tick_keys += resolved - keys.size();
+        if (keys.empty() && resolved != 0) {
+            m_bindless_log.tick_heaps++; // no memo check at all for this consumer
+        }
+        for (const auto key: index) {
+            stamp_validated(heap, key, generation);
+        }
+        m_bindless_repeat_kept = resolved;
         for (size_t key = 0; key < keys_records.size(); ++key) {
             if (heap.slots[key] != 0) {
                 BindImage(heap.images[key], false);
@@ -1727,7 +1800,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         };
         auto& cache = m_context.GetTextureCache();
         if (keep_keys && repeat_heap(*heap, std::span<const std::array<uint32_t, 8>>(records), array)) {
-            const auto kept = m_bindless_repeat_keys.size(); // the resolved keys
+            const auto kept = m_bindless_repeat_kept; // the resolved keys
             Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
             Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
             Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapsRepeated);
@@ -1757,6 +1830,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             auto& passed     = m_bindless_repeat_passed;
             candidates.clear();
             index.clear();
+            const auto generation = Image::BindingStateGeneration();
             for (uint32_t key = 0; key < count64; ++key) {
                 if (heap->settled[key] == 0 || heap->slots[key] == 0 ||
                     heap->descriptors[key] != records[key]) {
@@ -1767,6 +1841,11 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                 if (hint.tag == 0 || view == nullptr) {
                     continue;
                 }
+                if (tick_validated(*heap, key, generation) && !tick_verify) {
+                    key_repeated[key] = 1;
+                    m_bindless_log.tick_keys++;
+                    continue;
+                }
                 candidates.push_back({hint.hash, hint.tag, heap->images[key], view});
                 index.push_back(key);
             }
@@ -1774,6 +1853,25 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             if (m_texture_memo.TryRepeatEachKey(cache, candidates, passed) != 0) {
                 for (size_t i = 0; i < index.size(); ++i) {
                     key_repeated[index[i]] = passed[i];
+                    if (passed[i] == 0) {
+                        if (tick_validated(*heap, index[i], generation)) {
+                            m_bindless_log.tick_verify_mismatches++;
+                            note_mismatch(candidates[i]);
+                        }
+                        continue;
+                    }
+                    if (tick_validated(*heap, index[i], generation)) {
+                        m_bindless_log.tick_verify_checks++;
+                    } else {
+                        stamp_validated(*heap, index[i], generation);
+                    }
+                }
+            } else if (tick_verify) {
+                for (size_t i = 0; i < index.size(); ++i) {
+                    if (tick_validated(*heap, index[i], generation)) {
+                        m_bindless_log.tick_verify_mismatches++;
+                        note_mismatch(candidates[i]);
+                    }
                 }
             }
         }
@@ -1800,6 +1898,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                 m_bindless_log.pending_waits++;
                 continue;
             }
+            heap->key_validated[key] = 0; // settled again below: checked again before a skip
             {
                 auto& full = m_bindless_log.full;
                 if (heap->settled[key] == 0) {
@@ -1963,10 +2062,11 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         m_bindless_log.time = now;
     } else if (now - m_bindless_log.time >= std::chrono::seconds(10)) {
         const auto& log   = m_bindless_log;
-        const auto  stats = table.TakePublishStats();
+        const auto  stats  = table.TakePublishStats();
+        const auto  counts = table.CountHeaps();
         Log::WriteToConsoleAndLog(fmt::format(
-            "Bindless heaps {:.0f}s: {} consumers, {} keys resolved, {} kept ({:.1f}%), {} heaps "
-            "repeated whole; translations published: {} moved, {} in place, {} unchanged, {} in "
+            "Bindless heaps {:.0f}s: {} consumers ({} heaps at {} places, {} evicted, {} sampler heaps), "
+            "{} keys resolved, {} kept ({:.1f}%), {} heaps repeated whole; translations published: {} moved, {} in place, {} unchanged, {} in "
             "place while in use (no free region), {} regions recycled; {} GPU drains "
             "(KYTY_BINDLESS_DRAIN); keys repeated one by one {}, fixed placeholders kept {} "
             "(KYTY_BINDLESS_KEY_REPEAT); resolved in full: unsettled {}, T# changed {}, pending "
@@ -1974,15 +2074,31 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             "placeholder {}, pending placeholder {} (no image {}, no view {}); pending placeholders "
             "waiting to retry {} (KYTY_BINDLESS_PENDING_RETRY_MS); image slots: {} new, {} "
             "recycled, {} released, {} not available; textures made readable by commits {}, "
-            "repeats skipped {} (KYTY_BINDLESS_COMMIT_DEDUP)\n",
-            std::chrono::duration<double>(now - log.time).count(), log.consumers, log.keys,
+            "repeats skipped {} (KYTY_BINDLESS_COMMIT_DEDUP); memo checks skipped {} keys, {} whole "
+            "heaps, {} generation resets, verify {} checks {} mismatches (memo entry {}, image {}), "
+            "generation bumps: {} (KYTY_BINDLESS_TICK_REPEAT)\n",
+            std::chrono::duration<double>(now - log.time).count(), log.consumers, counts.heaps,
+            counts.places, stats.heaps_evicted, counts.sampler_heaps, log.keys,
             log.kept, log.keys != 0 ? 100.0 * static_cast<double>(log.kept) / static_cast<double>(log.keys) : 0.0,
             log.repeated, stats.moved, stats.in_place, stats.unchanged, stats.full, stats.recycled,
             log.drains, log.key_repeats, log.fixed_skips, log.full.unsettled, log.full.changed,
             log.full.pending, log.full.no_hint, log.full.refused, log.full.same_slot,
             log.full.new_slot, log.full.fixed, log.full.placeholder, log.full.pending_image,
             log.full.pending_view, log.pending_waits, stats.slots_new, stats.slots_recycled,
-            stats.slots_released, stats.slot_failures, log.commit_textures, log.commit_dups));
+            stats.slots_released, stats.slot_failures, log.commit_textures, log.commit_dups,
+            log.tick_keys, log.tick_heaps, log.tick_resets, log.tick_verify_checks,
+            log.tick_verify_mismatches, log.tick_mismatch_memo, log.tick_mismatch_image,
+            [] {
+                std::string bumps;
+                const auto counts = Image::TakeBindingChanges();
+                for (size_t i = 0; i < counts.size(); i++) {
+                    if (counts[i] != 0) {
+                        bumps += fmt::format("{}{} {}", bumps.empty() ? "" : ", ",
+                                             Image::BindingChangeName(i), counts[i]);
+                    }
+                }
+                return bumps.empty() ? std::string("none") : bumps;
+            }()));
         m_bindless_log = {now};
     }
 }

@@ -753,6 +753,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, uint32_t resident_first
 		if (resident_prefix != 0) {
 			auto& image          = m_slot_images[id];
 			image.resident_first = resident_first;
+			Image::NoteBindingStateChange(Image::BindingChange::ResidentFirst);
 			image.live           = {info.data.address, resident_prefix};
 			if (m_resident_idle_frames != 0) {
 				m_partial_images.push_back(id);
@@ -858,6 +859,7 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 		UnregisterImage(id);
 	}
 	image.resident_first = new_first;
+	Image::NoteBindingStateChange(Image::BindingChange::ResidentFirst);
 	image.live = new_first != 0 ? GuestRange {image.info.data.address, prefix} : image.info.data;
 	if (image.backing.sparse) {
 		// KYTY_TEXTURE_SPARSE_RESIDENCY: memory behind the newly resident levels, bound (and waited
@@ -1101,6 +1103,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	                              -static_cast<int64_t>(accounted));
 	Common::DebugCounters::Adjust(Common::DebugCounters::Gauge::TextureImages, -1);
 	image.registered = false;
+	Image::NoteBindingStateChange(Image::BindingChange::Unregister);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1394,6 +1397,9 @@ uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_
 		chunks.untracked_count -= changed;
 	} else {
 		chunks.untracked_count += changed;
+		if (changed != 0) {
+			Image::NoteBindingStateChange(Image::BindingChange::ChunkUntrack);
+		}
 	}
 	return changed;
 }
@@ -1432,6 +1438,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		return;
 	}
+	Image::NoteBindingStateChange(Image::BindingChange::Untrack);
 	if (image.ChunkTracked()) {
 		(void)UpdateChunkWatchers<false>(image, 0, image.chunks.count);
 		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
@@ -1459,6 +1466,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	}
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
+	Image::NoteBindingStateChange(Image::BindingChange::Untrack);
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
@@ -1476,6 +1484,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
+	Image::NoteBindingStateChange(Image::BindingChange::Untrack);
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
@@ -1953,6 +1962,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			}
 			if (cached.binding.is_bound || cached.binding.is_target) {
 				cached.binding.needs_rebind = true;
+				Image::NoteBindingStateChange(Image::BindingChange::Rebind);
 			}
 			return other_id;
 		}
@@ -1972,6 +1982,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		Image::NoteBindingStateChange(Image::BindingChange::Rebind);
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
@@ -2170,6 +2181,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		Image::NoteBindingStateChange(Image::BindingChange::Rebind);
 	}
 	// The copy below supplies the source's bytes (and their ownership): the refresh must not move
 	// them into the buffer first.
@@ -4446,6 +4458,7 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 					continue;
 				}
 				other->alias_owner = false;
+				Image::NoteBindingStateChange(Image::BindingChange::AliasOwner);
 				if (!other->IsGpuModified()) {
 					continue;
 				}
@@ -4500,6 +4513,7 @@ void TextureCache::CommitGpuWrite(Image& image, const WriteClaim& claim) {
 				continue;
 			}
 			other->alias_owner = false;
+			Image::NoteBindingStateChange(Image::BindingChange::AliasOwner);
 			if (other->IsGpuModified()) {
 				other->ClearGpuModified();
 				InvalidateCleanImageProofs(other->live.address, other->live.size,

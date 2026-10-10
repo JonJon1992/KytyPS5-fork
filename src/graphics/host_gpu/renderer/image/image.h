@@ -8,6 +8,8 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <array>
+#include <atomic>
 #include <algorithm>
 #include <compare>
 #include <limits>
@@ -122,8 +124,59 @@ public:
 	// (BufferCache::InvalidateContentRevisions stamps unbounded buffer writers with it).
 	[[nodiscard]] static uint64_t NextContentSerial() noexcept;
 
+	// Bumped by every change that can make a texture binding memo repeat of an image fail
+	// (TextureBindingMemo::TryRepeatKeys): CPU or buffer dirtiness, released write tracking,
+	// unregistration, rebinding, residency and structure changes (TextureCache). A bindless heap
+	// validated at an older value is validated again (RenderExecutor::PrepareBindlessHeaps).
+	// Any thread: CPU writes reach images from guest threads' write faults.
+	[[nodiscard]] static uint64_t BindingStateGeneration() noexcept {
+		return s_binding_state_generation.load(std::memory_order_acquire);
+	}
+	// What bumped the generation (counted for the "Bindless heaps 10s" line).
+	enum class BindingChange : uint8_t {
+		CpuWrite,       // a CPU write over the image's bytes
+		PageWrite,      // a CPU write elsewhere on one of its pages (maybe dirty)
+		Residency,      // newly resident levels to refresh
+		ChunkWrite,     // a CPU write to a chunk-tracked image
+		MaybeDirty,     // marked maybe dirty
+		BufferModified, // written through the buffer cache
+		Structure,      // TextureCache::NoteStructureChange (page versions)
+		ResidentFirst,  // resident levels changed
+		Unregister,     // unregistered
+		ChunkUntrack,   // chunks released from write tracking
+		Untrack,        // write tracking released or shrunk
+		Rebind,         // needs_rebind
+		AliasOwner,     // lost alias ownership
+		BindlessSlot,   // a bindless slot forgot its view
+		BindlessUnregister,
+		Partner,        // a memo revalidation found an alias partner
+		Count
+	};
+	static void NoteBindingStateChange(BindingChange change) noexcept {
+		s_binding_state_generation.fetch_add(1, std::memory_order_acq_rel);
+		s_binding_changes[static_cast<size_t>(change)].fetch_add(1, std::memory_order_relaxed);
+	}
+	// The counts since the last call, by BindingChange.
+	[[nodiscard]] static std::array<uint64_t, static_cast<size_t>(BindingChange::Count)>
+	TakeBindingChanges() noexcept {
+		std::array<uint64_t, static_cast<size_t>(BindingChange::Count)> counts {};
+		for (size_t i = 0; i < counts.size(); i++) {
+			counts[i] = s_binding_changes[i].exchange(0, std::memory_order_relaxed);
+		}
+		return counts;
+	}
+	[[nodiscard]] static const char* BindingChangeName(size_t change) noexcept {
+		static constexpr const char* names[] = {
+		    "cpu write", "page write", "residency", "chunk write", "maybe dirty", "buffer modified",
+		    "structure", "resident levels", "unregister", "chunk untrack", "untrack", "rebind",
+		    "alias owner", "bindless slot", "bindless unregister", "partner"};
+		static_assert(std::size(names) == static_cast<size_t>(BindingChange::Count));
+		return change < std::size(names) ? names[change] : "?";
+	}
+
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {
+			NoteBindingStateChange(BindingChange::CpuWrite);
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
@@ -131,6 +184,7 @@ public:
 			m_partial_valid = false;
 			NoteDirtySpan(vaddr, size);
 		} else if (ImagePageRangesOverlap(live.address, live.size, vaddr, size)) {
+			NoteBindingStateChange(BindingChange::PageWrite);
 			m_maybe_cpu_dirty = true;
 			NoteDirtySpan(vaddr, size);
 		}
@@ -145,6 +199,7 @@ public:
 	[[nodiscard]] bool FullyResident() const noexcept { return resident_first == 0; }
 	// Every resident level must be refreshed from guest memory (newly resident levels).
 	void MarkResidencyDirty() noexcept {
+		NoteBindingStateChange(BindingChange::Residency);
 		m_cpu_dirty        = true;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
@@ -211,6 +266,7 @@ public:
 	}
 	// A CPU write to guest bytes of this chunk-tracked image: the image needs a refresh.
 	void NoteChunkWrite(uint64_t vaddr, uint64_t size) noexcept {
+		NoteBindingStateChange(BindingChange::ChunkWrite);
 		m_cpu_dirty        = true;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
@@ -273,6 +329,7 @@ public:
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
 		if (!m_cpu_dirty) {
+			NoteBindingStateChange(BindingChange::MaybeDirty);
 			m_maybe_cpu_dirty = true;
 		}
 	}
@@ -419,6 +476,7 @@ public:
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
+		NoteBindingStateChange(BindingChange::BufferModified);
 		m_buffer_modified = true;
 		m_partial_valid   = false;
 	}
@@ -517,6 +575,9 @@ private:
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
+	inline static std::atomic<uint64_t> s_binding_state_generation {1};
+	inline static std::array<std::atomic<uint64_t>, static_cast<size_t>(BindingChange::Count)>
+	    s_binding_changes {};
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;

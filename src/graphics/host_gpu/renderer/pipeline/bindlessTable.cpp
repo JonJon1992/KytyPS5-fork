@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -130,17 +131,16 @@ BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base
                                                                    uint32_t table_offset,
                                                                    uint32_t record_stride,
                                                                    uint32_t flags) {
-	for (auto& heap: m_sampler_heaps) {
-		if (heap.base == base && heap.table_offset == table_offset &&
-		    heap.record_stride == record_stride && heap.flags == flags) {
-			return &heap;
-		}
+	auto& indexed = m_sampler_heap_index[HeapPlace {base, table_offset, record_stride, flags}];
+	if (indexed != nullptr) {
+		return indexed;
 	}
 	auto& heap         = m_sampler_heaps.emplace_back();
 	heap.base          = base;
 	heap.table_offset  = table_offset;
 	heap.record_stride = record_stride;
 	heap.flags         = flags;
+	indexed            = &heap;
 	return &heap;
 }
 
@@ -412,6 +412,7 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	heap.layouts.resize(capacity, vk::ImageLayout::eUndefined);
 	heap.ranges.resize(capacity);
 	heap.pending_ms.resize(capacity, 0u);
+	heap.key_validated.resize(capacity, 0u);
 	// Kept keys keep their translation; new keys are pending.
 	heap.values.resize(capacity, ShaderRecompiler::IR::BindlessPending);
 	if (old_region != 0) {
@@ -521,35 +522,114 @@ bool BindlessTable::Publish(Heap& heap) {
 	return !in_use;
 }
 
+namespace {
+// KYTY_BINDLESS_HEAP_INDEX=0 (live, default on): find heaps by scanning every heap, as before the
+// place index (A/B only).
+Live::Switch g_heap_index("KYTY_BINDLESS_HEAP_INDEX", Live::ParseDefaultOn);
+// Idle heaps are swept every HeapSweepInterval new heaps: a heap no lookup returned for
+// HeapIdleTicks scheduler ticks (Ghost of Yotei submits about 1300 a second) is released. A full
+// translation buffer sweeps at once with HeapIdleTicksWhenFull.
+constexpr uint32_t HeapSweepInterval     = 1024;
+constexpr uint64_t HeapIdleTicks         = 2048;
+constexpr uint64_t HeapIdleTicksWhenFull = 64;
+} // namespace
+
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
     uint64_t base, uint32_t table_offset, uint32_t record_stride, uint32_t binding, uint32_t entries,
     const ShaderRecompiler::IR::ImageResource& resource) {
 	if (entries == 0) {
 		return nullptr;
 	}
-	for (auto& heap: m_heaps) {
-		// Interpretations sharing a typed array still need independent translations (for
-		// example, local cube-coordinate lowering and ordinary 2D-array sampling).
-		if (heap.base == base && heap.table_offset == table_offset &&
-		    heap.record_stride == record_stride && heap.binding == binding &&
-		    heap.resource == resource) {
-			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
-				return nullptr;
+	const auto       now = m_scheduler.CurrentTick();
+	const HeapPlace  place {base, table_offset, record_stride, binding};
+	const auto found_heap = [&](Heap& heap) -> Heap* {
+		if (entries > heap.entries && !AllocateRegion(heap, entries)) {
+			return nullptr;
+		}
+		heap.last_use_tick = now;
+		return &heap;
+	};
+	if (!g_heap_index.On()) {
+		for (auto& heap: m_heaps) {
+			if (heap.live && heap.base == base && heap.table_offset == table_offset &&
+			    heap.record_stride == record_stride && heap.binding == binding &&
+			    heap.resource == resource) {
+				return found_heap(heap);
 			}
-			return &heap;
+		}
+	} else if (const auto indexed = m_heap_index.find(place); indexed != m_heap_index.end()) {
+		for (auto* heap: indexed->second) {
+			// Interpretations sharing a typed array still need independent translations (for
+			// example, local cube-coordinate lowering and ordinary 2D-array sampling).
+			if (heap->resource == resource) {
+				return found_heap(*heap);
+			}
 		}
 	}
-	auto& heap        = m_heaps.emplace_back();
-	heap.base         = base;
-	heap.table_offset = table_offset;
-	heap.record_stride = record_stride;
-	heap.binding      = binding;
-	heap.resource     = resource;
-	if (!AllocateRegion(heap, entries)) {
-		m_heaps.pop_back();
+	// A new heap. Idle ones go first every so often, and at once when the translation buffer is
+	// full.
+	if (++m_heaps_since_sweep >= HeapSweepInterval) {
+		m_heaps_since_sweep = 0;
+		EvictIdleHeaps(HeapIdleTicks);
+	}
+	Heap* heap = nullptr;
+	if (!m_free_heaps.empty()) {
+		heap = m_free_heaps.back();
+		m_free_heaps.pop_back();
+	} else {
+		heap = &m_heaps.emplace_back();
+	}
+	*heap               = Heap {};
+	heap->base          = base;
+	heap->table_offset  = table_offset;
+	heap->record_stride = record_stride;
+	heap->binding       = binding;
+	heap->resource      = resource;
+	heap->last_use_tick = now;
+	bool allocated      = AllocateRegion(*heap, entries);
+	if (!allocated) {
+		EvictIdleHeaps(HeapIdleTicksWhenFull);
+		allocated = AllocateRegion(*heap, entries);
+	}
+	if (!allocated) {
+		heap->live = false;
+		m_free_heaps.push_back(heap);
 		return nullptr;
 	}
-	return &heap;
+	m_heap_index[place].push_back(heap);
+	return heap;
+}
+
+void BindlessTable::EvictIdleHeaps(uint64_t idle_ticks) {
+	const auto now = m_scheduler.CurrentTick();
+	for (auto& heap: m_heaps) {
+		if (heap.live && heap.last_use_tick + idle_ticks < now) {
+			EvictHeap(heap);
+		}
+	}
+}
+
+void BindlessTable::EvictHeap(Heap& heap) {
+	for (uint32_t key = 0; key < heap.entries; key++) {
+		if (heap.images[key]) {
+			(void)ReleaseKey(heap, key);
+		}
+	}
+	if (heap.region != 0) {
+		RetireRegion(heap.region, heap.entries);
+	}
+	if (const auto found = m_heap_index.find(
+	        HeapPlace {heap.base, heap.table_offset, heap.record_stride, heap.binding});
+	    found != m_heap_index.end()) {
+		std::erase(found->second, &heap);
+		if (found->second.empty()) {
+			m_heap_index.erase(found);
+		}
+	}
+	heap      = Heap {};
+	heap.live = false;
+	m_free_heaps.push_back(&heap);
+	m_publish_stats.heaps_evicted++;
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
@@ -634,6 +714,7 @@ void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 }
 
 bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
+	heap.key_validated[key] = 0;
 	const auto id      = heap.images[key];
 	bool       no_refs = false;
 	if (id) {
@@ -683,6 +764,7 @@ void BindlessTable::ForgetSlot(uint32_t binding, uint32_t slot) {
 	if (view == nullptr) {
 		return;
 	}
+	Image::NoteBindingStateChange(Image::BindingChange::BindlessSlot);
 	if (const auto found = m_view_slots.find(static_cast<VkImageView>(view));
 	    found != m_view_slots.end()) {
 		std::erase(found->second, std::pair {binding, slot});
@@ -705,6 +787,7 @@ void BindlessTable::AddSlotOwner(ImageId id, uint32_t binding, uint32_t slot) {
 }
 
 void BindlessTable::OnImageUnregistered(ImageId id) {
+    Image::NoteBindingStateChange(Image::BindingChange::BindlessUnregister);
     // Keep ownership even after the last key moved elsewhere. Otherwise a recycled raw view
     // handle could match a stale slot whose Vulkan descriptor still names the retired object.
     ReleaseImageSlots(id);

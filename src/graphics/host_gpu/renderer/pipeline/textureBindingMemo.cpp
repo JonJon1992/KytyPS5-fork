@@ -428,6 +428,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 			}
 			entry.has_partner  = HasPartner(cache, entry.page, entry.image, *image);
 			entry.page_version = version;
+			Image::NoteBindingStateChange(Image::BindingChange::Partner);
 			revalidated        = true;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRevalidated);
 			m_totals.revalidated++;
@@ -753,6 +754,26 @@ bool TextureBindingMemo::TryRepeatKeys(TextureCache& cache, std::span<const Repe
 	m_totals.hits += keys.size();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits, keys.size());
 	return true;
+}
+
+TextureBindingMemo::RepeatCheck TextureBindingMemo::ClassifyRepeat(TextureCache& cache,
+                                                                  const RepeatKey& key) {
+	if (!m_entries) {
+		return RepeatCheck::MemoEntry;
+	}
+	std::scoped_lock lock {cache.m_lock};
+	const auto       slot = SlotWithTag(key.hash, key.tag);
+	if (slot == UINT32_MAX) {
+		return RepeatCheck::MemoEntry;
+	}
+	const auto& entry = m_entries[slot];
+	if (key.tag == 0 || entry.tag != key.tag || entry.image != key.image || entry.dcc ||
+	    entry.null_image || entry.view == nullptr || entry.view != key.view) {
+		return RepeatCheck::MemoEntry;
+	}
+	const auto* image = HitImage(cache, entry);
+	return image == nullptr || !ViewImageReady(entry, *image) ? RepeatCheck::Image
+	                                                          : RepeatCheck::Pass;
 }
 
 size_t TextureBindingMemo::TryRepeatEachKey(TextureCache& cache, std::span<const RepeatKey> keys,

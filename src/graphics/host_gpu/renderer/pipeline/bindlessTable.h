@@ -105,6 +105,17 @@ public:
 		// Per key settled as a pending placeholder (no fixed answer from its T#): when, in
 		// steady-clock milliseconds (KYTY_BINDLESS_PENDING_RETRY_MS).
 		std::vector<uint64_t> pending_ms;
+		// KYTY_BINDLESS_TICK_REPEAT: per key, the scheduler tick in which its memo repeat checks
+		// (TextureBindingMemo::TryRepeatKeys / TryRepeatEachKey) last passed, at Image::
+		// BindingStateGeneration() == validated_generation (0: not in that generation). A later
+		// consumer in the same tick at the same generation skips them for that key: nothing that
+		// could fail them changed, and their LRU touches are per tick already.
+		std::vector<uint64_t> key_validated;
+		uint64_t              validated_generation = 0;
+		// The scheduler tick of the last FindOrCreateHeap that returned it; false once evicted
+		// (EvictIdleHeaps), when the object waits in the free list for another heap.
+		uint64_t last_use_tick = 0;
+		bool     live          = true;
 	};
 
 	// The heap for (base, table offset, view binding, complete resource interpretation), created
@@ -115,6 +126,13 @@ public:
 	                                     uint32_t record_stride, uint32_t binding, uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
+	// Heaps, their distinct places, and sampler heaps (the "Bindless heaps 10s" line).
+	struct HeapCounts {
+		size_t heaps = 0, places = 0, sampler_heaps = 0;
+	};
+	[[nodiscard]] HeapCounts CountHeaps() const noexcept {
+		return {m_heaps.size() - m_free_heaps.size(), m_heap_index.size(), m_sampler_heaps.size()};
+	}
 	// A slot no command that may still run reads: one released earlier (its image lost its last
 	// key, or was retired) once the commands recorded up to then completed, else a new one; 0
 	// when every slot is in use.
@@ -143,8 +161,15 @@ public:
 		uint64_t slots_new      = 0; // image slots never used before
 		uint64_t slot_failures  = 0; // AllocateSlot found no slot (the key samples the placeholder)
 		uint64_t slots_released = 0; // image slots released (no key left, or the image retired)
+		uint64_t heaps_evicted  = 0; // idle heaps whose region, keys and slots were released
 	};
 	[[nodiscard]] PublishStats TakePublishStats() noexcept { return std::exchange(m_publish_stats, {}); }
+	// Releases every heap no lookup returned for more than `idle_ticks` scheduler ticks: its keys
+	// (and the image slots only they held), its region (reusable once the GPU is done with it) and
+	// its place in the index. Guest descriptor tables move (Ghost of Yotei builds tens of
+	// thousands at new addresses), so heaps that are never released fill the translation buffer.
+	// FindOrCreateHeap calls it; public for tests.
+	void EvictIdleHeaps(uint64_t idle_ticks);
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
     void AddSlotOwner(ImageId id, uint32_t binding, uint32_t slot);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
@@ -198,6 +223,7 @@ public:
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
+	void EvictHeap(Heap& heap);
 	// A region of `size` entries no command that may still run reads (recycled or new), or 0.
 	[[nodiscard]] uint32_t TakeRegion(uint32_t size);
 	// The region may be reused once every command recorded so far has completed.
@@ -220,12 +246,37 @@ private:
 		return static_cast<uint64_t>(id.index) | (static_cast<uint64_t>(id.generation) << 32u);
 	}
 
+	// Where a heap's descriptor table is: its base, the offset and stride of its records, and its
+	// image array (or, for a sampler heap, its flags). FindOrCreateHeap and
+	// FindOrCreateSamplerHeap look heaps up by it; a scan of every heap per bindless binding was
+	// 26.5% of Thread_Gpu in Ghost of Yotei once its strided compute shaders ran.
+	struct HeapPlace {
+		uint64_t base          = 0;
+		uint32_t table_offset  = 0;
+		uint32_t record_stride = 0;
+		uint32_t binding       = 0;
+		bool     operator==(const HeapPlace&) const = default;
+	};
+	struct HeapPlaceHash {
+		size_t operator()(const HeapPlace& place) const noexcept {
+			uint64_t hash = place.base * 0x9e3779b97f4a7c15ull;
+			hash ^= (static_cast<uint64_t>(place.table_offset) << 32u | place.record_stride) +
+			        0x632be59bd9b4e019ull + (hash << 6u) + (hash >> 2u);
+			hash ^= place.binding + 0x94d049bb133111ebull + (hash << 6u) + (hash >> 2u);
+			return static_cast<size_t>(hash ^ (hash >> 29u));
+		}
+	};
+
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;
 	std::mutex m_retirement_mutex;
 	std::vector<ImageId> m_unregistered;
 	bool m_used = false;
 	std::deque<Heap>        m_heaps;
+	// The heaps at each place (interpretations of one table differ by ImageResource; usually one).
+	std::unordered_map<HeapPlace, std::vector<Heap*>, HeapPlaceHash> m_heap_index;
+	std::vector<Heap*> m_free_heaps;        // evicted heap objects, reused by FindOrCreateHeap
+	uint32_t           m_heaps_since_sweep = 0;
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> m_image_slots;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
@@ -254,6 +305,7 @@ private:
 	uint32_t                m_next_sampler_slot  = 1; // slot 0 is the default sampler
 	bool                    m_default_sampler_written = false;
 	std::deque<SamplerHeap> m_sampler_heaps;
+	std::unordered_map<HeapPlace, SamplerHeap*, HeapPlaceHash> m_sampler_heap_index; // binding: flags
 	std::unique_ptr<Buffer> m_translation;
 	std::unique_ptr<Buffer> m_feedback;
 	// The view each image slot holds, and the slots each view is in (placeholders excluded).
