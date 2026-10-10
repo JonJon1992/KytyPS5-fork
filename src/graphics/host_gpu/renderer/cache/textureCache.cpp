@@ -471,6 +471,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		     m_dcc_clear->Available() ? "any 8/16/32/64/128-bit color view format"
 		                              : "unavailable on this device");
 	}
+	if (const auto* tiny = std::getenv("KYTY_READBACK_TINY_IMAGES"); tiny != nullptr) {
+		m_readback_tiny_texels = std::strtoull(tiny, nullptr, 10);
+		if (m_readback_tiny_texels != 0) {
+			LOGF("Image readback: GPU-written tiled images of at most %" PRIu64
+			     " texels are written back to guest memory on submit (KYTY_READBACK_TINY_IMAGES)\n",
+			     m_readback_tiny_texels);
+		}
+	}
 	if (const auto* idle = std::getenv("KYTY_VRAM_IDLE_FRAMES"); idle != nullptr) {
 		m_idle_frames = std::strtoull(idle, nullptr, 10);
 		if (m_idle_frames != 0) {
@@ -1477,8 +1485,20 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
+// Linear images with --readback-linear-images. KYTY_READBACK_TINY_IMAGES=N adds tiled ones of at
+// most N texels: the CPU reads small render targets straight from memory after waiting for the GPU
+// (Unreal Engine 4's sky-light average brightness is a 1x1 RGBA16F target read back at level
+// load; without it the brightness is 0 and the reflection mixing weight saturates to white).
+bool TextureCache::IsTinyReadbackImage(const ImageInfo& info) const {
+	return m_readback_tiny_texels != 0 && info.IsTiled() &&
+	       uint64_t {info.extent.width} * info.extent.height * info.extent.depth <=
+	           m_readback_tiny_texels;
+}
+
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	const auto& info = image.info;
+	if (!info.data.Empty() &&
+	    ((m_readback_linear_images && !info.IsTiled()) || IsTinyReadbackImage(info))) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -6500,8 +6520,29 @@ void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+		if (owner == nullptr || !owner->registered || !owner->IsGpuModified()) {
+			continue;
+		}
+		const bool downloaded = DownloadImageMemory(id);
+		const auto& info = owner->info;
+		if (!IsTinyReadbackImage(info) || m_readback_tiny_logged.size() >= 64 ||
+		    !m_readback_tiny_logged.insert(info.data.address).second) {
+			continue;
+		}
+		// The first tiny write-back of each address, with the first texel as it lands in guest
+		// memory (the priority runner keeps order, so this runs after the write-back).
+		LOGF("Image readback (tiny): 0x%016" PRIx64 " %ux%ux%u format %u (%u bytes/block) %s\n",
+		     info.data.address, info.extent.width, info.extent.height, info.extent.depth,
+		     static_cast<uint32_t>(owner->backing.format), info.bytes_per_block,
+		     downloaded ? "written back" : "refused (unsafe or no transfer)");
+		if (downloaded) {
+			m_scheduler.DeferPriorityOperation([address = info.data.address] {
+				std::array<uint32_t, 4> texel {};
+				if (LibKernel::Memory::TryReadBacking(address, texel.data(), sizeof(texel))) {
+					LOGF("Image readback (tiny): 0x%016" PRIx64 " now holds %08x %08x %08x %08x\n",
+					     address, texel[0], texel[1], texel[2], texel[3]);
+				}
+			});
 		}
 	}
 	m_download_images.clear();

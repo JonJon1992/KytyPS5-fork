@@ -6,13 +6,14 @@
   "folder_names": [
     "PPSA02433"
   ],
-  "notes": "Medido em 2026-10-09 com A/B ao vivo no mesmo ponto (build 897dc5c). Janela de fault de escrita (KYTY_FAULT_AHEAD_ADAPT): o automático escolhe 512 KiB com userfaultfd e é o pior caso: 16,4/17,9 fps, 85 MB de upload por quadro; 64 KiB deu 23,6 fps (+32% a +44%), 37 MB por quadro, ~40 ms de Thread_Gpu por quadro; 32-128 KiB ficam no mesmo patamar, 64 com menos faults que 32. F1+F2+F3 (KYTY_COHERENCE_COPY=read, KYTY_COHERENCE_PROTECT=1): +6% a +12% de FPS. Páginas quentes desligadas (KYTY_HOT_PAGES=0): +4% de FPS e -1,4 ms de Thread_Gpu por quadro no A/B ao vivo (com userfaultfd o fault ficou barato e a comparação das ~190 mil páginas por segundo custava mais). Tempo de quadro ~= tempo ocupado do Thread_Gpu (caminho crítico). Antes, em 2026-10-08: proteção BDA agrupada +6%; userfaultfd corta a falha de escrita de 119 para 35-40 us. O patch _Patches/PPSA02433.json (1080p) é aplicado pelo title id.",
+  "notes": "Medido em 2026-10-09 com A/B ao vivo no mesmo ponto (build 897dc5c). Janela de fault de escrita (KYTY_FAULT_AHEAD_ADAPT): o automático escolhe 512 KiB com userfaultfd e é o pior caso: 16,4/17,9 fps, 85 MB de upload por quadro; 64 KiB deu 23,6 fps (+32% a +44%), 37 MB por quadro, ~40 ms de Thread_Gpu por quadro; 32-128 KiB ficam no mesmo patamar, 64 com menos faults que 32. F1+F2+F3 (KYTY_COHERENCE_COPY=read, KYTY_COHERENCE_PROTECT=1): +6% a +12% de FPS. Páginas quentes desligadas (KYTY_HOT_PAGES=0): +4% de FPS e -1,4 ms de Thread_Gpu por quadro no A/B ao vivo (com userfaultfd o fault ficou barato e a comparação das ~190 mil páginas por segundo custava mais). Tempo de quadro ~= tempo ocupado do Thread_Gpu (caminho crítico). Antes, em 2026-10-08: proteção BDA agrupada +6%; userfaultfd corta a falha de escrita de 119 para 35-40 us. O patch _Patches/PPSA02433.json (1080p) é aplicado pelo title id. Exterior branco corrigido (2026-10-09, KYTY_READBACK_TINY_IMAGES=16): o UE4 calcula o brilho médio da sky light num render target 1x1 RGBA16F tiled e a CPU o lê de volta; sem a devolução de imagens tiled pequenas a CPU lia 0, o SkyLightCubemapBrightness ficava 0 e o peso de mistura do reflexo (ComputeMixingWeight) saturava em ~1000x.",
   "environment": {
     "KYTY_BDA_BATCH_PROTECT": "1",
     "KYTY_UFFD_WP": "1",
     "KYTY_COHERENCE_COPY": "read",
     "KYTY_COHERENCE_PROTECT": "1",
     "KYTY_FAULT_AHEAD_ADAPT": "64",
-    "KYTY_HOT_PAGES": "0"
+    "KYTY_HOT_PAGES": "0",
+    "KYTY_READBACK_TINY_IMAGES": "16"
   }
 }

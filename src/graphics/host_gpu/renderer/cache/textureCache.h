@@ -344,6 +344,7 @@ private:
 	void InvalidateCleanImageProofs(uint64_t address = 0, uint64_t size = UINT64_MAX,
 	                                Coherence::Source source = Coherence::Source::Universe);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	[[nodiscard]] bool        IsTinyReadbackImage(const ImageInfo& info) const;
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -595,6 +596,10 @@ private:
 	// DccDecisionEffects (GPU thread).
 	uint64_t         m_dcc_decision_effects = 0;
 	bool             m_readback_linear_images = false;
+	// KYTY_READBACK_TINY_IMAGES (TrackImageDownload): texel limit of tiled write-backs; 0 is off.
+	uint64_t         m_readback_tiny_texels   = 0;
+	// Addresses whose first tiny write-back was logged (at most 64).
+	std::unordered_set<uint64_t> m_readback_tiny_logged;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;
 	bool             m_partial_bands       = true;
