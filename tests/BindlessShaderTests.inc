@@ -154,11 +154,12 @@ void TestBindlessCompactRecordWithSampler() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-// A depth-comparison sample is not served by the bindless arrays: with bindless images on, the
-// handle keeps the CPU-enumerated path (or the shader is skipped) instead of becoming a bindless
-// image whose draws ResourceMaterialization would drop ("bindless requires a non-comparison ...").
-void TestBindlessCompareStaysOff() {
+// A depth-comparison sample through a GPU-keyed T# table is a bindless image (Ghost of Yotei's
+// shadow pixel shaders select shadow maps per lane): it materializes with depth_compare, and its
+// SPIR-V samples the bindless array with Dref and validates.
+void TestBindlessCompareSample() {
   using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
   const uint32_t code[] = {
       EncodeVop1(0x02, 8, 256),    // GPU-selected key: first lane of v0
       EncodeSop2(0x1e, 9, 8, 133), // image key * 32
@@ -170,6 +171,7 @@ void TestBindlessCompareStaysOff() {
   std::array<uint32_t, 16> roots {};
   roots[0] = 0x10000; roots[2] = 4096;
   roots[12] = 0x30000; roots[14] = 64;
+  roots[15] = 3u << 28u;
   auto options = MakeCompileOptions(ShaderType::Compute);
   ShaderComputeInputInfo compute {};
   compute.threads_num[0] = 64;
@@ -183,11 +185,87 @@ void TestBindlessCompareStaysOff() {
   auto codegen = saved;
   codegen.srt_variant_reads = true;
   SetCodegenOptions(codegen);
-  const auto translated = TranslateProgram(code, options);
+  auto translated = TranslateProgram(code, options);
   SetCodegenOptions(saved);
-  Check(translated.skip_dispatch || translated.program.info.images.empty() ||
-            !translated.program.info.images[0].bindless,
-        "depth-comparison sample became a bindless image");
+  Check(!translated.skip_dispatch && translated.program.info.images.size() == 1 &&
+            translated.program.info.images[0].bindless &&
+            translated.program.info.images[0].depth_compare,
+        "depth-comparison sample through a GPU-keyed table is not a bindless comparison image");
+  auto plan = ExtractResourcePlan(translated.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  SrtRuntime runtime {.user_data = roots};
+  runtime.read_specialization_memory = [](void *, uint64_t, std::span<uint32_t> values) {
+    std::fill(values.begin(), values.end(), 0u); // a null S#
+    return true;
+  };
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "bindless comparison image did not materialize");
+  Check(snapshot.bindless_heaps.size() == 1, "bindless comparison image has no heap");
+  auto result = CompileProgram(std::move(translated), options, specialization);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("bindless_images") != std::string::npos &&
+            source.find("OpImageSampleDrefExplicitLod") != std::string::npos,
+        "bindless comparison sample is not a Dref sample of the bindless array");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+// IMAGE_LOAD through a GPU-keyed T# table fetches from the bindless arrays (Ghost of Yotei's
+// compute and pixel shaders that load from texture records chosen per lane).
+void TestBindlessImageLoad() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  const uint32_t code[] = {
+      EncodeVop1(0x02, 8, 256),    // GPU-selected key: first lane of v0
+      EncodeSop2(0x1e, 9, 8, 133), // image key * 32
+      EncodeSmem0(0x0b, 32, 0), 9u << 25u,
+      EncodeMimg0(0x00, 0xf), EncodeMimg1(8, 8, 0, 1), // image_load, no sampler
+      EncodeMubuf0(0x1c, 0), EncodeMubuf1(8, 3, 1),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 16> roots {};
+  roots[0] = 0x10000; roots[2] = 4096;
+  roots[12] = 0x30000; roots[14] = 64;
+  roots[15] = 3u << 28u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute {};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.thread_ids_num = 1;
+  options.input_info.compute = &compute;
+  options.user_data = roots;
+  options.bindless_images = true;
+  const auto saved = GetCodegenOptions();
+  auto codegen = saved;
+  codegen.srt_variant_reads = true;
+  SetCodegenOptions(codegen);
+  auto translated = TranslateProgram(code, options);
+  SetCodegenOptions(saved);
+  Check(!translated.skip_dispatch && translated.program.info.images.size() == 1 &&
+            translated.program.info.images[0].bindless,
+        "IMAGE_LOAD through a GPU-keyed table is not a bindless image");
+  auto plan = ExtractResourcePlan(translated.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  uint32_t reads = 0;
+  SrtRuntime runtime {.user_data = roots};
+  runtime.userdata = &reads;
+  runtime.read_specialization_memory = [](void *count, uint64_t, std::span<uint32_t> values) {
+    ++*static_cast<uint32_t *>(count);
+    std::fill(values.begin(), values.end(), 0u);
+    return true;
+  };
+  // The plan needs a specialization reader; a bindless image reads no guest heap.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0 &&
+            snapshot.bindless_heaps.size() == 1,
+        "bindless IMAGE_LOAD did not materialize from its heap root alone");
+  auto result = CompileProgram(std::move(translated), options, specialization);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("bindless_images") != std::string::npos &&
+            source.find("OpImageFetch") != std::string::npos,
+        "bindless IMAGE_LOAD is not a fetch from the bindless array");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestBindlessShaderContract() {
@@ -266,5 +344,6 @@ void TestBindlessShaderContract() {
   CheckSpirvBinaryValidates(result.spirv);
   TestBindlessStridedRecords();
   TestBindlessCompactRecordWithSampler();
-  TestBindlessCompareStaysOff();
+  TestBindlessCompareSample();
+  TestBindlessImageLoad();
 }

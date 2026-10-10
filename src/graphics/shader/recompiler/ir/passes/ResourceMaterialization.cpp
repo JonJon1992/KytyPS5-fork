@@ -672,10 +672,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
         if (image.bindless) {
             using D = Decoder::ImageDimension;
             if (base.resource_class != ImageResourceClass::Sampled || base.written || base.atomic ||
-                base.depth_compare ||
+                (base.depth_compare && base.dimension == D::Dim3D) ||
                 (base.dimension != D::Dim2D && base.dimension != D::Dim2DArray &&
                  base.dimension != D::Dim3D && base.dimension != D::Unknown))
-                return SpecializationFail("bindless requires a non-comparison sampled 2D, array, cube or 3D image");
+                return SpecializationFail("bindless requires a sampled 2D, array, cube or 3D image "
+                                          "(depth comparison not on 3D)");
             image.numeric_class = Prospero::TextureNumericClass::Float;
             image.dimension = base.dimension == D::Unknown ? D::Dim2D : base.dimension;
             image.cube = base.cube;

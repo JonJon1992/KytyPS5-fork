@@ -897,6 +897,194 @@ void TestBoundedComputeImageLoop() {
         "oversized compute loop bound was accepted for image enumeration");
 }
 
+// Samples the T# at key * 32 + table_offset of the pointer table in user data s[0:1].
+const DescriptorSource::IndirectImage *SampleTableImage(Fixture &fixture, Value key,
+                                                        uint32_t table_offset) {
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(table_offset)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * sizeof(uint32_t);
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                               {table, offset, Value(0u), Value(true)},
+                               fixture.AddMemory(memory, 0x7c4));
+  }
+  const auto image = fixture.Image(words, 0x7c4);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0x7c4));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images.at(0).source;
+  const auto &indirect = fixture.program.descriptor_sources.at(source).indirect_image;
+  return indirect ? &*indirect : nullptr;
+}
+
+uint32_t ImmediateKeyCount(const DescriptorSource::IndirectImage *indirect) {
+  return indirect != nullptr && indirect->key_count.Resolve().IsImmediate()
+             ? indirect->key_count.Resolve().U32() : 0u;
+}
+
+// A GPU-selected key bounded by its bit width (Ghost of Yotei's 6cc64dee32dc7094: S_BFE_U32 key,
+// 5 bits at 16, into a 32-entry pointer table) enumerates every value it can take.
+void TestBitBoundedImageKey() {
+  const auto plan = [](ValueOpcode opcode, uint32_t operand) {
+    Fixture fixture;
+    const auto invocation = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+    const auto selector = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+    const auto key = opcode == ValueOpcode::BitFieldUExtract
+                         ? fixture.Emit(opcode, {selector, Value(16u), Value(operand)})
+                         : fixture.Emit(opcode, {selector, Value(operand)});
+    return SampleTableImage(fixture, key, 0x830u);
+  };
+  Check(ImmediateKeyCount(plan(ValueOpcode::BitFieldUExtract, 5u)) == 32u,
+        "a 5-bit field key did not enumerate 32 table entries");
+  Check(ImmediateKeyCount(plan(ValueOpcode::BitwiseAnd32, 0xfu)) == 16u,
+        "a 4-bit mask key did not enumerate 16 table entries");
+  Check(ImmediateKeyCount(plan(ValueOpcode::ShiftRightLogical32, 27u)) == 32u,
+        "a key shifted down to 5 bits did not enumerate 32 table entries");
+  CheckFatal([&] { (void)plan(ValueOpcode::BitFieldUExtract, 8u); }, "not a valid runtime value",
+             "an 8-bit key was enumerated");
+  CheckFatal([&] { (void)plan(ValueOpcode::BitwiseAnd32, 0x5u); }, "not a valid runtime value",
+             "a non-contiguous mask bounded a key");
+}
+
+// The CPU-enumerated path serves only samples: an IMAGE_LOAD of a bit-bounded table key keeps the
+// shader out of it (materialization would stop the emulator: Ghost of Yotei 5f3fdf61a7ca4a20).
+void TestEnumeratedTableRefusesImageLoad() {
+  // Without bindless, and with it: a pointer table falls back to the CPU path in either case.
+  for (const bool bindless: {false, true}) {
+  Fixture fixture;
+  fixture.program.bindless_images = bindless;
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto selector = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto key = fixture.Emit(ValueOpcode::BitFieldUExtract, {selector, Value(16u), Value(5u)});
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(0x830u)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * sizeof(uint32_t);
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                               fixture.AddMemory(memory, 0x7c4));
+  }
+  const auto image = fixture.Image(words, 0x7c4);
+  MemoryInfo load;
+  load.kind = ResourceKind::Image;
+  load.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageRead, {image, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(load, 0x7c4));
+  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+             "an IMAGE_LOAD of an enumerated table was planned on the CPU path");
+  }
+}
+
+// A do-while counter (Ghost of Yotei's 5f3fdf61a7ca4a20: increment, then loop while < 6) bounds
+// its key by the immediate the back edge compares the increment with.
+void TestDoWhileImageLoop() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Bounded, InvertedEdge, Oversized, CompareKey };
+  const auto plan = [](Variant variant) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(header);
+    header->AddBranch(exit);
+    fixture.program.block_info[0].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 1u};
+    const bool inverted = variant == Variant::InvertedEdge;
+    fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                                .true_block = inverted ? 2u : 1u,
+                                                .false_block = inverted ? 1u : 2u};
+    fixture.program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Return};
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto key = Value(&phi);
+    fixture.block = header;
+    const auto step = fixture.Emit(ValueOpcode::IAdd32, {key, Value(1u)});
+    const auto bound = Value(variant == Variant::Oversized ? 65u : 6u);
+    fixture.program.block_info[1].condition = fixture.Emit(
+        ValueOpcode::SLessThan32, {variant == Variant::CompareKey ? key : step, bound});
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(header, step);
+    return SampleTableImage(fixture, key, 0x10u);
+  };
+  Check(ImmediateKeyCount(plan(Variant::Bounded)) == 6u,
+        "a do-while counter compared after its increment did not bound its key to 6");
+  CheckFatal([&] { (void)plan(Variant::InvertedEdge); }, "not a valid runtime value",
+             "a back edge taken when the increment is not below the bound was accepted");
+  CheckFatal([&] { (void)plan(Variant::Oversized); }, "not a valid runtime value",
+             "a do-while bound above the enumeration limit was accepted");
+  CheckFatal([&] { (void)plan(Variant::CompareKey); }, "not a valid runtime value",
+             "a do-while bound on the key instead of its increment was accepted");
+}
+
+// A T# read before an if/else and sampled at the join dominates its use even though the join has
+// two predecessors (Ghost of Yotei's 6cc64dee32dc7094).
+void TestTableReadDominatesJoin() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *left = fixture.AddBlock();
+  auto *right = fixture.AddBlock();
+  auto *join = fixture.AddBlock();
+  entry->AddBranch(left);
+  entry->AddBranch(right);
+  left->AddBranch(join);
+  right->AddBranch(join);
+  fixture.program.block_info[0].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                              .true_block = 1u, .false_block = 2u};
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(3), Value(0u)});
+  fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 3u};
+  fixture.program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 3u};
+  fixture.program.block_info[3].terminator = {.kind = CFG::TerminatorKind::Return};
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto selector = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto key = fixture.Emit(ValueOpcode::BitFieldUExtract, {selector, Value(16u), Value(5u)});
+  // The T# words are read in the entry block; the sample is at the join.
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}), Value(0x10u)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * sizeof(uint32_t);
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                               fixture.AddMemory(memory, 0x7a8));
+  }
+  fixture.block = join;
+  const auto image = fixture.Image(words, 0x1344);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0x1344));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images.at(0).source;
+  const auto &indirect = fixture.program.descriptor_sources.at(source).indirect_image;
+  Check(indirect.has_value() && ImmediateKeyCount(&*indirect) == 32u,
+        "a T# read before an if/else was not planned for its sample at the join");
+}
+
 void TestUniformizedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   const auto make_plan = [](bool wrong_update, bool wrong_equality) {
@@ -3365,6 +3553,10 @@ int main(int argc, char **argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--indirect-image-only") {
       Run("guarded direct image table", TestGuardedDirectImageTable);
       Run("bounded compute image loop", TestBoundedComputeImageLoop);
+      Run("bit-bounded image key", TestBitBoundedImageKey);
+      Run("enumerated table refuses IMAGE_LOAD", TestEnumeratedTableRefusesImageLoad);
+      Run("do-while image loop", TestDoWhileImageLoop);
+      Run("table read dominates join", TestTableReadDominatesJoin);
       Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
       std::cout << "indirect image resource tracking tests passed\n";
       return 0;
@@ -3381,6 +3573,10 @@ int main(int argc, char **argv) {
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("bit-bounded image key", TestBitBoundedImageKey);
+    Run("enumerated table refuses IMAGE_LOAD", TestEnumeratedTableRefusesImageLoad);
+    Run("do-while image loop", TestDoWhileImageLoop);
+    Run("table read dominates join", TestTableReadDominatesJoin);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);

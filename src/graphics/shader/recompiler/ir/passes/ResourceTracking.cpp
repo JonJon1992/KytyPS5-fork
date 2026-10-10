@@ -762,6 +762,14 @@ private:
 		return false;
 	}
 
+	// Whether `read` dominates `use`: the single-predecessor chain (ReadDominatesHandle), or else no
+	// path from the entry reaches `use` without passing `read`. The chain alone refused T# reads
+	// before an if/else whose join samples them (Ghost of Yotei's 6cc64dee32dc7094).
+	bool Dominates(const Block* read, const Block* use) const {
+		return ReadDominatesHandle(read, use) || m_program.blocks.empty() ||
+		       !CanReach(m_program.blocks.front(), use, read);
+	}
+
 	bool ConditionalEdge(const Block* from, const Block* to, Value& condition,
 	                     bool& positive) const {
 		const auto position = std::ranges::find(m_program.blocks, from);
@@ -1036,14 +1044,55 @@ private:
 	// A loop over a T# table that the CPU enumerates before the dispatch: the shader must not
 	// rewrite the table or the bound meanwhile. Storage image writes cannot (Ghost of Yotei's
 	// froxel passes sample a table of 3D textures and store a 3D image).
+	// The number of values a table key can take when its bit width bounds it: an unsigned field
+	// extract of at most MaxBitBoundedKeyBits bits, a low-bit mask, or a logical right shift that
+	// leaves that many bits. Ghost of Yotei's 6cc64dee32dc7094 selects a T# in a 32-entry pointer
+	// table with S_BFE_U32 key, 5 bits at 16. Every possible key is enumerated (CPU path).
+	static constexpr uint32_t MaxBitBoundedKeyBits = 6;
+	static Value BitBoundedKeyCount(Value key) {
+		const auto* inst = key.Resolve().TryInstruction();
+		if (inst == nullptr) {
+			return {};
+		}
+		uint32_t bits = 0;
+		uint32_t value = 0;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitFieldUExtract:
+				if (inst->NumArgs() != 3u || !ImmediateU32(inst->Arg(2), bits)) return {};
+				break;
+			case ValueOpcode::BitwiseAnd32:
+				if (inst->NumArgs() != 2u ||
+				    (!ImmediateU32(inst->Arg(1), value) && !ImmediateU32(inst->Arg(0), value)) ||
+				    value == 0u || (value & (value + 1u)) != 0u) {
+					return {};
+				}
+				bits = static_cast<uint32_t>(std::popcount(value));
+				break;
+			case ValueOpcode::ShiftRightLogical32:
+				if (inst->NumArgs() != 2u || !ImmediateU32(inst->Arg(1), value) || value == 0u ||
+				    value >= 32u) {
+					return {};
+				}
+				bits = 32u - value;
+				break;
+			default: return {};
+		}
+		if (bits == 0u || bits > MaxBitBoundedKeyBits) {
+			return {};
+		}
+		return Value(1u << bits);
+	}
+
 	Value BoundedLoopCount(Value key, const Block* use) const {
 		const auto* phi = key.Resolve().TryInstruction();
-		if (m_table_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return {};
 		}
 		bool induction = false;
+		const Inst* induction_step = nullptr;
+		uint32_t    back_edge      = 0;
 		for (uint32_t initial = 0; initial < 2u; ++initial) {
 			const auto zero = phi->Arg(initial).Resolve();
 			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
@@ -1057,7 +1106,11 @@ private:
 			             ImmediateU32(step->Arg(1), increment) && increment == 1u) ||
 			            (step->Arg(1).Resolve() == key &&
 			             ImmediateU32(step->Arg(0), increment) && increment == 1u);
-			if (induction) break;
+			if (induction) {
+				induction_step = step;
+				back_edge      = initial ^ 1u;
+				break;
+			}
 		}
 		if (!induction) return {};
 
@@ -1070,8 +1123,12 @@ private:
 		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
+			// A shader that writes buffers could rewrite a bound read from the SRT before the loop
+			// reads it (the CPU evaluates it before the dispatch); an immediate bound (Ghost of
+			// Yotei's 5f3fdf61a7ca4a20: `s_cmp_lt_i32 s16, 6`) it cannot.
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
-			    !ValidateRuntimeValue(m_program, compare->Arg(1))) continue;
+			    !ValidateRuntimeValue(m_program, compare->Arg(1)) ||
+			    (m_table_writes && !compare->Arg(1).Resolve().IsImmediate())) continue;
 			for (uint32_t i = 0; i < m_program.block_info.size(); ++i) {
 				const auto& info = m_program.block_info[i];
 				const auto* negated = info.condition.Resolve().TryInstruction();
@@ -1089,14 +1146,57 @@ private:
 				return compare->Arg(1);
 			}
 		}
+		return DoWhileLoopCount(*phi, *induction_step, back_edge);
+	}
+
+	// A do-while counter (Ghost of Yotei's 5f3fdf61a7ca4a20: `s_add_i32 s16, s16, 1;
+	// s_cmp_lt_i32 s16, 6; s_cbranch_scc1 header`): the phi takes 0 and key + 1, and the edge back
+	// to the header is taken only while key + 1 < n for an immediate n >= 1. The key is then in
+	// [0, n - 1] wherever it is used, inside the loop or after it.
+	static constexpr uint32_t MaxDoWhileKeys = 64;
+	Value DoWhileLoopCount(const Inst& phi, const Inst& step, uint32_t back_edge) const {
+		const auto* header = phi.Parent();
+		const Block* to    = header;
+		const Block* from  = phi.PhiBlock(back_edge);
+		// The back edge, or the single-predecessor chain that leads to it, must be guarded.
+		for (uint32_t depth = 0; from != nullptr && depth < 8u; ++depth) {
+			Value condition;
+			bool positive = false;
+			if (ConditionalEdge(from, to, condition, positive)) {
+				const auto* compare = condition.TryInstruction();
+				uint32_t bound = 0;
+				if (!positive || compare == nullptr ||
+				    compare->GetOpcode() != ValueOpcode::SLessThan32 ||
+				    compare->Arg(0).Resolve().TryInstruction() != &step ||
+				    !ImmediateU32(compare->Arg(1), bound) || bound == 0u ||
+				    bound > MaxDoWhileKeys) {
+					return {};
+				}
+				return Value(bound);
+			}
+			if (from->ImmSuccessors().size() != 1u || from->ImmPredecessors().size() != 1u) {
+				return {};
+			}
+			to   = from;
+			from = from->ImmPredecessors()[0];
+		}
 		return {};
 	}
 
-	// Whether every use of an image handle is one the bindless arrays serve (the specialization
-	// check in ResourceMaterialization.cpp): a read through a sampler, no depth comparison, 2D,
-	// 2D array, cube or 3D. A handle used otherwise keeps the CPU-enumerated path (or is skipped)
-	// instead of becoming a bindless image whose draws would all be dropped.
-	bool BindlessCompatibleUses(const Inst& handle) const {
+	// Whether the bindless arrays serve every use of an image handle (the specialization check in
+	// ResourceMaterialization.cpp): reads of a 2D, 2D array, cube or 3D image.
+	//  - Direct: samples without depth comparison. Bindless comes first.
+	//  - Fallback: some use compares depth (not on 3D: Vulkan has no 3D Dref) or is an IMAGE_LOAD
+	//    fetch. The CPU-enumerated path keeps the handles it serves (Ghost of Yotei's shadow
+	//    samples through bounded tables rendered there); bindless takes the rest, e.g. its shadow
+	//    pixel shaders that select shadow maps per lane (waterfall over a VGPR key). A comparing
+	//    consumer gets its own heap (heaps are keyed by the whole ImageResource), whose keys
+	//    resolve to depth views.
+	//  - None: otherwise; the handle keeps the CPU-enumerated path (or is skipped) instead of
+	//    becoming a bindless image whose draws would all be dropped.
+	enum class BindlessUses { None, Direct, Fallback };
+	BindlessUses BindlessCompatibleUses(const Inst& handle) const {
+		auto result = BindlessUses::Direct;
 		for (const auto& use: handle.Uses()) {
 			const auto* user = use.user;
 			if (user == nullptr || user->NumArgs() == 0u ||
@@ -1104,27 +1204,38 @@ private:
 				continue;
 			}
 			const auto info = ImageOpcodeInfoOf(user->GetOpcode());
+			const bool fetch = user->GetOpcode() == ValueOpcode::ImageRead;
 			if (info.access != ImageAccess::Read || info.resource_class != ImageResourceClass::Sampled ||
-			    !info.needs_sampler) {
-				return false;
+			    (!info.needs_sampler && !fetch)) {
+				return BindlessUses::None;
 			}
 			const auto index = user->Flags<MemoryFlags>().index;
 			if (index >= m_program.memory_info.size()) {
-				return false;
+				return BindlessUses::None;
 			}
 			const auto& memory = m_program.memory_info[index];
 			using D = Decoder::ImageDimension;
-			if ((memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u ||
+			const bool compare = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
+			if ((compare && memory.image_dimension == D::Dim3D) ||
 			    (memory.image_dimension != D::Unknown && memory.image_dimension != D::Dim2D &&
 			     memory.image_dimension != D::Dim2DArray && memory.image_dimension != D::Dim3D)) {
-				return false;
+				return BindlessUses::None;
+			}
+			if (compare || fetch) {
+				result = BindlessUses::Fallback;
 			}
 		}
-		return true;
+		return result;
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
-		const bool bindless_images = m_program.bindless_images && BindlessCompatibleUses(handle);
+	// `allow_fallback`: also bindless for BindlessUses::Fallback handles (PlanIndirectImages tries
+	// the CPU-enumerated path first).
+	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan,
+	                          bool allow_fallback = false) {
+		const auto uses = m_program.bindless_images ? BindlessCompatibleUses(handle)
+		                                            : BindlessUses::None;
+		const bool bindless_images =
+		    uses == BindlessUses::Direct || (allow_fallback && uses == BindlessUses::Fallback);
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -1175,7 +1286,7 @@ private:
 			                                      ? ValueOpcode::GetAddressResource
 			                                      : ValueOpcode::GetBufferResource) ||
 			    (memory->kind == ResourceKind::ScalarAddress &&
-			     !ReadDominatesHandle(read->Parent(), handle.Parent())) ||
+			     !Dominates(read->Parent(), handle.Parent())) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
 			    !matched() || memory->offset > UINT32_MAX - offset) {
@@ -1231,6 +1342,9 @@ private:
 				indirect.key_count = Value(32u);
 			} else {
 				indirect.key_count = BoundedLoopCount(key, handle.Parent());
+				if (indirect.key_count.IsEmpty()) {
+					indirect.key_count = BitBoundedKeyCount(key);
+				}
 			}
 			if (indirect.key_count.IsEmpty() &&
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
@@ -1269,6 +1383,20 @@ private:
 				return false;
 			}
 			indirect.material_source = InternSource(material_source);
+		}
+		// The CPU-enumerated path selects among its candidates only for IMAGE_SAMPLE*
+		// (ImageSampleRaw: the emitter's candidate switch, ResourceMaterialization's check); an
+		// IMAGE_LOAD of an enumerated pointer table ended Ghost of Yotei (5f3fdf61a7ca4a20).
+		if (!indirect.bindless) {
+			for (const auto& use: handle.Uses()) {
+				const auto* user = use.user;
+				if (user != nullptr && user->NumArgs() != 0u &&
+				    user->Arg(0).Resolve().TryInstruction() == &handle &&
+				    ImageOpcodeInfoOf(user->GetOpcode()).access != ImageAccess::None &&
+				    user->GetOpcode() != ValueOpcode::ImageSampleRaw) {
+					return false;
+				}
+			}
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -1322,8 +1450,23 @@ private:
 				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
 					continue;
 				}
+				const auto pc = inst.Flags<MemoryFlags>().pc;
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				bool planned = TryMakeIndirectImage(*handle, pc, plan);
+				// A T# the host can evaluate before the dispatch keeps its ordinary binding; the
+				// fallback serves only T#s whose table key the GPU selects.
+				const auto evaluable = [&] {
+					for (size_t dword = 0; dword < handle->NumArgs(); ++dword) {
+						if (!ValidateRuntimeValue(m_program, handle->Arg(dword))) return false;
+					}
+					return true;
+				};
+				if (!planned && m_program.bindless_images &&
+				    BindlessCompatibleUses(*handle) == BindlessUses::Fallback && !evaluable()) {
+					plan    = {};
+					planned = TryMakeIndirectImage(*handle, pc, plan, true);
+				}
+				if (planned) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
