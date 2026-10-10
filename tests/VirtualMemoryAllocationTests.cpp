@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -717,6 +718,101 @@ void TestBackingInPlaceInspection() {
 	        "KernelReleaseDirectMemory(second)");
 	CheckOk(test, Memory::KernelReleaseDirectMemory(first, SceKernelPageSize),
 	        "KernelReleaseDirectMemory(first)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// KYTY_BACKING_MAP_CACHE_ENTRIES: a thread reading in turn from more mappings than it keeps records
+// for misses every time; with enough records every read after the first pass hits without the
+// mapping lock. A guest unmap advances the map generation: the surviving records turn stale (a
+// stale miss, then correct bytes and a hit again) and the unmapped range is no longer read.
+void TestBackingMapCacheCapacity() {
+	namespace Memory           = Libs::LibKernel::Memory;
+	const char*        test     = "BackingMapCacheCapacity";
+	constexpr uint32_t Mappings = 8;
+	constexpr uint64_t Tag      = 0x4d41504341434845ull; // "MAPCACHE"
+	const auto         end      = Memory::KernelGetDirectMemorySize();
+	std::array<int64_t, Mappings>  physical {};
+	std::array<uint64_t, Mappings> bases {};
+	for (uint32_t i = 0; i < Mappings; i++) {
+		CheckOk(test,
+		        Memory::KernelAllocateDirectMemory(0, end, SceKernelPageSize, SceKernelPageSize,
+		                                           SceKernelMtypeC, &physical[i]),
+		        "KernelAllocateDirectMemory");
+		void* addr = nullptr;
+		CheckOk(test,
+		        Memory::KernelMapNamedDirectMemory(&addr, SceKernelPageSize, SceKernelProtCpuRw, 0,
+		                                           physical[i], SceKernelPageSize, "map_cache"),
+		        "KernelMapNamedDirectMemory");
+		bases[i] = reinterpret_cast<uint64_t>(addr);
+		std::memcpy(addr, &Tag, sizeof(Tag));
+		static_cast<uint8_t*>(addr)[0] = static_cast<uint8_t>(i);
+	}
+	const auto expected = [&](uint32_t i) { return (Tag & ~uint64_t {0xff}) | i; };
+	const auto set_entries = [](const char* value) {
+		Live::Testing::StageText(std::string("KYTY_BACKING_MAP_CACHE_ENTRIES=") + value + "\n");
+		Live::OnCpFlip();
+	};
+	const auto read = [&](uint32_t i) {
+		uint64_t value = 0;
+		Check(test,
+		      Memory::TryReadBackingDirect(bases[i], &value, sizeof(value)) && value == expected(i),
+		      "a cached-mapping read returned the wrong bytes");
+	};
+	const auto read_rounds = [&](uint32_t rounds) {
+		for (uint32_t round = 0; round < rounds; round++) {
+			for (uint32_t i = 0; i < Mappings; i++) {
+				read(i);
+			}
+		}
+	};
+
+	set_entries("4");
+	read_rounds(1);
+	auto before = Memory::BackingMapCacheThreadStats();
+	read_rounds(4);
+	auto after = Memory::BackingMapCacheThreadStats();
+	Check(test,
+	      after.entries == 4 && after.hits == before.hits &&
+	          after.misses_absent - before.misses_absent == 4 * Mappings &&
+	          after.misses_stale == before.misses_stale,
+	      "4 records, 8 mappings read in turn: every read should be a capacity miss");
+
+	set_entries("16");
+	read_rounds(1);
+	before = Memory::BackingMapCacheThreadStats();
+	read_rounds(4);
+	after = Memory::BackingMapCacheThreadStats();
+	Check(test,
+	      after.entries == 16 && after.hits - before.hits == 4 * Mappings &&
+	          after.misses_absent == before.misses_absent &&
+	          after.misses_stale == before.misses_stale,
+	      "16 records, 8 mappings read in turn: every read after the first pass should hit");
+
+	CheckOk(test, Memory::KernelMunmap(bases[0], SceKernelPageSize), "KernelMunmap(first)");
+	before = Memory::BackingMapCacheThreadStats();
+	Check(test, after.map_generation != before.map_generation,
+	      "an unmap did not advance the map generation");
+	read(1);
+	auto stale = Memory::BackingMapCacheThreadStats();
+	Check(test, stale.misses_stale - before.misses_stale == 1 && stale.hits == before.hits,
+	      "a record from before the unmap should be a stale miss");
+	read(1);
+	after = Memory::BackingMapCacheThreadStats();
+	Check(test, after.hits - stale.hits == 1, "the record remembered after a stale miss should hit");
+	uint64_t gone = 0;
+	Check(test, !Memory::TryReadBackingDirect(bases[0], &gone, sizeof(gone)),
+	      "an unmapped range was read through a stale record");
+
+	set_entries("");
+	Check(test, Memory::BackingMapCacheThreadStats().entries == 4,
+	      "an unset KYTY_BACKING_MAP_CACHE_ENTRIES should keep 4 records");
+	for (uint32_t i = 1; i < Mappings; i++) {
+		CheckOk(test, Memory::KernelMunmap(bases[i], SceKernelPageSize), "KernelMunmap");
+	}
+	for (uint32_t i = 0; i < Mappings; i++) {
+		CheckOk(test, Memory::KernelReleaseDirectMemory(physical[i], SceKernelPageSize),
+		        "KernelReleaseDirectMemory");
+	}
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4690,6 +4786,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
 	RunTest(TestBackingInPlaceInspection);
+	RunTest(TestBackingMapCacheCapacity);
 	RunTest(TestPrtReadDuringDirectCommit);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

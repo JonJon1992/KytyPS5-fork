@@ -58,15 +58,18 @@ frame. The log shows the measured costs in a `Kyty platform:` line and
    default limit of 65530, `mprotect` fails and Kyty stops):
    `sudo sysctl -w vm.max_map_count=1048576` (until reboot; to keep it, put
    `vm.max_map_count=1048576` in `/etc/sysctl.d/99-kyty.conf`).
-3. Optional: `"KYTY_UFFD_WP": "1"` in `u59-preset.json` tracks the writes with
-   userfaultfd write-protection instead of `mprotect` (off by default; untested
-   in a game on Linux so far). It needs kernel 5.19 or newer; 6.4 adds it for
-   all guest memory. In a WSL2 benchmark with 15 writing threads a fault cost
-   about 11 us instead of about 230 us; with the larger windows above, plain
-   `mprotect` was as fast in that benchmark. The log then says `guest write
+3. The current U59 preset enables `"KYTY_UFFD_WP": "1"` to track writes with
+   userfaultfd write-protection instead of `mprotect`, together with
+   `"KYTY_BDA_BATCH_PROTECT": "1"` to group protection before staging copies.
+   Native Linux Crash 4 measurements on Fedora 44 and memory/Vulkan checks
+   are recorded in [the performance report](CRASH4-PERFORMANCE-2026-10-08.md).
+   Userfaultfd needs kernel 5.19 or newer; 6.4 adds it for all guest memory.
+   In the earlier WSL2 benchmark, plain `mprotect` with larger windows was as
+   fast; results depend on the host and workload. The log says `guest write
    tracking with userfaultfd write-protection (KYTY_UFFD_WP=1): on`. If it says
    `unavailable`, the kernel is too old or userfaultfd is blocked, and
-   everything runs as without the flag.
+   tracking falls back to `mprotect`. Setting `"KYTY_UFFD_WP": "0"` selects
+   `mprotect` explicitly. The adaptive window remains enabled.
 
 ## Portability changes
 

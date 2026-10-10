@@ -110,11 +110,25 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!program.info.buffers.empty()) {
-		std::vector<uint32_t> resources(program.info.buffers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
+		std::vector<uint32_t> resources;
+		std::vector<uint32_t> readonly_resources;
+		const auto& options = GetCodegenOptions();
+		const bool split_readonly = options.readonly_buffers && options.readonly_buffer_bindings &&
+		    !std::ranges::any_of(program.memory_info, [](const auto& memory) { return memory.coherent; });
+		resources.reserve(program.info.buffers.size());
+		if (split_readonly) readonly_resources.reserve(program.info.buffers.size());
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& buffer = program.info.buffers[i];
+			const bool readonly = split_readonly && buffer.readonly_safe && buffer.read &&
+			                      !buffer.written && !buffer.atomic;
+			(readonly ? readonly_resources : resources).push_back(i);
 		}
-		AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+		if (!resources.empty()) {
+			AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+		}
+		if (!readonly_resources.empty()) {
+			AddBinding(next, DescriptorBindingKind::ReadOnlyBuffers, std::move(readonly_resources));
+		}
 	}
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;

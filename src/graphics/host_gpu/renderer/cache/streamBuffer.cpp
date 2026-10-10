@@ -185,6 +185,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		                       m_mapped.data(), size);
 	}
 	if (VramStats::Enabled()) {
+		if (usage == MemoryUsage::Stream || usage == MemoryUsage::Upload) {
+			// Report the actual VMA choice, not just the requested preference: BAR
+			// budget pressure can put an otherwise device-preferred ring in host RAM.
+			VramStats::Line("upload allocation usage=%u bytes=%llu memory_type=%u properties=0x%x mapped=%u",
+			    static_cast<unsigned>(usage), static_cast<unsigned long long>(size),
+			    allocation_result.memoryType, properties,
+			    static_cast<unsigned>(allocation_result.pMappedData != nullptr));
+		}
 		const auto kind = cpu_address != 0              ? VramStats::Kind::GuestBuffer
 		                  : usage != MemoryUsage::DeviceLocal ? VramStats::Kind::RingBuffer
 		                                                      : VramStats::Kind::OtherBuffer;

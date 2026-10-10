@@ -259,6 +259,7 @@ uint32_t LoadBdaInline(ValueEmitContext& ctx, uint32_t address, uint32_t active,
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
 	auto& state = ctx.state;
 	const auto function = state.bda_scalar_load_functions[bits == 8u ? 0 : bits == 16u ? 1 : 2];
+	EXIT_IF(function == 0);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function, address, active);
 	return result;
@@ -1292,11 +1293,24 @@ namespace {
 
 // Share the exact guarded/unaligned body, including the wide-load slow path.
 void DefineScalarBdaLoads(EmitterState& state) {
-	std::array<bool, 3> widths {false, false, true}; // Indirect buffers and wide fallbacks use u32.
+	std::array<bool, 3> widths {};
+	// Both indirect buffer emitters use the u32 helper. Keep it conservatively
+	// whenever that domain is present, including dynamically selected descriptors.
+	for (const auto& mem : state.program.memory_info) {
+		if (mem.kind == IR::ResourceKind::IndirectBuffer) widths[2] = true;
+	}
 	for (const auto* block : state.program.blocks) {
 		for (const auto& inst : *block) {
-			if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU8) widths[0] = true;
-			if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU16) widths[1] = true;
+			const auto op = inst.GetOpcode();
+			const auto address = IR::AddressOpcodeInfoOf(op);
+			if (address.access != IR::AddressAccess::Read) continue;
+			const auto& mem = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) continue;
+			// ScalarAddress uses an aligned dword load directly; scratch uses its
+			// own storage. Global wide loads still need u32 for their slow path.
+			if (mem.kind == IR::ResourceKind::ScalarAddress ||
+			    mem.kind == IR::ResourceKind::Scratch) continue;
+			widths[address.data_bits == 8u ? 0 : address.data_bits == 16u ? 1 : 2] = true;
 		}
 	}
 	const auto type = TypeU32(state);
@@ -1328,6 +1342,10 @@ void DefineWideBdaLoads(EmitterState& state) {
 	std::array<bool, 3> widths {};
 	for (const auto* block : state.program.blocks) {
 		for (const auto& inst : *block) {
+			const auto address = IR::AddressOpcodeInfoOf(inst.GetOpcode());
+			if (address.access != IR::AddressAccess::Read || address.data_dwords <= 1u) continue;
+			const auto& mem = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (mem.kind != IR::ResourceKind::Global) continue;
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::LoadAddressU32x2: widths[0] = true; break;
 				case IR::ValueOpcode::LoadAddressU32x3: widths[1] = true; break;

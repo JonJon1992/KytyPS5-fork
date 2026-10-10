@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "gpu_mesh_shaders/gpu_mesh_indirect_count_spv.h"
 #include "gpu_mesh_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +54,14 @@ Mode GetMode() {
 bool ConversionEnabled() {
 	const auto mode = GetMode();
 	return mode == Mode::On || mode == Mode::Verify || mode == Mode::VerifyExit;
+}
+
+bool CountEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_INDIRECT_MESH_COUNT");
+		return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0);
+	}();
+	return enabled;
 }
 
 Totals& GetTotals() {
@@ -148,8 +158,10 @@ struct PushData {
 	uint32_t max_groups_y         = 0;
 	uint32_t max_groups_total     = 0;
 	uint32_t generation           = 0;
+	uint32_t count_word           = 0; // Only the count-specific shader/layout uses this dword.
 };
-static_assert(sizeof(PushData) == 56);
+inline constexpr uint32_t OrdinaryPushBytes = offsetof(PushData, count_word);
+static_assert(OrdinaryPushBytes == 56 && sizeof(PushData) == 60);
 
 // 1,024 slots: a slot is reused only after the recording that wrote it and its completion check
 // finished (a Download ring waits for both on wrap).
@@ -162,49 +174,60 @@ Converter::Converter(RenderContext& context): m_context(context) {}
 Converter::~Converter() {
 	// RenderContext shuts its scheduler down (draining the completion checks) before members die.
 	auto device = m_context.GetGraphics().device;
+	if (m_count_pipeline) device.destroyPipeline(m_count_pipeline);
+	if (m_count_layout) device.destroyPipelineLayout(m_count_layout);
+	if (m_count_descriptors) device.destroyDescriptorSetLayout(m_count_descriptors);
 	if (m_pipeline) device.destroyPipeline(m_pipeline);
 	if (m_layout) device.destroyPipelineLayout(m_layout);
 	if (m_descriptors) device.destroyDescriptorSetLayout(m_descriptors);
 }
 
-void Converter::Initialize() {
-	if (m_pipeline) {
+void Converter::Initialize(bool counted) {
+	auto& pipeline_handle = counted ? m_count_pipeline : m_pipeline;
+	auto& pipeline_layout = counted ? m_count_layout : m_layout;
+	auto& descriptors    = counted ? m_count_descriptors : m_descriptors;
+	if (pipeline_handle) {
 		return;
 	}
 	// Push descriptors (VK_KHR_push_descriptor) are required by the renderer itself.
 	auto& graphics = m_context.GetGraphics();
-	const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {{
+	const std::array<vk::DescriptorSetLayoutBinding, 3> bindings {{
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+	    {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
 	}};
 	vk::DescriptorSetLayoutCreateInfo descriptor {};
 	descriptor.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	descriptor.bindingCount = static_cast<uint32_t>(bindings.size());
+	descriptor.bindingCount = counted ? 3u : 2u;
 	descriptor.pBindings    = bindings.data();
-	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&descriptor, nullptr, &m_descriptors),
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&descriptor, nullptr, &descriptors),
 	                     "create mesh-indirect descriptors");
-	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, sizeof(PushData)};
+	const auto push_bytes = counted ? uint32_t {sizeof(PushData)} : OrdinaryPushBytes;
+	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, push_bytes};
 	vk::PipelineLayoutCreateInfo layout {};
 	layout.setLayoutCount         = 1;
-	layout.pSetLayouts            = &m_descriptors;
+	layout.pSetLayouts            = &descriptors;
 	layout.pushConstantRangeCount = 1;
 	layout.pPushConstantRanges    = &push;
-	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout, nullptr, &m_layout),
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout, nullptr, &pipeline_layout),
 	                     "create mesh-indirect layout");
-	const auto module = CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device);
+	const auto module = counted ? CompileSPV(GPU_MESH_INDIRECT_COUNT_SPV, graphics.device)
+	                            : CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device);
 	vk::ComputePipelineCreateInfo pipeline {};
-	pipeline.layout       = m_layout;
+	pipeline.layout       = pipeline_layout;
 	pipeline.stage.stage  = vk::ShaderStageFlagBits::eCompute;
 	pipeline.stage.module = module;
 	pipeline.stage.pName  = "main";
 	const auto result = graphics.device.createComputePipelines(nullptr, 1, &pipeline, nullptr,
-	                                                           &m_pipeline);
+	                                                           &pipeline_handle);
 	graphics.device.destroyShaderModule(module);
 	RequireVulkanSuccess(result, "create mesh-indirect pipeline");
-	m_ring = std::make_unique<StreamBuffer>(graphics, m_context.GetCommandScheduler(),
-	                                        MemoryUsage::Download, RingSize, false,
-	                                        vk::BufferUsageFlagBits::eShaderDeviceAddress);
-	SetVulkanObjectNameF(graphics.device, m_ring->Handle(), "Kyty.MeshIndirectRing");
+	if (m_ring == nullptr) {
+		m_ring = std::make_unique<StreamBuffer>(graphics, m_context.GetCommandScheduler(),
+		                                        MemoryUsage::Download, RingSize, false,
+		                                        vk::BufferUsageFlagBits::eShaderDeviceAddress);
+		SetVulkanObjectNameF(graphics.device, m_ring->Handle(), "Kyty.MeshIndirectRing");
+	}
 }
 
 Converter::Slot Converter::Reserve() {
@@ -223,9 +246,12 @@ Converter::Slot Converter::Reserve() {
 }
 
 void Converter::Record(CommandBuffer& buffer, const Slot& slot, const Inputs& inputs,
-                       vk::Buffer args, uint64_t args_offset) {
+                       vk::Buffer args, uint64_t args_offset, vk::Buffer count,
+                       uint64_t count_offset) {
 	KYTY_GPU_OP_SITE("draw.mesh_indirect");
-	Initialize();
+	const bool counted = count != nullptr;
+	Initialize(counted);
+	const auto layout = counted ? m_count_layout : m_layout;
 	auto& graphics  = m_context.GetGraphics();
 	auto& scheduler = m_context.GetCommandScheduler();
 	// A dispatch cannot be recorded inside dynamic rendering.
@@ -239,20 +265,27 @@ void Converter::Record(CommandBuffer& buffer, const Slot& slot, const Inputs& in
 	const auto record_size = inputs.indexed ? 20u : 16u;
 	const auto aligned     = Common::AlignDown(args_offset, graphics.StorageMinAlignment());
 	EXIT_IF(((args_offset - aligned) & 3u) != 0);
-	const std::array<vk::DescriptorBufferInfo, 2> infos {{
+	std::array<vk::DescriptorBufferInfo, 3> infos {{
 	    {args, aligned, args_offset - aligned + record_size},
 	    {slot.buffer, slot.offset, SlotBytes},
+	    {},
 	}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
-	for (uint32_t i = 0; i < writes.size(); i++) {
+	const auto count_aligned = Common::AlignDown(count_offset, graphics.StorageMinAlignment());
+	if (counted) {
+		EXIT_IF(((count_offset - count_aligned) & 3u) != 0);
+		infos[2] = vk::DescriptorBufferInfo {count, count_aligned, count_offset - count_aligned + 4u};
+	}
+	std::array<vk::WriteDescriptorSet, 3> writes {};
+	const uint32_t binding_count = counted ? 3u : 2u;
+	for (uint32_t i = 0; i < binding_count; i++) {
 		writes[i].dstBinding      = i;
 		writes[i].descriptorCount = 1;
 		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
 		writes[i].pBufferInfo     = &infos[i];
 	}
-	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
-	(void)buffer.PushDescriptors(vk::PipelineBindPoint::eCompute, m_layout, 0,
-	                             static_cast<uint32_t>(writes.size()), writes.data());
+	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, counted ? m_count_pipeline : m_pipeline);
+	(void)buffer.PushDescriptors(vk::PipelineBindPoint::eCompute, layout, 0,
+	                             binding_count, writes.data());
 	PushData push;
 	push.args_word            = static_cast<uint32_t>((args_offset - aligned) / 4u);
 	push.out_word             = 0;
@@ -268,10 +301,12 @@ void Converter::Record(CommandBuffer& buffer, const Slot& slot, const Inputs& in
 	push.max_groups_y         = inputs.max_groups_y;
 	push.max_groups_total     = inputs.max_groups_total;
 	push.generation           = slot.generation;
+	push.count_word           = static_cast<uint32_t>((count_offset - count_aligned) / 4u);
 	// Sink() records the pending batch (the barrier above) first, as Handle() did, and resets the
 	// push-constant shadow, without draining the CP recorder.
 	auto sink = buffer.Sink();
-	sink.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	sink.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                   counted ? uint32_t {sizeof(push)} : OrdinaryPushBytes, &push);
 	sink.dispatch(1, 1, 1);
 	// The conversion's writes before the draw's indirect command reads and its mesh shaders'
 	// parameter loads, and before the completion check's host read. Recorded by the draw's
@@ -283,7 +318,7 @@ void Converter::Record(CommandBuffer& buffer, const Slot& slot, const Inputs& in
 	    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eShaderStorageRead |
 	        vk::AccessFlagBits2::eHostRead,
 	    BarrierOrigin::IndirectArgs);
-	scheduler.DeferPriorityOperation([this, slot, inputs] { Check(slot, inputs); });
+	scheduler.DeferPriorityOperation([this, slot, inputs, counted] { Check(slot, inputs, counted); });
 	GetTotals().draws.fetch_add(1, std::memory_order_relaxed);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::MeshIndirectDraws);
 }
@@ -295,7 +330,7 @@ std::array<uint32_t, SlotDwords> Converter::ReadSlot(const Slot& slot) const {
 	return words;
 }
 
-void Converter::Check(const Slot& slot, const Inputs& inputs) {
+void Converter::Check(const Slot& slot, const Inputs& inputs, bool counted) {
 	// Completion runner: the recording that wrote the slot has finished.
 	auto&      totals = GetTotals();
 	const auto words  = ReadSlot(slot);
@@ -335,7 +370,10 @@ void Converter::Check(const Slot& slot, const Inputs& inputs) {
 		std::copy_n(words.begin() + ParamsWord + k * ParamDwords, ParamDwords, gpu.params[k].begin());
 	}
 	gpu.status = status;
-	if (gpu == expected) {
+	const bool count_valid = !counted ||
+	    (words[CountWord] <= 1u && (words[CountWord] != 0u ||
+	        std::all_of(args.begin(), args.end(), [](uint32_t word) { return word == 0u; })));
+	if (gpu == expected && count_valid) {
 		return;
 	}
 	totals.mismatches.fetch_add(1, std::memory_order_relaxed);

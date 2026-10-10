@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/liveSwitch.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <array>
 #include <atomic>
@@ -101,6 +102,95 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0});
   return ExtractResourcePlan(program);
+}
+
+// Runtime alias proof must follow descriptor rebinding, not just shader access flags.
+void TestReadOnlyBufferSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto saved = GetCodegenOptions();
+  auto options = saved;
+  options.readonly_buffers = true;
+  options.readonly_buffer_bindings = true;
+  SetCodegenOptions(options);
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  for (uint32_t resource = 0; resource < 2; ++resource) {
+    DescriptorSource source;
+    source.dword_count = 4;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto &word = block.AppendNewInst(ValueOpcode::GetUserData,
+          {Value(static_cast<ScalarReg>(resource * 4 + i))});
+      source.dwords[i] = Value(&word);
+    }
+    program.descriptor_sources.push_back(source);
+    BufferResource buffer;
+    buffer.source = resource;
+    buffer.read = resource == 0;
+    buffer.written = resource == 1;
+    program.info.buffers.push_back(buffer);
+  }
+  std::array<uint32_t, 8> data{0x1000u, 0u, 256u, 3u << 28u,
+                              0x2000u, 0u, 256u, 3u << 28u};
+  const auto materialize = [&] {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(ExtractResourcePlan(program), {.user_data = data},
+                               snapshot, specialization), "readonly fixture failed materialization");
+    Check(specialization.buffers.size() == 2 && !specialization.buffers[1].readonly_safe,
+          "writable resource was marked readonly");
+    return specialization;
+  };
+  const auto disjoint = materialize();
+  Check(disjoint.buffers[0].readonly_safe, "disjoint read buffer was not proved readonly");
+  data[4] = 0x1000u;
+  const auto alias = materialize();
+  Check(!alias.buffers[0].readonly_safe && alias != disjoint,
+        "descriptor rebind to exact alias retained readonly specialization");
+  data[4] = 0x1080u;
+  Check(!materialize().buffers[0].readonly_safe, "partial alias was marked readonly");
+  data[2] = 4u;
+  data[4] = 0x1004u;
+  Check(!materialize().buffers[0].readonly_safe,
+        "disjoint bytes sharing a padded 256-byte binding were marked readonly");
+  data[2] = 256u;
+  data[4] = 0u;
+  Check(!materialize().buffers[0].readonly_safe, "null writer allowed readonly proof");
+  data[4] = 0x2000u;
+  data[0] = 0u;
+  Check(!materialize().buffers[0].readonly_safe, "null reader allowed readonly proof");
+  data[0] = 0x1000u;
+  data[6] = 0u;
+  Check(!materialize().buffers[0].readonly_safe, "empty writer allowed readonly proof");
+  data[6] = 256u;
+  program.info.buffers[0].max_byte_extent = 0x1100u;
+  // NativeStorageBuffer binds descriptor.GetSize(), clamped to mapped guest memory.
+  // max_byte_extent is access metadata and does not enlarge that Vulkan binding.
+  Check(materialize().buffers[0].readonly_safe,
+        "unused access extent changed the native descriptor alias proof");
+  program.info.buffers[0].max_byte_extent = 0u;
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  memory.coherent = true;
+  program.memory_info.push_back(memory);
+  Check(!materialize().buffers[0].readonly_safe, "coherent access allowed readonly proof");
+  program.memory_info.clear();
+  program.info.bda_writes = true;
+  Check(!materialize().buffers[0].readonly_safe, "BDA writes allowed readonly proof");
+  program.info.bda_writes = false;
+  program.has_address_writes = true;
+  Check(!materialize().buffers[0].readonly_safe, "address writes allowed readonly proof");
+  program.has_address_writes = false;
+  program.info.buffers[0].atomic = true;
+  Check(!materialize().buffers[0].readonly_safe, "atomic buffer was marked readonly");
+  program.info.buffers[0].atomic = false;
+  options.readonly_buffer_bindings = false;
+  SetCodegenOptions(options);
+  Check(!materialize().buffers[0].readonly_safe, "disabled option retained readonly proof");
+  SetCodegenOptions(saved);
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
@@ -689,6 +779,7 @@ int main() {
   for (const char* state : {"KYTY_BUFFER_REFRESH_FUSION=0\n", "KYTY_BUFFER_REFRESH_FUSION=1\n", "KYTY_BUFFER_REFRESH_FUSION=0\n"}) {
     Live::Testing::StageText(state);
     Live::OnCpFlip();
+  TestReadOnlyBufferSpecialization();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();

@@ -48,6 +48,9 @@ static void ResyncRemappedViews() {
 // bumps that generation under m_mutex first (InvalidateMapHints). The backing view stays
 // mapped for the store's lifetime and the destructor bumps too, so even a stale entry never
 // dereferences unmapped host memory; the tag check keeps it from using a changed mapping.
+// A lookup tries the record of the thread's last hit first, then the others. A new record replaces
+// the same mapping's record, else a stale one (an older generation, or never written), else the
+// next round-robin slot. Counters are the thread's lookups (Memory::BackingMapCacheThreadStats).
 struct GuestBackingMappingCache {
 	struct Entry {
 		const void* owner          = nullptr;
@@ -56,10 +59,39 @@ struct GuestBackingMappingCache {
 		uint64_t    size           = 0;
 		uint64_t    backing_offset = 0;
 	};
-	std::array<Entry, 4> entries {};
-	uint32_t             next = 0;
+	static constexpr uint32_t Capacity = 16;
+
+	std::array<Entry, Capacity> entries {};
+	uint32_t                    next = 0; // round-robin slot when none is stale
+	uint32_t                    last = 0; // the record of the last hit or insertion
+	uint64_t                    hits = 0;
+	// No record of this store covers the range / only records of an older generation do.
+	uint64_t                    misses_absent = 0;
+	uint64_t                    misses_stale  = 0;
 };
 static thread_local GuestBackingMappingCache t_backing_mapping_cache;
+
+// KYTY_BACKING_MAP_CACHE_ENTRIES=1..16 (default 4, live): the records a thread keeps. The GPU thread
+// alone reads constant and vertex buffers, command buffers, labels and image metadata from
+// different mappings, so four records can thrash there; every miss takes the store's mapping lock,
+// shared with the draw-prep workers, and a tree search (docs/BINDINGS-DESCRIPTORS-2026-10-09.md).
+// Records beyond a lowered count are only left unused; a raised count may find records that are
+// still valid, since validity depends on the generation alone.
+static Live::Switch g_backing_map_cache_entries("KYTY_BACKING_MAP_CACHE_ENTRIES",
+                                                [](const char* value) -> int64_t {
+	                                                if (value == nullptr) {
+		                                                return 4;
+	                                                }
+	                                                return std::clamp<int64_t>(
+	                                                    std::strtoll(value, nullptr, 10), 1,
+	                                                    GuestBackingMappingCache::Capacity);
+                                                });
+
+// At least 1: the switch reads 0 until its dynamic initialization has run.
+static uint32_t BackingMapCacheEntries() noexcept {
+	const auto entries = g_backing_map_cache_entries.Get();
+	return entries > 0 ? static_cast<uint32_t>(entries) : 1u;
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Post-mortem scan helper: a page can vanish between the working-set query and the read. No object with
@@ -409,20 +441,15 @@ public:
 			return TryReadBacking(vaddr, data, size); // the mapping cache is off
 		}
 		const auto generation = s_map_generation.load(std::memory_order_acquire);
-		for (const auto& entry: t_backing_mapping_cache.entries) {
-			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
-			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
-				continue;
-			}
+		if (const auto* entry = FindCachedMapping(vaddr, size, generation); entry != nullptr) {
 			// RangeOk held for the whole record when it was cached under m_mutex.
-			std::memcpy(data, m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+			std::memcpy(data, m_backing_base + entry->backing_offset + (vaddr - entry->vaddr),
 			            static_cast<size_t>(size));
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (s_map_generation.load(std::memory_order_relaxed) == generation) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheHits);
 				return true;
 			}
-			break;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheMisses);
 		auto* destination = static_cast<uint8_t*>(data);
@@ -447,21 +474,16 @@ public:
 			return false;
 		}
 		const auto generation = s_map_generation.load(std::memory_order_acquire);
-		for (const auto& entry: t_backing_mapping_cache.entries) {
-			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
-			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
-				continue;
-			}
+		if (const auto* entry = FindCachedMapping(vaddr, size, generation); entry != nullptr) {
 			// RangeOk held for the whole record when it was cached under m_mutex, and the backing
 			// view stays mapped for the store's lifetime.
-			inspect(static_cast<const uint8_t*>(m_backing_base + entry.backing_offset +
-			                                    (vaddr - entry.vaddr)));
+			inspect(static_cast<const uint8_t*>(m_backing_base + entry->backing_offset +
+			                                    (vaddr - entry->vaddr)));
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (s_map_generation.load(std::memory_order_relaxed) == generation) {
 				*locked = false;
 				return true;
 			}
-			break;
 		}
 		*locked = true;
 		std::lock_guard lock(m_mutex);
@@ -855,6 +877,11 @@ public:
 		return true;
 	}
 
+	// The map generation: every guest map or unmap of any store advances it.
+	[[nodiscard]] static uint64_t MapGeneration() noexcept {
+		return s_map_generation.load(std::memory_order_relaxed);
+	}
+
 private:
 	// Starts at 1 so zero-initialized GuestBackingMappingCache entries never match.
 	inline static std::atomic<uint64_t> s_map_generation {1};
@@ -871,27 +898,58 @@ private:
 		    UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		const auto generation = s_map_generation.load(std::memory_order_acquire);
-		for (const auto& entry: t_backing_mapping_cache.entries) {
-			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
-			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
+		const auto  generation = s_map_generation.load(std::memory_order_acquire);
+		const auto* entry      = FindCachedMapping(vaddr, size, generation);
+		if (entry == nullptr) {
+			return false;
+		}
+		// RangeOk held for the whole record when it was cached under m_mutex.
+		std::array<uint8_t, MAX_CACHED_MAPPING_READ> bounce;
+		std::memcpy(bounce.data(), m_backing_base + entry->backing_offset + (vaddr - entry->vaddr),
+		            static_cast<size_t>(size));
+		// Seqlock-style validation: if a map mutation started during the copy, the caller
+		// redoes the read under m_mutex so it is ordered before or after that mutation.
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (s_map_generation.load(std::memory_order_relaxed) != generation) {
+			return false;
+		}
+		std::memcpy(data, bounce.data(), static_cast<size_t>(size));
+		return true;
+	}
+
+	// The calling thread's record of this store covering [vaddr, vaddr + size) under `generation`,
+	// or nullptr; counted as a hit, or as a miss by reason. A hit whose copy then races a map
+	// mutation (the caller's generation check fails) still counts as a hit.
+	const GuestBackingMappingCache::Entry* FindCachedMapping(uint64_t vaddr, uint64_t size,
+	                                                         uint64_t generation) const {
+		auto&      cache   = t_backing_mapping_cache;
+		const auto entries = BackingMapCacheEntries();
+		const auto covers  = [&](const GuestBackingMappingCache::Entry& entry) {
+			return entry.owner == this && vaddr >= entry.vaddr && vaddr - entry.vaddr < entry.size &&
+			       size <= entry.size - (vaddr - entry.vaddr);
+		};
+		if (cache.last < entries) {
+			const auto& entry = cache.entries[cache.last];
+			if (entry.generation == generation && covers(entry)) {
+				cache.hits++;
+				return &entry;
+			}
+		}
+		bool stale = false;
+		for (uint32_t i = 0; i < entries; i++) {
+			const auto& entry = cache.entries[i];
+			if (!covers(entry)) {
 				continue;
 			}
-			// RangeOk held for the whole record when it was cached under m_mutex.
-			std::array<uint8_t, MAX_CACHED_MAPPING_READ> bounce;
-			std::memcpy(bounce.data(),
-			            m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
-			            static_cast<size_t>(size));
-			// Seqlock-style validation: if a map mutation started during the copy, the caller
-			// redoes the read under m_mutex so it is ordered before or after that mutation.
-			std::atomic_thread_fence(std::memory_order_acquire);
-			if (s_map_generation.load(std::memory_order_relaxed) != generation) {
-				return false;
+			if (entry.generation == generation) {
+				cache.last = i;
+				cache.hits++;
+				return &entry;
 			}
-			std::memcpy(data, bounce.data(), static_cast<size_t>(size));
-			return true;
+			stale = true;
 		}
-		return false;
+		(stale ? cache.misses_stale : cache.misses_absent)++;
+		return nullptr;
 	}
 
 	// Caller holds m_mutex, so the generation cannot change while it is sampled.
@@ -899,9 +957,28 @@ private:
 		if (!RangeOk(backing_offset, size)) {
 			return;
 		}
-		auto& cache = t_backing_mapping_cache;
-		cache.entries[cache.next++ % cache.entries.size()] = {
-		    this, s_map_generation.load(std::memory_order_relaxed), vaddr, size, backing_offset};
+		auto&      cache      = t_backing_mapping_cache;
+		const auto entries    = BackingMapCacheEntries();
+		const auto generation = s_map_generation.load(std::memory_order_relaxed);
+		// The same mapping's record (stale, or a duplicate after a raced hit), else the first stale
+		// one, else a round-robin slot. Never-written records have generation 0 (always stale).
+		uint32_t slot  = entries;
+		uint32_t stale = entries;
+		for (uint32_t i = 0; i < entries; i++) {
+			const auto& entry = cache.entries[i];
+			if (entry.owner == this && entry.vaddr == vaddr) {
+				slot = i;
+				break;
+			}
+			if (stale == entries && entry.generation != generation) {
+				stale = i;
+			}
+		}
+		if (slot == entries) {
+			slot = stale != entries ? stale : cache.next++ % entries;
+		}
+		cache.entries[slot] = {this, generation, vaddr, size, backing_offset};
+		cache.last          = slot;
 	}
 
 	template <typename Transfer>

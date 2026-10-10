@@ -3495,7 +3495,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// outside rendering (it ends the active instance, before the targets are acquired for the
 		// new one), after every earlier write, before the draw (MeshIndirect::Converter::Record).
 		m_mesh_indirect->Record(buffer, mesh_slot, emit.mesh_inputs, indirect_buffers.args,
-		                        indirect_buffers.args_offset);
+		                        indirect_buffers.args_offset, indirect_buffers.count,
+		                        indirect_buffers.count_offset);
 	}
 	vk::ImageAspectFlags feedback_aspects;
 	// KYTY_DRAW_PREP_BINDINGS statics: the plan's program flags and scissor union.
@@ -4181,6 +4182,15 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
                                         const DrawIndirectSource& source) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid() || source.args_addr == 0 || source.max_count == 0);
+	// A clean zero count lets the CPU path skip the packet without inspecting arguments or
+	// creating a conversion dispatch. This read never waits for GPU-owned count data.
+	if (source.max_count == 1 && source.count_addr != 0 && MeshIndirect::CountEnabled()) {
+		uint32_t count = 0;
+		if (LibKernel::Memory::TryReadGpuCleanBacking(source.count_addr, &count, sizeof(count)) &&
+		    count == 0) {
+			return false;
+		}
+	}
 	const auto& graphics = m_context.GetGraphics();
 	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
 	// Host command forms. firstInstance is GPU data, so its feature is always required.
@@ -4356,8 +4366,8 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 		if (!MeshIndirect::ConversionEnabled()) {
 			return decline(std::nullopt);
 		}
-		// One record without a count: the CPU path draws a multi-draw record by record.
-		if (source.max_count != 1 || source.count_addr != 0) {
+		// Keep multi-record packets on the CPU path: one record can write another's arguments.
+		if (source.max_count != 1 || (source.count_addr != 0 && !MeshIndirect::CountEnabled())) {
 			return decline(Profiler::FrameEvent::MeshIndirectDeclinedMulti);
 		}
 		// Restart segments come from a CPU scan of the indices (KYTY_MESH_RESTART=1).

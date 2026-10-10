@@ -191,8 +191,8 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.robust_buffer_loads = !o.robust_buffer_loads; });
   options_differ("readonly_buffers",
                  [](CodegenOptions &o) { o.readonly_buffers = !o.readonly_buffers; });
-  options_differ("readonly_buffers",
-                 [](CodegenOptions &o) { o.readonly_buffers = !o.readonly_buffers; });
+  options_differ("readonly_buffer_bindings",
+                 [](CodegenOptions &o) { o.readonly_buffer_bindings = !o.readonly_buffer_bindings; });
   for (const auto mode : {ShaderRecompiler::MadMode::Exact, ShaderRecompiler::MadMode::Position,
                           ShaderRecompiler::MadMode::Fused}) {
     if (mode != GetCodegenOptions().mad_mode) {

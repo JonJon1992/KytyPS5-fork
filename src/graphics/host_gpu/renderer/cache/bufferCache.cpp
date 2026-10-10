@@ -424,6 +424,13 @@ bool StreamDirectReadEnabled() {
 	return enabled;
 }
 
+// KYTY_BINDING_STATS=1 (default off): a "Bindings" line with every "Hot pages" line
+// (BufferCache::LogBindingStats).
+bool BindingStatsEnabled() {
+	static const bool enabled = ParseEnvU64("KYTY_BINDING_STATS", 0) != 0;
+	return enabled;
+}
+
 int RangeMemoVerifyMode() {
 	static const int mode = [] {
 		const auto* value = std::getenv("KYTY_BUFFER_RANGE_MEMO_VERIFY");
@@ -1571,6 +1578,7 @@ void BufferCache::LogHotPages() {
 		m_hot_log.faults  = m_memory_tracker.WriteFaultCount();
 		m_hot_log.refused = m_memory_tracker.HotRefusedCount();
 		m_hot_log.frame   = m_memory_tracker.Frame();
+		m_binding_stats_log = BindingStatsNow();
 		return;
 	}
 	if (now - m_hot_log.time < std::chrono::seconds(10)) {
@@ -1585,6 +1593,9 @@ void BufferCache::LogHotPages() {
 	    frame - m_hot_log.frame, faults - m_hot_log.faults, m_memory_tracker.HotPageCount(),
 	    m_memory_tracker.HotMax(), refused - m_hot_log.refused));
 	m_hot_log = {now, faults, refused, frame};
+	if (BindingStatsEnabled()) {
+		LogBindingStats(seconds);
+	}
 	if (auto& log = m_bda_candidate_log; log.admitted + log.skipped != 0) {
 		std::string reasons;
 		for (const auto& [reason, count]: log.reasons) {
@@ -1597,6 +1608,37 @@ void BufferCache::LogHotPages() {
 		                                      reasons.empty() ? "" : ")"));
 		log = {};
 	}
+}
+
+BufferCache::BindingStatsLog BufferCache::BindingStatsNow() const {
+	const auto backing = Libs::LibKernel::Memory::BackingMapCacheThreadStats();
+	return {m_buffers_created,    m_buffers_created_bytes, m_buffers_joined,
+	        m_idle_freed,         backing.hits,            backing.misses_absent,
+	        backing.misses_stale, backing.map_generation,  backing.entries};
+}
+
+// One line per LogHotPages line with KYTY_BINDING_STATS=1 (docs/BINDINGS-DESCRIPTORS-2026-10-09.md,
+// step 0). The backing counts are this (GPU) thread's only: a miss with no record of the range is a
+// possible capacity miss, cold lookup or ineligible range; one with only stale records follows a
+// guest map or unmap (the generation advances). A lookup hit can still fail post-copy validation.
+void BufferCache::LogBindingStats(double seconds) {
+	const auto  now     = BindingStatsNow();
+	const auto& before  = m_binding_stats_log;
+	const auto  hits    = now.backing_hits - before.backing_hits;
+	const auto  absent  = now.backing_absent - before.backing_absent;
+	const auto  stale   = now.backing_stale - before.backing_stale;
+	const auto  lookups = hits + absent + stale;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Bindings {:.0f}s: buffers created {} ({:.1f} MiB), joined {}, idle-freed {}; GPU-thread "
+	    "backing map cache ({} entries) hits {}, misses {} absent + {} stale ({:.1f}% hits), map "
+	    "generations +{}\n",
+	    seconds, now.created - before.created,
+	    static_cast<double>(now.created_bytes - before.created_bytes) / (1024.0 * 1024.0),
+	    now.joined - before.joined, now.idle_freed - before.idle_freed,
+	    now.backing_entries, hits, absent, stale,
+	    lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0,
+	    now.map_generation - before.map_generation));
+	m_binding_stats_log = now;
 }
 
 void BufferCache::NoteBdaCandidate(const char* reject) noexcept {
@@ -3308,6 +3350,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	m_buffers_created++;
+	m_buffers_created_bytes += overlap.end - overlap.begin;
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -3316,6 +3360,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		m_buffers_joined++;
 	}
 	if (joined) {
 		// The joined contents (including GPU-dirty bytes) are copied by this recording.

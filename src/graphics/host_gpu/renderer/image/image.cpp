@@ -57,6 +57,15 @@ bool GuestStorageRepeatEnabled() {
 }
 thread_local bool g_guest_transit = false;
 
+// Experimental: preserve each dependency, joining only equal adjacent layers.
+bool ImageBarrierCoalesceEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_BARRIER_COALESCE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
                                                 vk::AccessFlagBits2::eShaderWrite |
                                                 vk::AccessFlagBits2::eMemoryWrite;
@@ -310,7 +319,20 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.levelCount     = 1;
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
-					barriers.push_back(barrier);
+					// Destination scopes, image, aspects and queue families are identical
+					// within this call. Never bridge a skipped layer or a mip boundary.
+					const bool join = ImageBarrierCoalesceEnabled() && !barriers.empty() &&
+					    barriers.back().subresourceRange.baseMipLevel == level &&
+					    barriers.back().subresourceRange.baseArrayLayer +
+					        barriers.back().subresourceRange.layerCount == layer &&
+					    barriers.back().srcStageMask == barrier.srcStageMask &&
+					    barriers.back().srcAccessMask == barrier.srcAccessMask &&
+					    barriers.back().oldLayout == barrier.oldLayout;
+					if (join) {
+						++barriers.back().subresourceRange.layerCount;
+					} else {
+						barriers.push_back(barrier);
+					}
 					subresource_state = {destination_stage, destination_access, destination_layout,
 					                     guest};
 				}

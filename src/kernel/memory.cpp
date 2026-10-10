@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/platform/uffdWriteWatch.h"
 #include "common/profiler.h"
@@ -1096,6 +1097,12 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBackingDirect(vaddr, data, size);
+}
+
+BackingMapCacheStats BackingMapCacheThreadStats() noexcept {
+	const auto& cache = t_backing_mapping_cache;
+	return {cache.hits, cache.misses_absent, cache.misses_stale, GuestBackingStore::MapGeneration(),
+	        BackingMapCacheEntries()};
 }
 
 const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {

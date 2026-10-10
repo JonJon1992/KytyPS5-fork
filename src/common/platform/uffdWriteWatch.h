@@ -21,7 +21,8 @@
 // costs 1.4-3 us instead of 26-97 us with mprotect, but on memfd views every first write after a
 // release also takes a minor (write-notify) fault, ~4,700 per frame, so the total (6-7 ms of fault
 // time per frame) loses to mprotect with the larger fault-ahead windows (0.9-2 ms).
-// KYTY_UFFD_WP=1 turns it on (default off until it has run in the game on Linux; 0 = mprotect).
+// KYTY_UFFD_WP=1 turns it on (off when unset; the U59 preset enables it after native Linux
+// Crash 4 measurements and memory/Vulkan regression checks; 0 = mprotect).
 // Requirements, probed once at the first use and logged ("Kyty platform: userfaultfd ..."):
 //  - the userfaultfd syscall. When vm.unprivileged_userfaultfd is 0, an unprivileged process gets
 //    a user-mode-only descriptor (UFFD_USER_MODE_ONLY, Linux 5.11+). Kernel-mode writes to a

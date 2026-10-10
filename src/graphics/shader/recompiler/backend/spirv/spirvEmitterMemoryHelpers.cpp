@@ -115,15 +115,18 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	const auto kind = variable == state.readonly_storage_buffer_variable
+	                      ? IR::DescriptorBindingKind::ReadOnlyBuffers
+	                      : IR::DescriptorBindingKind::Buffers;
+	const auto array_index = ResourceForDescriptor(state, kind, mem.resource);
 	MemoryResourceAccess access {
 	    .kind = mem.kind,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
+	// Descriptor arrays may be partitioned; shader data retains original resource indices.
+	access.byte_offset = state.memory_byte_offsets[mem.resource];
 	// Plain AMD loads use hardware bounds, so omit their unused descriptor-length query.
 	// Keep shared lengths for wide/typed/formatted accesses. Single-word stores/atomics still
 	// request an explicit length at their bounds check below, in the correct storage view.
@@ -170,8 +173,13 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
+			const auto& buffer = state.program.info.buffers.at(mem.resource);
+			const bool readonly = state.readonly_storage_buffer_variable != 0 &&
+			                      buffer.readonly_safe && buffer.read && !buffer.written &&
+			                      !buffer.atomic && !mem.coherent;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			    state, mem, readonly ? state.readonly_storage_buffer_variable : state.storage_buffer_variable,
+			    TypeStorageBufferPointer(state));
 			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
 			                                    ConstantU32(state, 2u));
 			access.add_index_offset = true;

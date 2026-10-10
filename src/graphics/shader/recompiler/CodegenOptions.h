@@ -60,6 +60,7 @@ struct CodegenOptions {
 	// (every lane already holds the same value) passes through OpGroupNonUniformBroadcastFirst,
 	// which returns it unchanged but lets the host compiler treat it and everything derived from
 	// it (a waterfall loop's key, addresses, loop exits) as uniform. Exact.
+	// Reads whose source is proven identical in all guest lanes are eliminated in the IR first.
 	bool uniform_lane_reads = false;
 	// KYTY_SHORT_F32_HELPERS=1 (default off): NaN tests are one OpIsNan instead of exponent and
 	// mantissa tests (float-to-int conversions, the legacy min/max/med3, float atomics). Exact.
@@ -88,6 +89,8 @@ struct CodegenOptions {
 	// on an RX 6800 XT); other drivers may use their read-only caches. The page table, shader data
 	// and flattened SRT buffers, which no program writes, are NonWritable in every program.
 	bool readonly_buffers = true;
+	// Opt-in until game/ISA A/B: split disjoint read-only resources out of mixed buffer arrays.
+	bool readonly_buffer_bindings = false;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
 	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide

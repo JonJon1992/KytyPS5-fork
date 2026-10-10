@@ -103,6 +103,7 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   static const auto user_data = [] {
     std::array<uint32_t, 64> data{};
     data[3] = 3u << 28u; // Default fixture buffer uses raw offset bounds.
+    data[51] = 3u << 28u; // Fixtures also store through the output V# at s[48:51].
     return data;
   }();
 
@@ -5204,6 +5205,8 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
+  std::printf("aligned scalar BDA: words=%zu calls=%zu\n", raw.spirv.size(),
+              static_cast<size_t>(SpirvInstructionOpcodeCount(raw.spirv, 57)));
   Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
         "aligned scalar DWORDs must each use one BDA lookup");
   Check(SpirvContainsOpcode(raw.spirv, 199),
@@ -6045,7 +6048,7 @@ void TestNewShaderRecompilerImageGatherLodVariants() {
   user_data[16] = 0x1000u;
   user_data[17] = 0u;
   user_data[18] = 64u;
-  user_data[19] = 0u;
+  user_data[19] = 3u << 28u; // Raw offset bounds keep the gather results' stores live.
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
   options.user_data = user_data;
@@ -11648,8 +11651,7 @@ size_t CountSpirvDecoration(const std::vector<uint32_t> &binary, uint32_t decora
 
 void TestReadOnlyBuffers() {
   constexpr uint32_t NonWritable = 24u;
-  // The fixture buffer in s[0:3] (raw offset bounds): a buffer at s[48:51] is all zero, whose
-  // stride-0 OOB_SELECT 0 bounds drop every store.
+  // The default fixture buffers use raw offset bounds so their stores remain live in the IR.
   const uint32_t load_only[] = {
       EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0), // buffer_load_dword v0
       EncodeDs0(0x0d), EncodeDs1(0, 0, 0),                  // ds_write_b32 v0, v0
@@ -11718,6 +11720,104 @@ void TestReadOnlyBuffers() {
   Check(compile(flat_load_store, true).page_table && flat_added == flat_host,
         "read-only buffers: the page table of a program that stores to its buffers is not "
         "NonWritable");
+}
+
+void TestReadOnlyBufferBindings() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint32_t NonWritable = 24u;
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 0, 0),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 1, 0),
+      0xbf810000u,
+  };
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  std::array<uint32_t, 64> data{};
+  data[0] = 0x1000u;
+  data[2] = 256u;
+  data[3] = 3u << 28u;
+  data[4] = 0x2000u;
+  data[6] = 256u;
+  data[7] = 3u << 28u;
+  auto compile_options = MakeCompileOptions(ShaderType::Compute);
+  compile_options.user_data = data;
+  const auto compile = [&](bool enabled) {
+    auto options = saved;
+    options.readonly_buffers = true;
+    options.readonly_buffer_bindings = enabled;
+    ShaderRecompiler::SetCodegenOptions(options);
+    auto result = RecompileForTest(shader, compile_options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    bool stores = false;
+    for (const auto *block : result.program.blocks)
+      for (const auto &inst : *block)
+        stores |= BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write;
+    Check(stores && result.program.info.buffers.size() == 2,
+          "per-binding readonly fixture lost its load/store resources");
+    return result;
+  };
+  const auto off = compile(false);
+  Check(FindBinding(off.program.bindings, DescriptorBindingKind::ReadOnlyBuffers) == nullptr,
+        "flag off changed the legacy descriptor layout");
+  auto on = compile(true);
+  {
+    auto options = saved;
+    options.readonly_buffers = true;
+    options.readonly_buffer_bindings = true;
+    ShaderRecompiler::SetCodegenOptions(options);
+    auto translated = ShaderRecompiler::TranslateProgram(shader, compile_options);
+    const auto plan = ExtractResourcePlan(translated.program);
+    std::vector<uint8_t> plan_bytes;
+    ResourcePlan reloaded_plan;
+    Check(EncodeResourcePlan(plan, plan_bytes) && DecodeResourcePlan(plan_bytes, reloaded_plan),
+          "readonly resource plan did not round trip");
+    ResourceSnapshot snapshot;
+    ResourceSpecialization original, reloaded;
+    Check(MaterializeResources(plan, {.user_data = data}, snapshot, original) &&
+              MaterializeResources(reloaded_plan, {.user_data = data}, snapshot, reloaded) &&
+              original == reloaded && original.buffers[0].readonly_safe,
+          "reloaded resource plan lost the disjoint readonly proof");
+    data[4] = data[0];
+    Check(MaterializeResources(reloaded_plan, {.user_data = data}, snapshot, reloaded) &&
+              reloaded != original && !reloaded.buffers[0].readonly_safe,
+          "cached plan reused readonly proof after descriptor rebinding");
+    data[4] = 0x2000u;
+    ShaderRecompiler::SetCodegenOptions(saved);
+  }
+  const auto *ro = FindBinding(on.program.bindings, DescriptorBindingKind::ReadOnlyBuffers);
+  const auto *rw = FindBinding(on.program.bindings, DescriptorBindingKind::Buffers);
+  Check(ro != nullptr && rw != nullptr && ro->resources == std::vector<uint32_t>{0} &&
+            rw->resources == std::vector<uint32_t>{1},
+        "disjoint mixed load/store resources were not split by binding");
+  Check(CountSpirvDecoration(on.spirv, NonWritable) ==
+            CountSpirvDecoration(off.spirv, NonWritable) + 1u,
+        "readonly subset did not add exactly one NonWritable decoration");
+  // The persisted compiled layout and resource proof must agree after cache reload.
+  auto compiled_info = std::move(on.program).TakeCompiledInfo();
+  std::vector<uint8_t> bytes;
+  EncodeCompiledShaderInfo(compiled_info, bytes);
+  CompiledShaderInfo decoded;
+  Check(DecodeCompiledShaderInfo(bytes, decoded) && decoded.info == compiled_info.info &&
+            decoded.bindings == compiled_info.bindings,
+        "compiled metadata codec lost the readonly proof or split binding");
+  ResourceSpecialization specialization;
+  specialization.buffers.resize(2);
+  specialization.buffers[0].readonly_safe = true;
+  bytes.clear(); // CodecWriter appends; start a new payload after compiled metadata.
+  EncodeSpecialization(specialization, bytes);
+  ResourceSpecialization decoded_specialization;
+  Check(DecodeSpecialization(bytes, decoded_specialization) &&
+            decoded_specialization == specialization,
+        "specialization codec lost per-resource readonly proof");
+  data[4] = data[0];
+  const auto aliased = compile(true);
+  Check(FindBinding(aliased.program.bindings, DescriptorBindingKind::ReadOnlyBuffers) == nullptr &&
+            CountSpirvDecoration(aliased.spirv, NonWritable) ==
+                CountSpirvDecoration(off.spirv, NonWritable),
+        "aliased resources received an unsafe NonWritable binding");
+  data[4] = data[0] + 128u;
+  Check(FindBinding(compile(true).program.bindings, DescriptorBindingKind::ReadOnlyBuffers) == nullptr,
+        "partially overlapping resources received a readonly binding");
 }
 
 void TestGeometryOutputGuard() {
@@ -15933,6 +16033,10 @@ int main(int argc, char **argv) {
     TestNewShaderRecompilerSpirvSizeBaselines();
     return 0;
   }
+  if (argc == 2 && std::string_view(argv[1]) == "--scalar-memory-domains-only") {
+    TestNewShaderRecompilerScalarMemoryBindingDomains();
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--traversal-break-region-only") {
     TestTraversalLoopBreakRegion();
     std::puts("ShaderCfgTests: traversal break region passed");
@@ -16049,6 +16153,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--readonly-buffers-only") == 0) {
     TestReadOnlyBuffers();
+    TestReadOnlyBufferBindings();
     std::printf("shader_cfg --readonly-buffers-only: ok\n");
     return 0;
   }
@@ -16205,6 +16310,7 @@ int main(int argc, char **argv) {
   TestMeshIndirectParams();
   TestGeometryOutputGuard();
   TestReadOnlyBuffers();
+  TestReadOnlyBufferBindings();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

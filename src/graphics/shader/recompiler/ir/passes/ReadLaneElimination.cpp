@@ -1,4 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/passes/Uniformity.h"
 
 #include <algorithm>
 
@@ -286,10 +288,25 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;
 	}
+	const bool uniform_reads = GetCodegenOptions().uniform_lane_reads;
+	// Only lane reads (Unknown to this analysis) are rewritten below. Cached Uniform
+	// proofs cannot depend on those nodes; stale Unknown results merely miss optimizations.
+	UniformityAnalysis uniformity;
 
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
-			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
+			const auto opcode = inst.GetOpcode();
+			if (opcode != ValueOpcode::ReadLane &&
+			    !(uniform_reads && opcode == ValueOpcode::ReadFirstLane)) {
+				continue;
+			}
+			if (uniform_reads && uniformity.Get(inst.Arg(0)) == Uniformity::Uniform) {
+				// The proof includes inactive lanes and the lane-zero fallback for empty EXEC.
+				inst.ReplaceUsesWith(inst.Arg(0));
+				stats.rewritten_reads++;
+				continue;
+			}
+			if (opcode != ValueOpcode::ReadLane) {
 				continue;
 			}
 			const auto selector = inst.Arg(1).Resolve();

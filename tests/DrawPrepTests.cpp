@@ -1906,6 +1906,57 @@ void TestRegisterIndirectPairs() {
 	      "other packets have no register-indirect range");
 }
 
+std::atomic<uint64_t> g_live_spin_ns {0};
+std::atomic<bool> g_live_spin_seen {false};
+
+void TestWorkerLiveSpinBudget(bool hot) {
+	DrawPrep::Window<Item> window(4);
+	DrawPrep::WorkerGate gate(2, 1, 1, true);
+	std::atomic<bool> stop {false};
+	g_live_spin_ns.store(10'000'000'000ull);
+	g_live_spin_seen.store(false);
+	std::thread worker([&] {
+		DrawPrep::RunPreparationWorker(
+		    gate, window, hot ? 0u : 1u, 10'000'000'000ull, 10'000'000'000ull, stop,
+		    [&](Item& item, uint64_t seq) {
+			    item.output = Work(item.input);
+			    item.preparations++;
+			    window.Complete(seq);
+		    }, [] {}, [](bool) -> uint64_t {
+			    g_live_spin_seen.store(true, std::memory_order_release);
+			    return g_live_spin_ns.load(std::memory_order_relaxed);
+		    });
+	});
+	const auto until = [](auto&& ready) {
+		const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (!ready() && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+		return ready();
+	};
+	Check(until([] { return g_live_spin_seen.load(std::memory_order_acquire); }),
+	      "worker reads its live spin budget while idle");
+	g_live_spin_ns.store(0, std::memory_order_relaxed);
+	Check(until([&] { return hot ? gate.HotSleepers() != 0 : gate.ColdSleepers() != 0; }),
+	      "lowering the live budget parks an already idle worker");
+	for (uint64_t i = 0; i < 8; ++i) {
+		auto& pending = window.Reserve();
+		pending = {};
+		pending.input = i;
+		window.Publish();
+		(void)gate.OnPublish([&] { return window.Unclaimed(); });
+		if (!until([&] { return window.HeadDone(); })) {
+			Check(false, "parked live-budget worker wakes for the next draw");
+			break;
+		}
+		const auto& item = window.HeadPayload();
+		Check(item.output == Work(i) && item.preparations == 1,
+		      "live-budget worker preserves output and prepares each draw once");
+		window.Retire();
+	}
+	stop.store(true, std::memory_order_seq_cst);
+	gate.WakeAll();
+	worker.join();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1942,6 +1993,8 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
 	TestWorkerGateBasics();
+	TestWorkerLiveSpinBudget(true);
+	TestWorkerLiveSpinBudget(false);
 	TestAwaitHead();
 	TestWorkerGateStress();
 	TestColdTokenStranded();

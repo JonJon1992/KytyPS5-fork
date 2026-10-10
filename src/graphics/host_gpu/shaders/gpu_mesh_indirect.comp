@@ -13,6 +13,9 @@
 layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
 layout(set = 0, binding = 1, std430) writeonly buffer Out { uint words[]; } slot;
+#ifdef KYTY_MESH_INDIRECT_COUNT
+layout(set = 0, binding = 2, std430) readonly buffer Count { uint words[]; } count_buffer;
+#endif
 layout(push_constant) uniform Push {
 	uint args_word;
 	uint out_word;
@@ -28,6 +31,9 @@ layout(push_constant) uniform Push {
 	uint max_groups_y;
 	uint max_groups_total;
 	uint generation;
+#ifdef KYTY_MESH_INDIRECT_COUNT
+	uint count_word;
+#endif
 } push_data;
 
 const uint RECORDS = 4u;
@@ -35,6 +41,9 @@ const uint PARAMS_WORD = RECORDS * 3u;
 const uint STATUS_WORD = PARAMS_WORD + RECORDS * 8u;
 const uint ARGS_COPY_WORD = STATUS_WORD + 1u;
 const uint GENERATION_WORD = ARGS_COPY_WORD + 5u;
+#ifdef KYTY_MESH_INDIRECT_COUNT
+const uint COUNT_WORD = GENERATION_WORD + 1u;
+#endif
 // Status bits (MeshIndirect::Status).
 const uint STATUS_OVERFLOW = 1u;      // more dispatches needed than RECORDS: instances dropped
 const uint STATUS_LIMITS = 2u;        // the CPU path would stop the emulator (host limits)
@@ -45,11 +54,21 @@ void main() {
 	const uint o = push_data.out_word;
 	const bool indexed = push_data.indexed != 0u;
 	uint w[5];
+#ifdef KYTY_MESH_INDIRECT_COUNT
+	const uint draw_count = min(count_buffer.words[push_data.count_word], 1u);
+	slot.words[o + COUNT_WORD] = draw_count;
+	w = uint[5](0u, 0u, 0u, 0u, 0u);
+	// A zero count does not consume the argument record on the CPU path either.
+	if (draw_count != 0u) {
+#endif
 	w[0] = args.words[a];
 	w[1] = args.words[a + 1u];
 	w[2] = args.words[a + 2u];
 	w[3] = args.words[a + 3u];
 	w[4] = indexed ? args.words[a + 4u] : 0u;
+#ifdef KYTY_MESH_INDIRECT_COUNT
+	}
+#endif
 	for (uint i = 0u; i < 5u; ++i) {
 		slot.words[o + ARGS_COPY_WORD + i] = w[i];
 	}

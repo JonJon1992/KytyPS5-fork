@@ -530,6 +530,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Optional single-record count conversion. The ordinary shader retains its two bindings.
+set(gpu_mesh_indirect_count_spv "${gpu_mesh_generated_dir}/gpu_mesh_indirect_count.spv")
+set(gpu_mesh_indirect_count_header "${gpu_mesh_generated_dir}/gpu_mesh_indirect_count_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_mesh_indirect_count_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DKYTY_MESH_INDIRECT_COUNT=1
+	        -o "${gpu_mesh_indirect_count_spv}" "${gpu_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_mesh_indirect_count_spv} -DOUTPUT=${gpu_mesh_indirect_count_header}
+	        -DSYMBOL=GPU_MESH_INDIRECT_COUNT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_mesh_indirect_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_mesh_indirect_count_header}")
+
 # Guest SET_PREDICATION on the GPU (renderer/gpuPredication.h): 64-bit guest predicate -> the
 # 32-bit word VK_EXT_conditional_rendering reads.
 set(gpu_predicate_source "${gpu_tiler_shader_dir}/gpu_predicate.comp")
@@ -699,6 +715,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/Uniformity.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests common fmt::fmt)
@@ -1339,6 +1356,8 @@ if(BUILD_TESTING)
 	add_test(NAME registered_shader_code_cert COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
 	set_tests_properties(registered_shader_code_cert PROPERTIES ENVIRONMENT "KYTY_REGISTERED_SHADER_CODE=1")
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
+	add_test(NAME shader_uniformity
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --uniformity-only)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME image_clear_range COMMAND $<TARGET_FILE:image_clear_range_tests>)
@@ -1488,6 +1507,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-image-only)
 	add_test(NAME shader_packed_image_decode
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --packed-image-decode-only)
+	add_test(NAME shader_scalar_memory_domains
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --scalar-memory-domains-only)
 	if(NOT WIN32)
 		add_test(NAME shader_indirect_buffer_loop
 			COMMAND $<TARGET_FILE:shader_cfg_tests> --indirect-buffer-loop-only)
@@ -1586,6 +1607,12 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	foreach(host_ring IN ITEMS 0 1)
+		add_test(NAME stream_upload_paths_host${host_ring}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-upload-paths-only)
+		set_tests_properties(stream_upload_paths_host${host_ring} PROPERTIES
+			ENVIRONMENT "KYTY_STREAM_RING_HOST=${host_ring}" TIMEOUT 120)
+	endforeach()
 	# SRT readiness over a render target the CPU overwrote (Crash 4, KYTY_DCC_GPU=1 EXIT).
 	add_test(NAME cpu_overwritten_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-overwritten-image-only)
@@ -1891,6 +1918,14 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_IMAGE_LRU_SKIP=0")
 	# KYTY_IMAGE_TRANSIT_SKIP: the no-op pre-check against GetBarriers, and Transit's skips (or
 	# verify checks).
+	foreach(mode IN ITEMS off on unbatched)
+		add_test(NAME image_barrier_coalesce_${mode}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-barrier-coalesce-only)
+	endforeach()
+	set_tests_properties(image_barrier_coalesce_off PROPERTIES ENVIRONMENT "KYTY_IMAGE_BARRIER_COALESCE=0")
+	set_tests_properties(image_barrier_coalesce_on PROPERTIES ENVIRONMENT "KYTY_IMAGE_BARRIER_COALESCE=1")
+	set_tests_properties(image_barrier_coalesce_unbatched PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_BARRIER_COALESCE=1;KYTY_BARRIER_BATCH=0")
 	add_test(NAME image_transit_skip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
 	add_test(NAME image_transit_skip_verify
@@ -1926,6 +1961,18 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_NATIVE_INDIRECT_MESH=0")
 	add_test(NAME mesh_indirect_codegen
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-indirect-only)
+	add_test(NAME mesh_indirect_count
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_count PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT=1;KYTY_NATIVE_INDIRECT_MESH=1;KYTY_NATIVE_INDIRECT_MESH_COUNT=1")
+	add_test(NAME mesh_indirect_count_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_count_verify PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT=1;KYTY_NATIVE_INDIRECT_MESH=exit;KYTY_NATIVE_INDIRECT_MESH_COUNT=1")
+	add_test(NAME mesh_indirect_count_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_count_off PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT=1;KYTY_NATIVE_INDIRECT_MESH=1;KYTY_NATIVE_INDIRECT_MESH_COUNT=0")
 	# DPP row scans read by V_READLANE become native subgroup reductions (KYTY_LANE_REDUCTIONS);
 	# the GPU checks of the reductions and of DPP inactive sources are --wave-reductions-only.
 	add_test(NAME wave_row_reduction_codegen
@@ -2079,6 +2126,23 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-live)
 	set_tests_properties(draw_run_live PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1")
+	# CPU-clean WRITE_DATA may keep a run; GPU writes and rewritten textures remain guarded.
+	add_test(NAME draw_run_quiet_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-quiet-only)
+	set_tests_properties(draw_run_quiet_off PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_RUN=1;KYTY_DRAW_RUN_QUIET_OPS=0")
+	add_test(NAME draw_run_quiet_inline
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-quiet-only)
+	set_tests_properties(draw_run_quiet_inline PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_RUN=1;KYTY_DRAW_RUN_QUIET_OPS=1;KYTY_DRAW_RUN_PUSH=1")
+	add_test(NAME draw_run_quiet_parallel_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-quiet-only)
+	set_tests_properties(draw_run_quiet_parallel_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_RUN=exit;KYTY_DRAW_RUN_QUIET_OPS=1;KYTY_DRAW_RUN_ACQUIRE=1;KYTY_DRAW_RUN_PUSH=1")
+	add_test(NAME draw_run_quiet_live
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-quiet-live)
+	set_tests_properties(draw_run_quiet_live PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_RUN=1;KYTY_DRAW_RUN_QUIET_OPS=0;KYTY_DRAW_RUN_ACQUIRE=1;KYTY_DRAW_RUN_PUSH=1")
 	# KYTY_DRAW_RUN_PUSH: continuations push only their per-draw descriptors.
 	add_test(NAME draw_run_inline_push
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)

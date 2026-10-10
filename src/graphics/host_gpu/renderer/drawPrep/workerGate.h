@@ -205,10 +205,13 @@ inline void WorkerRelax() noexcept {
 // One preparation worker (Engine::Workers::Run; the unit tests run the same loop). `prepare` gets
 // each claimed slot and its sequence number and must complete it; `on_cold_wake` is called after
 // this worker woke a cold one. Workers look at the clock only every 256 idle spins.
+// An optional live budget is read at that same interval, including while already idle.
+// It changes only when to park; the claim and wakeup protocols remain the same.
 template <typename WindowT, typename Prepare, typename OnColdWake>
 void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uint64_t hot_spin_ns,
                           uint64_t cold_spin_ns, const std::atomic<bool>& stop, Prepare&& prepare,
-                          OnColdWake&& on_cold_wake) {
+                          OnColdWake&& on_cold_wake,
+                          uint64_t (*live_spin_ns)(bool hot) = nullptr) {
 	const bool hot        = gate.Hot(index);
 	const auto spin_limit = hot ? hot_spin_ns : cold_spin_ns;
 	auto       idle_start = WorkerNowNs();
@@ -225,7 +228,11 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 			continue;
 		}
 		WorkerRelax();
-		if ((++spins & 255u) != 0u || WorkerNowNs() - idle_start < spin_limit) {
+		if ((++spins & 255u) != 0u) {
+			continue;
+		}
+		const auto budget = live_spin_ns != nullptr ? live_spin_ns(hot) : spin_limit;
+		if (WorkerNowNs() - idle_start < budget) {
 			continue;
 		}
 		if (hot) {

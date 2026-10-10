@@ -369,6 +369,17 @@ void DefineDescriptors(EmitterState& state) {
 			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
 		};
 		switch (binding.kind) {
+			case IR::DescriptorBindingKind::ReadOnlyBuffers:
+				EXIT_IF(!GetCodegenOptions().readonly_buffers ||
+				        !GetCodegenOptions().readonly_buffer_bindings ||
+				        state.requirements.coherent_buffers);
+				for (const auto resource: binding.resources) {
+					const auto& buffer = state.program.info.buffers.at(resource);
+					EXIT_IF(!buffer.readonly_safe || !buffer.read || buffer.written || buffer.atomic);
+				}
+				state.readonly_storage_buffer_variable =
+				    DefineReadOnly(Define(ArrayType(StorageBufferType(state)), "readonly_buffers"));
+				break;
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");

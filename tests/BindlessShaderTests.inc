@@ -207,6 +207,8 @@ void TestBindlessShaderContract() {
   roots[0] = 0x10000; roots[2] = 4096;
   roots[4] = 0x20000; roots[6] = 1024;
   roots[12] = 0x30000; roots[14] = 64;
+  // A byte-addressed output needs OOB_SELECT=3; zero stride with OOB_SELECT=0 drops every store.
+  roots[15] = 3u << 28u;
   auto options = MakeCompileOptions(ShaderType::Compute);
   // v0 holds the thread id only with thread_ids_num; otherwise it is the constant 0 and its first
   // lane a static key. 64 threads keep the key GPU-selected.

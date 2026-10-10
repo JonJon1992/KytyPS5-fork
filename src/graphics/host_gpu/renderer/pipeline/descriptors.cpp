@@ -82,6 +82,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	switch (kind) {
 		case BindingKind::Samplers: return vk::DescriptorType::eSampler;
 		case BindingKind::Buffers:
+		case BindingKind::ReadOnlyBuffers:
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
@@ -182,12 +183,21 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     uint32_t slot, uint32_t& buffer_offset,
                     const std::vector<GuestRange>* written_ranges) {
 	buffer_offset = 0;
+	const auto empty_binding = [&]() -> vk::DescriptorBufferInfo {
+		if (resource.readonly_safe) {
+			// Deferred/unmapped resources must not turn a disjoint RO binding into an alias
+			// of the writable null buffer. Keep zero-read fallback in host-written storage.
+			const std::array<uint32_t, 4> zero {};
+			return NativeUpload(context, zero);
+		}
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+	};
 
 	const auto& [address, size, id] = source;
 	if (context.DeferGpuAccess(address, size))
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		return empty_binding();
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		return empty_binding();
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
@@ -232,7 +242,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 			            static_cast<uint64_t>(size), static_cast<uint64_t>(adjustment),
 			            static_cast<uint64_t>(alignment), static_cast<uint32_t>(stage), slot, count);
 		}
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		return empty_binding();
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	// OpArrayLength counts whole dwords. A 4-byte robustness alignment would round a partial
@@ -2540,7 +2550,8 @@ static void CountDescriptorPushMiss(int32_t result, std::span<const vk::WriteDes
 	}
 	switch (kind) {
 		case BindingKind::Samplers: Profiler::CountFrameEvent(Event::DescriptorPushMissSampler); break;
-		case BindingKind::Buffers: Profiler::CountFrameEvent(Event::DescriptorPushMissBuffer); break;
+		case BindingKind::Buffers:
+		case BindingKind::ReadOnlyBuffers: Profiler::CountFrameEvent(Event::DescriptorPushMissBuffer); break;
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData: Profiler::CountFrameEvent(Event::DescriptorPushMissUpload); break;
 		default: Profiler::CountFrameEvent(Event::DescriptorPushMissOther); break;
@@ -2624,7 +2635,8 @@ private:
 				const auto& write = writes[i];
 				const auto  kind  = kind_of(write);
 				const bool  table = kind == BindingKind::FlattenedSrt || kind == BindingKind::ShaderData;
-				if (write.pBufferInfo == nullptr || (tables ? !table : kind != BindingKind::Buffers)) {
+				if (write.pBufferInfo == nullptr ||
+				    (tables ? !table : kind != BindingKind::Buffers && kind != BindingKind::ReadOnlyBuffers)) {
 					continue;
 				}
 				masked[i] = std::min(write.descriptorCount, budget);
@@ -2870,6 +2882,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (binding.kind) {
 					case BindingKind::Buffers:
+					case BindingKind::ReadOnlyBuffers:
 						for (const auto resource: binding.resources) {
 							const auto& view = descriptors.buffers.at(resource);
 							EXIT_IF(view.buffer == nullptr &&

@@ -62,12 +62,15 @@ class StreamBuffer;
 //                  Convert() of the argument bytes the GPU read (MeshIndirectVerifyMismatches);
 //   exit           verify, stopping on the first difference;
 //   0              off: every indirect mesh draw reads its record on the CPU.
+// KYTY_NATIVE_INDIRECT_MESH_COUNT=1|on (default off) additionally permits one-record packets
+// with a GPU count. A count-specific converter reads min(count, 1) before the arguments.
 namespace MeshIndirect {
 
 enum class Mode : uint8_t { Off, Empty, On, Verify, VerifyExit };
 [[nodiscard]] Mode GetMode();
 // The GPU conversion is enabled (On, Verify, VerifyExit).
 [[nodiscard]] bool ConversionEnabled();
+[[nodiscard]] bool CountEnabled();
 
 // Slot layout (dwords): Records commands {x, y, z}, Records parameter blocks of 8 dwords
 // {count, vertex offset, instance chunk, index size, index address lo, hi, 0, first instance}, the status
@@ -79,9 +82,10 @@ inline constexpr uint32_t ParamsWord     = Records * CommandDwords;
 inline constexpr uint32_t StatusWord     = ParamsWord + Records * ParamDwords;
 inline constexpr uint32_t ArgsCopyWord   = StatusWord + 1;
 inline constexpr uint32_t GenerationWord = ArgsCopyWord + 5;
+inline constexpr uint32_t CountWord      = GenerationWord + 1; // Count-specific shader only.
 inline constexpr uint32_t SlotDwords     = 64;
 inline constexpr uint32_t SlotBytes      = SlotDwords * 4;
-static_assert(GenerationWord < SlotDwords);
+static_assert(CountWord < SlotDwords);
 
 inline constexpr uint32_t StatusOverflow   = 1;
 inline constexpr uint32_t StatusLimits     = 2;
@@ -158,19 +162,22 @@ public:
 	// dispatch flushes) and before the draw's indirect reads, mesh-shader reads and a host read
 	// (requested, recorded at the draw's BeginRendering). Queues the completion check.
 	void Record(CommandBuffer& buffer, const Slot& slot, const Inputs& inputs, vk::Buffer args,
-	            uint64_t args_offset);
+	            uint64_t args_offset, vk::Buffer count = nullptr, uint64_t count_offset = 0);
 
 	// Tests: the slot's words once its recording has completed.
 	[[nodiscard]] std::array<uint32_t, SlotDwords> ReadSlot(const Slot& slot) const;
 
 private:
-	void Initialize();
-	void Check(const Slot& slot, const Inputs& inputs);
+	void Initialize(bool counted = false);
+	void Check(const Slot& slot, const Inputs& inputs, bool counted);
 
 	RenderContext&                m_context;
 	vk::DescriptorSetLayout       m_descriptors = nullptr;
 	vk::PipelineLayout            m_layout      = nullptr;
 	vk::Pipeline                  m_pipeline    = nullptr;
+	vk::DescriptorSetLayout       m_count_descriptors = nullptr;
+	vk::PipelineLayout            m_count_layout      = nullptr;
+	vk::Pipeline                  m_count_pipeline    = nullptr;
 	std::unique_ptr<StreamBuffer> m_ring;
 	uint32_t                      m_generation = 0;
 };

@@ -1704,7 +1704,7 @@ void TestFmaskLoadSpecialization() {
       ValueOpcode::ImageRead, {ordinary, fixture.ImageAddress(), Value(true)},
       ordinary_flags);
   const auto output = fixture.Buffer(
-      {Value(0x3000u), Value(0u), Value(12u), Value(0u)}, 12);
+      {Value(0x3000u), Value(0u), Value(12u), Value(3u << 28u)}, 12);
   MemoryInfo store;
   store.kind = ResourceKind::Buffer;
   Value result;
@@ -2954,7 +2954,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
             static_cast<uint32_t>(DescriptorBindingKind::MipStats) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
+            static_cast<uint32_t>(DescriptorBindingKind::ReadOnlyBuffers) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{

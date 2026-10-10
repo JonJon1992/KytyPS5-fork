@@ -131,6 +131,18 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // then): any size through a per-thread mapping record, without the mapping lock (see
 // GuestBackingStore::TryReadBackingDirect). Any thread.
 bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size);
+// The calling thread's lookups in its backing mapping cache (the mapping records TryReadBacking,
+// TryReadBackingDirect and the in-place inspections use without the mapping lock), cumulative:
+// hits, misses with no record of the range, misses with only records of an older map generation;
+// and the map generation, which every guest map or unmap advances (KYTY_BACKING_MAP_CACHE_ENTRIES).
+struct BackingMapCacheStats {
+	uint64_t hits           = 0;
+	uint64_t misses_absent  = 0;
+	uint64_t misses_stale   = 0;
+	uint64_t map_generation = 0;
+	uint32_t entries        = 0; // the records a thread keeps now
+};
+[[nodiscard]] BackingMapCacheStats BackingMapCacheThreadStats() noexcept;
 // The direct-memory backing alias of [vaddr, vaddr + size) when one mapping holds the whole range,
 // or nullptr (not direct memory, or spanning mappings). The alias stays mapped and writable for
 // the process lifetime: reading it never faults, whatever the guest view's protection, and after

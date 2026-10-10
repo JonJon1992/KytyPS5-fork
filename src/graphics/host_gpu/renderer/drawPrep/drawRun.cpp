@@ -37,6 +37,9 @@ Live::Switch g_mode("KYTY_DRAW_RUN", ParseMode,
                     [](int64_t, int64_t) { NoteForeignActivity(); });
 Live::Switch g_acquire("KYTY_DRAW_RUN_ACQUIRE", Live::ParseDefaultOff);
 Live::Switch g_push("KYTY_DRAW_RUN_PUSH", Live::ParseDefaultOff);
+// Live A/B at the CP flip. No certificate from the previous policy may survive a change.
+Live::Switch g_quiet_ops("KYTY_DRAW_RUN_QUIET_OPS", Live::ParseDefaultOff,
+                         [](int64_t, int64_t) { NoteForeignActivity(); });
 
 } // namespace Detail
 
@@ -74,11 +77,7 @@ void NoteForeignActivity() noexcept {
 }
 
 bool QuietOpsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
-	return enabled;
+	return Detail::g_quiet_ops.On();
 }
 
 bool IndirectRunsEnabled() {

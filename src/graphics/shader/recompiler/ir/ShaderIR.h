@@ -153,6 +153,8 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// Specialization proof, refreshed with the descriptors; never inferred from read alone.
+	bool                   readonly_safe      = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -358,11 +360,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	MipStats,
+	ReadOnlyBuffers,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

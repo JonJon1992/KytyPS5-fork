@@ -48,6 +48,7 @@ CodegenOptions FromEnvironment() {
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
 	options.readonly_buffers    = EnvFlag("KYTY_READONLY_BUFFERS", options.readonly_buffers);
+	options.readonly_buffer_bindings = EnvFlag("KYTY_READONLY_BUFFER_BINDINGS", options.readonly_buffer_bindings);
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
 	options.sample_offsets = EnvFlag("KYTY_SAMPLE_OFFSETS", options.sample_offsets);
 	options.sample_lod_clamp = EnvFlag("KYTY_SAMPLE_LOD_CLAMP", options.sample_lod_clamp);

@@ -452,6 +452,19 @@ std::array<std::atomic<uint64_t>, static_cast<size_t>(Failure::Mismatch) + 1u> g
 
 namespace {
 
+// These are idle budgets, not preparation deadlines. Live changes neither cancel work nor
+// change the gate's wake protocol, so they can be sampled by each worker at its clock check.
+Live::Switch g_hot_spin_us("KYTY_DRAW_PREP_SPIN_US", [](const char* value) -> int64_t {
+	return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 1000000) : 200;
+});
+Live::Switch g_cold_spin_us("KYTY_DRAW_PREP_COLD_SPIN_US", [](const char* value) -> int64_t {
+	return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 1000000) : 50;
+});
+
+uint64_t WorkerSpinBudgetNs(bool hot) {
+	return static_cast<uint64_t>(hot ? g_hot_spin_us.Get() : g_cold_spin_us.Get()) * 1000u;
+}
+
 // KYTY_DRAW_PREP_CERT_DIAG=1 (live, default off; diagnostics): for every commit refused as
 // CertUnclean, the path that refused it, which exact predicate makes its first unclean range
 // unclean (Memory::GpuUncleanReasons), whether that range is a read or a digest, and how many
@@ -988,7 +1001,8 @@ struct Engine::Workers {
 				    Common::SamplePlacement(Common::ThreadRole::Host);
 			    }
 		    },
-		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); },
+		    &WorkerSpinBudgetNs);
 	}
 
 	PipelineCache&           pipeline_cache;
@@ -1012,7 +1026,7 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 	if (m_mode == Mode::Parallel) {
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
 		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
-		const auto spin_us = EnvUnsigned("KYTY_DRAW_PREP_SPIN_US", 200, 0, 1000000);
+		const auto spin_us = static_cast<uint32_t>(g_hot_spin_us.Get());
 		// Workers that keep spinning; the rest park until the backlog needs them. A value of at
 		// least KYTY_DRAW_PREP_WORKERS keeps every worker hot (the behaviour before the gate).
 		// Wake a parked worker once 2 slots wait unclaimed (8 until U54: the CP then waited for
@@ -1020,7 +1034,7 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		// --measure-worker-gate, heavy bursts: 270.4 -> 265.2 ms, no extra worker CPU).
 		const auto hot          = EnvUnsigned("KYTY_DRAW_PREP_HOT", 2, 1, 32);
 		const auto wake_backlog = EnvUnsigned("KYTY_DRAW_PREP_WAKE_BACKLOG", 2, 1, 1024);
-		const auto cold_spin_us = EnvUnsigned("KYTY_DRAW_PREP_COLD_SPIN_US", 50, 0, 1000000);
+		const auto cold_spin_us = static_cast<uint32_t>(g_cold_spin_us.Get());
 		// Work stealing while a worker holds the head (Engine::CommitHead): the unclaimed backlog
 		// that makes the command processor prepare slots itself (0 = never, the default), and how
 		// long it first waits for the head. Off by default: in the measured workloads it removes

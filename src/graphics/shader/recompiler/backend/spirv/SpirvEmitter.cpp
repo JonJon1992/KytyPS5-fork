@@ -71,7 +71,17 @@ void ValidateNativeProgram(const IR::Program& program) {
 		expected[index]  = std::move(resources);
 	};
 	if (!program.info.buffers.empty()) {
-		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
+		std::vector<uint32_t> writable, readonly;
+		const auto& options = GetCodegenOptions();
+		const bool split = options.readonly_buffers && options.readonly_buffer_bindings &&
+		    !std::ranges::any_of(program.memory_info, [](const auto& memory) { return memory.coherent; });
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& buffer = program.info.buffers[i];
+			const bool safe = split && buffer.readonly_safe && buffer.read && !buffer.written && !buffer.atomic;
+			(safe ? readonly : writable).push_back(i);
+		}
+		if (!writable.empty()) Expect(Kind::Buffers, std::move(writable));
+		if (!readonly.empty()) Expect(Kind::ReadOnlyBuffers, std::move(readonly));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		// Bindless images read the bindless table, not a native group (AllocateBindings).

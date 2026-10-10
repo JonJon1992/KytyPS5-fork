@@ -18,13 +18,13 @@ namespace {
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
-// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 26; BufferResource 12;
+// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 26; BufferResource 13;
 // ImageResource 21; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (IndirectImage
 // 9, BindlessSampler 2); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 30;
-// ResourceSpecialization 3 (Buffer 3, Image 11, Sampler 2).
+// ResourceSpecialization 3 (Buffer 5, Image 11, Sampler 2).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
@@ -357,6 +357,7 @@ void Write(CodecWriter& w, const BufferResource& v) {
 	w.Bool(v.atomic);
 	w.Bool(v.formatted);
 	w.Bool(v.scalar);
+	w.Bool(v.readonly_safe);
 }
 
 void Read(CodecReader& r, BufferResource& v) {
@@ -372,6 +373,7 @@ void Read(CodecReader& r, BufferResource& v) {
 	v.atomic             = r.Bool();
 	v.formatted          = r.Bool();
 	v.scalar             = r.Bool();
+	v.readonly_safe      = r.Bool();
 }
 
 void Write(CodecWriter& w, const ImageResource& v) {
@@ -539,6 +541,7 @@ void Write(CodecWriter& w, const ResourceSpecialization::Buffer& v) {
 	w.U32(EnumBits(v.descriptor_format));
 	w.U32(v.descriptor_swizzle);
 	w.Bool(v.zero_stride_oob);
+	w.Bool(v.readonly_safe);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Buffer& v) {
@@ -546,6 +549,7 @@ void Read(CodecReader& r, ResourceSpecialization::Buffer& v) {
 	v.descriptor_format  = EnumFrom<Prospero::BufferFormat>(r.U32());
 	v.descriptor_swizzle = r.U32();
 	v.zero_stride_oob    = r.Bool();
+	v.readonly_safe      = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {

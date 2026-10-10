@@ -296,6 +296,96 @@ void CheckUniformLaneReads(VulkanHarness *vulkan) {
   }
 }
 
+// The source is draw-constant, including lanes outside EXEC. ReadFirstLane with
+// empty EXEC must still return it, while a partial VGPR overwrite must keep the shuffle.
+TestCase ProvenUniformLaneSource(u32 wave_size, bool partial_write) {
+  TestCase test;
+  test.name = partial_write ? "UniformityPartialExecFallback" : "UniformityUserDataSource";
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.has_user_data = true;
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[8] = 0x13579bdfu;
+  test.user_data[9] = wave_size - 1u;
+  test.user_data[50] = 3u * sizeof(u32);
+  // Explicit full-wave EXEC makes the original VGPR write valid for inactive lanes too.
+  test.code.push_back(EncodeSop1(0x04, 126, 193u)); // s_mov_b64 exec, -1
+  test.code.push_back(EncodeSop2(0x00, 33, 8, InlineU32(7)));
+  test.code.push_back(EncodeVop1(0x01, 1, 33));
+  if (partial_write) {
+    test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    AppendVMovLiteral(&test.code, 1, 0xabcdef01u);
+  }
+  AppendVop3(&test.code, 0x360, 34, Vgpr(1), 9); // dynamic selector in SGPR
+  test.code.push_back(EncodeVop1(0x02, 35, Vgpr(1)));
+  test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  test.code.push_back(EncodeVop1(0x02, 36, Vgpr(1))); // EXEC=0 reads lane zero
+  test.code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendStoreSgpr(&test.code, 34, 0);
+  AppendStoreSgpr(&test.code, 35, 1);
+  AppendStoreSgpr(&test.code, 36, 2);
+  AppendEnd(&test.code);
+  test.initial.assign(3u, 0u);
+  test.expected = {test.user_data[8] + 7u,
+                   partial_write ? 0xabcdef01u : test.user_data[8] + 7u,
+                   partial_write ? 0xabcdef01u : test.user_data[8] + 7u};
+  test.opcodes = {ShaderOpcode::S_MOV_B64, ShaderOpcode::S_ADD_U32,
+                  ShaderOpcode::V_MOV_B32, ShaderOpcode::V_READLANE_B32,
+                  ShaderOpcode::V_READFIRSTLANE_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  if (partial_write) {
+    test.opcodes.push_back(ShaderOpcode::S_MOV_B32);
+  }
+  return test;
+}
+
+void CheckProvenUniformLaneReads(VulkanHarness *vulkan) {
+  for (const u32 wave_size : {32u, 64u}) {
+    for (const bool partial_write : {false, true}) {
+      const auto test = ProvenUniformLaneSource(wave_size, partial_write);
+      size_t shuffles[2]{};
+      size_t words[2]{};
+      for (const bool enabled : {false, true}) {
+        auto options = GetCodegenOptions();
+        options.uniform_lane_reads = enabled;
+        ScopedCodegenOptions scope(options);
+        std::vector<u32> spirv;
+        const auto actual = RunCollect(vulkan, test, test.expected.size(), &spirv);
+        RequireEqualWords(test.name, "on/off readback", test.expected, actual);
+        shuffles[enabled] = CountSpirv(spirv, "OpGroupNonUniformShuffle ");
+        words[enabled] = spirv.size();
+      }
+      std::printf("[uniformity] %s wave=%u shuffles=%zu->%zu words=%zu->%zu\n",
+                  test.name, wave_size, shuffles[0], shuffles[1], words[0], words[1]);
+      Require(test.name, "uniform source elimination",
+              shuffles[0] > 0u && (partial_write ? shuffles[1] > 0u : shuffles[1] == 0u),
+              "uniform proof missed the source or accepted a partial-EXEC write");
+      // Validate both host layouts independently of this device's default subgroup width.
+      for (const u32 host_lanes : {32u, 64u}) {
+        auto options = GetCodegenOptions();
+        options.uniform_lane_reads = true;
+        ScopedCodegenOptions scope(options);
+        const auto compiled = CompileCase(test, host_lanes);
+        const auto count = CountSpirv(compiled.spirv, "OpGroupNonUniformShuffle ");
+        Require(test.name, "guest/host lane layouts",
+                partial_write ? count > 0u : count == 0u,
+                "proof changed between host32 and host64");
+      }
+    }
+  }
+  for (const bool enabled : {false, true}) {
+    auto options = GetCodegenOptions();
+    options.uniform_lane_reads = enabled;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, VectorReadFirstLaneEmptyExecReadsLane0());
+  }
+  CheckUniformLaneReads(vulkan);
+}
+
 // A 64-thread workgroup that loops over `count` elements (a multiple of 64). Input i of element
 // e is at dword i * count + e; output o at (inputs + o) * count + e. The body reads inputs from
 // v2.. and writes outputs to v10.. (v1 holds the lane byte offset, s40 the element byte offset).

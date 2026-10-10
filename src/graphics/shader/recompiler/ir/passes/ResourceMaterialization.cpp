@@ -599,6 +599,54 @@ static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& desc
 	return true;
 }
 
+// Prove a property of the current descriptors, not of their source register numbers. Only the
+// boolean proof enters the permutation key; moving disjoint buffers does not create variants.
+static void ProveReadOnlyBuffers(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                 ResourceSpecialization& specialization) {
+	for (auto& buffer: specialization.buffers) buffer.readonly_safe = false;
+	const auto& options = GetCodegenOptions();
+	if (!options.readonly_buffers || !options.readonly_buffer_bindings ||
+	    program.has_address_writes || program.info.bda_writes ||
+	    std::ranges::any_of(program.memory_info, [](const auto& memory) { return memory.coherent; }) ||
+	    std::ranges::any_of(program.info.images, [](const auto& image) { return image.written || image.atomic; })) {
+		return;
+	}
+	const auto writes = [](const auto& buffer) { return buffer.written || buffer.atomic; };
+	if (!std::ranges::any_of(program.info.buffers, writes)) return; // existing all-read-only path
+	struct Range { uint64_t begin = 0; uint64_t end = 0; };
+	std::array<Range, ShaderInfo::MaxBuffers> ranges {};
+	EXIT_IF(program.info.buffers.size() > ranges.size());
+	for (size_t i = 0; i < program.info.buffers.size(); ++i) {
+		ShaderBufferResource descriptor;
+		if (DecodeBufferDescriptor(snapshot.buffers[i], descriptor) && descriptor.Type() == 0) {
+			const auto begin = descriptor.Base48();
+			const auto size = descriptor.GetSize();
+			constexpr uint64_t limit = uint64_t {1} << 48u;
+			// NativeStorageBuffer exposes a prefix of less than 256 bytes for alignment;
+			// include that prefix and a conservatively rounded tail in overlap checks.
+			if (begin != 0 && size >= 4 && begin % 4u == 0 && size <= limit - begin &&
+			    begin + size <= limit - 255u) {
+				ranges[i] = {begin & ~uint64_t {255}, (begin + size + 255u) & ~uint64_t {255}};
+			}
+		}
+		if (writes(program.info.buffers[i]) && ranges[i].end == 0) return;
+	}
+	for (size_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& buffer = program.info.buffers[i];
+		if (!buffer.read || writes(buffer) || buffer.image_alias != BufferResource::NoImageAlias ||
+		    ranges[i].end == 0) continue;
+		bool disjoint = true;
+		for (size_t j = 0; j < program.info.buffers.size(); ++j) {
+			if (writes(program.info.buffers[j]) && ranges[i].begin < ranges[j].end &&
+			    ranges[j].begin < ranges[i].end) {
+				disjoint = false;
+				break;
+			}
+		}
+		specialization.buffers[i].readonly_safe = disjoint;
+	}
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization, bool buffers_ready) {
 	if (!buffers_ready) {
@@ -608,6 +656,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
 		}
 	}
+	ProveReadOnlyBuffers(program, snapshot, specialization);
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -1460,6 +1509,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	auto buffers = program.info.buffers;
 	for (size_t index = 0; index < buffers.size(); index++) {
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
+		buffers[index].readonly_safe      = specialization.buffers[index].readonly_safe;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
 	}

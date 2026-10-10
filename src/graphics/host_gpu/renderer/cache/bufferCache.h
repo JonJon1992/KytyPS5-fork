@@ -1002,6 +1002,27 @@ private:
 		uint32_t                              frame   = 0;
 	};
 	HotLog m_hot_log;
+	// KYTY_BINDING_STATS=1: the totals behind the "Bindings" line LogHotPages adds (GPU thread):
+	// buffers CreateBuffer made, the overlapping buffers it joined into them (deleted), the idle
+	// buffers retired, and this thread's backing mapping cache lookups (Memory::
+	// BackingMapCacheThreadStats: the stream-ring copies of small read bindings miss there).
+	struct BindingStatsLog {
+		uint64_t created         = 0;
+		uint64_t created_bytes   = 0;
+		uint64_t joined          = 0;
+		uint64_t idle_freed      = 0;
+		uint64_t backing_hits    = 0;
+		uint64_t backing_absent  = 0;
+		uint64_t backing_stale   = 0;
+		uint64_t map_generation  = 0;
+		uint32_t backing_entries = 0;
+	};
+	[[nodiscard]] BindingStatsLog BindingStatsNow() const;
+	void                          LogBindingStats(double seconds);
+	uint64_t                      m_buffers_created       = 0;
+	uint64_t                      m_buffers_created_bytes = 0;
+	uint64_t                      m_buffers_joined        = 0;
+	BindingStatsLog               m_binding_stats_log;
 	// KYTY_BDA_WRITES=candidates since the last LogHotPages line (GPU thread): dispatches admitted
 	// and skipped, per reason (Plan::reject literals; the few distinct ones fit).
 	struct BdaCandidateLog {

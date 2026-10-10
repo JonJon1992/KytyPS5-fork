@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/Uniformity.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -538,6 +539,139 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
+void TestUniformLaneReadElimination() {
+  namespace Recompiler = Libs::Graphics::ShaderRecompiler;
+  const auto saved = Recompiler::GetCodegenOptions();
+  struct Restore {
+    Recompiler::CodegenOptions options;
+    ~Restore() { Recompiler::SetCodegenOptions(options); }
+  } restore{saved};
+
+  for (const bool enabled : {false, true}) {
+    auto options = saved;
+    options.uniform_lane_reads = enabled;
+    Recompiler::SetCodegenOptions(options);
+    for (const uint32_t wave_size : {32u, 64u}) {
+      Fixture fixture;
+      const auto userdata = fixture.Emit(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+      const auto sum = fixture.Emit(ValueOpcode::IAdd32, {userdata, Value(7u)});
+      const auto pair = fixture.Emit(ValueOpcode::CompositeConstructU32x2,
+                                     {sum, userdata});
+      const auto extracted = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                          {pair, Value(0u)});
+      const auto choice = fixture.Emit(ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {userdata, Value(0u)}),
+           extracted, userdata});
+      // Even a varying selector is irrelevant if every guest lane holds the same value.
+      const auto selector = fixture.Emit(ValueOpcode::LaneId);
+      const auto read = fixture.Emit(ValueOpcode::ReadLane, {choice, selector});
+      const auto read_use = fixture.Emit(ValueOpcode::ReferenceU32, {read});
+      const auto first = fixture.Emit(ValueOpcode::ReadFirstLane, {sum, Value(true)});
+      const auto first_use = fixture.Emit(ValueOpcode::ReferenceU32, {first});
+      // An empty EXEC reads lane zero. The proof must cover inactive lanes too.
+      const auto empty = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                      {Value(42u), Value(false)});
+      const auto empty_use = fixture.Emit(ValueOpcode::ReferenceU32, {empty});
+      const auto stats = EliminateReadLane(fixture.program, wave_size);
+      Check(stats.rewritten_reads == (enabled ? 3u : 0u),
+            "uniform lane reads did not respect the feature flag");
+      Check(read_use.ResolveInstruction()->Arg(0).Resolve() == (enabled ? choice : read) &&
+                first_use.ResolveInstruction()->Arg(0).Resolve() == (enabled ? sum : first) &&
+                empty_use.ResolveInstruction()->Arg(0).Resolve() ==
+                    (enabled ? Value(42u) : empty),
+            "uniform lane read did not preserve its source value");
+    }
+  }
+}
+
+void TestUniformLaneReadFallbacks() {
+  namespace Recompiler = Libs::Graphics::ShaderRecompiler;
+  const auto saved = Recompiler::GetCodegenOptions();
+  struct Restore {
+    Recompiler::CodegenOptions options;
+    ~Restore() { Recompiler::SetCodegenOptions(options); }
+  } restore{saved};
+  auto options = saved;
+  options.uniform_lane_reads = true;
+  Recompiler::SetCodegenOptions(options);
+
+  Fixture fixture(3);
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto active = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto selected = fixture.Emit(ValueOpcode::SelectU32,
+                                     {active, Value(42u), lane});
+  const auto conditional_constants = fixture.Emit(ValueOpcode::SelectU32,
+                                                   {active, Value(1u), Value(2u)});
+  const auto undef = fixture.Emit(ValueOpcode::UndefU32);
+  const auto buffer = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
+  const auto loaded = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
+                                          {buffer, Value(0u)}, memory);
+  const auto clock = fixture.Emit(ValueOpcode::CompositeExtractU64,
+      {fixture.Emit(ValueOpcode::ReadClockRealtime64), Value(0u)});
+  auto &phi = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi, {},
+                                               static_cast<uint64_t>(Type::U32));
+  // Different constants selected by a divergent branch are not uniform merely
+  // because each incoming value is uniform.
+  phi.AddPhiOperand(&fixture.BlockAt(0), Value(1u));
+  phi.AddPhiOperand(&fixture.BlockAt(1), Value(2u));
+  auto &cyclic = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi, {},
+                                                  static_cast<uint64_t>(Type::U32));
+  cyclic.AddPhiOperand(&fixture.BlockAt(0), Value(1u));
+  cyclic.AddPhiOperand(&fixture.BlockAt(2), Value(&cyclic));
+  for (const auto source : {lane, selected, conditional_constants, undef, loaded, clock,
+                            Value(&phi), Value(&cyclic)}) {
+    const auto first = fixture.Emit(ValueOpcode::ReadFirstLane, {source, active}, 0, 2);
+    fixture.Emit(ValueOpcode::ReferenceU32, {first}, 0, 2);
+    const auto empty = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                     {source, Value(false)}, 0, 2);
+    fixture.Emit(ValueOpcode::ReferenceU32, {empty}, 0, 2);
+    const auto read = fixture.Emit(ValueOpcode::ReadLane, {source, Value(0u)}, 0, 2);
+    fixture.Emit(ValueOpcode::ReferenceU32, {read}, 0, 2);
+  }
+  Check(EliminateReadLane(fixture.program, 64u).rewritten_reads == 0u,
+        "lane-read proof accepted divergence, inactive lanes, memory, undef, clock or a phi");
+}
+
+void TestUniformityClassification() {
+  Fixture fixture;
+  UniformityAnalysis analysis;
+  const auto userdata = fixture.Emit(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(2))});
+  const auto base = fixture.Emit(ValueOpcode::GetShaderBase);
+  const auto address = fixture.Emit(ValueOpcode::IAdd64, {base, Value(uint64_t{16})});
+  Check(analysis.Get(userdata) == Uniformity::Uniform &&
+            analysis.Get(address) == Uniformity::Uniform &&
+            analysis.Get(Value::F32(1.f)) == Uniformity::Uniform,
+        "uniform origins did not propagate through arithmetic");
+  Check(analysis.Get(Value{}) == Uniformity::Unknown &&
+            analysis.Get(Value(static_cast<ScalarReg>(2))) == Uniformity::Unknown,
+        "empty values or register tags were treated as numeric constants");
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto divergent = fixture.Emit(ValueOpcode::IAdd32, {lane, userdata});
+  const auto unknown = fixture.Emit(ValueOpcode::IAdd32,
+      {userdata, fixture.Emit(ValueOpcode::UndefU32)});
+  Check(analysis.Get(divergent) == Uniformity::Divergent &&
+            analysis.Get(unknown) == Uniformity::Unknown,
+        "divergent or unknown data was classified uniform");
+  const auto selected = fixture.Emit(ValueOpcode::SelectU32,
+      {fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)}), userdata, userdata});
+  Check(analysis.Get(selected) == Uniformity::Uniform,
+        "identical select arms lost uniformity");
+  const auto shuffled = fixture.Emit(ValueOpcode::ReadLane, {divergent, Value(0u)});
+  Check(analysis.Get(shuffled) == Uniformity::Unknown,
+        "a subgroup result was promoted to full-guest-wave uniformity");
+  Value deep = userdata;
+  for (uint32_t index = 0; index < 256u; index++) {
+    deep = fixture.Emit(ValueOpcode::IAdd32, {deep, Value(1u)});
+  }
+  UniformityAnalysis bounded;
+  Check(bounded.Get(deep) == Uniformity::Unknown,
+        "deep expressions did not use the bounded conservative fallback");
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -735,6 +869,9 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
+    TestUniformLaneReadElimination();
+    TestUniformLaneReadFallbacks();
+    TestUniformityClassification();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();

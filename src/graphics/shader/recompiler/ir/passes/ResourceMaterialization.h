@@ -15,6 +15,7 @@ struct ResourceSpecialization {
 		Prospero::BufferFormat descriptor_format               = Prospero::BufferFormat::kInvalid;
 		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
 		bool                   zero_stride_oob                 = false;
+		bool                   readonly_safe                   = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
