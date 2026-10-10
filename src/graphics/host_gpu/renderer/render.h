@@ -1222,13 +1222,33 @@ private:
 		uint64_t                              keys      = 0;
 		uint64_t                              kept      = 0;
 		uint64_t                              repeated  = 0; // heaps repeated whole
+		uint64_t                              drains    = 0; // KYTY_BINDLESS_DRAIN waits
+		uint64_t                              key_repeats = 0; // keys repeated one by one
+		uint64_t                              fixed_skips = 0; // fixed placeholders left as they were
+		// Keys resolved in full, by why they were not repeated and by what they settled to.
+		struct Full {
+			uint64_t unsettled = 0, changed = 0, pending = 0, no_hint = 0, refused = 0;
+			uint64_t same_slot = 0, new_slot = 0, fixed = 0, placeholder = 0;
+			// Pending placeholders: no registered image with data / no view for it.
+			uint64_t pending_image = 0, pending_view = 0;
+		} full;
+		uint64_t pending_waits = 0; // pending placeholders left until their retry time
+		uint64_t commit_textures = 0; // bindless textures the stage commits made readable
+		uint64_t commit_dups     = 0; // of those, repeats within one commit (skipped)
 	};
 	BindlessLog m_bindless_log;
 	// PrepareBindlessHeaps scratch, kept across consumers: the heap's T# records (and the raw
 	// span of strided records), and the keys of a heap repeat (TextureBindingMemo::TryRepeatKeys).
 	std::vector<std::array<uint32_t, 8>>        m_bindless_records;
 	std::vector<uint32_t>                       m_bindless_words;
+	std::vector<std::array<uint32_t, 4>>        m_bindless_sampler_records;
 	std::vector<TextureBindingMemo::RepeatKey>  m_bindless_repeat_keys;
+	// KYTY_BINDLESS_KEY_REPEAT scratch: the heap key of each repeat candidate, whether it passed,
+	// and per heap key whether it was repeated.
+	std::vector<uint32_t>                       m_bindless_repeat_index;
+	std::vector<uint8_t>                        m_bindless_repeat_passed;
+	std::vector<uint8_t>                        m_bindless_key_repeated;
+	uint64_t                                    m_bindless_commit_id = 0;
 	// KYTY_DRAW_SEQUENCE_VERIFY: the views a repeated stage claimed (RebindImages).
 	std::vector<vk::ImageView> m_claimed_views;
 	// KYTY_DRAW_SEQUENCE_FAST outcomes, always counted (the DrawSequence* frame events need a

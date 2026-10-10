@@ -15988,6 +15988,42 @@ public:
                   repeated() == repeats,
               "keeping the keys (or repeating the heap) skipped the texture's refresh");
 
+      // Commands recorded with the heap's region that have not completed (MarkRegionUsed, as the
+      // stage commit does): a changed key moves the heap to another region (copy on write)
+      // instead of rewriting the one they read. Once they completed, a move takes that region
+      // again; a change while nothing uses the region is written in place.
+      {
+        const auto used = heap().region;
+        table.MarkRegionUsed(used, scheduler.CurrentTick());
+        write_heap({a, b, a, volume});
+        (void)consume();
+        Require(name, "copy on write",
+                heap().region != used && heap().slots[1] != 0u &&
+                    heap().values[1] == heap().slots[1] && heap().published == heap().values,
+                "a change while commands used the region did not move the heap");
+        // A retired region waits one tick longer than the one it was retired in.
+        OnGpuThread(context, [&] {
+          scheduler.Finish();
+          scheduler.Finish();
+        });
+        const auto moved = heap().region;
+        write_heap({a, a, a, volume});
+        (void)consume();
+        Require(name, "in place", heap().region == moved && heap().published == heap().values &&
+                                      heap().values[1] == heap().slots[0],
+                "a change while nothing used the region moved the heap");
+        table.MarkRegionUsed(moved, scheduler.CurrentTick());
+        write_heap({a, b, a, volume});
+        (void)consume();
+        Require(name, "region recycled", heap().region == used,
+                "the region whose commands completed was not taken again");
+        write_heap({a, a, a, volume});
+        (void)consume();
+        const auto stats = table.TakePublishStats();
+        Require(name, "publish stats", stats.moved >= 2u && stats.recycled >= 1u,
+                "the publish counters missed the moves");
+      }
+
       // The cache retires A: its keys may not keep the slot that now holds the placeholder.
       OnGpuThread(context, [&] { TextureCacheTestAccess::FreeImage(texture_cache, first_images[0]); });
       Require(name, "retired texture",
@@ -15997,6 +16033,26 @@ public:
                   table.SlotView(BindlessTable::Images2D, heap().slots[0]) != nullptr &&
                   table.SlotView(BindlessTable::Images2D, first_slots[0]) == nullptr,
               "a key kept the slot of a retired texture");
+      // Slots go back to the free list when their image loses its last key or retires (B's and
+      // A's above): once the commands recorded up to then completed, the next texture that needs
+      // a slot takes the oldest released one instead of a new one.
+      {
+        OnGpuThread(context, [&] {
+          scheduler.Finish();
+          scheduler.Finish();
+        });
+        (void)table.TakePublishStats();
+        const auto c = texture(base + 0x60000);
+        write_heap({c, a, a, volume});
+        (void)consume();
+        const auto stats = table.TakePublishStats();
+        Require(name, "slot recycled",
+                stats.slots_recycled == 1u && stats.slots_new == 0u && heap().slots[0] != 0u &&
+                    heap().slots[0] != heap().slots[1] &&
+                    table.SlotView(BindlessTable::Images2D, heap().slots[0]) != nullptr &&
+                    heap().values[0] == heap().slots[0],
+                "the new texture did not take a released slot");
+      }
       OnGpuThread(context, [&] {
         scheduler.Finish();
         context.UnmapMemory(base, allocation_size);

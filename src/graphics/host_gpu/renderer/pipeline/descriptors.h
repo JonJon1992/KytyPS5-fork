@@ -51,6 +51,9 @@ struct PreparedBindings {
         ImageSubresourceRange range;
     };
     std::vector<BindlessPatch> bindless_patches;
+    // The translation regions this stage's image heap patches name, marked in use by the commit
+    // (BindlessTable::MarkRegionUsed) until the commands recorded with them complete.
+    std::vector<uint32_t> bindless_regions;
     std::vector<BindlessTexture> bindless_textures;
     std::vector<uint32_t> bindless_srt;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may

@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessLimits.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan.hpp>
 
@@ -48,7 +50,7 @@ public:
 	static constexpr uint32_t ImageArrays        = 4;
 	static constexpr uint32_t PlaceholderColors  = 3;
 	static constexpr uint32_t Placeholders       = ImageArrays * PlaceholderColors;
-	static constexpr uint32_t MaxImagesPerArray  = 16384;
+	static constexpr uint32_t MaxImagesPerArray  = BindlessMaxImagesPerArray;
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
 	static constexpr uint32_t MaxSamplers        = 4096;
 
@@ -95,6 +97,14 @@ public:
 		std::vector<uint8_t>               fixed_placeholder;
 		std::vector<vk::ImageLayout>       layouts;
 		std::vector<ImageSubresourceRange> ranges;
+		// Per key, the translation the host wants (SetTranslation) and the one the region holds
+		// (Publish writes the difference). `dirty`: values changed since the last Publish.
+		std::vector<uint32_t> values;
+		std::vector<uint32_t> published;
+		bool                  dirty = false;
+		// Per key settled as a pending placeholder (no fixed answer from its T#): when, in
+		// steady-clock milliseconds (KYTY_BINDLESS_PENDING_RETRY_MS).
+		std::vector<uint64_t> pending_ms;
 	};
 
 	// The heap for (base, table offset, view binding, complete resource interpretation), created
@@ -105,11 +115,36 @@ public:
 	                                     uint32_t record_stride, uint32_t binding, uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
-	// 0 when the array is full (slots are not reused yet).
+	// A slot no command that may still run reads: one released earlier (its image lost its last
+	// key, or was retired) once the commands recorded up to then completed, else a new one; 0
+	// when every slot is in use.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
-	// Resolve a key to a slot (0 = placeholder), or back to pending.
-	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
+	// Resolve a key to a slot (0 = placeholder), or back to pending. Only the host copy changes;
+	// Publish makes it visible to the commands recorded after it.
+	void SetTranslation(Heap& heap, uint32_t key, uint32_t slot);
+	// Writes the heap's changed translations. When commands that have not completed may read the
+	// heap's region (MarkRegionUsed), the whole translation moves to another region instead (copy
+	// on write), so those commands keep reading what they were recorded with; the old region is
+	// reused once they complete. With no region free the region is written in place: memory-safe
+	// (every value names a live view or the placeholder), but in-flight commands may then sample
+	// the new texture of a key. False in that case.
+	bool Publish(Heap& heap);
+	// Commands recorded up to `tick` read the translation region that starts at `region`.
+	void MarkRegionUsed(uint32_t region, uint64_t tick);
+	// Publish outcomes since the last call (the "Bindless heaps" line).
+	struct PublishStats {
+		uint64_t moved     = 0; // copy on write to another region
+		uint64_t in_place  = 0; // changed entries written into an idle region
+		uint64_t unchanged = 0; // dirty, but every value equals the published one
+		uint64_t full      = 0; // in place although in use: no region free
+		uint64_t recycled  = 0; // regions taken from the free list
+		uint64_t slots_recycled = 0; // image slots taken from the free list
+		uint64_t slots_new      = 0; // image slots never used before
+		uint64_t slot_failures  = 0; // AllocateSlot found no slot (the key samples the placeholder)
+		uint64_t slots_released = 0; // image slots released (no key left, or the image retired)
+	};
+	[[nodiscard]] PublishStats TakePublishStats() noexcept { return std::exchange(m_publish_stats, {}); }
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
     void AddSlotOwner(ImageId id, uint32_t binding, uint32_t slot);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
@@ -163,6 +198,20 @@ public:
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
+	// A region of `size` entries no command that may still run reads (recycled or new), or 0.
+	[[nodiscard]] uint32_t TakeRegion(uint32_t size);
+	// The region may be reused once every command recorded so far has completed.
+	void RetireRegion(uint32_t start, uint32_t size);
+	[[nodiscard]] bool RegionInUse(uint32_t start);
+	// Every value of the heap into its region, and its feedback cleared.
+	void WriteRegion(Heap& heap);
+	// The slot no longer belongs to any view: FindSlot cannot return it, so it is never chosen
+	// again. Its descriptor is left as it is: no translation names the slot once the keys that
+	// did are published, and a partially bound descriptor no shader uses is not a reference.
+	void ForgetSlot(uint32_t binding, uint32_t slot);
+	// Every slot the image owns: forgotten, and reusable once the commands recorded so far
+	// completed (one tick later, in case a submit lands before the commit of a prepared stage).
+	void ReleaseImageSlots(ImageId id);
 	// Slot 0 of every image array: a 1x1 grey texture of that view type, sampled for keys
 	// outside a heap and while a texture is pending. Created, cleared and made read-only once.
 	void CreatePlaceholders(CommandScheduler& scheduler);
@@ -172,6 +221,7 @@ private:
 	}
 
 	GraphicContext&         m_graphics;
+	CommandScheduler&       m_scheduler;
 	std::mutex m_retirement_mutex;
 	std::vector<ImageId> m_unregistered;
 	bool m_used = false;
@@ -179,8 +229,21 @@ private:
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> m_image_slots;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
+	struct FreeRegion {
+		uint32_t start = 0;
+		uint32_t size  = 0;
+	};
+	std::vector<FreeRegion> m_free_regions;
+	// Per region start (live or free), the last tick whose commands may read it.
+	std::unordered_map<uint32_t, uint64_t> m_region_ticks;
+	PublishStats                           m_publish_stats;
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
 	                                               PlaceholderColors, PlaceholderColors};
+	struct FreeSlot {
+		uint32_t slot = 0;
+		uint64_t tick = 0; // reusable once this tick completed
+	};
+	std::array<std::deque<FreeSlot>, ImageArrays> m_free_slots;
 	std::array<VulkanImage, Placeholders>   m_placeholders;
 	std::array<vk::ImageView, Placeholders> m_placeholder_views {};
 	vk::DescriptorPool      m_pool   = nullptr;

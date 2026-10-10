@@ -5,6 +5,11 @@
 
 namespace Libs::Graphics {
 
+// Sampled images per typed array at most. Slots are recycled once no key names their image and
+// the commands that could read them completed (BindlessTable::AllocateSlot); the capacity only
+// bounds the textures the heaps reference at once (Ghost of Yotei filled 16384 before recycling).
+inline constexpr uint32_t BindlessMaxImagesPerArray = 65536u;
+
 struct BindlessBudget {
     uint32_t images = 0;
     uint32_t samplers = 0;
@@ -28,7 +33,7 @@ BindlessBudget CalculateBindlessBudget(const Properties& p, const Limits& limits
         spare(p.maxDescriptorSetUpdateAfterBindSamplers, SetSamplers),
         spare(p.maxPerStageDescriptorUpdateAfterBindSamplers, 32u)});
     if (samplers == 0u) return {};
-    const auto total_images = std::min({4u * 16384u,
+    const auto total_images = std::min({4u * BindlessMaxImagesPerArray,
         spare(p.maxDescriptorSetUpdateAfterBindSampledImages, SetImages),
         spare(p.maxPerStageDescriptorUpdateAfterBindSampledImages, 64u),
         spare(p.maxPerStageUpdateAfterBindResources, StageResources + samplers + 2u),

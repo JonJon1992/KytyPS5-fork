@@ -1,11 +1,13 @@
 #include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <charconv>
@@ -46,6 +48,8 @@ struct TextureBindingMemo::Entry {
 	// FindHint's view of `key` and `tag` (P4b-2): Record makes `seq` odd, stores the packed key
 	// and the tag, and makes it even again (release); a reader that sees the same even value
 	// before and after its loads read a pair Record wrote together.
+	// The memo's use clock at the last hit or fill (two-choice replacement picks the older).
+	uint64_t                                      last_use = 0;
 	std::atomic<uint32_t>                         seq {0};
 	std::atomic<uint64_t>                         published_tag {0};
 	std::array<std::atomic<uint64_t>, KeyWords>   packed_key {};
@@ -231,28 +235,58 @@ TextureBindingMemo::PackedKey TextureBindingMemo::PackKey(const Key& key) {
 	return packed;
 }
 
+// KYTY_TEXTURE_MEMO_TWO_CHOICE (default on; =0 off, live): Record places a key in the better of
+// its two slots (SlotsOf) instead of always the first. Lookups probe both either way, so the
+// switch only changes where new entries go.
+static Live::Switch g_memo_two_choice("KYTY_TEXTURE_MEMO_TWO_CHOICE", Live::ParseDefaultOn);
+
+std::array<uint32_t, 2> TextureBindingMemo::SlotsOf(uint64_t hash) const noexcept {
+	const auto first  = static_cast<uint32_t>(hash & m_slot_mask);
+	// Bits of the hash the first slot does not use, mixed so that equal first slots spread.
+	auto       second = static_cast<uint32_t>(((hash >> 32u) * 0x9e3779b1u) & m_slot_mask);
+	if (second == first) {
+		second ^= 1u;
+	}
+	return {first, second};
+}
+
+uint32_t TextureBindingMemo::SlotWithTag(uint64_t hash, uint64_t tag) const noexcept {
+	if (!m_entries || tag == 0) {
+		return UINT32_MAX;
+	}
+	for (const auto slot: SlotsOf(hash)) {
+		if (m_entries[slot].tag == tag) {
+			return slot;
+		}
+	}
+	return UINT32_MAX;
+}
+
 bool TextureBindingMemo::FindHint(const Key& key, uint64_t hash, uint64_t& tag) const {
 	const auto* entries = m_published.load(std::memory_order_acquire);
 	if (entries == nullptr) {
 		return false;
 	}
-	const auto& entry  = entries[hash & m_slot_mask];
-	const auto  packed = PackKey(key);
-	const auto  before = entry.seq.load(std::memory_order_acquire);
-	if ((before & 1u) != 0) {
-		return false; // being rewritten
+	const auto packed = PackKey(key);
+	for (const auto slot: SlotsOf(hash)) {
+		const auto& entry  = entries[slot];
+		const auto  before = entry.seq.load(std::memory_order_acquire);
+		if ((before & 1u) != 0) {
+			continue; // being rewritten
+		}
+		const auto found = entry.published_tag.load(std::memory_order_relaxed);
+		bool       same  = found != 0;
+		for (uint32_t i = 0; i < KeyWords; i++) {
+			same = entry.packed_key[i].load(std::memory_order_relaxed) == packed[i] && same;
+		}
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (!same || entry.seq.load(std::memory_order_relaxed) != before) {
+			continue;
+		}
+		tag = found;
+		return true;
 	}
-	const auto found = entry.published_tag.load(std::memory_order_relaxed);
-	bool       same  = found != 0;
-	for (uint32_t i = 0; i < KeyWords; i++) {
-		same = entry.packed_key[i].load(std::memory_order_relaxed) == packed[i] && same;
-	}
-	std::atomic_thread_fence(std::memory_order_acquire);
-	if (!same || entry.seq.load(std::memory_order_relaxed) != before) {
-		return false;
-	}
-	tag = found;
-	return true;
+	return false;
 }
 
 Image* TextureBindingMemo::HitImage(TextureCache& cache, const Entry& entry) {
@@ -268,6 +302,7 @@ Image* TextureBindingMemo::HitImage(TextureCache& cache, const Entry& entry) {
 
 void TextureBindingMemo::ApplyHit(Entry& entry, uint32_t slot, TextureBinding& binding) {
 	binding.image_id = entry.image;
+	entry.last_use   = ++m_use_clock;
 	if (binding.memo_tag == entry.tag && binding.memo_slot == slot) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingDescCopiesAvoided);
 	} else {
@@ -292,11 +327,11 @@ uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const 
 	std::scoped_lock lock {cache.m_lock};
 	const auto       tick = cache.m_scheduler.CurrentTick();
 	for (; hits < bindings.size(); hits++) {
-		const auto slot  = static_cast<uint32_t>(hashes[hits] & m_slot_mask);
-		auto&      entry = m_entries[slot];
-		if (tags[hits] == 0 || entry.tag != tags[hits]) {
+		const auto slot = SlotWithTag(hashes[hits], tags[hits]);
+		if (slot == UINT32_MAX) {
 			break;
 		}
+		auto& entry = m_entries[slot];
 		if (entry.dcc) {
 			break; // TryResolve checks the DCC certificate outside the lock
 		}
@@ -328,10 +363,24 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
 	}
-	const auto slot  = static_cast<uint32_t>(hash & m_slot_mask);
-	auto&      entry = m_entries[slot];
-	// A hint naming this entry's tag proves the key (FindHint); otherwise compare it.
-	const bool hinted = tag_hint != 0 && entry.tag == tag_hint;
+	// The slot holding the key: the one whose tag a hint names (FindHint proved the key), else
+	// the one whose key compares equal.
+	uint32_t   slot   = SlotWithTag(hash, tag_hint);
+	const bool hinted = slot != UINT32_MAX;
+	if (!hinted) {
+		slot = UINT32_MAX;
+		for (const auto candidate: SlotsOf(hash)) {
+			if (m_entries[candidate].tag != 0 && m_entries[candidate].key == key) {
+				slot = candidate;
+				break;
+			}
+		}
+		if (slot == UINT32_MAX) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
+			return false;
+		}
+	}
+	auto& entry = m_entries[slot];
 	if (hinted && verify_hint) {
 		DrawPrep::CountBindingVerifyCheck();
 		if (!(entry.key == key)) {
@@ -456,8 +505,29 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 		m_entries = std::make_unique<Entry[]>(m_slot_mask + 1u);
 		m_published.store(m_entries.get(), std::memory_order_release);
 	}
-	const auto slot  = static_cast<uint32_t>(hash & m_slot_mask);
-	auto&      entry = m_entries[slot];
+	// The slot of the same key if it holds one; else (two-choice placement) an empty slot, else
+	// the one hit least recently; the first slot when the switch is off (direct-mapped).
+	const auto candidates = SlotsOf(hash);
+	uint32_t   slot       = candidates[0];
+	if (g_memo_two_choice.On()) {
+		const auto& a = m_entries[candidates[0]];
+		const auto& b = m_entries[candidates[1]];
+		if (a.tag != 0 && a.key == key) {
+			slot = candidates[0];
+		} else if (b.tag != 0 && b.key == key) {
+			slot = candidates[1];
+		} else if (a.tag == 0) {
+			slot = candidates[0];
+		} else if (b.tag == 0) {
+			slot = candidates[1];
+		} else {
+			slot = a.last_use <= b.last_use ? candidates[0] : candidates[1];
+		}
+	} else if (const auto& b = m_entries[candidates[1]]; b.tag != 0 && b.key == key) {
+		slot = candidates[1]; // keep a single entry per key
+	}
+	auto& entry = m_entries[slot];
+	entry.last_use = ++m_use_clock;
 	// FindHint's readers: odd while the key and tag change (the fence orders the odd value before
 	// the new words), even again once both are stored (release).
 	const auto seq = entry.seq.load(std::memory_order_relaxed);
@@ -659,7 +729,11 @@ bool TextureBindingMemo::TryRepeatKeys(TextureCache& cache, std::span<const Repe
 	}
 	std::scoped_lock lock {cache.m_lock};
 	for (const auto& key: keys) {
-		const auto& entry = m_entries[key.hash & m_slot_mask];
+		const auto slot = SlotWithTag(key.hash, key.tag);
+		if (slot == UINT32_MAX) {
+			return false;
+		}
+		const auto& entry = m_entries[slot];
 		// TryResolve checks a DCC entry's certificate outside the lock: left to it.
 		if (key.tag == 0 || entry.tag != key.tag || entry.image != key.image || entry.dcc ||
 		    entry.null_image || entry.view == nullptr || entry.view != key.view) {
@@ -679,6 +753,43 @@ bool TextureBindingMemo::TryRepeatKeys(TextureCache& cache, std::span<const Repe
 	m_totals.hits += keys.size();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits, keys.size());
 	return true;
+}
+
+size_t TextureBindingMemo::TryRepeatEachKey(TextureCache& cache, std::span<const RepeatKey> keys,
+                                            std::span<uint8_t> repeated) {
+	EXIT_IF(repeated.size() != keys.size());
+	std::ranges::fill(repeated, uint8_t {0});
+	if (keys.empty() || !m_entries) {
+		return 0;
+	}
+	size_t           hits = 0;
+	std::scoped_lock lock {cache.m_lock};
+	const auto       tick = cache.m_scheduler.CurrentTick();
+	for (size_t i = 0; i < keys.size(); i++) {
+		const auto& key  = keys[i];
+		const auto  slot = SlotWithTag(key.hash, key.tag);
+		if (slot == UINT32_MAX) {
+			continue;
+		}
+		const auto& entry = m_entries[slot];
+		// The checks of TryRepeatKeys (a DCC entry's certificate is left to TryResolve).
+		if (key.tag == 0 || entry.tag != key.tag || entry.image != key.image || entry.dcc ||
+		    entry.null_image || entry.view == nullptr || entry.view != key.view) {
+			continue;
+		}
+		const auto* image = HitImage(cache, entry);
+		if (image == nullptr || !ViewImageReady(entry, *image)) {
+			continue;
+		}
+		auto& hit              = cache.m_slot_images[key.image];
+		hit.tick_accessed_last = tick;
+		cache.TouchImage(hit);
+		repeated[i] = 1u;
+		hits++;
+	}
+	m_totals.hits += hits;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits, hits);
+	return hits;
 }
 
 vk::ImageView TextureBindingMemo::EntryView(const TextureBinding& binding) const {

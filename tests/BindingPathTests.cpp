@@ -254,11 +254,12 @@ void TestBindlessBudgets() {
     p.maxPerStageDescriptorUpdateAfterBindStorageBuffers = 10000;
     p.maxDescriptorSetUpdateAfterBindSamplers = 10000;
     p.maxPerStageDescriptorUpdateAfterBindSamplers = 10000;
-    p.maxDescriptorSetUpdateAfterBindSampledImages = 100000;
-    p.maxPerStageDescriptorUpdateAfterBindSampledImages = 100000;
-    p.maxPerStageUpdateAfterBindResources = 100000;
-    p.maxUpdateAfterBindDescriptorsInAllPools = 100000;
-    Check(CalculateBindlessBudget(p, limits).images == 16384, "ample budgets retain all image slots");
+    p.maxDescriptorSetUpdateAfterBindSampledImages = 1000000;
+    p.maxPerStageDescriptorUpdateAfterBindSampledImages = 1000000;
+    p.maxPerStageUpdateAfterBindResources = 1000000;
+    p.maxUpdateAfterBindDescriptorsInAllPools = 1000000;
+    Check(CalculateBindlessBudget(p, limits).images == BindlessMaxImagesPerArray,
+          "ample budgets retain all image slots");
     limits.maxBoundDescriptorSets = 1;
     Check(CalculateBindlessBudget(p, limits).images == 0, "set1 requires two bound sets");
     limits.maxBoundDescriptorSets = 2;
@@ -266,7 +267,7 @@ void TestBindlessBudgets() {
     Check(CalculateBindlessBudget(p, limits).images == 3, "single flagged pool includes buffers and samplers");
     --p.maxUpdateAfterBindDescriptorsInAllPools;
     Check(CalculateBindlessBudget(p, limits).images == 0, "pool cannot fit all typed placeholders");
-    p.maxUpdateAfterBindDescriptorsInAllPools = 100000;
+    p.maxUpdateAfterBindDescriptorsInAllPools = 1000000;
     p.maxPerStageUpdateAfterBindResources = 72 + 64*16 + 64 + 32 + 4096 + 2 + 12;
     Check(CalculateBindlessBudget(p, limits).images == 3, "per-stage reserve includes storage mip arrays");
     --p.maxPerStageUpdateAfterBindResources;

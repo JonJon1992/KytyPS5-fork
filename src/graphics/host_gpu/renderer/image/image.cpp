@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -65,6 +66,8 @@ bool ImageBarrierCoalesceEnabled() {
 	}();
 	return enabled;
 }
+
+Live::Switch g_transit_skip_partial("KYTY_IMAGE_TRANSIT_SKIP_PARTIAL", Live::ParseDefaultOn);
 
 constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
                                                 vk::AccessFlagBits2::eShaderWrite |
@@ -380,21 +383,53 @@ bool Image::TransitIsNoOp(vk::ImageLayout                             destinatio
 	// GetBarriers' conditions, in its order: per-subresource states or a partial range take its
 	// per-subresource path (which may create those states); otherwise it returns before changing
 	// anything exactly when the layout and access match and the access includes no write.
-	if (!backing.subresource_states.empty()) {
+	const auto matches = [&](const auto& state) {
+		return state.layout == destination_layout && state.access_mask == destination_access &&
+		       !static_cast<bool>(state.access_mask & TransitWriteAccess);
+	};
+	bool           partial     = false;
+	uint32_t       base_level  = 0;
+	uint32_t       level_count = info.resources.levels;
+	uint32_t       base_layer  = 0;
+	uint32_t       layer_count = info.resources.layers;
+	if (range) {
+		const bool volume = info.IsVolume();
+		base_level        = range->base_level;
+		level_count       = range->level_count;
+		base_layer        = volume ? 0u : range->base_layer;
+		layer_count       = volume ? 1u : range->layer_count;
+		partial           = base_level != 0 || level_count != info.resources.levels ||
+		          base_layer != 0 || layer_count != info.resources.layers;
+	}
+	// KYTY_IMAGE_TRANSIT_SKIP_PARTIAL (default on; =0 off, live): a partial range is a no-op too
+	// when every subresource it covers already has the layout and the read-only access asked
+	// for. The per-subresource path then records no barrier and changes no state value; it would
+	// only split a uniform state into equal per-subresource ones. Streamed textures sample a
+	// partial view (their resident levels), so before this every repeated bindless texture of
+	// every draw went through GetBarriers.
+	if (partial && !g_transit_skip_partial.On()) {
 		return false;
 	}
-	if (range) {
-		const bool     volume      = info.IsVolume();
-		const uint32_t base_layer  = volume ? 0u : range->base_layer;
-		const uint32_t layer_count = volume ? 1u : range->layer_count;
-		if (range->base_level != 0 || range->level_count != info.resources.levels ||
-		    base_layer != 0 || layer_count != info.resources.layers) {
-			return false;
+	const auto& states = backing.subresource_states;
+	if (states.empty()) {
+		return matches(backing.state);
+	}
+	if (!partial) {
+		return false; // GetBarriers would merge the per-subresource states again
+	}
+	if (base_level + level_count > info.resources.levels ||
+	    base_layer + layer_count > info.resources.layers) {
+		return false; // GetBarriers decides (it exits on an out-of-range subresource)
+	}
+	for (uint32_t level = base_level; level < base_level + level_count; level++) {
+		for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
+			const auto index = level * info.resources.layers + layer;
+			if (index >= states.size() || !matches(states[index])) {
+				return false;
+			}
 		}
 	}
-	const auto& state = backing.state;
-	return state.layout == destination_layout && state.access_mask == destination_access &&
-	       !static_cast<bool>(state.access_mask & TransitWriteAccess);
+	return true;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,

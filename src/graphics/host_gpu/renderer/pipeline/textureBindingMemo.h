@@ -178,6 +178,11 @@ public:
 	// checked under one texture-cache lock. Each image then gets their access bookkeeping (the
 	// tick and the LRU touch), in key order. False changes nothing.
 	[[nodiscard]] bool TryRepeatKeys(TextureCache& cache, std::span<const RepeatKey> keys);
+	// TryRepeatKeys key by key, under one texture-cache lock: repeated[i] = 1 for every key that
+	// passes the same checks (those images get their access bookkeeping), 0 for the others, which
+	// the caller resolves. Returns the number repeated.
+	size_t TryRepeatEachKey(TextureCache& cache, std::span<const RepeatKey> keys,
+	                        std::span<uint8_t> repeated);
 	// The view recorded for the entry describing `binding` (verify mode, after TryRepeatViews).
 	[[nodiscard]] vk::ImageView EntryView(const TextureBinding& binding) const;
 
@@ -205,6 +210,14 @@ private:
 	static constexpr uint32_t MinSlots     = 1024;
 	static constexpr uint32_t MaxSlots     = 65536;
 	const uint32_t            m_slot_mask; // immutable; capacity is a power of two
+	// Two-choice placement (KYTY_TEXTURE_MEMO_TWO_CHOICE): a key lives in one of two slots of its
+	// hash, which every lookup probes; Record fills the slot of the same key, else an empty one,
+	// else the one hit least recently. A direct-mapped table loses about 1 - e^(-n/m) of n live
+	// keys in m slots to collisions (45% of Ghost of Yotei's ~39,000 bindless views in 65,536).
+	[[nodiscard]] std::array<uint32_t, 2> SlotsOf(uint64_t hash) const noexcept;
+	// The slot of `hash` whose entry holds `tag`, or UINT32_MAX.
+	[[nodiscard]] uint32_t SlotWithTag(uint64_t hash, uint64_t tag) const noexcept;
+	uint64_t                  m_use_clock = 0; // Entry::last_use stamps
 	static constexpr uint32_t KeyWords = 8;
 	using PackedKey                    = std::array<uint64_t, KeyWords>;
 

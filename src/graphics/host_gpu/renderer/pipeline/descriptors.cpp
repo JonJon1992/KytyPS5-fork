@@ -1527,12 +1527,49 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 	}
 }
 
+// KYTY_BINDLESS_DRAIN=1 (default off, live): before every draw and dispatch that follows one that
+// sampled the bindless table, submit and wait for the GPU, as before translation regions were
+// copied on write (BindlessTable::Publish). Off, nothing waits: a heap whose region commands not
+// yet completed may read moves to another region instead of being rewritten.
+static Live::Switch g_bindless_drain("KYTY_BINDLESS_DRAIN", Live::ParseDefaultOff);
+
+// KYTY_BINDLESS_COMMIT_DEDUP (default on; =0 off, live): a stage commit makes each bindless texture
+// of its list readable once per (image, layout, range): heaps name the same texture under many
+// keys. A repeat in the same list would find the transition a no-op, the LRU touch and the access
+// tick already done (nothing else transitions images between the entries of one list).
+static Live::Switch g_bindless_commit_dedup("KYTY_BINDLESS_COMMIT_DEDUP", Live::ParseDefaultOn);
+
+// KYTY_BINDLESS_KEY_REPEAT (default on; =0 off, live): when a heap cannot be repeated whole, its
+// keys still are, one by one. A resolved key whose T# is the one it was settled from and whose
+// memo entry would still answer with the same image and view (TextureBindingMemo::
+// TryRepeatEachKey, the checks of a whole-heap repeat) keeps its slot without a ResolveTexture; a
+// placeholder its T# alone decides stays one. Only the other keys (rewritten, dirty, not resident
+// yet) are resolved, instead of every key of the heap on every consumer.
+static Live::Switch g_bindless_key_repeat("KYTY_BINDLESS_KEY_REPEAT", Live::ParseDefaultOn);
+
+// KYTY_BINDLESS_PENDING_RETRY_MS (default 250, live; 0: every consumer, as before): a key whose T#
+// resolved to no usable texture (a pending placeholder: no registered image with data, or no view)
+// and whose T# has not changed is resolved again only once this long has passed since it settled.
+// Until then it keeps sampling the placeholder, as every resolution in between would have made
+// it. In Ghost of Yotei about half of the keys of every consumer (7.5 million per 10 s) settled as
+// pending placeholders again on every consumer, each through a full texture-cache lookup.
+static Live::Switch g_bindless_pending_retry_ms("KYTY_BINDLESS_PENDING_RETRY_MS",
+                                                [](const char* value) -> int64_t {
+	                                                if (value == nullptr) {
+		                                                return 250;
+	                                                }
+	                                                return std::clamp<int64_t>(
+	                                                    std::strtoll(value, nullptr, 10), 0, 60000);
+                                                });
+
 void RenderExecutor::BeginBindlessUpdate() {
     auto& table = m_context.GetBindlessTable();
     if (!table.Enabled()) return;
-    // ponytail: global producer drain; immutable translation regions can remove this stall.
     if (table.Used()) {
-        m_context.GetCommandScheduler().FlushAndWait();
+        if (g_bindless_drain.On()) {
+            m_context.GetCommandScheduler().FlushAndWait();
+            m_bindless_log.drains++;
+        }
         table.ClearUsed();
     }
     table.ApplyUnregistered();
@@ -1544,6 +1581,7 @@ void RenderExecutor::BeginBindlessUpdate() {
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                         PreparedBindings& prepared) {
     prepared.bindless_patches.clear();
+    prepared.bindless_regions.clear();
     prepared.bindless_textures.clear();
     auto& table = m_context.GetBindlessTable();
     const auto& snapshot = *runtime.resources;
@@ -1569,13 +1607,15 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         // Every key whose S# lies inside the table.
         const auto count64 = (use.size - use.table_offset - 16u) / stride + 1u;
         if (count64 == 0 || count64 >= BindlessTable::MaxSamplers) continue;
-        std::vector<std::array<uint32_t, 4>> records(static_cast<size_t>(count64));
+        auto& records = m_bindless_sampler_records;
+        records.assign(static_cast<size_t>(count64), {});
         if (stride == 16u) {
             if (!read(use.base + use.table_offset, records.data(), count64 * 16u)) continue;
         } else {
             // Records carrying their own S# (Ghost of Yotei: 872-byte light records).
             const auto span = (count64 - 1u) * stride + 16u;
-            std::vector<uint32_t> words(static_cast<size_t>((span + 3u) / 4u));
+            auto& words = m_bindless_words;
+            words.resize(static_cast<size_t>((span + 3u) / 4u));
             if (!read(use.base + use.table_offset, words.data(), span)) continue;
             for (uint64_t key = 0; key < count64; ++key) {
                 std::memcpy(records[key].data(), words.data() + key * stride / 4u, 16u);
@@ -1677,8 +1717,14 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, use.record_stride, array,
                                             static_cast<uint32_t>(count64), resource);
         if (heap == nullptr) continue;
-        prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
-                                            static_cast<uint32_t>(count64)};
+        // The heap's translations become visible to this stage's commands (and only to the
+        // commands recorded after them): the patch names the region Publish leaves the heap in.
+        const auto publish = [&] {
+            (void)table.Publish(*heap);
+            prepared.bindless_patches.back() = {use.mapping_offset, heap->region,
+                                                static_cast<uint32_t>(count64)};
+            prepared.bindless_regions.push_back(heap->region);
+        };
         auto& cache = m_context.GetTextureCache();
         if (keep_keys && repeat_heap(*heap, std::span<const std::array<uint32_t, 8>>(records), array)) {
             const auto kept = m_bindless_repeat_keys.size(); // the resolved keys
@@ -1688,6 +1734,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             m_bindless_log.keys += count64;
             m_bindless_log.kept += kept;
             m_bindless_log.repeated++;
+            publish();
             continue;
         }
         // Every key is resolved again (touch, residency, refresh). A key that still samples the
@@ -1696,7 +1743,78 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
         const auto expected_view = array == BindlessTable::Images3D ? vk::ImageViewType::e3D :
             array == BindlessTable::Images2DArray ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
         uint32_t kept = 0;
+        const auto retry_ms = static_cast<uint64_t>(g_bindless_pending_retry_ms.Get());
+        const auto now_ms   = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        auto& key_repeated = m_bindless_key_repeated;
+        key_repeated.assign(static_cast<size_t>(count64), 0u);
+        if (keep_keys && g_bindless_key_repeat.On()) {
+            table.ApplyUnregistered(); // a retired image resets its keys first
+            auto& candidates = m_bindless_repeat_keys;
+            auto& index      = m_bindless_repeat_index;
+            auto& passed     = m_bindless_repeat_passed;
+            candidates.clear();
+            index.clear();
+            for (uint32_t key = 0; key < count64; ++key) {
+                if (heap->settled[key] == 0 || heap->slots[key] == 0 ||
+                    heap->descriptors[key] != records[key]) {
+                    continue;
+                }
+                const auto& hint = heap->memo_hints[key];
+                const auto  view = table.SlotView(array, heap->slots[key]);
+                if (hint.tag == 0 || view == nullptr) {
+                    continue;
+                }
+                candidates.push_back({hint.hash, hint.tag, heap->images[key], view});
+                index.push_back(key);
+            }
+            passed.resize(candidates.size());
+            if (m_texture_memo.TryRepeatEachKey(cache, candidates, passed) != 0) {
+                for (size_t i = 0; i < index.size(); ++i) {
+                    key_repeated[index[i]] = passed[i];
+                }
+            }
+        }
         for (uint32_t key = 0; key < count64; ++key) {
+            if (key_repeated[key] != 0) {
+                BindImage(heap->images[key], false);
+                prepared.bindless_textures.push_back(
+                    {heap->images[key], heap->layouts[key], heap->ranges[key]});
+                kept++;
+                m_bindless_log.key_repeats++;
+                continue;
+            }
+            if (keep_keys && g_bindless_key_repeat.On() && heap->settled[key] != 0 &&
+                heap->slots[key] == 0 && heap->fixed_placeholder[key] != 0 &&
+                heap->descriptors[key] == records[key]) {
+                // The same T# decides the same placeholder (settle_placeholder(true) below).
+                m_bindless_log.fixed_skips++;
+                continue;
+            }
+            if (keep_keys && retry_ms != 0 && heap->settled[key] != 0 && heap->slots[key] == 0 &&
+                heap->fixed_placeholder[key] == 0 && heap->descriptors[key] == records[key] &&
+                now_ms - heap->pending_ms[key] < retry_ms) {
+                // A pending placeholder before its retry time (KYTY_BINDLESS_PENDING_RETRY_MS).
+                m_bindless_log.pending_waits++;
+                continue;
+            }
+            {
+                auto& full = m_bindless_log.full;
+                if (heap->settled[key] == 0) {
+                    full.unsettled++;
+                } else if (heap->descriptors[key] != records[key]) {
+                    full.changed++;
+                } else if (heap->slots[key] == 0) {
+                    full.pending++;
+                } else if (heap->memo_hints[key].tag == 0 ||
+                           table.SlotView(array, heap->slots[key]) == nullptr) {
+                    full.no_hint++;
+                } else {
+                    full.refused++;
+                }
+            }
             if (!keep_keys) {
                 // KYTY_BINDLESS_KEEP=0: the original release and settle of the key.
                 (void)table.ReleaseKey(*heap, key);
@@ -1746,6 +1864,8 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             // The key samples the placeholder: as a fresh release and settle leaves it. `fixed`:
             // its T# (with the heap's resource) alone decides so, whatever the texture cache holds.
             const auto settle_placeholder = [&](bool fixed) {
+                (fixed ? m_bindless_log.full.fixed : m_bindless_log.full.placeholder)++;
+                heap->pending_ms[key] = now_ms;
                 (void)table.ReleaseKey(*heap, key);
                 heap->settled[key] = 1;
                 heap->descriptors[key] = records[key];
@@ -1776,7 +1896,11 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             auto* image = cache.m_slot_images.try_get(binding.image_id);
             if (image == nullptr || !image->registered || image->info.data.Empty()) {
                 // A null descriptor resolves to the permanent null image (empty data).
-                settle_placeholder(image != nullptr && image->info.data.Empty());
+                const bool fixed = image != nullptr && image->info.data.Empty();
+                if (!fixed) {
+                    m_bindless_log.full.pending_image++;
+                }
+                settle_placeholder(fixed);
                 continue;
             }
             BindImage(binding.image_id, false);
@@ -1787,6 +1911,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             }
             image = cache.m_slot_images.try_get(binding.image_id);
             if (image == nullptr || !image->registered || !binding.image_view) {
+                m_bindless_log.full.pending_view++;
                 settle_placeholder(false);
                 continue;
             }
@@ -1807,6 +1932,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                 heap->fixed_placeholder[key] = 0u;
                 prepared.bindless_textures.push_back({binding.image_id, binding.layout, range});
                 kept++;
+                m_bindless_log.full.same_slot++;
                 continue;
             }
             settle_placeholder(false);
@@ -1822,11 +1948,13 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
             table.AddImageReference(binding.image_id, *heap, key);
             table.SetTranslation(*heap, key, slot);
             prepared.bindless_textures.push_back({binding.image_id, binding.layout, range});
+            m_bindless_log.full.new_slot++;
         }
         Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeys, count64);
         Profiler::CountFrameEvent(Profiler::FrameEvent::BindlessHeapKeysKept, kept);
         m_bindless_log.keys += count64;
         m_bindless_log.kept += kept;
+        publish();
     }
     // One console/log line every 10 s while heaps are consumed (as the hot-pages line).
     m_bindless_log.consumers++;
@@ -1834,14 +1962,28 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
     if (m_bindless_log.time == std::chrono::steady_clock::time_point {}) {
         m_bindless_log.time = now;
     } else if (now - m_bindless_log.time >= std::chrono::seconds(10)) {
-        const auto& log = m_bindless_log;
+        const auto& log   = m_bindless_log;
+        const auto  stats = table.TakePublishStats();
         Log::WriteToConsoleAndLog(fmt::format(
             "Bindless heaps {:.0f}s: {} consumers, {} keys resolved, {} kept ({:.1f}%), {} heaps "
-            "repeated whole\n",
+            "repeated whole; translations published: {} moved, {} in place, {} unchanged, {} in "
+            "place while in use (no free region), {} regions recycled; {} GPU drains "
+            "(KYTY_BINDLESS_DRAIN); keys repeated one by one {}, fixed placeholders kept {} "
+            "(KYTY_BINDLESS_KEY_REPEAT); resolved in full: unsettled {}, T# changed {}, pending "
+            "placeholder {}, no memo hint {}, memo refused {} -> same slot {}, new slot {}, fixed "
+            "placeholder {}, pending placeholder {} (no image {}, no view {}); pending placeholders "
+            "waiting to retry {} (KYTY_BINDLESS_PENDING_RETRY_MS); image slots: {} new, {} "
+            "recycled, {} released, {} not available; textures made readable by commits {}, "
+            "repeats skipped {} (KYTY_BINDLESS_COMMIT_DEDUP)\n",
             std::chrono::duration<double>(now - log.time).count(), log.consumers, log.keys,
             log.kept, log.keys != 0 ? 100.0 * static_cast<double>(log.kept) / static_cast<double>(log.keys) : 0.0,
-            log.repeated));
-        m_bindless_log = {now, 0, 0, 0, 0};
+            log.repeated, stats.moved, stats.in_place, stats.unchanged, stats.full, stats.recycled,
+            log.drains, log.key_repeats, log.fixed_skips, log.full.unsettled, log.full.changed,
+            log.full.pending, log.full.no_hint, log.full.refused, log.full.same_slot,
+            log.full.new_slot, log.full.fixed, log.full.placeholder, log.full.pending_image,
+            log.full.pending_view, log.pending_waits, stats.slots_new, stats.slots_recycled,
+            stats.slots_released, stats.slot_failures, log.commit_textures, log.commit_dups));
+        m_bindless_log = {now};
     }
 }
 
@@ -2849,7 +2991,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
+        // One stamp per stage's list: no other transition runs between its entries.
+        const auto bindless_commit = ++m_bindless_commit_id;
+        const bool dedup           = g_bindless_commit_dedup.On();
         for (const auto& texture: prepared->bindless_textures) {
+            m_bindless_log.commit_textures++;
+            if (dedup) {
+                const auto* seen = m_context.GetTextureCache().m_slot_images.try_get(texture.image_id);
+                if (seen != nullptr && seen->bindless_commit == bindless_commit &&
+                    seen->bindless_commit_layout == texture.layout &&
+                    seen->bindless_commit_range == texture.range) {
+                    m_bindless_log.commit_dups++;
+                    continue;
+                }
+            }
             auto& image = m_context.GetTextureCache().GetImage(texture.image_id);
             // The sampled arrays have read-only layouts. Reject attachment/storage overlap
             // explicitly until a matching feedback/general-layout binding is implemented.
@@ -2859,6 +3014,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                           vk_buffer, true);
             image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
             image.usage.texture = true;
+            image.bindless_commit        = bindless_commit;
+            image.bindless_commit_layout = texture.layout;
+            image.bindless_commit_range  = texture.range;
         }
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
@@ -3015,11 +3173,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
     if (pipeline.uses_bindless) {
-        const auto set = m_context.GetBindlessTable().Set();
+        auto&      table = m_context.GetBindlessTable();
+        const auto set   = table.Set();
         EXIT_IF(!set);
         buffer.StateHandle().bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
                                                 1, 1, &set, 0, nullptr);
-        m_context.GetBindlessTable().MarkUsed();
+        table.MarkUsed();
+        // The draw or dispatch is recorded right after, in this recording.
+        const auto tick = m_context.GetCommandScheduler().CurrentTick();
+        for (const auto* prepared: prepared_bindings) {
+            for (const auto region: prepared->bindless_regions) {
+                table.MarkRegionUsed(region, tick);
+            }
+        }
     }
 }
 

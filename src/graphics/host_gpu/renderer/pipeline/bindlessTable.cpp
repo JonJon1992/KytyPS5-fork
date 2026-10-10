@@ -16,11 +16,12 @@
 #include <cinttypes>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
 BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_graphics(graphics) {
+    : m_graphics(graphics), m_scheduler(scheduler) {
     graphics.bindless_enabled = false;
     graphics.bindless_layout = nullptr;
     graphics.bindless_set = nullptr;
@@ -92,8 +93,9 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	RequireVulkanSuccess(graphics.device.allocateDescriptorSets(&allocate_info, &m_set),
 	                     "allocate bindless descriptor set");
 
-	// Host mutations occur only after draining previous consumers. Every heap is eagerly
-	// resolved, so feedback is diagnostic and never races a host read/clear.
+	// A region is written only while no command that has not completed may read it (Publish
+	// moves a heap whose region is in use). Every heap is eagerly resolved, so feedback is
+	// diagnostic and never races a host read/clear.
 	m_translation = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
 	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
 	m_feedback    = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
@@ -391,16 +393,16 @@ BindlessTable::~BindlessTable() {
 }
 
 bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
-	// Allocate exactly the current bound; growth receives a new region after the producer drain.
+	// Exactly the current bound; growth takes another region, and the old one is retired.
 	const auto capacity = entries;
-	if (capacity > TranslationEntries - m_next_region) {
+	const auto region   = TakeRegion(capacity);
+	if (region == 0) {
 		return false;
 	}
 	const auto old_region  = heap.region;
 	const auto old_entries = heap.entries;
-	heap.region            = m_next_region;
+	heap.region            = region;
 	heap.entries           = capacity;
-	m_next_region += capacity;
 	heap.slots.resize(capacity, 0u);
 	heap.settled.resize(capacity, 0u);
 	heap.descriptors.resize(capacity);
@@ -409,24 +411,114 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	heap.fixed_placeholder.resize(capacity, 0u);
 	heap.layouts.resize(capacity, vk::ImageLayout::eUndefined);
 	heap.ranges.resize(capacity);
-	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
-	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
-	for (uint32_t key = 0; key < capacity; key++) {
-		uint32_t value = ShaderRecompiler::IR::BindlessPending;
-		if (key < old_entries && heap.settled[key] != 0) {
-			value = heap.slots[key];
-		}
-		translation[heap.region + key] = value;
-		feedback[heap.region + key]    = 0;
+	heap.pending_ms.resize(capacity, 0u);
+	// Kept keys keep their translation; new keys are pending.
+	heap.values.resize(capacity, ShaderRecompiler::IR::BindlessPending);
+	if (old_region != 0) {
+		RetireRegion(old_region, old_entries);
 	}
-	if (!m_translation->IsCoherent()) {
-		m_translation->Flush(heap.region * sizeof(uint32_t), capacity * sizeof(uint32_t));
-	}
-	m_feedback->Flush(heap.region * sizeof(uint32_t), capacity * sizeof(uint32_t));
+	WriteRegion(heap);
 	LOGF("Bindless heap region: base=0x%016" PRIx64 " binding=%u region=%u entries=%u (was %u at "
 	     "%u)\n",
 	     heap.base, heap.binding, heap.region, capacity, old_entries, old_region);
 	return true;
+}
+
+uint32_t BindlessTable::TakeRegion(uint32_t size) {
+	for (auto it = m_free_regions.begin(); it != m_free_regions.end(); ++it) {
+		if (it->size < size || RegionInUse(it->start)) {
+			continue;
+		}
+		const auto start = it->start;
+		if (it->size == size) {
+			m_free_regions.erase(it);
+		} else {
+			// The rest stays free (its commands have completed too).
+			it->start += size;
+			it->size -= size;
+		}
+		m_region_ticks.erase(start);
+		m_publish_stats.recycled++;
+		return start;
+	}
+	if (size > TranslationEntries - m_next_region) {
+		return 0;
+	}
+	const auto start = m_next_region;
+	m_next_region += size;
+	return start;
+}
+
+void BindlessTable::RetireRegion(uint32_t start, uint32_t size) {
+	// A stage prepared but not committed yet may still name the region. Its commit marks the tick
+	// it records in (MarkRegionUsed); until then the region waits one tick longer than the
+	// current one, in case a submit lands between the preparation and the commit.
+	MarkRegionUsed(start, m_scheduler.CurrentTick() + 1u);
+	m_free_regions.push_back({start, size});
+}
+
+bool BindlessTable::RegionInUse(uint32_t start) {
+	const auto found = m_region_ticks.find(start);
+	return found != m_region_ticks.end() && !m_scheduler.IsFree(found->second);
+}
+
+void BindlessTable::MarkRegionUsed(uint32_t region, uint64_t tick) {
+	auto& last = m_region_ticks[region];
+	last       = std::max(last, tick);
+}
+
+void BindlessTable::WriteRegion(Heap& heap) {
+	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	std::memcpy(translation + heap.region, heap.values.data(), heap.entries * sizeof(uint32_t));
+	std::memset(feedback + heap.region, 0, heap.entries * sizeof(uint32_t));
+	if (!m_translation->IsCoherent()) {
+		m_translation->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+	}
+	m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+	heap.published = heap.values;
+	heap.dirty     = false;
+}
+
+bool BindlessTable::Publish(Heap& heap) {
+	if (!heap.dirty) {
+		return true;
+	}
+	if (heap.values == heap.published) {
+		heap.dirty = false;
+		m_publish_stats.unchanged++;
+		return true;
+	}
+	const bool in_use = RegionInUse(heap.region);
+	if (in_use) {
+		if (const auto region = TakeRegion(heap.entries); region != 0) {
+			RetireRegion(heap.region, heap.entries);
+			heap.region = region;
+			WriteRegion(heap);
+			m_publish_stats.moved++;
+			return true;
+		}
+		m_publish_stats.full++;
+	} else {
+		m_publish_stats.in_place++;
+	}
+	auto*    translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
+	uint32_t first       = heap.entries;
+	uint32_t last        = 0;
+	for (uint32_t key = 0; key < heap.entries; key++) {
+		if (heap.values[key] != heap.published[key]) {
+			translation[heap.region + key] = heap.values[key];
+			heap.published[key]            = heap.values[key];
+			first                          = std::min(first, key);
+			last                           = key;
+		}
+	}
+	if (!m_translation->IsCoherent() && first <= last) {
+		m_translation->Flush((heap.region + first) * sizeof(uint32_t),
+		                     (last - first + 1u) * sizeof(uint32_t));
+	}
+	heap.dirty = false;
+	return !in_use;
 }
 
 BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
@@ -461,10 +553,38 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
-	if (binding >= ImageArrays || m_next_slot[binding] >= m_images_per_array) {
+	if (binding >= ImageArrays) {
 		return 0;
 	}
+	// Released slots in release order: the front is the oldest.
+	if (auto& free = m_free_slots[binding]; !free.empty() && m_scheduler.IsFree(free.front().tick)) {
+		const auto slot = free.front().slot;
+		free.pop_front();
+		m_publish_stats.slots_recycled++;
+		return slot;
+	}
+	if (m_next_slot[binding] >= m_images_per_array) {
+		m_publish_stats.slot_failures++;
+		return 0;
+	}
+	m_publish_stats.slots_new++;
 	return m_next_slot[binding]++;
+}
+
+void BindlessTable::ReleaseImageSlots(ImageId id) {
+	const auto slots = m_image_slots.find(ImageKey(id));
+	if (slots == m_image_slots.end()) {
+		return;
+	}
+	const auto tick = m_scheduler.CurrentTick() + 1u;
+	for (const auto& [binding, slot]: slots->second) {
+		ForgetSlot(binding, slot);
+		if (binding < ImageArrays) {
+			m_free_slots[binding].push_back({slot, tick});
+			m_publish_stats.slots_released++;
+		}
+	}
+	m_image_slots.erase(slots);
 }
 
 void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
@@ -502,11 +622,10 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	}
 }
 
-void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
-	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
-	translation[heap.region + key] = slot;
-	if (!m_translation->IsCoherent()) {
-		m_translation->Flush((heap.region + key) * sizeof(uint32_t), sizeof(uint32_t));
+void BindlessTable::SetTranslation(Heap& heap, uint32_t key, uint32_t slot) {
+	if (heap.values[key] != slot) {
+		heap.values[key] = slot;
+		heap.dirty       = true;
 	}
 }
 
@@ -532,6 +651,11 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 			}
 		}
 	}
+	if (no_refs) {
+		// No key names the image any more: its slots go back to the free list. A key that names
+		// it again takes a slot anew (FindSlot no longer finds these).
+		ReleaseImageSlots(id);
+	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
 	heap.images[key]  = {};
@@ -551,6 +675,24 @@ void BindlessTable::ApplyUnregistered() {
     for (const auto id: ids) OnImageUnregistered(id);
 }
 
+void BindlessTable::ForgetSlot(uint32_t binding, uint32_t slot) {
+	if (binding >= ImageArrays || slot >= m_slot_views[binding].size()) {
+		return;
+	}
+	auto& view = m_slot_views[binding][slot];
+	if (view == nullptr) {
+		return;
+	}
+	if (const auto found = m_view_slots.find(static_cast<VkImageView>(view));
+	    found != m_view_slots.end()) {
+		std::erase(found->second, std::pair {binding, slot});
+		if (found->second.empty()) {
+			m_view_slots.erase(found);
+		}
+	}
+	view = nullptr;
+}
+
 uint32_t BindlessTable::FindSlot(uint32_t binding, vk::ImageView view) const {
     const auto found = m_view_slots.find(static_cast<VkImageView>(view));
     if (found != m_view_slots.end()) for (const auto& [array, slot]: found->second)
@@ -565,11 +707,7 @@ void BindlessTable::AddSlotOwner(ImageId id, uint32_t binding, uint32_t slot) {
 void BindlessTable::OnImageUnregistered(ImageId id) {
     // Keep ownership even after the last key moved elsewhere. Otherwise a recycled raw view
     // handle could match a stale slot whose Vulkan descriptor still names the retired object.
-    if (const auto slots = m_image_slots.find(ImageKey(id)); slots != m_image_slots.end()) {
-        for (const auto& [binding, slot]: slots->second)
-            WriteSlot(binding, slot, m_placeholder_views[binding], vk::ImageLayout::eShaderReadOnlyOptimal);
-        m_image_slots.erase(slots);
-    }
+    ReleaseImageSlots(id);
     if (const auto found = m_image_refs.find(ImageKey(id)); found != m_image_refs.end()) {
         for (const auto& [heap, key]: found->second) {
             heap->slots[key] = 0;

@@ -458,6 +458,11 @@ public:
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last  = 0;
+	// RenderExecutor::CommitBindings (KYTY_BINDLESS_COMMIT_DEDUP): the commit that last made this
+	// image readable for a bindless heap, and the layout and range it did that for.
+	uint64_t              bindless_commit        = 0;
+	vk::ImageLayout       bindless_commit_layout = vk::ImageLayout::eUndefined;
+	ImageSubresourceRange bindless_commit_range {};
 	uint64_t         frame_accessed_last = 0; // presented guest frames, see TextureCache::AdvanceFrame
 	size_t           lru_id              = 0;
 	// While registered: the tick of TextureCache's LRU item lru_id (KYTY_IMAGE_LRU_SKIP). Set from
