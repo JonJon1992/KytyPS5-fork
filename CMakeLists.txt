@@ -1007,6 +1007,8 @@ add_kyty_full_emulator_test(http_uri_parse_tests
 
 # sceAjm: ATRAC9 config descriptions (Ghost of Yotei 12-channel streams).
 add_kyty_full_emulator_test(ajm_tests "${KYTY_TESTS_DIR}/AjmTests.cpp")
+# Offline translation of one shader from a program cache (tools/shader_offline_tool.cpp); not a test.
+add_kyty_full_emulator_test(shader_offline_tool "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_offline_tool.cpp")
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
