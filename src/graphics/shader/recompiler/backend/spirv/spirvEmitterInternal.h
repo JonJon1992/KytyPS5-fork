@@ -169,6 +169,9 @@ struct EmitterState {
 	uint32_t                   loop_guard_variable                   = 0;
 	// Opt-in scalar-read probe: a failed read leaves through existing loop exits.
 	uint32_t                   scalar_read_probe_failed              = 0;
+	// The buffer FORMAT table of formatted loads through runtime V#s (a Function array;
+	// UsesRuntimeFormatTable).
+	uint32_t                   runtime_format_table_variable         = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -570,6 +573,10 @@ inline constexpr auto EmitTBufferSelectF32 =
 bool IsSignedFormatComponent(Format::ComponentType type);
 
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
+// Formatted loads through V#s the shader computes decode their FORMAT through a table (Function
+// array state.runtime_format_table_variable, declared at the entry with DeclareRuntimeFormatTable).
+bool UsesRuntimeFormatTable(const IR::Program& program);
+void DeclareRuntimeFormatTable(EmitterState& state);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);

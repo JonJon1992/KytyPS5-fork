@@ -40782,7 +40782,7 @@ TestCase BufferLoadFormatGpuSelectedDescriptors(u32 components) {
       Prospero::BufferFormat::k32_32_32Float,
       Prospero::BufferFormat::k32_32_32_32Float};
   // Load each descriptor through a GPU-selected scalar-buffer table index.
-  // Full/partial records, unsupported format, and non-identity channel order.
+  // Full/partial records, a 16-bit format, and non-identity channel order.
   for (u32 fixture = 0; fixture < 5; ++fixture) {
     const auto format = fixture == 3
                             ? Prospero::BufferFormat::k16_16Float
@@ -40808,12 +40808,94 @@ TestCase BufferLoadFormatGpuSelectedDescriptors(u32 components) {
     test.code.push_back(EncodeMubuf1(0, 2, 21));
     for (u32 c = 0; c < components; ++c) {
       AppendStoreVgpr(&test.code, c, fixture * components + c);
-      const bool valid = fixture == 0 || (fixture == 1 && components == 1);
-      test.expected.push_back(valid ? std::bit_cast<u32>(float(c + 1)) : 0);
+      // The FORMAT and dst_sel are decoded at runtime: 16_16 FLOAT reads the halves of the
+      // first dword (1.0f: 0.0 and 1.875; dst_sel Z/W repeat X/Y), and the swapped dst_sel
+      // reads Y into X.
+      u32 expected = 0;
+      if (fixture == 0 || (fixture == 1 && components == 1)) {
+        expected = std::bit_cast<u32>(float(c + 1));
+      } else if (fixture == 3) {
+        expected = c % 2u == 0u ? 0u : std::bit_cast<u32>(1.875f);
+      } else if (fixture == 4) {
+        expected = std::bit_cast<u32>(float(c == 0 ? 2 : c == 1 ? 1 : c + 1));
+      }
+      test.expected.push_back(expected);
     }
   }
   for (u32 c = 0; c < 4; ++c)
     test.initial[1024 + c] = std::bit_cast<u32>(float(c + 1));
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// BUFFER_LOAD_FORMAT_* through V#s the shader selects at runtime, with FORMATs and dst_sels known
+// only from the V# (LoadIndirectFormatted): 16-bit floats through D16 (Ghost of Yotei pixel shaders
+// 0xc428451cf6d96d04 and 0x87c0e72de5cee120 read BUFFER_LOAD_FORMAT_D16_XYZW so), normalized,
+// packed float and integer formats, a reversed and a constant dst_sel, and a FORMAT that names
+// nothing (reads 0). Every expected value is exact in F32 and F16.
+TestCase BufferLoadFormatRuntimeFormats() {
+  using BF = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct Fixture {
+    u32 format;
+    u32 swizzle;
+    u32 opcode; // MUBUF, bit 7 in word0 bit 25
+    u32 outputs;
+    std::array<u32, 2> data;
+    std::array<u32, 4> expected;
+  };
+  const Fixture fixtures[] = {
+      // D16 XYZW of 1.0, -2.0, 0.5, 4.0 halves: the halves come back packed in pairs.
+      {static_cast<u32>(BF::k16_16_16_16Float), DstSel(4, 5, 6, 7), 0x83, 2,
+       {0xc0003c00u, 0x44003800u}, {0xc0003c00u, 0x44003800u}},
+      // UNORM bytes (1, 0, 1, 0) read W, Z, Y, X.
+      {static_cast<u32>(BF::k8_8_8_8UNorm), DstSel(7, 6, 5, 4), 0x03, 4,
+       {0x00ff00ffu, 0}, {0, 0x3f800000u, 0, 0x3f800000u}},
+      // SNORM 32767 is 1.0; -32767 and -32768 clamp to -1.0.
+      {static_cast<u32>(BF::k16_16SNorm), DstSel(4, 5, 6, 7), 0x01, 2,
+       {0x80017fffu, 0}, {0x3f800000u, 0xbf800000u}},
+      // 10_11_11 FLOAT: 1.0 (e5m5), 2.0 and 0.5 (e5m6).
+      {static_cast<u32>(BF::k10_11_11Float), DstSel(4, 5, 6, 7), 0x02, 3,
+       {0x701001e0u, 0}, {0x3f800000u, 0x40000000u, 0x3f000000u}},
+      // D16 of SINT keeps each component's low half: -2, 3, 32767, -32768.
+      {static_cast<u32>(BF::k16_16_16_16SInt), DstSel(4, 5, 6, 7), 0x83, 2,
+       {0x0003fffeu, 0x80007fffu}, {0x0003fffeu, 0x80007fffu}},
+      // dst_sel 1 of an integer FORMAT is 1, dst_sel 0 is 0.
+      {static_cast<u32>(BF::k8UInt), DstSel(4, 1, 0, 0), 0x03, 4,
+       {0x000000abu, 0}, {0xabu, 1u, 0, 0}},
+      // A FORMAT that names nothing reads 0.
+      {127u, DstSel(4, 5, 6, 7), 0x00, 1, {0x12345678u, 0}, {0}},
+  };
+  TestCase test;
+  test.name = "BufferLoadFormatRuntimeFormats";
+  test.initial.resize(2048);
+  for (u32 fixture = 0; fixture < std::size(fixtures); ++fixture) {
+    const auto &input = fixtures[fixture];
+    const u32 data_offset = 4096 + fixture * 64;
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + data_offset), 1u | (32u << 16u), 1u,
+        (input.format << 12u) | input.swizzle};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 128 + fixture * 4);
+    std::copy(input.data.begin(), input.data.end(), test.initial.begin() + data_offset / 4);
+    test.initial[64 + fixture] = fixture;
+    AppendVMovU32(&test.code, 30, (64 + fixture) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255));
+    test.code.push_back(16);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(512, 20));
+    AppendVMovU32(&test.code, 21, 0);
+    test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false) |
+                        (((input.opcode >> 7u) & 1u) << 25u));
+    test.code.push_back(EncodeMubuf1(0, 2, 21));
+    for (u32 output = 0; output < input.outputs; ++output) {
+      AppendStoreVgpr(&test.code, output, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(input.expected[output]);
+    }
+  }
   AppendEnd(&test.code);
   test.bda_mappings = {{GuestBase, 0}};
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
@@ -53876,6 +53958,7 @@ int main(int argc, char **argv) {
       }
     }
     ShaderRecompiler::SetCodegenOptions(saved);
+    vulkan.CheckVertexLaunchedExec();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
@@ -53958,7 +54041,6 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckVertexLaunchedExec();
     RunCase(&vulkan, VectorVopcCmpxEqU16SdwaCompactVop3ExecMask());
     return 0;
   }
@@ -54300,6 +54382,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, GpuSelectedFormatXY());
     RunCase(&vulkan, GpuSelectedFormatXYZ());
     RunCase(&vulkan, GpuSelectedFormatXYZW());
+    RunCase(&vulkan, BufferLoadFormatRuntimeFormats());
     RunCase(&vulkan, ImageLoadPackedPreservesBits());
     return 0;
   }
@@ -55314,6 +55397,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckDrawPrepCertifiedShaderHash();
+  vulkan.CheckVertexLaunchedExec();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckDrawPrepEngineDraw();
   vulkan.CheckDrawPrepEngineTextures();
@@ -55379,4 +55463,3 @@ int main(int argc, char **argv) {
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }
-  vulkan.CheckVertexLaunchedExec();

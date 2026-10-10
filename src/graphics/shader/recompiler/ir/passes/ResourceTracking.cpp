@@ -1686,7 +1686,7 @@ private:
 					}
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a DWORD x1/x2/x3/x4 load");
+					     "requires a UBYTE/USHORT or DWORD x1/x2/x3/x4 load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

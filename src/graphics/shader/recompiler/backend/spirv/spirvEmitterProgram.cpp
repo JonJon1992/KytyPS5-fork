@@ -1013,6 +1013,10 @@ void EmitProgram(EmitterState& state) {
 		state.scalar_read_probe_failed = state.builder.AllocateId();
 		state.builder.AddName(state.scalar_read_probe_failed, "scalar_read_probe_failed");
 	}
+	if (UsesRuntimeFormatTable(program)) {
+		state.runtime_format_table_variable = state.builder.AllocateId();
+		state.builder.AddName(state.runtime_format_table_variable, "runtime_buffer_formats");
+	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
@@ -1125,6 +1129,9 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeBool(state)),
 		                          state.scalar_read_probe_failed, spv::StorageClassFunction);
+	}
+	if (state.runtime_format_table_variable != 0) {
+		DeclareRuntimeFormatTable(state);
 	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;

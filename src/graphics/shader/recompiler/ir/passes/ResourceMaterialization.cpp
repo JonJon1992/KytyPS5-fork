@@ -931,11 +931,10 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			if (memory.planning_only) {
 				continue;
 			}
-			// KYTY_SRT_VARIANT_READS: an S_BUFFER_LOAD through a runtime V# reads through BDA and
-			// has no descriptor source (and no bound buffer to index).
-			// KYTY_BDA_WRITES_SHADERS: neither has a store through one.
-			if (memory.kind == ResourceKind::IndirectBuffer &&
-			    (op == ValueOpcode::ReadConstBuffer || buffer == BufferAccess::Write)) {
+			// An access through a runtime V# (an S_BUFFER_LOAD under KYTY_SRT_VARIANT_READS, a raw
+			// vector load, or a KYTY_BDA_WRITES_SHADERS store) goes through BDA: it has no
+			// descriptor source and no bound buffer to index (its resource index is unset).
+			if (memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {

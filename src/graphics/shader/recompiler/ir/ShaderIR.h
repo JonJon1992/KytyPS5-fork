@@ -78,8 +78,15 @@ struct MemoryInfo {
 	bool d16 = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		// Formatted loads (D16 included) decode the V#'s FORMAT at runtime; TBUFFER formats are
+		// not supported.
+		if (typed || (d16 && !formatted)) return false;
+		// A raw BUFFER_LOAD_UBYTE/SBYTE/USHORT/SSHORT (the sign extension follows the load).
+		if (opcode == ValueOpcode::LoadBufferU8 || opcode == ValueOpcode::LoadBufferU16) {
+			return !formatted && data_bits == (opcode == ValueOpcode::LoadBufferU8 ? 8u : 16u);
+		}
 		// ReadConstBuffer: one dword of an S_BUFFER_LOAD (no formats, RDNA2 ISA 7.2.1).
-		if (typed || d16 || data_bits != 32u) return false;
+		if (data_bits != 32u) return false;
 		if (opcode == ValueOpcode::ReadConstBuffer) return !formatted;
 		return (opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
 		       (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
