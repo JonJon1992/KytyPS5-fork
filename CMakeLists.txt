@@ -301,6 +301,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/rt/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/rt/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/drawPrep/*.cpp"
@@ -494,6 +496,22 @@ foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	)
 	list(APPEND kyty_emulator_src "${shader_header}")
 endforeach()
+
+# Experimental hardware RT backend, built with the same renderer as guest work.
+set(gpu_rt_dir "${PROJECT_BINARY_DIR}/gpu_rt_shaders")
+set(gpu_rt_source "${gpu_tiler_shader_dir}/gpu_hardware_rt.comp")
+set(gpu_rt_spv "${gpu_rt_dir}/gpu_hardware_rt.spv")
+set(gpu_rt_header "${gpu_rt_dir}/gpu_hardware_rt_spv.h")
+add_custom_command(
+ OUTPUT "${gpu_rt_header}"
+ COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_rt_dir}"
+ COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -o "${gpu_rt_spv}" "${gpu_rt_source}"
+ COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_rt_spv} -DOUTPUT=${gpu_rt_header}
+         -DSYMBOL=GPU_HARDWARE_RT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+ DEPENDS "${gpu_rt_source}"
+ VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_rt_header}")
 
 # Native indirect mesh draws (renderer/meshIndirect.h): guest argument record -> mesh dispatches.
 set(gpu_mesh_generated_dir "${PROJECT_BINARY_DIR}/gpu_mesh_shaders")
@@ -1038,6 +1056,12 @@ if(LINUX)
 	target_link_libraries(eop_timestamp_tests Threads::Threads)
 endif()
 
+add_executable(guest_bvh_conversion_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestBvhConversionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/rt/guestBvh.cpp"
+)
+target_include_directories(guest_bvh_conversion_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
@@ -1291,6 +1315,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --bindless-only)
 	add_test(NAME wolverine_instruction_fixtures_cpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-instructions-codegen-only)
+	add_test(NAME bvh_capture_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bvh-capture-only)
+	set_tests_properties(bvh_capture_gpu PROPERTIES LABELS "gpu;hardware-rt;capture")
+	add_test(NAME bvh_capture_reader
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bvh-capture-reader-only)
+	add_test(NAME bvh_capture_replay_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bvh-capture-replay-fixture)
+	set_tests_properties(bvh_capture_replay_gpu PROPERTIES
+		LABELS "gpu;hardware-rt;capture" SKIP_RETURN_CODE 77)
 	add_test(NAME shader_functions COMMAND $<TARGET_FILE:shader_function_tests>)
 	# Post-dominators against a path oracle, before and after structurizing (BryKytyPS5 197b094d).
 	add_test(NAME shader_cfg_post_dominators
@@ -1312,6 +1345,13 @@ if(BUILD_TESTING)
 	add_test(NAME clear_register_decode COMMAND $<TARGET_FILE:clear_register_decode_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
+	add_test(NAME guest_bvh_conversion COMMAND $<TARGET_FILE:guest_bvh_conversion_tests>)
+	add_test(NAME hardware_rt_backend_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hardware-rt-only)
+	add_test(NAME hardware_rt_backend_off
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hardware-rt-disabled-only)
+	set_tests_properties(hardware_rt_backend_gpu hardware_rt_backend_off PROPERTIES LABELS "gpu;hardware-rt")
+	set_tests_properties(hardware_rt_backend_gpu PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)

@@ -30,6 +30,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+namespace RT { class HardwareBackend; }
 
 class RenderContext {
 public:
@@ -64,6 +65,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
+
+	// Lazy experimental backend; does not replace guest shader traversal.
+	RT::HardwareBackend& GetHardwareRt();
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -132,6 +136,7 @@ private:
 	LodStatsCounter           m_lod_stats;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::unique_ptr<RT::HardwareBackend> m_hardware_rt;
 	std::unique_ptr<GuestGpu> m_gpu;
 	// Guards m_gpu_notify against GPU teardown (NotifyGpuProgress holds it shared).
 	std::shared_mutex         m_gpu_notify_mutex;

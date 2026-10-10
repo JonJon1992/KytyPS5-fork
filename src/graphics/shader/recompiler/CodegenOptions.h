@@ -215,6 +215,11 @@ struct CodegenOptions {
 	// local memory to SSA and eliminate redundant expressions. Experimental, default off.
 	// No inlining, unrolling or algebraic floating-point simplification. Ignored when OPT=0.
 	bool spirv_optimize_extended = false;
+	// KYTY_BVH_CAPTURE_SHADER=<hex hash>: bounded GPU witnesses of BVH calls in
+	// this compute shader ("all" selects every compute shader containing BVH).
+	// Diagnostic only; empty captures can retry up to 16 dispatches.
+	// Zero (default) emits no capture code and allocates no capture storage.
+	uint64_t bvh_capture_shader = 0;
 	// Diagnostic only: capture an invalid indirect scalar read at selected PCs
 	// and leave through existing loop exits in barrier-free native-wave compute.
 	uint64_t scalar_read_probe_shader = 0;
@@ -229,6 +234,7 @@ bool BindlessStridedComputeApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWritesApplies(uint64_t shader_hash);
 // KYTY_BDA_WRITES_SHADERS lists a shader: the fault buffer carries the written-page bitmap.
 [[nodiscard]] bool BdaWritesEnabled();
+[[nodiscard]] bool BvhCaptureApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWritesDeferredEnabled();
 [[nodiscard]] bool BdaWriteCandidatesApplies(uint64_t shader_hash);
 [[nodiscard]] bool BdaWriteCandidatesVerify();

@@ -370,7 +370,8 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
                                        const Decoder::Operand&     base) {
 	std::array<IR::Value, 13> components {};
 	components.fill(IR::Value(0u));
-	const auto count =
+	const bool bvh = inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	const auto count = bvh ? inst.image_address_components :
 	    Decoder::ImageAddressDwordCount(inst.image_sample_flags, inst.image_address_components);
 	EXIT_IF(count > components.size());
 	const auto nsa_components =
@@ -384,6 +385,27 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
 			components[index] = ir.GetVectorReg(static_cast<IR::VectorReg>(base.reg + index));
 		} else {
 			components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
+		}
+	}
+	if (bvh) {
+		// Canonical BVH payload: original eleven full-float components, then
+		// node high DWORD at index 11. This retains the intersection algorithm
+		// for all four ISA forms (RDNA2 ISA 8.2.10, table 48).
+		const auto raw = components;
+		const uint32_t ray = inst.opcode_id == 0xe7u ? 2u : 1u;
+		components[11] = ray == 2u ? raw[1] : IR::Value(0u);
+		for (uint32_t i = 0; i < 4u; ++i) components[1u + i] = raw[ray + i];
+		for (uint32_t i = 0; i < 6u; ++i) {
+			if ((inst.image_sample_flags & Decoder::ImageSampleFlagA16) == 0u) {
+				components[5u + i] = raw[ray + 4u + i];
+				continue;
+			}
+			const auto bits = ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			    {raw[ray + 4u + i / 2u], IR::Value((i % 2u) * 16u), IR::Value(16u)});
+			const auto half = ir.Emit(IR::ValueOpcode::BitCastF16U16,
+			    {ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits})});
+			components[5u + i] = ir.Emit(IR::ValueOpcode::BitCastU32F32,
+			    {ir.Emit(IR::ValueOpcode::ConvertF32F16, {half})});
 		}
 	}
 	return ir.Emit(IR::ValueOpcode::MakeImageAddress,
@@ -1155,7 +1177,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()});
+			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()}, inst.pc);
 			for (uint32_t component = 0; component < 4; ++component) {
 				WriteOperand(OffsetOperand(inst.dst, component),
 				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));

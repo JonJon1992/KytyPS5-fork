@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/bdaWriteCandidates.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -43,6 +44,26 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// Observe command recording only: this does not prove GPU execution or completion.
+// Keep the log independent of the general dispatch cap, which menus can exhaust.
+static void LogScalarReadProbeDispatch(RenderContext& context, uint64_t shader_hash,
+                                      const char* kind, uint32_t x, uint32_t y, uint32_t z,
+                                      uint32_t mode, uint64_t args_address = 0) {
+	const auto& options = ShaderRecompiler::GetCodegenOptions();
+	if (options.scalar_read_probe_shader == 0 ||
+	    options.scalar_read_probe_shader != shader_hash ||
+	    options.scalar_read_probe_pcs.empty()) return;
+	static std::atomic<uint32_t> logged {0};
+	const auto ordinal = logged.fetch_add(1, std::memory_order_relaxed);
+	if (ordinal >= 16) return;
+	LOGF("ScalarReadProbe dispatch recorded: shader=0x%016" PRIx64
+	     " kind=%s frame=%u tick=%" PRIu64 " ordinal=%u groups=%ux%ux%u mode=0x%x"
+	     " args=0x%016" PRIx64 "\n", shader_hash, kind,
+	     context.GetGpu().GetFrameNum(),
+	     static_cast<uint64_t>(context.GetCommandScheduler().CurrentTick()),
+	     ordinal, x, y, z, mode, args_address);
+}
+
 // KYTY_BDA_WRITES=candidates: a dispatch skipped because its proof failed (GPU thread).
 static void RejectBdaWriteCandidates(BufferCache& cache, const BdaWriteCandidates::Plan& plan) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaCandidateRejects);
@@ -461,6 +482,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	PreparedBindings* descriptor_stage = &bindings;
+	const bool bvh_capture = program.info.uses_bvh && m_context.GetBufferCache().BeginBvhCapture(
+	    program.shader_hash, thread_group_x, thread_group_y, thread_group_z, mode);
 	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
 	// is alive. Binding commits and the barrier requests below record state commands only (image
 	// transitions and dependencies are batched); the dispatch goes through Sink(), which records
@@ -484,11 +507,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    deferred_writes ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	LogScalarReadProbeDispatch(m_context, program.shader_hash, "direct",
+	                          thread_group_x, thread_group_y, thread_group_z, mode);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (bvh_capture) m_context.GetBufferCache().EndBvhCapture(program.shader_hash);
 	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
 	// it lets consumers skip reading the range back while nothing else writes it. Resolved once,
 	// from the guest dispatch dimensions, for the record and the profiler message below.
@@ -619,6 +645,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
+	const bool bvh_capture = program.info.uses_bvh && m_context.GetBufferCache().BeginBvhCapture(
+	    program.shader_hash, 0, 0, 0, mode, args_buffer, args_offset);
 	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -655,9 +683,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    deferred_writes ? m_context.GetBufferCache().BeginDeferredBdaWrite(program.shader_hash) : 0;
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
+	// Dimensions are GPU-produced; zero here means unknown, not an empty dispatch.
+	LogScalarReadProbeDispatch(m_context, program.shader_hash, "indirect", 0, 0, 0,
+	                          mode, args_addr);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (candidate_writes) m_context.GetBufferCache().FinishBdaWriteCandidates(*candidate_plan);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (bvh_capture) m_context.GetBufferCache().EndBvhCapture(program.shader_hash);
 	ResetBindings();
 	if (deferred_ticket != 0) {
 		m_context.GetBufferCache().QueueDeferredBdaWrite(deferred_ticket);

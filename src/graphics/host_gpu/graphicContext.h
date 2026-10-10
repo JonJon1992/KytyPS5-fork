@@ -62,6 +62,8 @@ void CaptureDiagnosticIndirectArgs(GraphicContext& graphics, vk::CommandBuffer c
                                    uint64_t count_offset);
 
 struct GraphicContext {
+	bool hardware_rt_enabled = false;
+	vk::PhysicalDeviceAccelerationStructurePropertiesKHR hardware_rt_properties {};
     bool bindless_supported = false;
     bool bindless_enabled = false;
     uint32_t bindless_images_per_array = 0;

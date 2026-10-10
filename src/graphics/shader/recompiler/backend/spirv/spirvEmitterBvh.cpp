@@ -1,6 +1,8 @@
 // Adapted from Senaxx/KytyPS5 Wolverine, commit 6b3fbc83d3bf39c89b3bb1adc68b6e50ce66732f (GPL-2.0).
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -27,6 +29,123 @@ uint32_t NodeWord(EmitterState& s, uint32_t block, uint32_t word) {
 	const auto result = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpLoad, TypeU32(s), result, pointer, spv::MemoryAccessAlignedMask, 4u);
 	return result;
+}
+
+bool CaptureApplies(const EmitterState& s) {
+	return s.program.stage == ShaderType::Compute && BvhCaptureApplies(s.program.shader_hash);
+}
+
+// Records executed calls under guest EXEC, including rejected inputs. Node
+// bytes are loaded only after the original bounds/mapping guards succeeded.
+void CaptureNode(EmitterState& s, std::span<const uint32_t> args, uint32_t pc, uint32_t invocation,
+                 uint32_t first, uint32_t second, uint32_t full, uint32_t status, uint32_t result) {
+	namespace C = BvhCapture;
+	const auto u = TypeU32(s), b = TypeBool(s);
+	const auto resident = Binary(s, spv::OpIEqual, b, status, ConstantU32(s, C::Resident));
+	constexpr auto base = uint32_t(BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE / 4);
+	const auto pointer = [&](uint32_t index) {
+		const auto p = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(s), p,
+		    s.fault_buffer_variable, ConstantU32(s, 0), index);
+		return p;
+	};
+	const auto field = [&](uint32_t index) { return pointer(ConstantU32(s, base + index)); };
+	const auto load = [&](uint32_t p, bool atomic) {
+		const auto value = s.builder.AllocateId();
+		if (atomic) s.builder.AddFunction(spv::OpAtomicLoad, u, value, p,
+		    ConstantU32(s, spv::ScopeDevice), ConstantU32(s, spv::MemorySemanticsMaskNone));
+		else s.builder.AddFunction(spv::OpLoad, u, value, p);
+		return value;
+	};
+	// When capture is disabled, avoid the counter entirely. Invocation sampling
+	// happens before its CAS loop so a large dispatch cannot contend on one word.
+	(void)EmitValueOrDefaultIfCondition(s,
+	    Binary(s, spv::OpIEqual, b, load(field(C::Enabled), true), ConstantU32(s, 1)),
+	    u, ConstantU32(s, 0), [&] {
+		const auto x = Extract(s, u, invocation, 0);
+		const auto y = Binary(s, spv::OpIMul, u, Extract(s, u, invocation, 1), ConstantU32(s, 0x9e3779b9));
+		const auto z = Binary(s, spv::OpIMul, u, Extract(s, u, invocation, 2), ConstantU32(s, 0x85ebca6b));
+		const auto hash = Binary(s, spv::OpBitwiseXor, u, x, Binary(s, spv::OpBitwiseXor, u, y, z));
+		const auto sampled = Binary(s, spv::OpIEqual, b,
+		    Binary(s, spv::OpBitwiseAnd, u, hash, load(field(C::SampleMask), false)), ConstantU32(s, 0));
+		const auto selected_pc = load(field(C::PcFilter), false);
+		const auto pc_matches = Binary(s, spv::OpLogicalOr, b,
+		    Binary(s, spv::OpIEqual, b, selected_pc, ConstantU32(s, 0)),
+		    Binary(s, spv::OpIEqual, b, selected_pc, pc));
+		return EmitValueOrDefaultIfCondition(s,
+		    Binary(s, spv::OpLogicalAnd, b, sampled, pc_matches), u, ConstantU32(s, 0), [&] {
+			const auto capacity = load(field(C::Capacity), false);
+			const auto count_ptr = field(C::Count);
+			const auto observed = load(count_ptr, true);
+			auto active = Binary(s, spv::OpULessThanEqual, b, capacity, ConstantU32(s, C::MaxRecords));
+			active = Binary(s, spv::OpLogicalAnd, b, active,
+			    Binary(s, spv::OpULessThan, b, observed, capacity));
+			(void)EmitValueOrDefaultIfCondition(s, active, u, ConstantU32(s, 0), [&] {
+				// Saturating CAS reservation: no counter wrap, duplicate slots or stores
+				// beyond capacity even when thousands of invocations arrive together.
+				const auto pre = s.current_label;
+				const auto header = s.builder.AllocateId(), attempt = s.builder.AllocateId();
+				const auto next = s.builder.AllocateId(), merge = s.builder.AllocateId();
+				const auto expected = s.builder.AllocateId(), old = s.builder.AllocateId();
+				s.builder.AddFunction(spv::OpBranch, header);
+				EmitLabel(s, header);
+				s.builder.AddFunction(spv::OpPhi, u, expected, observed, pre, old, next);
+				const auto has_space = Binary(s, spv::OpULessThan, b, expected, capacity);
+				s.builder.AddFunction(spv::OpLoopMerge, merge, next, spv::LoopControlMaskNone);
+				s.builder.AddFunction(spv::OpBranchConditional, has_space, attempt, merge);
+				EmitLabel(s, attempt);
+				s.builder.AddFunction(spv::OpAtomicCompareExchange, u, old, count_ptr,
+				    ConstantU32(s, spv::ScopeDevice), ConstantU32(s, spv::MemorySemanticsMaskNone),
+				    ConstantU32(s, spv::MemorySemanticsMaskNone),
+				    Binary(s, spv::OpIAdd, u, expected, ConstantU32(s, 1)), expected);
+				const auto claimed = Binary(s, spv::OpIEqual, b, old, expected);
+				s.builder.AddFunction(spv::OpBranchConditional, claimed, merge, next);
+				EmitLabel(s, next);
+				s.builder.AddFunction(spv::OpBranch, header);
+				EmitLabel(s, merge);
+				const auto slot = s.builder.AllocateId();
+				s.builder.AddFunction(spv::OpPhi, u, slot, ConstantU32(s, C::MaxRecords), header,
+				                      expected, attempt);
+				(void)EmitValueOrDefaultIfCondition(s,
+				    Binary(s, spv::OpULessThan, b, slot, capacity), u, ConstantU32(s, 0), [&] {
+					const auto at = Binary(s, spv::OpIAdd, u, ConstantU32(s, base + C::HeaderWords),
+					    Binary(s, spv::OpIMul, u, slot, ConstantU32(s, C::RecordWords)));
+					const auto store = [&](uint32_t word, uint32_t value) {
+						s.builder.AddFunction(spv::OpStore,
+						    pointer(Binary(s, spv::OpIAdd, u, at, ConstantU32(s, word))), value);
+					};
+					store(C::Pc, pc);
+					store(C::NodeLow, Unary(s, spv::OpUConvert, u, args[1]));
+					store(C::NodeHigh, Unary(s, spv::OpUConvert, u,
+					    Binary(s, spv::OpShiftRightLogical, TypeScalarU64(s), args[1], ConstantDeviceAddress(s, 32))));
+					store(C::NodeWords, Select(s, u, resident,
+					    Select(s, u, full, ConstantU32(s, 32), ConstantU32(s, 16)), ConstantU32(s, 0)));
+					store(C::Status, status);
+					for (uint32_t i = 0; i < 4; ++i) {
+						store(C::Descriptor + i, Extract(s, u, args[0], i));
+						store(C::Result + i, Extract(s, u, result, i));
+					}
+					store(C::Extent, Unary(s, spv::OpBitcast, u, args[2]));
+					for (uint32_t v = 0; v < 3; ++v)
+						for (uint32_t i = 0; i < 3; ++i)
+							store(C::Origin + v * 3 + i,
+							    Unary(s, spv::OpBitcast, u, Extract(s, TypeF32(s), args[3 + v], i)));
+					(void)EmitValueOrDefaultIfCondition(s, resident, u, ConstantU32(s, 0), [&] {
+						for (uint32_t i = 0; i < 16; ++i) store(C::Data + i, NodeWord(s, first, ConstantU32(s, i)));
+						(void)EmitValueOrDefaultIfCondition(s, full, u, ConstantU32(s, 0), [&] {
+							for (uint32_t i = 0; i < 16; ++i) store(C::Data + 16 + i, NodeWord(s, second, ConstantU32(s, i)));
+							return ConstantU32(s, 0);
+						});
+						return ConstantU32(s, 0);
+					});
+					for (uint32_t i = 0; i < 3; ++i) store(C::Invocation + i, Extract(s, u, invocation, i));
+					return ConstantU32(s, 0);
+				});
+				return ConstantU32(s, 0);
+			});
+			return ConstantU32(s, 0);
+		});
+	});
 }
 
 uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
@@ -228,16 +347,26 @@ void DefineBvhIntersect(EmitterState& s) {
 	if (!s.requirements.bvh) return;
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeScalarU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
-	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, u, f, vec3, vec3, vec3);
+	const bool capture = CaptureApplies(s);
+	const auto signature = capture
+	    ? s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3, u, TypeU32Vector(s, 3))
+	    : s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
 	s.bvh_intersect_function = s.builder.AllocateId();
 	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
 	s.builder.AddFunction(spv::OpFunction, vec4, s.bvh_intersect_function,
 	                      spv::FunctionControlMaskNone, signature);
 	std::array<uint32_t, 6> args;
-	const std::array types {vec4, u, f, vec3, vec3, vec3};
+	const std::array types {vec4, wide, f, vec3, vec3, vec3};
 	for (uint32_t i = 0; i < args.size(); ++i) {
 		args[i] = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionParameter, types[i], args[i]);
+	}
+	uint32_t pc = 0, invocation = 0;
+	if (capture) {
+		pc = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpFunctionParameter, u, pc);
+		invocation = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpFunctionParameter, TypeU32Vector(s, 3), invocation);
 	}
 	EmitLabel(s, s.builder.AllocateId());
 	const auto descriptor = args[0], node = args[1], extent = args[2];
@@ -255,7 +384,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto shr = [&](uint32_t value, uint32_t shift) {
 		return Binary(s, spv::OpShiftRightLogical, u, value, ConstantU32(s, shift));
 	};
-	const auto kind = and_bits(node, 7);
+	const auto kind = and_bits(Unary(s, spv::OpUConvert, u, node), 7);
 	const auto triangle = Binary(s, spv::OpULessThan, b, kind, ConstantU32(s, 4));
 	const auto full = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 5));
 	const auto half = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 4));
@@ -264,7 +393,7 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto grow = and_bits(shr(words[1], 23), 0xff);
 	const auto base = Binary(s, spv::OpShiftLeftLogical, wide,
 	    DeviceAddressFromWords(s, words[0], and_bits(words[1], 0xff)), ConstantDeviceAddress(s, 8));
-	const auto index = Unary(s, spv::OpUConvert, wide, shr(node, 3));
+	const auto index = Binary(s, spv::OpShiftRightLogical, wide, node, ConstantDeviceAddress(s, 3));
 	const auto last_index = Binary(s, spv::OpIAdd, wide, index,
 	    Select(s, wide, full, ConstantDeviceAddress(s, 1), ConstantDeviceAddress(s, 0)));
 	const auto address = Binary(s, spv::OpIAdd, wide, base,
@@ -292,7 +421,17 @@ void DefineBvhIntersect(EmitterState& s) {
 	for (uint32_t i = 0; i < 4; ++i)
 		invalid_words[i] = Select(s, u, triangle, triangle_invalid[i], box_invalid[i]);
 	const auto invalid = Vector(s, vec4, invalid_words);
-	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
+	// The diagnostic carries the guarded addresses alongside the unchanged
+	// software result, so failed inputs can be recorded without any node load.
+	const auto value_type = capture ? s.builder.Type(spv::OpTypeStruct, vec4, wide, wide, u) : vec4;
+	const auto bundle = [&](uint32_t value, uint32_t first, uint32_t second, uint32_t status) {
+		if (!capture) return value;
+		const std::array members{value, first, second, ConstantU32(s, status)};
+		return Vector(s, value_type, members);
+	};
+	const auto zero_address = ConstantDeviceAddress(s, 0);
+	const auto default_value = bundle(invalid, zero_address, zero_address, BvhCapture::InvalidInput);
+	const auto result = EmitValueOrDefaultIfCondition(s, valid, value_type, default_value, [&] {
 		const auto first = GetBdaPointer(s, address);
 		const auto second = EmitValueOrDefaultIfCondition(s, full, wide, ConstantDeviceAddress(s, 0), [&] {
 			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantDeviceAddress(s, 64)));
@@ -301,7 +440,8 @@ void DefineBvhIntersect(EmitterState& s) {
 		    Binary(s, spv::OpINotEqual, b, first, ConstantDeviceAddress(s, 0)),
 		    Binary(s, spv::OpLogicalOr, b, Unary(s, spv::OpLogicalNot, b, full),
 		        Binary(s, spv::OpINotEqual, b, second, ConstantDeviceAddress(s, 0))));
-		return EmitValueOrDefaultIfCondition(s, present, vec4, invalid, [&] {
+		const auto unmapped = bundle(invalid, zero_address, zero_address, BvhCapture::Unmapped);
+		return EmitValueOrDefaultIfCondition(s, present, value_type, unmapped, [&] {
 			const auto tri_label = s.builder.AllocateId(), box_label = s.builder.AllocateId();
 			const auto merge = s.builder.AllocateId();
 			s.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
@@ -317,31 +457,61 @@ void DefineBvhIntersect(EmitterState& s) {
 			EmitLabel(s, merge);
 			const auto value = s.builder.AllocateId();
 			s.builder.AddFunction(spv::OpPhi, vec4, value, tri_value, tri_exit, box_value, box_exit);
-			return value;
+			return bundle(value, first, second, BvhCapture::Resident);
 		});
 	});
-	s.builder.AddFunction(spv::OpReturnValue, result);
+	if (capture) {
+		const auto value = Extract(s, vec4, result, 0);
+		CaptureNode(s, args, pc, invocation, Extract(s, wide, result, 1), Extract(s, wide, result, 2),
+		    full, Extract(s, u, result, 3), value);
+		s.builder.AddFunction(spv::OpReturnValue, value);
+	} else s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
 
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
-	if (ray == nullptr || ray->NumArgs() < 11 || s.bvh_intersect_function == 0)
-		ctx.Fail(inst, "BVH intersection requires eleven address components and its shared function");
+	if (ray == nullptr || ray->NumArgs() < 12 || s.bvh_intersect_function == 0)
+		ctx.Fail(inst, "BVH intersection requires normalized ray/node components and its shared function");
 	const auto vector = [&](uint32_t first) {
 		Vec3 values;
 		for (uint32_t i = 0; i < 3; ++i)
 			values[i] = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, first + i));
 		return Vector(s, TypeF32Vector(s, 3), values);
 	};
-	const auto descriptor = ctx.Arg(inst, 0), node = ctx.Arg(*ray, 0);
+	const auto descriptor = ctx.Arg(inst, 0);
+	const auto node = DeviceAddressFromWords(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 11));
 	const auto extent = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, 1));
 	const auto origin = vector(2), direction = vector(5), inverse = vector(8);
 	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
 	    ConstantU32CompositeZero(s, 4), [&] {
 		const auto result = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
+		if (CaptureApplies(s)) {
+			std::array<uint32_t, 3> ids;
+			uint32_t divisor = 1;
+			for (uint32_t axis = 0; axis < 3; ++axis) {
+				if (s.lane_count == 1) {
+					ids[axis] = EmitInputComponentU32(s, IR::StageInputKind::GlobalInvocationId, axis);
+					continue;
+				}
+				// Match EmitBuiltinU32's virtual workgroup coordinates when a
+				// guest wave64 executes as two halves on a host wave32.
+				const auto* cs = ShaderWorkgroupInput(s.program.stage, s.input_info);
+				const auto size = std::max(cs->threads_num[axis], 1u);
+				const auto local = Binary(s, spv::OpUMod, TypeU32(s),
+				    Binary(s, spv::OpUDiv, TypeU32(s), EmitLocalInvocationIndex(s), ConstantU32(s, divisor)),
+				    ConstantU32(s, size));
+				ids[axis] = Binary(s, spv::OpIAdd, TypeU32(s), local,
+				    Binary(s, spv::OpIMul, TypeU32(s),
+				        EmitInputComponentU32(s, IR::StageInputKind::WorkgroupId, axis), ConstantU32(s, size)));
+				divisor *= size;
+			}
+			s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
+			    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse,
+			    ConstantU32(s, inst.Flags<uint32_t>()), Vector(s, TypeU32Vector(s, 3), ids));
+		}
+		else s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);
 		return result;
 	});

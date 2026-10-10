@@ -6,6 +6,7 @@
 #include "gpu_tiler_shaders/bda_write_process_spv.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -46,6 +47,22 @@ size_t DownloadAreaSize(const GraphicContext& graphics) {
 	return (PageFaultAreaSize + sizeof(ShaderTrapRecord) + alignment - 1) & ~(alignment - 1);
 }
 
+uint64_t FaultBufferSize(bool bda_writes) {
+	if (ShaderRecompiler::GetCodegenOptions().bvh_capture_shader != 0)
+		return BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + ShaderRecompiler::BvhCapture::Bytes;
+	return bda_writes ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
+	                  : PageFaultBitsetSize + sizeof(ShaderTrapRecord);
+}
+
+uint32_t CaptureValue(const char* name, uint32_t fallback, uint32_t minimum, uint32_t maximum) {
+	const auto* text = std::getenv(name);
+	if (!text || !*text) return fallback;
+	char* end = nullptr;
+	const auto value = std::strtoull(text, &end, 10);
+	return end != text && *end == '\0' && value >= minimum && value <= maximum
+	           ? static_cast<uint32_t>(value) : fallback;
+}
+
 // One page-bitmap compaction (fault_buffer_process.comp, built with some MAX_PAGE_FAULTS) on the
 // fault manager's push-descriptor layout: binding 0 the bitmap range, binding 1 the page list.
 vk::Pipeline CreateCompactionPipeline(vk::Device device, vk::PipelineLayout layout,
@@ -84,11 +101,11 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_bda_writes(ShaderRecompiler::BdaWritesEnabled()),
       // The written-page bitmap and the dropped count exist only while a shader is listed.
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     m_bda_writes ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
-                                  : PageFaultBitsetSize + sizeof(ShaderTrapRecord)),
+                     FaultBufferSize(m_bda_writes)),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * m_download_area_size) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+	EXIT_IF(m_fault_buffer.Size() > m_graphics.physical_device_properties.limits.maxStorageBufferRange);
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -133,6 +150,128 @@ Buffer* FaultManager::GetFaultBuffer() noexcept {
 		m_initialized = true;
 	}
 	return &m_fault_buffer;
+}
+
+bool FaultManager::BeginBvhCapture(uint64_t shader_hash, uint32_t x, uint32_t y,
+                                  uint32_t z, uint32_t mode, const Buffer* indirect_args,
+                                  uint64_t args_offset) {
+	using namespace ShaderRecompiler::BvhCapture;
+	if (!ShaderRecompiler::BvhCaptureApplies(shader_hash)) return false;
+	if (m_bvh_capture_recorded) {
+		// A shader can be dispatched with no active rays. Try later BVH
+		// dispatches, with a bounded number of attempts, after completion.
+		if (m_bvh_capture_attempts >= m_bvh_capture_shaders.size() ||
+		    m_bvh_capture_outcome->load(std::memory_order_acquire) != 2) return false;
+		m_bvh_capture_recorded = false;
+	}
+	if (ShaderRecompiler::GetCodegenOptions().bvh_capture_shader == UINT64_MAX) {
+		// In all-shader mode a frequently dispatched shader with no rays
+		// must not consume every attempt before a later shader can be sampled.
+		const auto end = m_bvh_capture_shaders.begin() + m_bvh_capture_attempts;
+		if (std::find(m_bvh_capture_shaders.begin(), end, shader_hash) != end) return false;
+	}
+	if (const auto* trigger = std::getenv("KYTY_BVH_CAPTURE_TRIGGER"); trigger && trigger[0]) {
+		std::error_code error;
+		if (!std::filesystem::exists(trigger, error) || error) return false;
+	}
+	static const auto skip = [] {
+		const auto* value = std::getenv("KYTY_BVH_CAPTURE_SKIP");
+		return value ? std::strtoull(value, nullptr, 10) : 0ull;
+	}();
+	if (m_bvh_capture_skips++ < skip) return false;
+	(void)GetFaultBuffer();
+	if (!m_bvh_capture_outcome) m_bvh_capture_outcome = std::make_shared<std::atomic<uint32_t>>(0);
+	else m_bvh_capture_outcome->store(0, std::memory_order_relaxed);
+	m_bvh_capture_shaders[m_bvh_capture_attempts++] = shader_hash;
+	const auto capacity = CaptureValue("KYTY_BVH_CAPTURE_RECORDS", 4096, 1, MaxRecords);
+	const auto sample_mask = CaptureValue("KYTY_BVH_CAPTURE_SAMPLE_MASK", 4095, 0, MaxRecords - 1);
+	const auto download_bytes = uint64_t(HeaderWords + capacity * RecordWords) * 4;
+	m_bvh_capture_download = std::make_shared<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, download_bytes);
+	SetVulkanObjectNameF(m_graphics.device, m_bvh_capture_download->Handle(), "BVH Capture Readback");
+	std::array<uint32_t, HeaderWords> header{};
+	header[Enabled] = 1;
+	header[FileMagic] = Magic;
+	header[FileVersion] = Version;
+	header[Stride] = RecordWords;
+	header[Capacity] = capacity;
+	header[SampleMask] = sample_mask;
+	header[PcFilter] = CaptureValue("KYTY_BVH_CAPTURE_PC", 0, 0, UINT32_MAX);
+	header[ShaderLow] = static_cast<uint32_t>(shader_hash);
+	header[ShaderHigh] = static_cast<uint32_t>(shader_hash >> 32);
+	header[GroupsX] = x; header[GroupsY] = y; header[GroupsZ] = z; header[Mode] = mode;
+	header[Indirect] = indirect_args != nullptr;
+	const auto tick = m_scheduler.CurrentTick();
+	header[TickLow] = static_cast<uint32_t>(tick);
+	header[TickHigh] = static_cast<uint32_t>(tick >> 32);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllCommands,
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+	    vk::PipelineStageFlagBits2::eTransfer,
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+	    BarrierOrigin::ShaderAccess);
+	command.Handle().updateBuffer(m_fault_buffer.Handle(), BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE,
+	                              sizeof(header), header.data());
+	if (indirect_args) {
+		EXIT_IF(args_offset > indirect_args->Size() ||
+		        sizeof(vk::DispatchIndirectCommand) > indirect_args->Size() - args_offset);
+		// Dispatch dimensions can be produced on the GPU. Capture those same bytes,
+		// rather than reading possibly stale guest backing on the host.
+		command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eTransfer,
+		    vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
+		    vk::AccessFlagBits2::eTransferWrite, BarrierOrigin::IndirectArgs);
+		command.Handle().copyBuffer(indirect_args->Handle(), m_fault_buffer.Handle(),
+		    vk::BufferCopy{args_offset, BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + GroupsX * 4,
+		                   sizeof(vk::DispatchIndirectCommand)});
+	}
+	m_fault_buffer.MarkContentWritten();
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eTransfer,
+	    vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+	    BarrierOrigin::ShaderAccess);
+	m_bvh_capture_recorded = true;
+	std::fprintf(stderr, "BVH capture armed: shader=0x%016" PRIx64 " tick=%" PRIu64 "\n", shader_hash, tick);
+	return true;
+}
+
+void FaultManager::EndBvhCapture(uint64_t shader_hash) {
+	using namespace ShaderRecompiler::BvhCapture;
+	EXIT_IF(!m_bvh_capture_download);
+	auto& command = m_scheduler.Current();
+	m_bvh_capture_download->CopyFrom(command, m_fault_buffer,
+	    BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE, 0, m_bvh_capture_download->Size(),
+	    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+	command.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eTransfer,
+	    vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+	    vk::AccessFlagBits2::eHostRead, BarrierOrigin::ShaderAccess);
+	// No subsequent dispatch appends to this snapshot; the copy precedes the
+	// clear. Its completion lease owns the staging buffer independently of us.
+	m_fault_buffer.Fill(BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Enabled * 4, 4, 0);
+	const auto tick = m_scheduler.CurrentTick();
+	const auto* folder = std::getenv("KYTY_BVH_CAPTURE_DIR");
+	const std::filesystem::path directory = folder && folder[0] ? folder : "_RTCapture";
+	m_scheduler.DeferOperation([download = std::move(m_bvh_capture_download),
+	                           outcome = m_bvh_capture_outcome, shader_hash, tick, directory] {
+		download->Invalidate(0, download->Size());
+		std::array<uint32_t, HeaderWords> header{};
+		std::memcpy(header.data(), download->Mapped().data(), sizeof(header));
+		const auto capacity = static_cast<uint32_t>((download->Size() - HeaderWords * 4) / (RecordWords * 4));
+		const auto count = std::min(header[Count], capacity);
+		outcome->store(count == 0 ? 2u : 1u, std::memory_order_release);
+		std::error_code error;
+		std::filesystem::create_directories(directory, error);
+		const auto path = directory / ("bvh-" + std::to_string(shader_hash) + "-" + std::to_string(tick) + ".bin");
+		std::ofstream file(path, std::ios::binary);
+		const auto bytes = uint64_t(HeaderWords + count * RecordWords) * 4;
+		if (!error) file.write(reinterpret_cast<const char*>(download->Mapped().data()), bytes);
+		if (error || !file) {
+			std::fprintf(stderr, "BVH capture could not be saved: %s\n", path.string().c_str());
+			return;
+		}
+		std::fprintf(stderr, "BVH capture saved: %s records=%u%s\n", path.string().c_str(), count,
+		             count == capacity ? " (capacity reached; partial dispatch)" : "");
+	});
 }
 
 void FaultManager::ProcessFaultBuffer() {
@@ -234,27 +373,47 @@ void FaultManager::ProcessFaultBuffer() {
 		if (trap.claimed != 0) {
 			const auto hash = (uint64_t{trap.shader_hash_high} << 32) | trap.shader_hash_low;
 			if (trap.code == ShaderTrapRecord::ScalarReadFailure) {
+				const auto* continue_value = std::getenv("KYTY_SCALAR_READ_PROBE_CONTINUE");
+				const bool continue_capture = continue_value && std::strcmp(continue_value, "1") == 0;
+				static std::atomic<uint64_t> record_sequence {0};
+				const auto sequence = record_sequence.fetch_add(1, std::memory_order_relaxed);
 				const auto* folder = std::getenv("KYTY_SCALAR_READ_PROBE_DIR");
 				const std::filesystem::path directory = folder && *folder ? folder : "_RTCapture";
 				std::error_code error;
 				std::filesystem::create_directories(directory, error);
 				const auto path = directory / ("scalar-read-" + std::to_string(hash) + "-" +
-				                               std::to_string(trap.pc) + ".bin");
+				                               std::to_string(trap.pc) + "-" +
+				                               std::to_string(sequence) + ".bin");
 				std::ofstream file(path, std::ios::binary);
 				if (!error) file.write(reinterpret_cast<const char*>(&trap), sizeof(trap));
 				file.close();
 				std::fprintf(stderr, "Scalar read probe: %s %s\n", error || !file ? "save failed:" : "saved:",
 				             path.string().c_str());
-				EXIT("GPU scalar read probe (intentional diagnostic stop): hash=0x%016" PRIx64
+				// Preserve the completed batch's missing-page list before the diagnostic
+				// exit. A zero descriptor bound can originate in an earlier absent
+				// header/instance page, rather than in the descriptor size calculation.
+				auto faults_path = path;
+				faults_path.replace_extension(".faults.bin");
+				std::ofstream faults_file(faults_path, std::ios::binary);
+				if (!error) faults_file.write(reinterpret_cast<const char*>(mapped), PageFaultAreaSize);
+				faults_file.close();
+				std::fprintf(stderr, "Scalar read probe page list: %s %s\n",
+				             error || !faults_file ? "save failed:" : "saved:",
+				             faults_path.string().c_str());
+				if (!continue_capture) EXIT("GPU scalar read probe (intentional diagnostic stop): hash=0x%016" PRIx64
 				     " pc=0x%08x reason=%u address=0x%08x%08x size=0x%08x%08x offset=0x%08x"
 				     " descriptor=[%08x,%08x,%08x,%08x] bda=0x%08x%08x\n",
 				     hash, trap.pc, trap.reason, trap.address_high, trap.address_low,
 				     trap.size_high, trap.size_low, trap.offset,
 				     trap.descriptor[0], trap.descriptor[1], trap.descriptor[2], trap.descriptor[3],
 				     trap.bda_high, trap.bda_low);
+				std::fprintf(stderr, "Scalar read probe: continuing diagnostic capture after invalid read;"
+				             " hash=0x%016" PRIx64 " pc=0x%x reason=%u; affected dispatch output is incomplete\n",
+				             hash, trap.pc, trap.reason);
+			} else {
+				EXIT("GPU shader trap: hash=0x%016" PRIx64 " pc=0x%08x code=0x%02x\n",
+				     hash, trap.pc, trap.code);
 			}
-			EXIT("GPU shader trap: hash=0x%016" PRIx64 " pc=0x%08x code=0x%02x\n",
-			     hash, trap.pc, trap.code);
 		}
 
 		RangeSet    fault_ranges;

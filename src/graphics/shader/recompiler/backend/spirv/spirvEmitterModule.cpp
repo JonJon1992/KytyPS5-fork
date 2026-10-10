@@ -631,6 +631,13 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
+	if (state.requirements.bvh && state.program.stage == ShaderType::Compute &&
+	    BvhCaptureApplies(state.program.shader_hash) &&
+	    std::ranges::none_of(state.inputs, [](const InputBinding& input) {
+		    return input.kind == IR::StageInputKind::GlobalInvocationId;
+	    })) {
+		state.inputs.push_back({{IR::StageInputKind::GlobalInvocationId, 0, 3, "gl_GlobalInvocationID"}});
+	}
 	if (state.lane_count == 2) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {

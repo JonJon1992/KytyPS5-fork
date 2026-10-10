@@ -101,6 +101,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.spirv_optimize ? 1u : 0u);
 	b.U8(options.spirv_optimize_extended ? 1u : 0u);
 	b.U8(options.function_lds_compact ? 1u : 0u);
+	b.U64(options.bvh_capture_shader);
 	b.U64(options.scalar_read_probe_shader);
 	b.U32(static_cast<uint32_t>(options.scalar_read_probe_pcs.size()));
 	for (const auto pc: options.scalar_read_probe_pcs) b.U32(pc);
@@ -128,6 +129,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U64(BufferCache::CACHING_PAGEBITS);
 	b.U64(BufferCache::CACHING_PAGESIZE);
 	b.U64(BufferCache::CACHING_NUMPAGES);
+	b.U64(BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE);
 	b.U32(sizeof(ShaderTrapRecord));
 
 	b.U32(static_cast<uint32_t>(kSwitchCount));

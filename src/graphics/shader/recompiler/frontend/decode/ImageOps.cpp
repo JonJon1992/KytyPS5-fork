@@ -246,7 +246,10 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
-		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		// Both encodings share the intersection operation; opcode_id retains
+		// the node-pointer width for operand normalization in the frontend.
+		case 0xe6u:
+		case 0xe7u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -372,6 +375,12 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_address_components =
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	const bool bvh = opcode == 0xe6u || opcode == 0xe7u;
+	if (bvh) {
+		// Unlike texture coordinates, only direction/inverse are packed by A16.
+		// This is the number of raw address DWORDs, not half components.
+		inst.image_address_components = (a16 ? 8u : 11u) + (opcode == 0xe7u ? 1u : 0u);
+	}
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -405,10 +414,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
 
-	if (opcode == 0xe6u &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
+	const uint32_t bvh_nsa_dwords = (inst.image_address_components + 2u) / 4u;
+	if (bvh &&
+	    (!r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != bvh_nsa_dwords))) {
 		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires eleven full-float ray DWORDs and R128/dmask:0xf");
+		               "BVH intersection requires its complete ray operands and R128/dmask:0xf");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

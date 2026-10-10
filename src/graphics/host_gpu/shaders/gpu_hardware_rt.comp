@@ -1,0 +1,27 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+struct Ray { vec3 origin; float minT; vec3 direction; float maxT; };
+layout(std430, set = 0, binding = 1) readonly buffer Rays { Ray rays[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Hits { vec4 hits[]; };
+layout(push_constant) uniform Params { uint count; } params;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.count) return;
+    Ray ray = rays[id];
+    // Inputs are checked on the host too. Keep invalid rays away from RayQuery.
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 255,
+                          ray.origin, ray.minT, ray.direction, ray.maxT);
+    while (rayQueryProceedEXT(query)) {}
+    vec4 result = vec4(0, 0, 0, uintBitsToFloat(0xffffffffu));
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        result = vec4(rayQueryGetIntersectionTEXT(query, true), bary,
+                      uintBitsToFloat(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)));
+    }
+    hits[id] = result;
+}

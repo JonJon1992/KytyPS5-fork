@@ -54,6 +54,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rt/hardwareRt.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -62,6 +63,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/BvhCapture.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -1873,6 +1875,12 @@ struct TestCase {
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   uint64_t shader_hash = 0;
+  // A bounded witness of the node/ray/result actually read by the shader.
+  u32 bvh_capture_capacity = 0;
+  u32 bvh_capture_sample_mask = 0;
+  u32 bvh_capture_pc_filter = 0;
+  bool bvh_capture_enabled = true;
+  std::function<void(std::span<const u32>)> check_bvh_capture;
   std::function<void(const ShaderTrapRecord&)> check_shader_trap;
 };
 
@@ -7520,6 +7528,8 @@ public:
   // than MeshIndirect::Records, a draw the CPU path stops on, indices read past
   // INDEX_BUFFER_SIZE); AlwaysEmpty holds exactly when no record can yield a primitive. With
   // KYTY_NATIVE_INDIRECT_MESH=verify|exit every conversion is also compared on completion.
+#include "HardwareRtGpuTests.inc"
+
   void CheckMeshIndirectConversion() {
     constexpr const char *name = "MeshIndirectConversion";
     namespace MI = MeshIndirect;
@@ -26230,6 +26240,36 @@ public:
       cmd.fillBuffer(m_bda_pagetable_buffer.buffer, 0,
                      m_bda_pagetable_buffer.size, 0);
       cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      if (test.bvh_capture_capacity != 0) {
+        namespace Capture = ShaderRecompiler::BvhCapture;
+        Require(test.name, "capture allocation",
+                ShaderRecompiler::BvhCaptureApplies(test.shader_hash) &&
+                    test.bvh_capture_capacity < Capture::MaxRecords,
+                "capture test needs the matching codegen option and room for its guard");
+        vk::MemoryBarrier order{};
+        order.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        order.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                             vk::PipelineStageFlagBits::eTransfer, {}, 1, &order,
+                             0, nullptr, 0, nullptr);
+        const std::array<u32, 2> control{test.bvh_capture_enabled ? 1u : 0u,
+                                       test.bvh_capture_capacity};
+        cmd.updateBuffer(m_fault_buffer.buffer,
+                         BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::Enabled * 4,
+                         sizeof(u32), &control[0]);
+        cmd.updateBuffer(m_fault_buffer.buffer,
+                         BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::Capacity * 4,
+                         sizeof(u32), &control[1]);
+        cmd.updateBuffer(m_fault_buffer.buffer,
+                         BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::SampleMask * 4,
+                         sizeof(u32), &test.bvh_capture_sample_mask);
+        cmd.updateBuffer(m_fault_buffer.buffer,
+                         BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + Capture::PcFilter * 4,
+                         sizeof(u32), &test.bvh_capture_pc_filter);
+        cmd.fillBuffer(m_fault_buffer.buffer, BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE +
+                         (Capture::HeaderWords + test.bvh_capture_capacity * Capture::RecordWords) * 4,
+                         Capture::RecordWords * 4, 0xc5a17e5u);
+      }
       std::array<vk::BufferMemoryBarrier, 2> barriers{};
       barriers[0].sType = vk::StructureType::eBufferMemoryBarrier;
       barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -26386,6 +26426,35 @@ public:
       dependency.pBufferMemoryBarriers = &host;
       cmd.pipelineBarrier2(dependency);
     }
+    Buffer bvh_readback;
+    if (test.check_bvh_capture) {
+      namespace Capture = ShaderRecompiler::BvhCapture;
+      const auto bytes = (Capture::HeaderWords + (test.bvh_capture_capacity + 1) * Capture::RecordWords) * 4;
+      bvh_readback = CreateHostBuffer(test.name, bytes,
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferMemoryBarrier2 barrier{};
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE;
+      barrier.size = bytes;
+      vk::DependencyInfo dep{};
+      dep.bufferMemoryBarrierCount = 1;
+      dep.pBufferMemoryBarriers = &barrier;
+      cmd.pipelineBarrier2(dep);
+      cmd.copyBuffer(m_fault_buffer.buffer, bvh_readback.buffer,
+                      vk::BufferCopy{barrier.offset, 0, bytes});
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      barrier.buffer = bvh_readback.buffer;
+      barrier.offset = 0;
+      cmd.pipelineBarrier2(dep);
+    }
     Buffer trap_readback;
     if (test.check_shader_trap) {
       trap_readback = CreateHostBuffer(test.name, sizeof(ShaderTrapRecord),
@@ -26420,6 +26489,15 @@ public:
       std::memcpy(&trap, words.data(), sizeof(trap));
       test.check_shader_trap(trap);
       DestroyBuffer(&trap_readback);
+    }
+    if (test.check_bvh_capture) {
+      auto capture = ReadBuffer(test.name, bvh_readback, bvh_readback.size / 4);
+      Require(test.name, "capture bounds", std::ranges::all_of(
+                  std::span<const u32>(capture).last(ShaderRecompiler::BvhCapture::RecordWords),
+                  [](u32 word) { return word == 0xc5a17e5u; }),
+              "capture wrote past its capacity");
+      test.check_bvh_capture(capture);
+      DestroyBuffer(&bvh_readback);
     }
     if (check_bda_writes) {
       const auto words =
@@ -29894,6 +29972,8 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    m_runtime_context.hardware_rt_enabled = m_hardware_rt.enabled;
+    m_runtime_context.hardware_rt_properties = m_hardware_rt.properties;
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
@@ -30340,6 +30420,8 @@ private:
     // As on the emulator's device (vulkanWindow.cpp): the renderer's rasterization state always
     // enables depth clamping, like the DB.
     device_features.depthClamp = available_features.depthClamp;
+    // Match the emulator: graphics modules may declare the ClipDistance capability.
+    device_features.shaderClipDistance = available_features.shaderClipDistance;
     device_features.robustBufferAccess = robustness2_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     // Optional, as in the emulator: TileManager::TileFromImage reads through format-less views.
@@ -30454,6 +30536,8 @@ private:
         GpuTiming::NoteCalibrationExtensionEnabled(calibration);
       }
     }
+    m_hardware_rt.Enable(m_physical_device, device_extensions, RT::BackendRequested());
+    device_info.pNext = m_hardware_rt.Chain(device_info.pNext);
     device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
@@ -30744,6 +30828,8 @@ private:
     // dropped-write count (BufferCache's fault buffer layout), read back after the dispatch.
     m_fault_buffer = CreateDeviceBuffer(
         shader_name,
+        ShaderRecompiler::GetCodegenOptions().bvh_capture_shader != 0
+            ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE + ShaderRecompiler::BvhCapture::Bytes :
         ShaderRecompiler::BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
                                              : BufferCache::CACHING_NUMPAGES / 8 + sizeof(ShaderTrapRecord),
         usage | vk::BufferUsageFlagBits::eTransferSrc);
@@ -30818,6 +30904,7 @@ private:
   vk::Instance m_instance = nullptr;
   vk::DebugUtilsMessengerEXT m_messenger = nullptr; // KYTY_TEST_VULKAN_VALIDATION
   vk::PhysicalDevice m_physical_device = nullptr;
+  RT::DeviceFeatures m_hardware_rt;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
@@ -47202,6 +47289,12 @@ std::vector<TestCase> MakeCases() {
   for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
     cases.push_back(BvhIntersections(barycentrics, sorted));
   cases.push_back(BvhIntersections(false, true, 1));
+  for (bool node64 : {false, true}) for (bool a16 : {false, true}) {
+    if (!node64 && !a16) continue;
+    for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+      cases.push_back(BvhIntersections(barycentrics, sorted, 0, node64, a16));
+  }
+  cases.push_back(BvhIntersections(true, true, 0, true, true, 64));
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
@@ -52987,6 +53080,8 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "GuestSyncTests.inc"
 #include "ScalarMaskPairCases.inc"
 #include "ShaderBdaWritesTests.inc"
+#include "BvhCaptureTests.inc"
+#include "BvhCaptureReplayTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -54355,6 +54450,18 @@ int main(int argc, char **argv) {
   }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
   // checks that precede them in the default run.
+  if (argc == 2 && (std::strcmp(argv[1], "--hardware-rt-only") == 0 ||
+                    std::strcmp(argv[1], "--hardware-rt-disabled-only") == 0)) {
+    const bool enabled = std::strcmp(argv[1], "--hardware-rt-only") == 0;
+    SetEnvironment("KYTY_HW_RT_BACKEND", enabled ? "1" : "0");
+    VulkanHarness vulkan;
+    if (enabled && !vulkan.RuntimeContext().hardware_rt_enabled) {
+      std::puts("SKIP HardwareRtBackend: this device lacks the required RT features/extensions");
+      return 77;
+    }
+    vulkan.CheckHardwareRtBackend(enabled);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-codegen-only") == 0) {
     for (u32 subgroup : {32u, 64u}) {
       (void)CompileCase(FlatStackApertures(32), subgroup);
@@ -54362,6 +54469,12 @@ int main(int argc, char **argv) {
       for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
         (void)CompileCase(BvhIntersections(barycentrics, sorted), subgroup);
       (void)CompileCase(BvhIntersections(false, true, 1), subgroup);
+      for (bool node64 : {false, true}) for (bool a16 : {false, true}) {
+        if (!node64 && !a16) continue;
+        for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+          (void)CompileCase(BvhIntersections(barycentrics, sorted, 0, node64, a16), subgroup);
+      }
+      (void)CompileCase(BvhIntersections(true, true, 0, true, true, 64), subgroup);
     }
     std::puts("ShaderRecompilerComputeTests: Wolverine fixture CPU/SPIR-V cases passed");
     return 0;
@@ -54373,8 +54486,40 @@ int main(int argc, char **argv) {
     for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
       RunCase(&vulkan, BvhIntersections(barycentrics, sorted));
     RunCase(&vulkan, BvhIntersections(false, true, 1));
+    for (bool node64 : {false, true}) for (bool a16 : {false, true}) {
+      if (!node64 && !a16) continue;
+      for (bool barycentrics : {false, true}) for (bool sorted : {false, true})
+        RunCase(&vulkan, BvhIntersections(barycentrics, sorted, 0, node64, a16));
+    }
+    RunCase(&vulkan, BvhIntersections(true, true, 0, true, true, 64));
     std::puts("ShaderRecompilerComputeTests: Wolverine instruction GPU cases passed");
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-capture-only") == 0) {
+    auto options = ShaderRecompiler::GetCodegenOptions();
+    options.bvh_capture_shader = 1;
+    CodegenTests::ScopedCodegenOptions capture_options(options);
+    VulkanHarness vulkan(false);
+    BvhCaptureTests::Run(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-capture-reader-only") == 0) {
+    BvhCaptureReplay::CheckReader();
+    return 0;
+  }
+  if ((argc == 4 && std::strcmp(argv[1], "--bvh-capture-replay") == 0) ||
+      (argc == 2 && std::strcmp(argv[1], "--bvh-capture-replay-fixture") == 0)) {
+    SetEnvironment("KYTY_HW_RT_BACKEND", "1");
+    auto options = ShaderRecompiler::GetCodegenOptions();
+    options.bvh_capture_shader = argc == 2 ? 1 : 0;
+    CodegenTests::ScopedCodegenOptions capture_options(options);
+    VulkanHarness vulkan(false);
+    if (!vulkan.RuntimeContext().hardware_rt_enabled) {
+      std::puts("SKIP BvhCaptureReplay: hardware RT unavailable");
+      return 77;
+    }
+    if (argc == 2) { BvhCaptureReplay::CheckGpuFixture(vulkan); return 0; }
+    return BvhCaptureReplay::Run(vulkan, argv[2], argv[3]);
   }
   if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
     VulkanHarness vulkan;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rt/hardwareRt.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 
@@ -66,6 +67,11 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+}
+
+RT::HardwareBackend& RenderContext::GetHardwareRt() {
+	if (!m_hardware_rt) m_hardware_rt.reset(new RT::HardwareBackend(*this));
+	return *m_hardware_rt;
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {

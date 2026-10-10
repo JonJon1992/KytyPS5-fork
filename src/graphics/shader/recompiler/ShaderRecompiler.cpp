@@ -769,8 +769,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// IMAGE_BVH_INTERSECT_RAY with an eleven-DWORD full-float ray is lowered (spirvEmitterBvh.cpp).
-	// The other BVH forms (BVH64, A16 rays, without R128 or dmask 0xf) decode as unsupported, and
+	// BVH32/BVH64 with full-float or A16 rays are lowered (spirvEmitterBvh.cpp).
+	// Malformed BVH forms (e.g. without R128 or dmask 0xf) decode as unsupported, and
 	// the CFG builder would end the emulator on them: as for games that compile ray-tracing
 	// shaders before the player can select a mode without ray tracing, the dispatch or draw is
 	// skipped in every stage instead.

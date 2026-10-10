@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -24,6 +25,13 @@ public:
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept;
 	void                  ProcessFaultBuffer();
+	// Diagnostic one-dispatch capture, opt-in per compute shader. Optional
+	// KYTY_BVH_CAPTURE_TRIGGER gates arming until that file exists.
+	[[nodiscard]] bool BeginBvhCapture(uint64_t shader_hash, uint32_t x, uint32_t y,
+	                                   uint32_t z, uint32_t mode,
+	                                   const Buffer* indirect_args = nullptr,
+	                                   uint64_t args_offset = 0);
+	void EndBvhCapture(uint64_t shader_hash);
 
 	// KYTY_BDA_WRITES_SHADERS: what the dispatches recorded since the previous collection wrote
 	// through BDA, from the fault buffer's written-page bitmap and dropped-write count.
@@ -65,6 +73,12 @@ private:
 	bool                                       m_bda_writes  = false;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
+	bool m_bvh_capture_recorded = false;
+	uint64_t m_bvh_capture_skips = 0;
+	uint32_t m_bvh_capture_attempts = 0;
+	std::array<uint64_t, 16> m_bvh_capture_shaders{};
+	std::shared_ptr<std::atomic<uint32_t>> m_bvh_capture_outcome;
+	std::shared_ptr<Buffer> m_bvh_capture_download;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;

@@ -109,6 +109,14 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.function_lds_compact = EnvFlag("KYTY_FUNCTION_LDS_COMPACT", options.function_lds_compact);
+	if (const auto* hash = std::getenv("KYTY_BVH_CAPTURE_SHADER"); hash != nullptr) {
+		if (std::strcmp(hash, "all") == 0) options.bvh_capture_shader = UINT64_MAX;
+		else {
+			char* end = nullptr;
+			const auto value = std::strtoull(hash, &end, 16);
+			if (end != hash && *end == '\0') options.bvh_capture_shader = value;
+		}
+	}
 	if (const auto* hash = std::getenv("KYTY_SCALAR_READ_PROBE_SHADER"); hash && *hash) {
 		char* end = nullptr;
 		const auto value = std::strtoull(hash, &end, 16);
@@ -155,6 +163,11 @@ bool BdaWritesApplies(uint64_t shader_hash) {
 
 bool BdaWritesEnabled() {
 	return !Storage().bda_writes_shaders.empty() || Storage().bda_write_mode != BdaWriteMode::Off;
+}
+
+bool BvhCaptureApplies(uint64_t shader_hash) {
+	const auto selected = Storage().bvh_capture_shader;
+	return selected != 0 && (selected == UINT64_MAX || selected == shader_hash);
 }
 
 bool BdaWritesDeferredEnabled() {

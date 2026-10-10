@@ -161,6 +161,12 @@ public:
 	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] bool BeginBvhCapture(uint64_t hash, uint32_t x, uint32_t y, uint32_t z,
+	                                   uint32_t mode, const Buffer* indirect_args = nullptr,
+	                                   uint64_t args_offset = 0) {
+		return m_fault_manager.BeginBvhCapture(hash, x, y, z, mode, indirect_args, args_offset);
+	}
+	void EndBvhCapture(uint64_t hash) { m_fault_manager.EndBvhCapture(hash); }
 	// KYTY_BDA_WRITES_SHADERS, right after recording a dispatch of a program with bda_writes
 	// (phase 0: synchronous). Submits and waits for the dispatch and the compaction of its
 	// written-page bitmap (FaultManager::CollectBdaWrites), then settles every written page as a

@@ -231,6 +231,7 @@ void CheckFingerprint() {
   options_differ("spirv_optimize", [](CodegenOptions &o) { o.spirv_optimize = !o.spirv_optimize; });
   options_differ("spirv_optimize_extended", [](CodegenOptions &o) { o.spirv_optimize_extended = !o.spirv_optimize_extended; });
   options_differ("function_lds_compact", [](CodegenOptions &o) { o.function_lds_compact = !o.function_lds_compact; });
+  options_differ("bvh_capture_shader", [](CodegenOptions &o) { o.bvh_capture_shader ^= 1u; });
   options_differ("scalar_read_probe_shader", [](CodegenOptions &o) { o.scalar_read_probe_shader ^= 1u; });
   options_differ("scalar_read_probe_pcs", [](CodegenOptions &o) { o.scalar_read_probe_pcs.push_back(0x4fc); });
 

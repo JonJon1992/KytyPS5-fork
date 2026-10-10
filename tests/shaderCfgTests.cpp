@@ -15996,6 +15996,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--wolverine-instructions-only") == 0) {
     TestWolverineInstructions();
+    TestUnsupportedBvhSkipsDispatch();
+    TestTraversalLoopBreakRegion();
     TestRdna2LdsWaitcntBarrierAndFloatControls();
     std::puts("ShaderCfgTests: Wolverine instruction CPU/SPIR-V cases passed");
     return 0;

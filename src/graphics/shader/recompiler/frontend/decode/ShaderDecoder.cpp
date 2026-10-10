@@ -129,6 +129,9 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 std::string FormatMimg(const Instruction& inst) {
 	const char* sample_name =
 	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY && inst.opcode_id == 0xe7u) {
+		sample_name = "IMAGE_BVH64_INTERSECT_RAY";
+	}
 	const std::string_view name =
 	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
 	std::string text =

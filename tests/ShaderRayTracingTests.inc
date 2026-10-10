@@ -199,10 +199,29 @@ void TestWolverineInstructions() {
     Decoder::DecodeInstruction(code, 0, instruction);
     Check(instruction.opcode == Decoder::Opcode::UNSUPPORTED, "malformed BVH accepted");
   }
-  const std::array bvh64{EncodeMimg0(0xe7, 0xf) | (1u << 15u), EncodeMimg1(20, 0, 0, 40)};
-  Decoder::Instruction unsupported;
-  Decoder::DecodeInstruction(bvh64, 0, unsupported);
-  Check(unsupported.opcode == Decoder::Opcode::UNSUPPORTED, "unimplemented BVH64 silently accepted");
+  // RDNA2 ISA section 8.2.10: A16 packs only direction/inverse; node,
+  // extent and origin remain full width. NSA words encode raw VGPRs.
+  for (const bool node64 : {false, true}) for (const bool a16 : {false, true}) {
+    const uint32_t address_count = (a16 ? 8u : 11u) + (node64 ? 1u : 0u);
+    for (const uint32_t nsa : {0u, (address_count - 1u + 3u) / 4u}) {
+      std::vector<uint32_t> code{EncodeMimg0(node64 ? 0xe7 : 0xe6, 0xf) |
+                                    (1u << 15u) | (nsa << 1u),
+                                EncodeMimg1(20, 0, 0, 40) | (a16 ? 1u << 30u : 0u)};
+      for (uint32_t i = 0; i < nsa; ++i) code.push_back(0x302f2e2du + i * 0x04040404u);
+      Decoder::Instruction decoded;
+      Decoder::DecodeInstruction(code, 0, decoded);
+      Check(decoded.opcode != Decoder::Opcode::UNSUPPORTED,
+            "BVH64/A16 form was rejected by decoder");
+      Check(decoded.image_address_components == address_count && decoded.word_count == 2u + nsa,
+            "BVH raw address DWORD count or NSA length is wrong");
+      code.insert(code.end(), {EncodeDs0(0xdf), EncodeDs1(0, 20, 30), EncodeSopp(0x01)});
+      for (uint32_t wave : {32u, 64u}) {
+        const auto result = compile(code, wave);
+        Check(count(result.program, IR::ValueOpcode::BvhIntersect) == 1,
+              "BVH64/A16 shader was skipped instead of compiled");
+      }
+    }
+  }
   const std::array ds64{EncodeDs0(0x40), EncodeDs1(0, 10, 20), EncodeSopp(0x01)};
   const auto atomic = compile(ds64, 32);
   const auto atomic_text = DisassembleSpirvBinary(atomic.spirv);
@@ -212,7 +231,7 @@ void TestWolverineInstructions() {
         "DS_ADD_U64 lost its genuine 64-bit shared atomic path");
 }
 
-// BVH forms the recompiler does not lower (BVH64, malformed BVH32) skip the dispatch or draw in
+// Malformed BVH forms skip the dispatch or draw in
 // every stage instead of ending the emulator in the CFG builder. Ordinary shaders, and BVH-shaped
 // literals and operand words, are not skipped.
 void TestUnsupportedBvhSkipsDispatch() {
@@ -235,7 +254,8 @@ void TestUnsupportedBvhSkipsDispatch() {
             message);
     }
   };
-  skips({0xf19c9f01u, 0x00081014u, EncodeSopp(0x01)}, "RDNA2 BVH64 instruction did not skip");
+  skips({EncodeMimg0(0xe7, 0x7) | (1u << 15u), EncodeMimg1(20, 0, 0, 40),
+         EncodeSopp(0x01)}, "BVH64 with partial dmask did not skip");
   skips({EncodeMimg0(0xe6, 0xf), EncodeMimg1(20, 0, 0, 40), EncodeSopp(0x01)},
         "BVH32 without R128 did not skip");
 

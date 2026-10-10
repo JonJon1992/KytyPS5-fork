@@ -179,6 +179,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma   = false;
+		m_info.uses_bvh   = false;
 		m_info.bda_writes = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 		m_table_writes  = HasShaderMemoryWrites(program, false);
@@ -1622,6 +1623,7 @@ private:
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap) {
 			m_info.uses_dma = true;
+			m_info.uses_bvh |= op == ValueOpcode::BvhIntersect;
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);

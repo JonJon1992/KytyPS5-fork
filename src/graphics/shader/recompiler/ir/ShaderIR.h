@@ -553,6 +553,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             uses_bvh           = false;
 	// KYTY_BDA_WRITES_SHADERS: the program stores through a V# it computed (IndirectBuffer), marking
 	// written pages in the fault buffer's bitmap; the dispatch is settled after it runs.
 	bool                             bda_writes         = false;

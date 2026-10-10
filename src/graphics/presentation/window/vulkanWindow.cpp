@@ -15,6 +15,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/deviceLostReport.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/rt/hardwareRt.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -1335,8 +1336,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
-	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
-	create_info.ppEnabledExtensionNames = device_extensions.data();
+	auto rt_extensions = device_extensions;
+	RT::DeviceFeatures hardware_rt;
+	hardware_rt.Enable(physical_device, rt_extensions, RT::BackendRequested());
+	create_info.pNext = hardware_rt.Chain(create_info.pNext);
+	graphics.hardware_rt_enabled = hardware_rt.enabled;
+	graphics.hardware_rt_properties = hardware_rt.properties;
+	std::printf("Kyty hardware RT backend: %s; guest traversal remains software\n",
+	            hardware_rt.enabled ? "available (experimental)" : "off/unavailable");
+	create_info.enabledExtensionCount   = static_cast<uint32_t>(rt_extensions.size());
+	create_info.ppEnabledExtensionNames = rt_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;
