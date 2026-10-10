@@ -161,9 +161,11 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
+	// Extended (0x30) configurations describe their independent mono substreams as one stream
+	// (AjmAt9InitConfiguration); classic ones describe themselves.
 	const auto describe = [handle](const uint8_t* config, Atrac9CodecInfo* info) {
-		const int init_result = AjmAt9InitDecoder(handle, config);
-		return init_result == 0 ? Atrac9GetCodecInfo(handle, info) : init_result;
+		uint32_t mono_channels = 0;
+		return AjmAt9InitConfiguration(handle, config, info, &mono_channels);
 	};
 	const auto*     config = static_cast<const uint8_t*>(config_data);
 	Atrac9CodecInfo codec_info {};
@@ -171,12 +173,11 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	if (info_result != 0 && config[0] != 0xfeu) {
 		// The console also describes configurations whose first byte is not the 0xFE sync byte,
 		// and the game divides by the buffer size it computes from the description (an error left
-		// it 0: SIGFPE). Ghost of Yotei's multichannel streams carry 30 71 c0 fe (8 channels) and
-		// 30 72 c0 fe (12): the low nibble after the 48 kHz rate index follows the channel count,
-		// so the classic channel-configuration and validation fields do not apply. LibAtrac9 checks
-		// only the sync byte and the validation bit; with both set as it expects, the remaining
-		// fields describe the stream. Only the description is lenient: AjmAt9Decoder still refuses
-		// to decode such a stream, which stays silent.
+		// it 0: SIGFPE). Extended 0x30 configurations (Ghost of Yotei's ambisonic beds and 8/12
+		// channel objects) are described and decoded above as mono substreams; any other unsynced
+		// configuration that LibAtrac9 rejects is still described leniently here: with the sync
+		// byte and validation bit set as it expects, the remaining fields describe the stream.
+		// Only the description is lenient: AjmAt9Decoder refuses to decode such a stream.
 		uint8_t synced[ATRAC9_CONFIG_DATA_SIZE];
 		std::memcpy(synced, config, sizeof(synced));
 		synced[0] = 0xfeu;
