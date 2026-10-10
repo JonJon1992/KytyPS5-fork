@@ -45,3 +45,8 @@ native replacement of the TLAS, and a controlled FPS comparison without
 diagnostics. The present acceptance does not complete these broader items.
 
 Progress and measured limitations are recorded in the backend research document.
+
+Stopped at the user's request after code commit 90200ebf and gameplay validation.
+The game exited normally (0); final counters were 24,638,470 native results and
+472,193,263 software fallbacks. Resume with dynamic coherent BVH import and
+validation-cost reduction; general hardware RT and FPS gains remain incomplete.

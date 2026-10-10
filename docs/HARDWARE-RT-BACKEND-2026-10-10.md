@@ -808,3 +808,21 @@ e substituição da TLAS. Ganho de FPS permanece **não medido**; a sessão usa
 validação Vulkan e diagnóstico escalar, inclusive o modo de continuação.
 Não houve trap escalar registrado nesta execução. A opção continua desligada
 por padrão e esse build não deve ser tratado como benchmark de desempenho.
+
+## Encerramento e retomada
+
+Código e testes commitados em `90200ebf` na branch `guest-sync-release-mem`.
+A execução terminou regularmente: retorno 0, `Window 5 closed` e `Event: quit`
+no log, sem perda do device ou erro de validação registrado. A sessão durou
+cerca de 7 minutos; a pipeline alvo foi ativada após cerca de 3 minutos.
+Últimos contadores: **24.638.470 resultados nativos e 472.193.263 fallbacks**.
+A imagem foi confirmada normal pelo usuário depois da ativação do hardware.
+
+Trabalho interrompido a pedido do usuário após documentar e commitar.
+Na retomada, priorizar importação coerente dinâmica de outras BVHs e redução
+do custo de conferir os bytes atuais. Depois ampliar árvores/listas e regras
+de outros shaders, tratar TLAS nativa e medir FPS com diagnóstico desligado.
+O estado atual é um protótipo limitado, sem ganho de desempenho comprovado.
+Launcher preservado:
+`_Build/rt-integration-20261010/astro-native-wave64-run/start.sh`.
+Não houve alteração do executável normal instalado nem envio ao remoto.
