@@ -826,3 +826,29 @@ O estado atual é um protótipo limitado, sem ganho de desempenho comprovado.
 Launcher preservado:
 `_Build/rt-integration-20261010/astro-native-wave64-run/start.sh`.
 Não houve alteração do executável normal instalado nem envio ao remoto.
+
+## Caminho para RT completo
+
+O teste confirmou a integração de uma BLAS real ao shader. Ainda dependemos de
+arquivos históricos, uma árvore pequena e um shader específico. Para ampliar
+a cobertura do Astro, seguir esta ordem; suporte geral a outros jogos exige
+validar também seus formatos e shaders.
+
+| Etapa | Trabalho necessário | Arquivos principais | Critério de validação |
+| --- | --- | --- | --- |
+| 1. Importação dinâmica coerente | Descobrir as BLAS usadas pelo dispatch e obter seus bytes atuais pela GPU, sem exigir dumps externos. Tratar páginas ausentes antes de aceitar a cena e não usar backing CPU posterior como prova. | `renderer/cache/faultManager.cpp`, `renderer/renderCompute.cpp`, `renderer/rt/astroBvh.cpp` | Mudança de cena, streaming e páginas ausentes: snapshot correto ou fallback explícito, sem leitura inválida ou resultado inventado. |
+| 2. Árvores maiores e cache | Remover o limite do protótipo de uma caixa/lista e 1024 bytes; converter árvores completas e preservar nó/ID de cada folha. Manter AS por geometria e versão, com reconstrução ou atualização quando necessário. | `renderer/rt/guestBvh.cpp`, `renderer/rt/hardwareRt.cpp`, `shader/recompiler/AstroNativeBinding.h` | Comparação GPU software/hardware para várias BLAS; alterações de geometria invalidam a AS e recursos antigos sobrevivem até a conclusão GPU. |
+| 3. Regras e shaders | Cobrir a ordem de travessia de várias caixas/listas, empates, faces, distância e saídas vivas. Ampliar o reconhecimento apenas após verificar cada shader do jogo; casos ambíguos podem continuar em software até serem comprovados. | `shader/recompiler/frontend/translate/Dispatch.cpp`, `shader/recompiler/backend/spirv/spirvEmitterAstroRt.inc` | Mesmo acerto, nó, ID, instância e distância que o shader original; EXEC e pilhas corretos em waves mistas. |
+| 4. TLAS e instâncias nativas | Importar a hierarquia de instâncias e suas transformações atuais; associar resultados nativos aos ponteiros/IDs esperados pelo jogo. Hoje essa travessia permanece no shader original. | `renderer/rt/astroBvh.cpp`, `renderer/rt/hardwareRt.cpp`, frontend e emitter | Instâncias múltiplas, movimento, escala não uniforme e reflexão: resultados equivalentes e AS sincronizadas. |
+| 5. Desempenho | Reduzir a conferência de memória feita hoje por entrada no helper, reaproveitar cenas válidas e diminuir trabalho duplicado. A reutilização deve preservar a prova de que os bytes usados continuam atuais. | `renderer/rt/hardwareRt.cpp`, `renderer/renderCompute.cpp`, `spirvEmitterAstroRt.inc` | Perfil mostra redução de custo; comparação na mesma cena, sem compilação concorrente, validação, captura ou probe escalar. |
+| 6. Aceitação do caminho normal | Testar sem patch e sem instrumentação que modifica a saída, incluindo carregamento, caminhada, transições e sessões prolongadas. Medir cobertura nativa e falhas, além da imagem. | Testes BVH/RT e `docs/ASTRO-RT-HANG-2026-10-10.md` | Imagem correta, ausência de travamentos/perda do device, regras suportadas documentadas e ganho de FPS medido antes de ativar por padrão. |
+
+Os caminhos da tabela são relativos a `src/graphics/`. Começar pelas etapas
+1 e 2 amplia a cobertura que hoje deixa a maioria das entradas em software.
+A TLAS nativa amplia a substituição completa; a integração BLAS híbrida já
+pode continuar sendo testada enquanto essa etapa é preparada.
+
+Não há porcentagem confiável de conclusão do RT completo: os contadores do
+protótipo contam chamadas ao helper, não todas as operações RT do jogo.
+O trabalho permanece interrompido a pedido do usuário; este roteiro registra
+a retomada, sem iniciar nova implementação.
