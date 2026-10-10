@@ -35,6 +35,10 @@ public:
 	// LDS writes not yet ordered by a barrier; carried across blocks in program order.
 	[[nodiscard]] bool LdsWritePending() const { return lds_write_pending; }
 	void               SetLdsWritePending(bool pending) { lds_write_pending = pending; }
+	// The EXEC words of the lanes the host launched (the entry EXEC); a scalar write to EXEC keeps
+	// only those lanes in the mask words (CodegenOptions::vs_launched_exec). Values of the entry
+	// block, which dominates every block.
+	void SetLaunchedExec(const std::array<IR::U32, 2>& words) { launched_exec = words; }
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -65,6 +69,8 @@ private:
 	IR::U32 ReadU16AsU32(const Decoder::Operand& operand, bool sign_extend);
 	IR::U32 Read16LaneBits(const Decoder::Operand& operand, bool high_lane);
 	std::array<IR::U32, 2> ExtractU64(IR::U64 value);
+	// `value` (word `part` of a scalar EXEC write) without the lanes the host did not launch.
+	IR::U32 LaunchedExecWord(IR::U32 value, uint32_t part);
 	void    WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
 	IR::U32 ConditionBit(const Decoder::Operand& operand);
 	IR::U1  ReadMask(const Decoder::Operand& operand);
@@ -288,6 +294,7 @@ private:
 	uint32_t        current_vector_limit = 1;
 	bool            lds_write_pending    = false;
 	bool            flush_f32_inputs;
+	std::array<IR::U32, 2> launched_exec; // empty values: every lane counts as launched
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

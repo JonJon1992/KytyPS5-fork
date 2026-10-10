@@ -18129,6 +18129,152 @@ public:
                 CpSeq::ConfiguredMode() == CpSeq::Mode::Thread ? ", sequenced" : "");
   }
 
+  // A guest vertex shader's EXEC holds only the lanes the host launched (KYTY_VS_LAUNCHED_EXEC).
+  // The NGG prologue makes EXEC the first MERGED_WAVE_INFO-count lanes (the whole wave here); a
+  // copy of EXEC then counts its lanes with S_BCNT1. One triangle launches three vertices, so the
+  // count is 3, not the wave size: with lanes that never run in the copy, a waterfall loop over it
+  // (s_ff1 / v_readlane / v_cmp / s_andn2) never ends and the GPU hangs (Ghost of Yotei VS
+  // 0x575accd2bb424a4f). The pixel shader writes the provoking vertex's count.
+  void CheckVertexLaunchedExec() {
+    constexpr const char *name = "VertexLaunchedExec";
+    constexpr uintptr_t base = 0x000000020c000000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr uint64_t pixel_offset = 0x2000;
+    constexpr uint64_t user_data_offset = 0x4000;
+    constexpr uint64_t target_offset = 0x20000;
+    constexpr uint32_t extent = 16;
+
+    // A fullscreen triangle from the vertex index (as in CheckRasterization).
+    std::vector<u32> vertex_code;
+    AppendVMovLiteral(&vertex_code, 1, 0xbf800000u);
+    AppendVMovLiteral(&vertex_code, 2, 0x40400000u);
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+    AppendVMovU32(&vertex_code, 0, 0);
+    AppendVMovLiteral(&vertex_code, 6, 0x3f800000u);
+    vertex_code.push_back(EncodeSop2(0x0e, 0, 3, 255));          // s_and_b32 s0, s3, 0xff
+    vertex_code.push_back(0xffu);
+    vertex_code.push_back(EncodeSop2(0x03, 1, InlineU32(64), 0)); // s_sub_i32 s1, 64, s0
+    vertex_code.push_back(EncodeSop2(0x21, 126, 193u, 1));        // s_lshr_b64 exec, -1, s1
+    vertex_code.push_back(EncodeSop1(0x04, 56, 126));             // s_mov_b64 s[56:57], exec
+    vertex_code.push_back(EncodeSop1(0x10, 20, 56));              // s_bcnt1_i32_b64 s20, s[56:57]
+    vertex_code.push_back(EncodeVop1(0x06, 7, 20));               // v_cvt_f32_u32 v7, s20
+    vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+    vertex_code.push_back(EncodeExp1(3, 4, 0, 6));
+    vertex_code.push_back(EncodeExp0(0x20, 0xf));
+    vertex_code.push_back(EncodeExp1(7, 7, 7, 7));
+    AppendEnd(&vertex_code);
+    std::vector<u32> pixel_code;
+    pixel_code.push_back(EncodeVintrp(0x02, 0, 0, 0, 2)); // v_interp_mov_f32 v0, p0, attr0.x
+    pixel_code.push_back(EncodeExp0(0x00, 0xf));
+    pixel_code.push_back(EncodeExp1(0, 0, 0, 0));
+    AppendEnd(&pixel_code);
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "draw allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    const auto vertex_address = base + vertex_offset;
+    const auto pixel_address = base + pixel_offset;
+    auto *user_data = reinterpret_cast<ShaderUserData *>(memory + user_data_offset);
+    std::memcpy(memory + vertex_offset, vertex_code.data(), vertex_code.size() * sizeof(u32));
+    std::memcpy(memory + pixel_offset, pixel_code.data(), pixel_code.size() * sizeof(u32));
+    ShaderMapUserData(vertex_address,
+                      {.type = Prospero::ShaderBinaryType::kGs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+                      {.type = Prospero::ShaderBinaryType::kPs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(pixel_code.size() * sizeof(u32))});
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.Reset();
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8001);
+      registers.SetPsInputEna(2);
+      registers.SetPsInputAddr(2);
+      registers.SetPsInputSettings(0, 0);
+      registers.SetColorBase(0, {.addr = base + target_offset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      Require(name, "color target", static_cast<bool>(color.image_id),
+              "the 16x16 RGBA32F target was not created");
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      const auto pixels = ReadCachedTexel(name, context, color.image_id, {}, {extent, extent, 1});
+      bool ok = pixels.size() == size_t{extent} * extent * 4u;
+      size_t bad = 0;
+      for (size_t i = 0; ok && i < pixels.size(); i++) {
+        ok = pixels[i] == 0x40400000u;
+        bad = i;
+      }
+      const auto shown = pixels.empty() ? std::string("missing")
+                                        : std::to_string(std::bit_cast<float>(pixels[bad]));
+      Require(name, "launched lanes in an EXEC copy", ok,
+              "S_BCNT1 of a copy of EXEC after the NGG prologue counted " + shown +
+                  " lanes for a three-vertex draw, expected 3");
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "draw allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_DRAW_PREP_BINDINGS with textures (P4b-1 samplers and texture hashes, P4b-2 memo hints and
   // runs): five draws sample five textures (a T# and an S# in the pixel shader's user SGPRs, each
   // texture on its own 1 MiB page, cycled so that no stage repeats), serially and then in two
@@ -53812,6 +53958,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckVertexLaunchedExec();
     RunCase(&vulkan, VectorVopcCmpxEqU16SdwaCompactVop3ExecMask());
     return 0;
   }
@@ -55232,3 +55379,4 @@ int main(int argc, char **argv) {
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }
+  vulkan.CheckVertexLaunchedExec();

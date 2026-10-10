@@ -96,6 +96,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.realtime_clock ? 1u : 0u);
 	b.U8(options.dpp_skip_inactive ? 1u : 0u);
 	b.U8(options.lane_reductions ? 1u : 0u);
+	b.U8(options.vs_launched_exec ? 1u : 0u);
 	b.U32(options.dispatcher_cap);
 	b.U8(options.ir_linear_uses ? 1u : 0u);
 	b.U8(options.fold_lane_masks ? 1u : 0u);

@@ -378,11 +378,11 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
-			ir.SetExecLo(IR::U32(value));
+			ir.SetExecLo(LaunchedExecWord(IR::U32(value), 0));
 			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
 			break;
 		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
+			ir.SetExecHi(LaunchedExecWord(IR::U32(value), 1));
 			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
 			break;
 		case Decoder::OperandKind::Scc:
@@ -639,6 +639,17 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	return value;
 }
 
+IR::U32 Translator::LaunchedExecWord(IR::U32 value, uint32_t part) {
+	const auto& launched = launched_exec[part];
+	if (launched.IsEmpty() || (value.IsImmediate() && value.U32() == 0u)) {
+		return value;
+	}
+	if (value.IsImmediate() && value.U32() == UINT32_MAX) {
+		return launched;
+	}
+	return ir.BitwiseAnd(value, launched);
+}
+
 std::array<IR::U32, 2> Translator::ExtractU64(IR::U64 value) {
 	return {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)};
 }
@@ -650,9 +661,11 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::ExecLo:
+			// The lane's own bit comes from the written value, which keeps an all-one constant
+			// foldable; a launched lane's bit is the same in the masked words.
 			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+			ir.SetExecLo(LaunchedExecWord(value[0], 0));
+			ir.SetExecHi(LaunchedExecWord(value[1], 1));
 			return;
 		case Decoder::OperandKind::VccLo:
 			ir.SetVcc(ThreadBit(value));
@@ -1156,6 +1169,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			result.blocks[source_index]->AddBranch(result.blocks[target->second]);
 		}
 	}
+	// CodegenOptions::vs_launched_exec: the entry EXEC words, which every block may use.
+	std::array<IR::U32, 2> launched_exec;
 	{
 		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.blocks.front().id)));
 		IR::IREmitter entry_ir(result.blocks.front());
@@ -1192,11 +1207,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
-		entry_ir.SetExecLo(options.wave_size == 64u
-		                       ? entry_ir.CompositeExtract(initial_mask, 0)
-		                       : GuestWaveMask(entry_ir, result, initial_mask));
-		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
-		                                            : IR::U32(IR::Value(0u)));
+		const std::array<IR::U32, 2> initial_words {
+		    options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 0)
+		                             : GuestWaveMask(entry_ir, result, initial_mask),
+		    options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
+		                             : IR::U32(IR::Value(0u))};
+		entry_ir.SetExecLo(initial_words[0]);
+		entry_ir.SetExecHi(initial_words[1]);
+		// A vertex shader starts with every launched lane in EXEC.
+		if (options.stage == ShaderType::Vertex && GetCodegenOptions().vs_launched_exec) {
+			launched_exec = initial_words;
+		}
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1415,7 +1436,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts. The
+			// constant vertex count keeps the prologue's EXEC (the first `count` lanes) foldable;
+			// lanes the host did not launch leave the EXEC words through launched_exec.
 			if (WaveHalvesInHostSubgroup(result)) {
 				// A 64-lane host subgroup holds two guest waves: one NGG subgroup of 64
 				// vertices, whose upper-half lanes are wave 1 (MERGED_WAVE_INFO bits 24-27), so
@@ -1455,6 +1478,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		translator.SetLaunchedExec(launched_exec);
 		// Blocks are visited in address order; keep unordered LDS writes pending across
 		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
 		translator.SetLdsWritePending(lds_write_pending);

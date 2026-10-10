@@ -43,6 +43,14 @@ struct CodegenOptions {
 	// Default on: scalar lane-relative LDS uses one cell per distinct wrapped offset,
 	// while the original guest address and bounds checks remain unchanged.
 	bool function_lds_compact = true;
+	// KYTY_VS_LAUNCHED_EXEC=0: a scalar write to EXEC in a vertex shader keeps lanes the host never
+	// launched in the EXEC mask words. Default on: the words keep only the launched lanes (the
+	// entry ballot), while the per-lane EXEC still comes from the written value. A guest wave can
+	// be larger than the vertices Vulkan put in its host subgroup, and the NGG prologue makes EXEC
+	// the wave's first MERGED_WAVE_INFO-count lanes (a constant whole wave here), so without this a
+	// waterfall loop over a copy of EXEC (s_ff1 / v_readlane / v_cmp / s_andn2) never clears the
+	// bits of lanes that do not run, and the GPU hangs (Ghost of Yotei VS 0x575accd2bb424a4f).
+	bool vs_launched_exec = true;
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
 	bool movrel_range = true;
