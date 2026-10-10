@@ -8502,6 +8502,120 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // KYTY_READBACK_SIDE_WRITES: a guest thread's write fault on a page the GPU wrote in a completed
+  // submission takes a side copy (the GPU thread only issues it) instead of a drain. Its
+  // publication leaves the page GPU-clean but not yet CPU-dirty: the retried write makes it
+  // CPU-dirty. With the switch off the first fault drains and makes the page CPU-dirty at once. A
+  // writer in the current recording still drains, and that drain makes a write CPU-dirty.
+  void CheckSideReadbackWrite() {
+    constexpr const char *name = "SideReadbackWrite";
+    constexpr uintptr_t base = 0x0000000200e00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = 0x3000;
+    constexpr uint64_t written = page + 0x10, other = page + 0x80;
+
+    SetEnvironment("KYTY_READBACK_EAGER", "0");
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "side-write direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "side-write fixed direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto gpu_write = [&](uint64_t offset, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false);
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+      // The writes' submission completes: the copy no longer waits for the current recording.
+      const auto complete = [&] {
+        OnGpuThread(context, [&] { scheduler.Flush(); });
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+      };
+      // RenderContext::HandleFault's buffer-cache step for a guest write of one byte.
+      const auto write_fault = [&] { cache.InvalidateMemory(base + written, 1, true); };
+      const auto stage = [&](const char *text) {
+        Live::Testing::StageText(text);
+        Live::OnCpFlip();
+      };
+
+      for (const bool side : {true, false}) {
+        stage(side ? "KYTY_READBACK_SIDE_WRITES=1\n" : "KYTY_READBACK_SIDE_WRITES=0\n");
+        const uint32_t value = side ? 0xaaaa0001u : 0xbbbb0001u;
+        gpu_write(written, value);
+        gpu_write(other, value + 1);
+        complete();
+        Require(name, "gpu-owned", cache.IsRegionGpuModified(base + page, 0x1000),
+                "the GPU-written page was not GPU-owned");
+        write_fault();
+        Require(name, side ? "side publication" : "drain",
+                backing(written) == value && backing(other) == value + 1 &&
+                    !cache.IsRegionGpuModified(base + page, 0x1000) &&
+                    cache.IsRegionCpuModified(base + page, 0x1000) == !side,
+                side ? "the side copy did not publish the GPU bytes, or made the page CPU-dirty "
+                       "before the retried write"
+                     : "the drain did not publish the GPU bytes and make the page CPU-dirty");
+        if (side) {
+          write_fault(); // the retried write
+          Require(name, "retried write",
+                  cache.IsRegionCpuModified(base + page, 0x1000) &&
+                      !cache.IsRegionGpuModified(base + page, 0x1000),
+                  "the retried write did not make the published page CPU-dirty");
+        }
+        // Back to GPU ownership for the next round: an upload, then a GPU write.
+        (void)cache.ObtainBuffer(base + page, 0x1000, false, false);
+      }
+
+      // A writer in the current (unsubmitted) recording: the side copy is refused and the drain
+      // publishes its bytes and makes the written page CPU-dirty.
+      stage("KYTY_READBACK_SIDE_WRITES=1\n");
+      complete();
+      gpu_write(other, 0xcccc0001u);
+      write_fault();
+      Require(name, "current writer drains",
+              backing(other) == 0xcccc0001u && cache.IsRegionCpuModified(base + page, 0x1000) &&
+                  !cache.IsRegionGpuModified(base + page, 0x1000),
+              "a write fault next to a current-recording writer lost its bytes or stayed GPU-owned");
+      stage("KYTY_READBACK_SIDE_WRITES=\n");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "side-write direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "side-write direct-memory allocation release failed");
+    SetEnvironment("KYTY_READBACK_EAGER", nullptr);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_BUFFER_RANGE_MEMO: read bindings of a range whose tracker bits did not change skip the
   // tracker work (a clean range's synchronization, a small range's stream decision) and still
   // bind what the full path binds; every CPU write fault makes them look again.
@@ -16052,6 +16166,29 @@ public:
                     table.SlotView(BindlessTable::Images2D, heap().slots[0]) != nullptr &&
                     heap().values[0] == heap().slots[0],
                 "the new texture did not take a released slot");
+      }
+      // An idle heap is released (EvictIdleHeaps): its keys let go of their images' slots, its
+      // region retires and its place leaves the index. The next consumer makes the heap anew in
+      // the evicted object (Heaps() keeps one element).
+      {
+        OnGpuThread(context, [&] {
+          scheduler.Finish();
+          scheduler.Finish();
+        });
+        const auto before = table.CountHeaps();
+        (void)table.TakePublishStats();
+        table.EvictIdleHeaps(0);
+        const auto stats = table.TakePublishStats();
+        const auto after = table.CountHeaps();
+        Require(name, "idle heap evicted",
+                stats.heaps_evicted == 1u && stats.slots_released >= 1u && after.heaps == 0u &&
+                    after.places == 0u && before.heaps == 1u && !heap().live,
+                "the idle heap kept its place, region or slots");
+        (void)consume();
+        Require(name, "evicted heap made again",
+                table.CountHeaps().heaps == 1u && heap().live && heap().slots[0] != 0u &&
+                    heap().values[0] == heap().slots[0],
+                "the consumer did not make the evicted heap again");
       }
       OnGpuThread(context, [&] {
         scheduler.Finish();
@@ -54990,6 +55127,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readback-eager-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckEagerReadback();
+    vulkan.CheckSideReadbackWrite();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--side-readback-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSideReadbackWrite();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--late-storage-write-only") == 0) {

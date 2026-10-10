@@ -252,6 +252,16 @@ enum class ReadbackKind : uint8_t {
 void SetFaultContext(uint64_t pc, std::string_view thread_name);
 void ClearFaultContext();
 void SetReadbackKind(ReadbackKind kind);
+// What a host thread is doing when one of its reads faults (readbacks.csv stack_callers, where a
+// guest fault puts its guest callers): the guest shader whose resources it materializes.
+void SetHostShaderContext(uint64_t shader_hash);
+class ScopedHostShaderContext {
+public:
+	explicit ScopedHostShaderContext(uint64_t shader_hash) { SetHostShaderContext(shader_hash); }
+	~ScopedHostShaderContext() { SetHostShaderContext(0); }
+	ScopedHostShaderContext(const ScopedHostShaderContext&)            = delete;
+	ScopedHostShaderContext& operator=(const ScopedHostShaderContext&) = delete;
+};
 [[nodiscard]] ReadbackKind GetReadbackKind();
 // Exclusive wall-time phases of ReadMemory. drain_wait includes scheduler submission/recorder
 // work in Wait(), not just GPU execution. issue includes copy preparation and native submission.

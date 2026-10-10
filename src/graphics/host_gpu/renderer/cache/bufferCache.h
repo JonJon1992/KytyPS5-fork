@@ -626,7 +626,9 @@ private:
 		bool     downloaded = false;
 	};
 	// The drain path: GPU thread only.
-	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// `gpu_thread_write`: the write fault was taken by the GPU thread itself (an emulator write).
+	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace,
+	                     bool gpu_thread_write = false);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
@@ -981,7 +983,11 @@ private:
 	// KYTY_FALSE_SHARING_WRITES (TryFalseSharingWrite): switch, verify mode, the releases whose
 	// publication has not been seen landed yet (GPU thread), and the outcomes (tests read them;
 	// the verify counts are updated by the publications).
-	bool m_false_sharing        = false;
+	// 1: every write fault; 2 (gpu-thread): only writes by the GPU thread itself (end-of-pipe
+	// labels and other recording-time emulator writes). Guest threads keep the drain: their writes
+	// to a released page's GPU-owned bytes are what the publication overwrites (Ghost of Yotei:
+	// FalseSharingVerify conflicts in per-frame CPU blocks next to GPU-written bindings).
+	int  m_false_sharing        = 0;
 	int  m_false_sharing_verify = 0;
 	std::vector<std::shared_ptr<EarlyReleasedDownload>> m_early_released;
 	struct FalseSharingTotals {

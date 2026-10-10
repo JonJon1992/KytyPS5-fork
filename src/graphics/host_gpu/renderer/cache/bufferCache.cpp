@@ -60,6 +60,14 @@ Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaul
 Live::Switch g_eager_current_tick("KYTY_READBACK_EAGER_CURRENT_TICK", Live::ParseDefaultOn);
 // A/B only until the publication dependency's throughput and latency are measured.
 Live::Switch g_readback_wait_publication("KYTY_READBACK_WAIT_PUBLICATION", Live::ParseDefaultOff);
+// KYTY_READBACK_SIDE_WRITES (live): a guest thread's write fault on GPU-written pages takes the side
+// copy reads take (the GPU thread only issues it; the faulting thread waits and publishes) instead
+// of a drain the GPU thread waits for. Publication leaves the pages readable but not writable (a
+// page is writable only while CPU-dirty), so the retried write faults again on a page the GPU no
+// longer owns and makes it CPU-dirty the ordinary way; a writer that dirtied it again meanwhile
+// keeps it GPU-owned for another readback. Ghost of Yotei's job threads made the GPU thread wait
+// ~120 ms/s in these drains (KYTY_SYNC_WAITS, BufferCache::ReadMemoryDrain).
+Live::Switch g_readback_side_writes("KYTY_READBACK_SIDE_WRITES", Live::ParseDefaultOff);
 
 Live::Switch g_upload_coalesce("KYTY_UPLOAD_COALESCE", Live::ParseDefaultOn);
 
@@ -500,8 +508,13 @@ bool WrittenSyncSkipEnabled() {
 
 // KYTY_FALSE_SHARING_WRITES (default off; =1 on): write faults on GPU-owned pages at bytes the GPU
 // never wrote release the page without draining the GPU (BufferCache::TryFalseSharingWrite).
-bool FalseSharingWritesEnabled() {
-	return ParseEnvU64("KYTY_FALSE_SHARING_WRITES", 0) != 0;
+// KYTY_FALSE_SHARING_WRITES=1 (every write fault) | 2 or gpu-thread (GPU-thread writes only).
+int FalseSharingWritesMode() {
+	const auto* value = std::getenv("KYTY_FALSE_SHARING_WRITES");
+	if (value != nullptr && std::strcmp(value, "gpu-thread") == 0) {
+		return 2;
+	}
+	return static_cast<int>(std::min<uint64_t>(ParseEnvU64("KYTY_FALSE_SHARING_WRITES", 0), 2));
 }
 
 // KYTY_BDA_SYNC_EPOCH_VERIFY=1|exit: every skipped BDA pass runs anyway and counts the pages the
@@ -1323,8 +1336,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (m_written_sync_skip) {
 		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
 	}
-	m_false_sharing = FalseSharingWritesEnabled();
-	if (m_false_sharing) {
+	m_false_sharing = FalseSharingWritesMode();
+	if (m_false_sharing != 0) {
 		m_false_sharing_verify = EnvVerifyMode("KYTY_FALSE_SHARING_WRITES_VERIFY");
 	}
 	if (m_bda_pagetable_buffer.IsSparse()) {
@@ -1830,8 +1843,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 	// themselves: it waits only for the producing recording, not for the current one, and the
 	// current recording is neither split nor submitted.
 	const bool gpu_thread = GuestGpu::IsGpuThread();
-	const bool side_path =
-	    m_side != nullptr && !is_write && (!gpu_thread || SideReadbackGpuThreadEnabled());
+	// KYTY_READBACK_SIDE_WRITES: guest-thread writes too (their retry makes the pages CPU-dirty).
+	const bool side_write = is_write && !gpu_thread && g_readback_side_writes.On();
+	const bool side_path  = m_side != nullptr && (!is_write || side_write) &&
+	                       (!gpu_thread || SideReadbackGpuThreadEnabled());
 	if (OverlapsPendingSideReadback(page_begin, page_end)) {
 		// Another fault already copies these pages (or an eager copy publishes them): wait for
 		// (or finish) its publication instead of copying again. Writes and GPU-thread reads must
@@ -1872,7 +1887,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 			if (!is_write) {
 				NoteEagerRead(vaddr, size, gpu_thread);
 			}
-			ReadMemoryDrain(vaddr, size, is_write, trace);
+			ReadMemoryDrain(vaddr, size, is_write, trace, gpu_thread);
 		});
 		record(std::nullopt);
 		return;
@@ -1916,10 +1931,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 		if (timing != nullptr) {
 			timing->cp_queue_ns += HangTrace::NowNs() - queued;
 		}
-		NoteEagerRead(vaddr, size, false);
+		if (!is_write) {
+			NoteEagerRead(vaddr, size, false);
+		}
 		result = issue(issued);
 		if (result != SideIssueResult::Issued && result != SideIssueResult::Pending) {
-			ReadMemoryDrain(vaddr, size, false, trace);
+			// The drain makes a write's pages CPU-dirty itself.
+			ReadMemoryDrain(vaddr, size, is_write, trace);
 		}
 	});
 	switch (result) {
@@ -1963,7 +1981,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 }
 
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
-                                  ReadMemoryTrace& trace) {
+                                  ReadMemoryTrace& trace, bool gpu_thread_write) {
 	// SendCommandSync crosses threads; the requesting thread's trace context does not.
 	HangTrace::SyncResource sync_resource(vaddr, size);
 	EXIT_IF(!GuestGpu::IsGpuThread());
@@ -1972,7 +1990,8 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 		return;
 	}
 	WaitBdaWritesForRange(vaddr, size);
-	if (is_write && m_false_sharing && TryFalseSharingWrite(vaddr, size, trace)) {
+	const bool false_sharing = m_false_sharing == 1 || (m_false_sharing == 2 && gpu_thread_write);
+	if (is_write && false_sharing && TryFalseSharingWrite(vaddr, size, trace)) {
 		return;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];

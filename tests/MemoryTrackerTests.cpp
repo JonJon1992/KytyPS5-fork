@@ -1016,6 +1016,56 @@ uint32_t WriteFault(MemoryTracker &tracker, uint64_t address,
   return flushes;
 }
 
+// KYTY_READBACK_SIDE_WRITES: a guest write fault on GPU-dirty pages publishes them through a side
+// readback (MarkReadbackPending / UnmarkReadbackPending) instead of a drain that makes them
+// CPU-dirty. The published page is readable but not writable, so the retried write faults again on
+// a page the GPU no longer owns: no readback, CPU-dirty and writable. A writer that re-owned the
+// page before the retry makes the retry read back again.
+void TestSideReadbackWriteRetry() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(tracker.IsRegionGpuModified(address, page_size) && Protection(memory) == PAGE_NOACCESS,
+        "side write: the GPU-written page was not GPU-owned");
+  // The side readback of the faulting write.
+  tracker.MarkReadbackPending(address, page_size);
+  auto result = tracker.UnmarkReadbackPending(address, page_size);
+  Check(result.unmarked_pages == 1 && !tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            Protection(memory) == PAGE_READONLY,
+        "side write: publication left the page writable or GPU-owned");
+  // The retried write.
+  Check(WriteFault(tracker, address) == 0 && tracker.IsRegionCpuModified(address, page_size) &&
+            IsWritable(memory),
+        "side write: the retried write read back again or left the page protected");
+
+  // A newer writer re-owns the page between the publication and the retried write.
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.MarkReadbackPending(address, page_size);
+  result = tracker.UnmarkReadbackPending(address, page_size);
+  tracker.ForEachUploadRange(
+      address, page_size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(result.unmarked_pages == 1 && tracker.IsRegionGpuModified(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "side write: the newer writer did not re-own the published page");
+  Check(WriteFault(tracker, address) == 1,
+        "side write: the retry on a re-owned page skipped its readback");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 // Hot-aware read upload: returns {normal pages, hot pages} reported.
 std::pair<uint64_t, uint64_t> UploadHotAware(MemoryTracker &tracker,
                                              uint64_t address, uint64_t size) {
@@ -3248,6 +3298,7 @@ int main(int argc, char **argv) {
   TestWriteTickMapModel();
   TestEagerReadbackPages();
   TestReadbackPendingUnmark();
+  TestSideReadbackWriteRetry();
   TestRangeGpuOwned();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();

@@ -149,6 +149,7 @@ struct FaultContext {
 };
 thread_local FaultContext g_fault_context {};
 thread_local ReadbackKind g_readback_kind = ReadbackKind::Invalidate;
+thread_local uint64_t g_host_shader_context = 0;
 thread_local ImageFreeReason g_image_free_reason = ImageFreeReason::Other;
 
 thread_local GpuWriteKind g_gpu_write_kind = GpuWriteKind::ShaderStorage;
@@ -1672,6 +1673,10 @@ void ClearFaultContext() {
 	g_readback_kind           = ReadbackKind::Invalidate;
 }
 
+void SetHostShaderContext(uint64_t shader_hash) {
+	g_host_shader_context = shader_hash;
+}
+
 void SetReadbackKind(ReadbackKind kind) {
 	g_readback_kind = kind;
 }
@@ -1716,7 +1721,10 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	// VirtualQuery calls, so scan only the first few faults of each faulting instruction.
 	thread_local std::unordered_map<uint64_t, uint32_t> scanned_pcs;
 	const bool scan    = fault && scanned_pcs.size() < 4096 && scanned_pcs[g_fault_context.pc]++ < 4;
-	const auto callers = scan ? CaptureGuestCallers() : std::string();
+	const auto callers = g_host_shader_context != 0
+	                         ? fmt::format("shader=0x{:016x}", g_host_shader_context)
+	                     : scan ? CaptureGuestCallers()
+	                            : std::string();
 	const auto now_ms  = NowMs();
 	std::string writer = ",,";
 	{
