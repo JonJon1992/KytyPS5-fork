@@ -19,6 +19,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -230,6 +233,26 @@ void FaultManager::ProcessFaultBuffer() {
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
 		if (trap.claimed != 0) {
 			const auto hash = (uint64_t{trap.shader_hash_high} << 32) | trap.shader_hash_low;
+			if (trap.code == ShaderTrapRecord::ScalarReadFailure) {
+				const auto* folder = std::getenv("KYTY_SCALAR_READ_PROBE_DIR");
+				const std::filesystem::path directory = folder && *folder ? folder : "_RTCapture";
+				std::error_code error;
+				std::filesystem::create_directories(directory, error);
+				const auto path = directory / ("scalar-read-" + std::to_string(hash) + "-" +
+				                               std::to_string(trap.pc) + ".bin");
+				std::ofstream file(path, std::ios::binary);
+				if (!error) file.write(reinterpret_cast<const char*>(&trap), sizeof(trap));
+				file.close();
+				std::fprintf(stderr, "Scalar read probe: %s %s\n", error || !file ? "save failed:" : "saved:",
+				             path.string().c_str());
+				EXIT("GPU scalar read probe (intentional diagnostic stop): hash=0x%016" PRIx64
+				     " pc=0x%08x reason=%u address=0x%08x%08x size=0x%08x%08x offset=0x%08x"
+				     " descriptor=[%08x,%08x,%08x,%08x] bda=0x%08x%08x\n",
+				     hash, trap.pc, trap.reason, trap.address_high, trap.address_low,
+				     trap.size_high, trap.size_low, trap.offset,
+				     trap.descriptor[0], trap.descriptor[1], trap.descriptor[2], trap.descriptor[3],
+				     trap.bda_high, trap.bda_low);
+			}
 			EXIT("GPU shader trap: hash=0x%016" PRIx64 " pc=0x%08x code=0x%02x\n",
 			     hash, trap.pc, trap.code);
 		}

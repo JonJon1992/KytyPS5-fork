@@ -109,6 +109,15 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.function_lds_compact = EnvFlag("KYTY_FUNCTION_LDS_COMPACT", options.function_lds_compact);
+	if (const auto* hash = std::getenv("KYTY_SCALAR_READ_PROBE_SHADER"); hash && *hash) {
+		char* end = nullptr;
+		const auto value = std::strtoull(hash, &end, 16);
+		if (end != hash && *end == '\0') options.scalar_read_probe_shader = value;
+	}
+	std::vector<uint64_t> probe_pcs;
+	ParseHashList(std::getenv("KYTY_SCALAR_READ_PROBE_PCS"), probe_pcs);
+	for (const auto pc: probe_pcs)
+		if (pc <= UINT32_MAX && (pc & 3) == 0) options.scalar_read_probe_pcs.push_back(pc);
 	return options;
 }
 

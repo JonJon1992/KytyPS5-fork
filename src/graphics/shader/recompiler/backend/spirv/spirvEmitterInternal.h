@@ -166,6 +166,8 @@ struct EmitterState {
 	uint32_t                   helper_invocation_variable            = 0;
 	// KYTY_LOOP_GUARD: the invocation's loop-iteration count (a Function variable).
 	uint32_t                   loop_guard_variable                   = 0;
+	// Opt-in scalar-read probe: a failed read leaves through existing loop exits.
+	uint32_t                   scalar_read_probe_failed              = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;

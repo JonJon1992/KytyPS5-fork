@@ -246,6 +246,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
+	const auto& options = GetCodegenOptions();
+	requirements.subgroup_ballot = options.scalar_read_probe_shader != 0 &&
+	    options.scalar_read_probe_shader == program.shader_hash &&
+	    !options.scalar_read_probe_pcs.empty();
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;

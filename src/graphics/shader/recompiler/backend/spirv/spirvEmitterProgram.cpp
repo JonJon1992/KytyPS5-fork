@@ -116,6 +116,23 @@ bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
 	});
 }
 
+uint32_t ScalarReadProbeFailed(EmitterState& state) {
+	const auto failed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), failed, state.scalar_read_probe_failed);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), failed);
+	uint32_t bits = ConstantU32(state, 0);
+	for (uint32_t i = 0; i < 4; ++i) {
+		const auto word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, ballot, i);
+		bits = EmitBinaryU32(state, spv::OpBitwiseOr, bits, word);
+	}
+	const auto any = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any, bits, ConstantU32(state, 0));
+	return any;
+}
+
 // An exhausted invocation reports once, at return, by adding one to the last GDS dword.
 void EmitLoopGuardReport(EmitterState& state) {
 	if (state.loop_guard_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
@@ -222,6 +239,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				return;
 			}
 			auto condition = BranchCondition(ctx, info);
+			if (ctx.state.scalar_read_probe_failed != 0) {
+				const bool true_exits = IsLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto failed = ScalarReadProbeFailed(ctx.state);
+					const auto forced = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced,
+						                              condition, failed);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive, failed);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced,
+						                              condition, alive);
+					}
+					condition = forced;
+				}
+			}
 			if (ctx.state.loop_guard_variable != 0) {
 				// KYTY_LOOP_GUARD: an exhausted invocation takes whichever edge leaves a loop.
 				const bool true_exits  = IsLoopMergeBlock(program, term.true_block);
@@ -972,6 +1007,12 @@ void EmitProgram(EmitterState& state) {
 		state.loop_guard_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_guard_variable, "loop_guard");
 	}
+	const auto& codegen = GetCodegenOptions();
+	if (codegen.scalar_read_probe_shader != 0 && codegen.scalar_read_probe_shader == program.shader_hash &&
+	    !codegen.scalar_read_probe_pcs.empty()) {
+		state.scalar_read_probe_failed = state.builder.AllocateId();
+		state.builder.AddName(state.scalar_read_probe_failed, "scalar_read_probe_failed");
+	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
@@ -1080,6 +1121,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
+	if (state.scalar_read_probe_failed != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeBool(state)),
+		                          state.scalar_read_probe_failed, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -1111,6 +1157,9 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
+	}
+	if (state.scalar_read_probe_failed != 0) {
+		state.builder.AddFunction(spv::OpStore, state.scalar_read_probe_failed, ConstantBool(state, false));
 	}
 	EmitGeometryOutputDefaults(state);
 	EmitMemoryOffsets(state);

@@ -107,6 +107,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <initializer_list>
 #include <limits>
@@ -1872,6 +1873,7 @@ struct TestCase {
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
   uint64_t shader_hash = 0;
+  std::function<void(const ShaderTrapRecord&)> check_shader_trap;
 };
 
 struct GraphicsCase {
@@ -26384,7 +26386,41 @@ public:
       dependency.pBufferMemoryBarriers = &host;
       cmd.pipelineBarrier2(dependency);
     }
+    Buffer trap_readback;
+    if (test.check_shader_trap) {
+      trap_readback = CreateHostBuffer(test.name, sizeof(ShaderTrapRecord),
+                                       vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferMemoryBarrier2 barrier{};
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = m_fault_buffer.buffer;
+      barrier.offset = BufferCache::FAULT_BITMAP_BYTES;
+      barrier.size = sizeof(ShaderTrapRecord);
+      vk::DependencyInfo dep{};
+      dep.bufferMemoryBarrierCount = 1;
+      dep.pBufferMemoryBarriers = &barrier;
+      cmd.pipelineBarrier2(dep);
+      cmd.copyBuffer(m_fault_buffer.buffer, trap_readback.buffer,
+                     vk::BufferCopy{barrier.offset, 0, barrier.size});
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      barrier.buffer = trap_readback.buffer;
+      barrier.offset = 0;
+      cmd.pipelineBarrier2(dep);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (test.check_shader_trap) {
+      const auto words = ReadBuffer(test.name, trap_readback, sizeof(ShaderTrapRecord) / 4);
+      ShaderTrapRecord trap;
+      std::memcpy(&trap, words.data(), sizeof(trap));
+      test.check_shader_trap(trap);
+      DestroyBuffer(&trap_readback);
+    }
     if (check_bda_writes) {
       const auto words =
           ReadBuffer(test.name, bda_writes_readback, bda_checked_pages.size() + 1);
@@ -30709,7 +30745,7 @@ private:
     m_fault_buffer = CreateDeviceBuffer(
         shader_name,
         ShaderRecompiler::BdaWritesEnabled() ? BufferCache::BDA_WRITES_FAULT_BUFFER_SIZE
-                                             : BufferCache::CACHING_NUMPAGES / 8,
+                                             : BufferCache::CACHING_NUMPAGES / 8 + sizeof(ShaderTrapRecord),
         usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
@@ -52944,6 +52980,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderFunctionLdsTests.inc"
 #include "ShaderGlobalWideTests.inc"
 #include "ShaderGiProbeTests.inc"
+#include "ShaderTraversalLaneTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
 #include "ShaderAsyncPipelineTests.inc"
@@ -53032,6 +53069,21 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckPixelAppendElectionCodegen();
     GiProbeTests::CheckPixelLiveExecCodegen();
     GiProbeTests::CheckLoopGuardCodegen();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--traversal-lanes-only") == 0) {
+    VulkanHarness vulkan;
+    TraversalLaneTests::Check(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--traversal-lists-only") == 0) {
+    VulkanHarness vulkan;
+    TraversalLaneTests::CheckSentinelLists(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-read-probe-only") == 0) {
+    VulkanHarness vulkan;
+    TraversalLaneTests::CheckScalarReadProbe(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gi-probe-only") == 0) {

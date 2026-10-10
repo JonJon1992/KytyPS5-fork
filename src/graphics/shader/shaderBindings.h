@@ -16,8 +16,16 @@ struct ShaderTrapRecord {
 	uint32_t pc               = 0;
 	uint32_t code             = 0;
 	uint32_t reserved[3] {};
+	// Optional scalar-read diagnostic payload, within the existing 256-byte gap.
+	static constexpr uint32_t ScalarReadFailure = 0x100;
+	uint32_t descriptor[4] {};
+	uint32_t address_low = 0, address_high = 0;
+	uint32_t size_low = 0, size_high = 0;
+	uint32_t bda_low = 0, bda_high = 0;
+	uint32_t offset = 0;
+	uint32_t reason = 0; // 1: descriptor bound, 2: outside aperture, 3: missing page
 };
-static_assert(sizeof(ShaderTrapRecord) == 32);
+static_assert(sizeof(ShaderTrapRecord) == 80);
 
 inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
 

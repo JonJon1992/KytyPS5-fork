@@ -215,6 +215,10 @@ struct CodegenOptions {
 	// local memory to SSA and eliminate redundant expressions. Experimental, default off.
 	// No inlining, unrolling or algebraic floating-point simplification. Ignored when OPT=0.
 	bool spirv_optimize_extended = false;
+	// Diagnostic only: capture an invalid indirect scalar read at selected PCs
+	// and leave through existing loop exits in barrier-free native-wave compute.
+	uint64_t scalar_read_probe_shader = 0;
+	std::vector<uint32_t> scalar_read_probe_pcs;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

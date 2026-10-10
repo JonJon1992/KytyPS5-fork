@@ -1687,6 +1687,69 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+void ProbeScalarRead(ValueEmitContext& ctx, const IR::Inst& inst,
+                     uint32_t guest, uint32_t size, uint32_t offset, uint32_t in_bounds) {
+	auto& s = ctx.state;
+	const auto& options = GetCodegenOptions();
+	const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+	if (options.scalar_read_probe_shader == 0 ||
+	    options.scalar_read_probe_shader != s.program.shader_hash ||
+	    std::ranges::find(options.scalar_read_probe_pcs, pc) == options.scalar_read_probe_pcs.end()) return;
+	// The probe deliberately changes faulty work, never repairs it. Its loop
+	// exits must not strand a workgroup at a barrier or split a virtual guest wave.
+	if (s.program.stage != ShaderType::Compute || s.lane_count != 1 ||
+	    WaveHalvesInHostSubgroup(s) || s.program.dispatcher_fallback)
+		ctx.Fail(inst, "scalar read probe requires structured native-wave compute");
+	for (const auto* block: s.program.blocks)
+		for (const auto& instruction: *block)
+			if (instruction.GetOpcode() == IR::ValueOpcode::Barrier)
+				ctx.Fail(inst, "scalar read probe cannot exit loops with a workgroup barrier");
+	const auto u = TypeU32(s), b = TypeBool(s), wide = TypeScalarU64(s);
+	const auto zero = ConstantDeviceAddress(s, 0);
+	const auto bda = EmitValueOrDefaultIfCondition(s, in_bounds, wide, zero, [&] {
+		return GetBdaPointer(ctx, guest);
+	});
+	const auto bad = Binary(s, spv::OpIEqual, b, bda, zero);
+	EmitIfCondition(s, bad, [&] {
+		// Returning here is invalid when the read is in a continue construct.
+		// Latch the failure and vote at existing loop exits instead; no CFG edge
+		// or fabricated sentinel is introduced in the continue construct.
+		s.builder.AddFunction(spv::OpStore, s.scalar_read_probe_failed, ConstantBool(s, true));
+		constexpr auto first = BufferCache::FAULT_BITMAP_BYTES / sizeof(uint32_t);
+		const auto claim = FaultElementPointer(s, ConstantU32(s, first));
+		const auto old = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpAtomicCompareExchange, u, old, claim,
+		    ConstantU32(s, spv::ScopeDevice), ConstantU32(s, 0), ConstantU32(s, 0),
+		    ConstantU32(s, 1), ConstantU32(s, 0));
+		EmitIfCondition(s, Binary(s, spv::OpIEqual, b, old, ConstantU32(s, 0)), [&] {
+			const auto store = [&](size_t byte, uint32_t value) {
+				s.builder.AddFunction(spv::OpStore,
+				    FaultElementPointer(s, ConstantU32(s, first + byte / 4)), value);
+			};
+			const auto store64 = [&](size_t byte, uint32_t value) {
+				store(byte, Unary(s, spv::OpUConvert, u, value));
+				store(byte + 4, Unary(s, spv::OpUConvert, u,
+				    Binary(s, spv::OpShiftRightLogical, wide, value, ConstantDeviceAddress(s, 32))));
+			};
+			store(offsetof(ShaderTrapRecord, shader_hash_low), ConstantU32(s, uint32_t(s.program.shader_hash)));
+			store(offsetof(ShaderTrapRecord, shader_hash_high), ConstantU32(s, uint32_t(s.program.shader_hash >> 32)));
+			store(offsetof(ShaderTrapRecord, pc), ConstantU32(s, pc));
+			store(offsetof(ShaderTrapRecord, code), ConstantU32(s, ShaderTrapRecord::ScalarReadFailure));
+			const auto& handle = *inst.Arg(0).ResolveInstruction();
+			for (uint32_t i = 0; i < 4; ++i)
+				store(offsetof(ShaderTrapRecord, descriptor) + i * 4, ctx.Arg(handle, i));
+			store64(offsetof(ShaderTrapRecord, address_low), guest);
+			store64(offsetof(ShaderTrapRecord, size_low), size);
+			store64(offsetof(ShaderTrapRecord, bda_low), bda);
+			store(offsetof(ShaderTrapRecord, offset), offset);
+			const auto canonical = Binary(s, spv::OpULessThan, b, guest,
+			    ConstantDeviceAddress(s, BufferCache::CACHING_NUMPAGES * BufferCache::CACHING_PAGESIZE));
+			store(offsetof(ShaderTrapRecord, reason), Select(s, u, in_bounds,
+			    Select(s, u, canonical, ConstantU32(s, 3), ConstantU32(s, 2)), ConstantU32(s, 1)));
+		});
+	});
+}
+
 // One dword of an S_BUFFER_LOAD through a V# the shader computed at runtime (KYTY_SRT_VARIANT_READS,
 // ResourceKind::IndirectBuffer), read through BDA. RDNA2 ISA 7.2.1, "Reads using Buffer Constant":
 // only base, stride and num_records are used; addr = (base + OFFSET + SOFFSET) & ~3. The bound is
@@ -1726,6 +1789,7 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto guest = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state),
 	                          Binary(state, spv::OpIAdd, TypeScalarU64(state), base, u64(offset)),
 	                          ConstantDeviceAddress(state, ~uint64_t {3}));
+	ProbeScalarRead(ctx, inst, guest, size, offset, in_bounds);
 	return LoadBda(ctx, guest, in_bounds, 32u);
 }
 

@@ -58,7 +58,7 @@ public:
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 	// Fault buffer layout (FaultManager), in bytes:
 	//   [0, FAULT_BITMAP_BYTES)                 page-fault bitmap, one bit per caching page
-	//   [FAULT_BITMAP_BYTES, +32)               ShaderTrapRecord
+	//   [FAULT_BITMAP_BYTES, +80)               ShaderTrapRecord (including scalar-read probe)
 	//   [BDA_WRITE_BITMAP_OFFSET, +BITMAP)      written-page bitmap (KYTY_BDA_WRITES_SHADERS only)
 	//   [BDA_DROPPED_WRITES_OFFSET, +4)         writes dropped on pages without a cache buffer
 	// The written-page bitmap starts on its own 256-byte boundary past the trap record, so neither
