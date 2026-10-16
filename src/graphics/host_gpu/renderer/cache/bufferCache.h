@@ -12,10 +12,17 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
+#include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -106,6 +113,12 @@ public:
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
 	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	// GPU thread, before it reads guest bytes on the host (indirect arguments, COND_EXEC): shared
+	// buffers are not page-protected, so a read there does not fault into a sync. Waits for the
+	// GPU writes to them recorded so far.
+	void WaitSharedWrites(uint64_t vaddr, uint64_t size);
+	// Diagnostics: the write-tracking state of the page holding vaddr.
+	[[nodiscard]] std::string DescribeWriteState(uint64_t vaddr);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
@@ -134,7 +147,34 @@ public:
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
 
+	// A ReadMemoryStep result with this bit set names a copy-queue readback (see bufferCache.cpp)
+	// for the caller to complete, instead of a tick to wait for.
+	static constexpr uint64_t CopyReadbackMarker = uint64_t {1} << 63u;
+	// Any thread: waits for a copy-queue readback and publishes its bytes to guest memory (once;
+	// a marker whose readback was already completed returns at once).
+	void CompleteCopyReadback(uint64_t marker);
+	// GPU thread, at the end of a submission: records the downloads of the windows the game
+	// threads keep reading back that the submission wrote to (KYTY_EAGER_READBACK).
+	void EagerDownloads();
+	// GPU thread, before guest memory is unmapped: drops the shared buffers over it (their
+	// imports point into that memory).
+	void UnmapShared(uint64_t vaddr, uint64_t size);
+
 private:
+	// Shared buffers (KYTY_SHARED_BUFFERS=1): a small buffer the game threads keep reading back is
+	// replaced by one over the guest's own memory (VK_EXT_external_memory_host), so GPU writes land
+	// in guest memory and the reads no longer wait for downloads. GPU thread only.
+	[[nodiscard]] bool IsShared(uint64_t vaddr, uint64_t size) const {
+		return !m_shared_ranges.Empty() && m_shared_ranges.Intersects(vaddr, size);
+	}
+	// A game-thread readback of this buffer: votes for sharing it, and shares it at enough votes.
+	// True when the buffer is shared now and the read may proceed.
+	bool VoteShared(BufferId id);
+	RangeSet                                   m_shared_ranges;
+	std::unordered_map<uint64_t, uint32_t>     m_shared_votes;
+	std::unordered_map<uint64_t, uint32_t>     m_shared_attempts;
+	// The tick of the latest GPU write recorded into each shared buffer, until it completes.
+	std::unordered_map<uint64_t, uint64_t>     m_shared_write_ticks;
 	friend struct BufferCacheTestAccess;
 
 	void ReleaseBuffer(BufferId id);
@@ -161,6 +201,58 @@ private:
 	// write. True with wait_tick set when an asynchronous caller must first wait for that tick.
 	bool RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size, bool async,
 	                           uint64_t& wait_tick);
+	// When a submission has completed: tracked pages its shaders did not write are released
+	// (no longer GPU-written, no longer protected). GPU thread.
+	void SettleWriteBitmap(uint64_t completed_tick);
+	// Whole pages whose GPU-written bytes were synced (downloaded or overwritten) leave
+	// m_bitmap_written. Caller holds m_dirty_ranges_mutex.
+	void ClearWriteBits(uint64_t vaddr, uint64_t size);
+	// Once per frame (GPU thread): the next epoch's bitmap moves its bits into m_bitmap_written
+	// and is cleared, then takes the frame's writes.
+	void AdvanceWriteBitmapEra();
+	// The written bits of [word_begin, word_end) ORed over all epochs (or of only_epoch), read
+	// with streaming loads.
+	void LoadWrittenWords(uint64_t word_begin, uint64_t word_end, std::vector<uint32_t>& out,
+	                      int only_epoch = -1) const;
+	uint64_t m_bitmap_settle_frame = UINT64_MAX;
+	// Eras: one per frame. At each era's end the GPU copies the era's bitmap words to host-cached
+	// staging and zeroes them, in command order, so each copy holds exactly the pages that era
+	// wrote (the host never reads the bitmap itself: device memory, ~1 us a word).
+	// m_bitmap_written: pages known written and not synced since.
+	static constexpr uint32_t                          WriteBitmapEpochs = 1;
+	uint64_t                                           m_bitmap_era      = 0;
+	std::array<uint64_t, 4>                            m_era_start_tick {};
+	// region -> last era it was marked in; erased once that era's copy is processed
+	std::unordered_map<uint64_t, uint64_t>             m_region_era;
+	RangeSet                                           m_bitmap_written;
+	struct BitmapCopy {
+		uint64_t                                   era  = 0;
+		uint64_t                                   tick = 0;
+		std::unique_ptr<Buffer>                    staging;
+		std::vector<std::pair<uint64_t, uint64_t>> spans;   // bitmap word ranges
+		std::vector<uint64_t>                      offsets; // their first word in staging
+	};
+	std::deque<BitmapCopy>                 m_bitmap_copies;
+	std::vector<std::unique_ptr<Buffer>>   m_bitmap_staging_pool;
+	// Write prediction (KYTY_WRITE_PREDICT, on with the bitmap): unbounded written bindings
+	// protect only the pages the GPU wrote in recent eras; a page written outside them is
+	// protected when its era's copy is processed.
+	RangeSet                               m_predicted;
+	uint64_t                               m_predicted_generation = 0;
+	std::unordered_map<uint64_t, uint64_t> m_predict_seen; // page -> last era written
+	struct BindingPrediction {
+		uint64_t era        = 0; // era + 1 it was last marked in
+		uint64_t generation = 0; // of m_predicted then
+		uint32_t eras_seen  = 0; // the first eras mark it whole, to learn its writes
+	};
+	std::unordered_map<uint64_t, BindingPrediction> m_predict_marked;
+	// Tracked bindings obtained so far, and per page the count when WaitSharedWrites last
+	// protected it: a page is protected again only after another tracked binding.
+	uint64_t                                        m_tracked_serial = 0;
+	std::unordered_map<uint64_t, uint64_t>          m_host_read_serial;
+	void               ProcessBitmapCopies();
+	void               ProcessBitmapCopy(BitmapCopy& copy);
+	[[nodiscard]] bool PredictWrites() const;
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -186,6 +278,48 @@ private:
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                          uint64_t total_size);
+
+	// Copy-queue readbacks (KYTY_COPY_QUEUE_READBACK, default on). GPU thread: when every GPU
+	// write to the window has executed, copies its GPU-written bytes on the second queue and
+	// returns the readback's marker (0: not taken, the caller downloads as before).
+	[[nodiscard]] uint64_t TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
+	                                            uint64_t window_end);
+	// GPU thread: the marker of an unfinished copy-queue readback overlapping the range, or 0.
+	[[nodiscard]] uint64_t FindCopyReadback(uint64_t vaddr, uint64_t size) const;
+	// Any thread: waits until no copy-queue readback is reading a cache buffer (before one is
+	// destroyed). Does not publish.
+	void                   WaitCopyReadbacks();
+	// GPU thread: the tick the bytes MarkGpuWritten records are written in, by 1 MiB block.
+	void                   NoteGpuWriteTick(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t LatestGpuWriteTick(uint64_t begin, uint64_t end) const;
+	struct CopyReadbackSlot {
+		std::mutex                  mutex;
+		std::atomic<uint32_t>       busy {0};
+		uint32_t                    generation = 0;
+		vk::CommandPool             pool       = nullptr;
+		vk::CommandBuffer           command    = nullptr;
+		vk::Fence                   fence      = nullptr;
+		std::unique_ptr<Buffer>     staging;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    window_begin   = 0;
+		uint64_t                    window_end     = 0;
+		uint64_t                    total_size     = 0;
+		std::vector<vk::BufferCopy> copies;
+	};
+	static constexpr uint32_t CopyReadbackSlots = 8;
+	std::array<CopyReadbackSlot, CopyReadbackSlots>   m_copy_slots;
+	std::atomic<uint32_t>                             m_copy_in_flight {0};
+	std::unordered_map<uint64_t, uint64_t>            m_write_ticks;
+	// Writes too large to note block by block: begin, end, tick.
+	std::vector<std::array<uint64_t, 3>>              m_large_writes;
+	void                                              NoteHotReadback(uint64_t vaddr);
+	void                                              NoteEagerWrite(uint64_t vaddr, uint64_t size);
+	std::unordered_map<uint64_t, uint64_t>            m_hot_windows;
+	std::unordered_set<uint64_t>                      m_eager_pending;
+	uint64_t                                          m_eager_count  = 0;
+	uint64_t                                          m_copy_taken   = 0;
+	uint64_t                                          m_copy_busy    = 0;
+	uint64_t                                          m_copy_running = 0;
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;

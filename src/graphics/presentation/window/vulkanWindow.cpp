@@ -437,11 +437,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	// A second queue of the same family, when there is one, copies readbacks whose GPU writers
+	// have finished without waiting behind the graphics queue (BufferCache, copy-queue
+	// readbacks; KYTY_COPY_QUEUE_READBACK=0 keeps one queue).
+	const auto  families            = physical_device.getQueueFamilyProperties();
+	const char* copy_queue_switch   = std::getenv("KYTY_COPY_QUEUE_READBACK");
+	const bool  want_copy_queue     = copy_queue_switch == nullptr || copy_queue_switch[0] != '0';
+	const float queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount =
+	    want_copy_queue && queue_family < families.size() && families[queue_family].queueCount >= 2
+	        ? 2u
+	        : 1u;
+	queue_create_info.pQueuePriorities = queue_priorities;
+	graphics.queue_count               = queue_create_info.queueCount;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1216,6 +1226,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// Shared guest memory (guest RAM imported as GPU-visible buffers, so the GPU's writes land
+		// where the game reads them): VK_EXT_external_memory_host.
+		if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			graphic_ctx.external_memory_host_enabled = true;
+		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 			graphic_ctx.diagnostic_checkpoints_enabled = true;
@@ -1270,6 +1286,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.queue_count >= 2) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

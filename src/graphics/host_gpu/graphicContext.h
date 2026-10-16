@@ -52,6 +52,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               external_memory_host_enabled          = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
 	bool                               host_query_reset_enabled              = false;
@@ -84,6 +85,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Queue 1 of queue_family when the device has one (BufferCache copy-queue readbacks). Only
+	// the GPU thread submits to it.
+	uint32_t                           queue_count    = 1;
+	vk::Queue                          readback_queue = nullptr;
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 

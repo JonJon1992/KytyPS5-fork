@@ -97,6 +97,9 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
+	// DRAW_INDIRECT(_MULTI) START_INST_LOC: the SH register the CP writes each draw's start
+	// instance into (0: none). Set by the PM4 handler before the draw.
+	void SetIndirectStartInstanceRegister(uint32_t reg) { m_start_instance_register = reg; }
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -161,6 +164,7 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	[[nodiscard]] RenderContext& GetRenderContext() const { return m_renderer; }
 
 private:
 	template <typename T>
@@ -190,6 +194,8 @@ private:
 	// The DrawIndirectArgs whose instance count NUM_INSTANCES holds after a GPU-read indirect draw;
 	// read on the CPU only if a later draw takes its instance count from there.
 	uint64_t m_num_instances_args = 0;
+	uint32_t m_start_instance_register = 0;
+	void     WriteIndirectStartInstance(uint32_t start_instance);
 	[[nodiscard]] uint32_t NumInstances();
 
 	uint32_t m_de_count    = 0;

@@ -11,6 +11,11 @@ namespace Common {
 // KYTY_PCORE_AFFINITY=0. `name` is for the log line.
 void PreferPerformanceCores(const char* name);
 
+// KYTY_GPU_THREAD_PRIORITY (default 1): scheduling priority of the calling thread, for the
+// threads that feed the host GPU (0 normal, 1 above normal, 2 highest; Windows only). Ported from
+// idxtri/wolverine-perf 861aa3d1: ~40 guest threads compete with them at normal priority.
+void RaiseGpuThreadPriority();
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

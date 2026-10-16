@@ -52,6 +52,21 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// True while the walker evaluates a control-flow condition (which blocks, and so which
+// descriptor sources, are active). The renderer's readers then fail a read of GPU-written bytes
+// instead of waiting for the GPU: the condition becomes "not known" and both successors are
+// walked. KYTY_SRT_CONDITIONS_WAIT=1 restores waiting.
+bool SrtEvaluatingCondition();
+bool SrtConditionsNoWait();
+// The same for other values the host only uses to narrow what it does (buffer write extents):
+// a failed evaluation falls back to the conservative answer.
+void SrtSetEvaluatingCondition(bool evaluating);
+// Reads refused under SrtSetEvaluatingCondition on this thread so far: a refused read may still
+// let an evaluation succeed (a condition's unknown value), so callers that need the exact value
+// compare the count before and after.
+uint64_t SrtConditionRefusals();
+void     SrtNoteConditionRefusal();
+
 class SrtWalker;
 
 // Replay traces (KYTY_SRT_TRACE=0 turns them off). A resource refresh evaluates one program's
@@ -189,6 +204,9 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// The last raw read that failed (diagnostics).
+	[[nodiscard]] const char* ReadFailure() const { return m_read_failure; }
+	[[nodiscard]] uint64_t    ReadFailureAddress() const { return m_read_failure_address; }
 
 private:
 	// RefreshFlatBuffer's full walk over the control flow (records the walk for replay).
@@ -241,6 +259,12 @@ private:
 	// While a GPU-fillable slot is refreshed: its flat offset (its own read is the only raw read).
 	bool           m_fill_active  = false;
 	uint32_t       m_fill_offset  = 0;
+	// A slot whose address comes from other reads (gpu_fill_slots 2): only its own read (this
+	// instruction) is left to the GPU; the reads that make its address are done on the host.
+	bool           m_fill_any     = true;
+	const Inst*    m_fill_inst    = nullptr;
+	// The read instruction ReadRawWord serves (EvaluateRawRead or a replayed RawRead op).
+	const Inst*    m_reading_inst = nullptr;
 	const uint8_t* m_mapped_bytes = nullptr;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;

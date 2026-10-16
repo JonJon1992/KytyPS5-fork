@@ -1238,6 +1238,40 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      entry_ir.IAdd(start_vertex, group));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
 				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				// START_INST_LOC: on hardware the CP writes the indirect draw's start instance into
+				// a user SGPR, which the shader adds to the instance VGPR (v6). With the arguments
+				// read on the GPU, draw(2) names that SGPR (index + 1) and its value comes from the
+				// arguments' fourth dword. Only the SGPRs the shader adds to v6 are touched, so
+				// resource pointers in user data keep their plain value.
+				std::vector<uint32_t> instance_sgprs;
+				for (const auto& inst: decoded.instructions) {
+					const bool add = inst.opcode == Decoder::Opcode::V_ADD_NC_U32 ||
+					                 inst.opcode == Decoder::Opcode::V_ADD_I32;
+					if (!add || inst.src0.kind != Decoder::OperandKind::Sgpr ||
+					    inst.src1.kind != Decoder::OperandKind::Vgpr || inst.src1.reg != 6u) {
+						continue;
+					}
+					const auto reg = inst.src0.reg;
+					if (reg >= options.user_data_base &&
+					    reg - options.user_data_base < options.user_data_count &&
+					    std::find(instance_sgprs.begin(), instance_sgprs.end(), reg) ==
+					        instance_sgprs.end()) {
+						instance_sgprs.push_back(reg);
+					}
+				}
+				if (!instance_sgprs.empty()) {
+					const auto named = entry_ir.LogicalAnd(gpu_args, entry_ir.INotEqual(draw(2), u32(0)));
+					const auto args_instance = IR::U32(entry_ir.Emit(
+					    IR::ValueOpcode::LoadAddressU32, {args_resource, u32(12), u32(0), named},
+					    IR::MemoryFlags {.index = args_memory}));
+					for (const auto reg: instance_sgprs) {
+						const auto sgpr = static_cast<IR::ScalarReg>(reg);
+						const auto hit  = entry_ir.LogicalAnd(
+						    named, entry_ir.IEqual(draw(2), u32(reg - options.user_data_base + 1u)));
+						entry_ir.SetScalarReg(sgpr, entry_ir.Select(hit, args_instance,
+						                                            entry_ir.GetScalarReg(sgpr)));
+					}
+				}
 			} else {
 				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 				// center in every subgroup; strip winding follows the global primitive.

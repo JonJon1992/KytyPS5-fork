@@ -5,8 +5,11 @@
 #include "graphics/shader/recompiler/ir/passes/SrtNativeAsm.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 
@@ -92,6 +95,27 @@ struct SrtNativeHelpers {
 	static bool Read(SrtNativeFrame* frame, uint64_t address, uint64_t base, uint64_t* result) {
 		auto&    walker = *frame->walker;
 		uint32_t word   = 0;
+		// As SrtWalker::ReadRawWord: inside a GPU-fill window (SrtGpuFill) GPU-written bytes are
+		// left to the GPU instead of read here, which would wait for the GPU. The native code does
+		// not know the instruction, so only windows that take any read (m_fill_any) qualify.
+		if (walker.m_fill_active && walker.m_fill_any && walker.m_runtime.gpu_written != nullptr &&
+		    walker.m_runtime.gpu_fills != nullptr &&
+		    walker.m_runtime.gpu_written(address, sizeof(uint32_t))) {
+			walker.m_runtime.gpu_fills->push_back({walker.m_fill_offset, address});
+			*result = 0;
+			return true;
+		}
+		if (static const bool debug_miss = std::getenv("KYTY_DEBUG_FILL_MISS") != nullptr;
+		    debug_miss && !SrtEvaluatingCondition() && walker.m_runtime.gpu_written != nullptr &&
+		    walker.m_runtime.gpu_written(address, sizeof(uint32_t))) {
+			static std::atomic<uint32_t> printed {0};
+			if (printed.fetch_add(1) < 24) {
+				std::fprintf(stderr, "[fill-miss-native] %016llx addr=0x%llx active=%d any=%d\n",
+				             static_cast<unsigned long long>(walker.m_program.shader_hash),
+				             static_cast<unsigned long long>(address), walker.m_fill_active ? 1 : 0,
+				             walker.m_fill_any ? 1 : 0);
+			}
+		}
 		if (walker.m_runtime.read_memory != nullptr) {
 			if (!walker.m_runtime.read_memory(walker.m_runtime.userdata, address, {&word, 1})) {
 				// As SrtWalker::EvaluateRawRead: zero for a null base in a plan without control flow.

@@ -830,6 +830,15 @@ static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
 	return XXH3_64bits(words, sizeof(words));
 }
 
+// KYTY_TESS_ES_USER_BASE=<n>: diagnostic offset of the evaluation shader's user data (default 0).
+static uint32_t TessEvaluationUserBase() {
+	static const uint32_t base = [] {
+		const char* value = std::getenv("KYTY_TESS_ES_USER_BASE");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return base;
+}
+
 bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                                  std::array<ShaderVertexInputInfo, 3>& input_info,
                                  std::array<ShaderParams, 3>&          params) {
@@ -856,8 +865,11 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	params = {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
+	    // The evaluation shader's user SGPRs start at s8 (NGG); the recompiler applies that base
+	    // itself (CompileOptions::user_data_base = 8 for vertex-type stages), so the array starts
+	    // at index 0 here. KYTY_TESS_ES_USER_BASE is a diagnostic override.
 	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
-	                    evaluation),
+	                    evaluation, TessEvaluationUserBase()),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
@@ -886,6 +898,29 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
 	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+		// Reported once per pair (the rejection is cached below): the draws are skipped.
+		std::fprintf(stderr,
+		             "[tess] rejected LS 0x%016llx HS 0x%016llx TES 0x%016llx in_cp=%u out_cp=%u "
+		             "domain=%u partitioning=%u topology=%u\n",
+		             static_cast<unsigned long long>(local_hash),
+		             static_cast<unsigned long long>(control_hash),
+		             static_cast<unsigned long long>(evaluation_hash), tess.input_control_points,
+		             tess.output_control_points, tess.domain, tess.partitioning,
+		             tess.output_topology);
+		if (const char* folder = std::getenv("KYTY_DUMP_GAVE_UP"); folder != nullptr) {
+			const std::pair<const char*, const std::span<const uint32_t>*> codes[] = {
+			    {"LS", &params[0].code}, {"HS", &params[1].code}, {"TES", &params[2].code}};
+			const uint64_t hashes[] = {local_hash, control_hash, evaluation_hash};
+			for (int c = 0; c < 3; c++) {
+				char path[512];
+				std::snprintf(path, sizeof(path), "%s/%s_%016llx.bin", folder, codes[c].first,
+				              static_cast<unsigned long long>(hashes[c]));
+				if (FILE* file = std::fopen(path, "wb"); file != nullptr) {
+					std::fwrite(codes[c].second->data(), 4, codes[c].second->size(), file);
+					std::fclose(file);
+				}
+			}
+		}
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
 		g_rejected_tessellation.insert(tess_key);
 		return false;

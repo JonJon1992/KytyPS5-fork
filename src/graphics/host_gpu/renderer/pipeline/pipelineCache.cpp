@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -230,6 +231,222 @@ void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 	}
 }
 
+// KYTY_SRT_SPECULATE: SRT reads of bytes the GPU wrote make the GPU thread wait for the GPU
+// (a download). In gameplay three compute shaders cause almost all of those waits (Tracy,
+// 2026-10-09: 5.5 s of every 20). Their values are likely the same frame to frame, so:
+//   1  diagnostic: read the stale backing first, then the exact value, and count differences.
+//   2  speculate: serve the stale backing (no wait); every KYTY_SRT_SPECULATE_CHECK-th read of
+//      a shader (default 16) is read exactly and compared, and a shader whose stale value ever
+//      differs is read exactly from then on.
+// A report per shader goes to stderr every 4096 such reads.
+static int SrtSpeculateMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_SRT_SPECULATE");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	return mode;
+}
+
+static uint32_t SrtSpeculateCheckInterval() {
+	static const uint32_t interval = [] {
+		const char* value = std::getenv("KYTY_SRT_SPECULATE_CHECK");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 16ul;
+		return static_cast<uint32_t>(n == 0 ? 1 : n);
+	}();
+	return interval;
+}
+
+struct SrtSpeculateStats {
+	uint64_t reads      = 0;
+	uint64_t served     = 0;
+	uint64_t checks     = 0;
+	uint64_t mismatches = 0;
+	bool     exact_only = false;
+	uint64_t last_addr  = 0;
+};
+
+// A control-flow condition that would read bytes the GPU wrote fails the read instead of waiting
+// (SrtConditionsNoWait): the walker treats the condition as not known and walks both successors.
+bool SrtConditionReadRefused(uint64_t address, std::span<const uint32_t> values) {
+	if (!ShaderRecompiler::IR::SrtEvaluatingCondition() ||
+	    !ShaderRecompiler::IR::SrtConditionsNoWait() ||
+	    !Libs::Graphics::GuestGpu::IsGpuThread() ||
+	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		return false;
+	}
+	ShaderRecompiler::IR::SrtNoteConditionRefusal();
+	static uint64_t refused = 0;
+	if ((++refused & (refused - 1)) == 0) {
+		std::fprintf(stderr, "[srt-condition] %llu condition reads of GPU-written bytes left to the GPU "
+		                     "(last: shader %016llx addr=0x%llx)\n",
+		             static_cast<unsigned long long>(refused),
+		             static_cast<unsigned long long>(t_srt_shader_hash),
+		             static_cast<unsigned long long>(address));
+	}
+	return true;
+}
+
+} // namespace
+namespace ShaderRecompiler::IR {
+const char* MaterializePhase(); // ResourceMaterialization.cpp
+} // namespace ShaderRecompiler::IR
+namespace {
+// KYTY_LOG_GPU_OWNED_SRT=1: the SRT reads that make the GPU thread download GPU-written bytes
+// (wait for the GPU), first three per shader and read size.
+void LogGpuOwnedSrtRead(const char* tag, uint64_t address, size_t dwords) {
+	static const bool enabled = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, dwords * 4u)) {
+		return;
+	}
+	static std::unordered_map<std::string, uint32_t> seen;
+	const char* phase = ShaderRecompiler::IR::MaterializePhase();
+	auto& n = seen[fmt::format("{:016x}{}{}", t_srt_shader_hash, dwords, phase)];
+	if (n++ < 2) {
+		std::fprintf(stderr,
+		             "[gpu-owned-srt] %s shader %016llx addr=0x%llx dwords=%zu cond=%d phase=%s\n",
+		             tag, static_cast<unsigned long long>(t_srt_shader_hash),
+		             static_cast<unsigned long long>(address), dwords,
+		             ShaderRecompiler::IR::SrtEvaluatingCondition() ? 1 : 0, phase);
+	}
+	static uint64_t total = 0;
+	static std::unordered_map<std::string, uint64_t> by_phase;
+	by_phase[phase]++;
+	if (++total % 2000 == 0) {
+		std::string text;
+		for (const auto& [name, count]: by_phase) text += fmt::format(" {}={}", name, count);
+		std::fprintf(stderr, "[gpu-owned-srt] totals:%s\n", text.c_str());
+	}
+}
+
+// KYTY_SRT_WAIT_STATS=1: time the SRT reads that download GPU-written bytes (the GPU thread waits
+// for the GPU), per shader, and print the top shaders by wait time every 10 s of wall time.
+bool TimedReadBufferBacking(uint64_t address, uint32_t* data, size_t bytes) {
+	static const bool enabled = std::getenv("KYTY_SRT_WAIT_STATS") != nullptr;
+	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, bytes)) {
+		return Libs::LibKernel::Memory::TryReadBufferBacking(address, data, bytes);
+	}
+	const auto start = std::chrono::steady_clock::now();
+	const bool ok    = Libs::LibKernel::Memory::TryReadBufferBacking(address, data, bytes);
+	const auto us    = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+	struct Stat {
+		uint64_t us = 0, count = 0;
+		const char* phase = "";
+	};
+	static std::mutex                          mutex;
+	static std::unordered_map<uint64_t, Stat>  stats;
+	static auto                                last  = std::chrono::steady_clock::now();
+	static uint64_t                            total = 0;
+	std::lock_guard lock(mutex);
+	auto& s = stats[t_srt_shader_hash];
+	s.us += static_cast<uint64_t>(us);
+	s.count++;
+	s.phase = ShaderRecompiler::IR::MaterializePhase();
+	total += static_cast<uint64_t>(us);
+	if (std::chrono::steady_clock::now() - last > std::chrono::seconds(10)) {
+		last = std::chrono::steady_clock::now();
+		std::vector<std::pair<uint64_t, Stat>> sorted(stats.begin(), stats.end());
+		std::sort(sorted.begin(), sorted.end(),
+		          [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+		std::fprintf(stderr, "[srt-wait] total=%llu ms shaders=%zu\n",
+		             static_cast<unsigned long long>(total / 1000), sorted.size());
+		for (size_t i = 0; i < sorted.size() && i < 12; i++) {
+			std::fprintf(stderr, "[srt-wait]   %016llx %llu ms n=%llu phase=%s\n",
+			             static_cast<unsigned long long>(sorted[i].first),
+			             static_cast<unsigned long long>(sorted[i].second.us / 1000),
+			             static_cast<unsigned long long>(sorted[i].second.count),
+			             sorted[i].second.phase);
+		}
+		stats.clear();
+		total = 0;
+	}
+	return ok;
+}
+
+// GPU thread only. True when `values` was served (stale, or exact after a check); false when the
+// caller should take its ordinary path.
+bool SrtSpeculativeRead(uint64_t address, std::span<uint32_t> values) {
+	const int mode = SrtSpeculateMode();
+	if (mode == 0 || t_srt_shader_hash == 0 || !Libs::Graphics::GuestGpu::IsGpuThread() ||
+	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		return false;
+	}
+	static std::unordered_map<uint64_t, SrtSpeculateStats> stats;
+	static uint64_t                                        total = 0;
+	auto&                                                  s     = stats[t_srt_shader_hash];
+	s.reads++;
+	s.last_addr = address;
+	if (mode == 1 && s.reads <= 6) {
+		// Which bytes: the guest address, the size, and the first dwords before and after the
+		// exact read (printed below once the exact value is known).
+		std::fprintf(stderr, "[srt-speculate] read %016llx #%llu addr=0x%llx dwords=%zu\n",
+		             static_cast<unsigned long long>(t_srt_shader_hash),
+		             static_cast<unsigned long long>(s.reads),
+		             static_cast<unsigned long long>(address), values.size());
+	}
+	if (++total % 4096 == 0) {
+		std::fprintf(stderr, "[srt-speculate] mode=%d reads=%llu shaders=%zu\n", mode,
+		             static_cast<unsigned long long>(total), stats.size());
+		for (const auto& [hash, e]: stats) {
+			std::fprintf(stderr,
+			             "[srt-speculate]   CS/VS %016llx reads=%llu served=%llu checks=%llu "
+			             "mismatches=%llu exact_only=%d last=0x%llx\n",
+			             static_cast<unsigned long long>(hash),
+			             static_cast<unsigned long long>(e.reads),
+			             static_cast<unsigned long long>(e.served),
+			             static_cast<unsigned long long>(e.checks),
+			             static_cast<unsigned long long>(e.mismatches), e.exact_only ? 1 : 0,
+			             static_cast<unsigned long long>(e.last_addr));
+		}
+	}
+	std::array<uint32_t, 64> stale_small {};
+	std::vector<uint32_t>    stale_large;
+	uint32_t*                stale = stale_small.data();
+	if (values.size() > stale_small.size()) {
+		stale_large.resize(values.size());
+		stale = stale_large.data();
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, stale, values.size_bytes())) {
+		return false;
+	}
+	const bool check = mode == 1 || s.exact_only || (s.reads % SrtSpeculateCheckInterval()) == 1u;
+	if (!check) {
+		std::memcpy(values.data(), stale, values.size_bytes());
+		s.served++;
+		return true;
+	}
+	// Exact read: the ordinary path downloads the GPU-written bytes into the backing store.
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                     values.size_bytes())) {
+		return false;
+	}
+	if (mode == 1 && s.reads <= 6) {
+		std::string text;
+		for (size_t i = 0; i < values.size() && i < 8; i++) {
+			char word[32];
+			std::snprintf(word, sizeof(word), " %08x/%08x", stale[i], values[i]);
+			text += word;
+		}
+		std::fprintf(stderr, "[srt-speculate]   stale/exact:%s\n", text.c_str());
+	}
+	if (!s.exact_only) {
+		s.checks++;
+		if (std::memcmp(values.data(), stale, values.size_bytes()) != 0) {
+			s.mismatches++;
+			if (mode == 2 && s.reads > 1) {
+				s.exact_only = true;
+				std::fprintf(stderr,
+				             "[srt-speculate] shader %016llx: stale value differed at 0x%llx, "
+				             "exact reads from now on\n",
+				             static_cast<unsigned long long>(t_srt_shader_hash),
+				             static_cast<unsigned long long>(address));
+			}
+		}
+	}
+	return true;
+}
+
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
@@ -241,11 +458,17 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
 	}
+	if (SrtConditionReadRefused(address, values)) {
+		return false;
+	}
+	if (SrtSpeculativeRead(address, values)) {
+		return true;
+	}
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
 	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
-	if (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
-	                                                    values.size_bytes())) {
+	LogGpuOwnedSrtRead("raw", address, values.size());
+	if (TimedReadBufferBacking(address, values.data(), values.size_bytes())) {
 		return true;
 	}
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
@@ -253,6 +476,17 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	}
 	if (t_srt_shader_hash != 0 && Libs::Graphics::GuestGpu::IsGpuThread()) {
 		CountGpuOwnedSrtRead(address, static_cast<uint32_t>(values.size_bytes()));
+		if (static const bool log_owned = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+		    log_owned) {
+			static std::unordered_map<uint64_t, uint32_t> seen;
+			auto& n = seen[t_srt_shader_hash ^ (static_cast<uint64_t>(values.size()) << 56u)];
+			if (n++ < 3) {
+				std::fprintf(stderr, "[gpu-owned-srt] raw shader %016llx addr=0x%llx dwords=%zu cond=%d\n",
+				             static_cast<unsigned long long>(t_srt_shader_hash),
+				             static_cast<unsigned long long>(address), values.size(),
+				             ShaderRecompiler::IR::SrtEvaluatingCondition() ? 1 : 0);
+			}
+		}
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
@@ -280,13 +514,31 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	    cache != nullptr && cache->Read(address, values)) {
 		return true;
 	}
-	if (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes())) {
+	if (SrtConditionReadRefused(address, values)) {
+		return false;
+	}
+	if (SrtSpeculativeRead(address, values)) {
+		return true;
+	}
+	LogGpuOwnedSrtRead("exact", address, values.size());
+	if (TimedReadBufferBacking(address, values.data(), values.size_bytes())) {
 		return true;
 	}
 	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
 	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
 	// the one the shader would see. Before, this only ever succeeded because the aggressive
 	// garbage collector happened to have downloaded the range first.
+	if (static const bool log_owned = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+	    log_owned && Libs::Graphics::GuestGpu::IsGpuThread()) {
+		static std::unordered_map<uint64_t, uint32_t> seen;
+		auto& n = seen[t_srt_shader_hash ^ (static_cast<uint64_t>(values.size()) << 56u)];
+		if (n++ < 3) {
+			std::fprintf(stderr, "[gpu-owned-srt] shader %016llx addr=0x%llx dwords=%zu cond=%d\n",
+			             static_cast<unsigned long long>(t_srt_shader_hash),
+			             static_cast<unsigned long long>(address), values.size(),
+			             ShaderRecompiler::IR::SrtEvaluatingCondition() ? 1 : 0);
+		}
+	}
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
 		return false;
 	}
@@ -991,6 +1243,12 @@ struct PipelineCache::ProgramCache {
 		}
 		Profiler::Add(Profiler::Counter::SkippedResources);
 		static std::atomic<uint32_t> reported = 0;
+		if (reported.load() < 64) {
+			std::fprintf(stderr,
+			             "[skip-resources] first use: %s 0x%016" PRIx64 " (materialization line %d)\n",
+			             stage_name, hash, ShaderRecompiler::IR::LastIndirectImageFailureLine());
+			std::fflush(stderr);
+		}
 		if (reported.fetch_add(1) < 16) {
 			LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
 			     ": resource materialization failed on first use (materialization line %d)\n",
@@ -1033,6 +1291,17 @@ struct PipelineCache::ProgramCache {
 		writer.bytes.reserve(disk_session_key.size() + code.size_bytes() +
 		                     params.back_code.size_bytes() + 512u);
 		writer.PutBytes(disk_session_key);
+		// Resource plans depend on the GPU-sized written buffers switches (ResourceMaterialization).
+		static const uint64_t sized_written = [] {
+			std::string text;
+			for (const char* name: {"KYTY_GPU_SIZED_WRITTEN", "KYTY_GPU_SIZED_WRITTEN_SHADERS"}) {
+				const char* value = std::getenv(name);
+				text += value != nullptr ? value : "-";
+				text += ';';
+			}
+			return XXH3_64bits(text.data(), text.size());
+		}();
+		writer.Put(sized_written);
 		writer.Put<uint8_t>('S');
 		writer.Put(static_cast<uint32_t>(options.stage));
 		writer.Put(options.shader_hash);
@@ -1122,18 +1391,87 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.function_code.clear();
+		// A compute shader that gave up is dispatched again every frame, and expanding its
+		// functions to find it in `unsupported` cost ~3 ms a dispatch (three such dispatches a
+		// frame in the jungle). Remember the refusal by shader, code address, static state and
+		// user data, and skip before expanding. KYTY_GAVE_UP_FAST=0 turns this off.
+		uint64_t gave_up_key = 0;
+		uint64_t                 fast_key = 0;
+		ProgramsMap::value_type* fast_hit = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			ExpandShaderFunctions(params, user_data, input_info.wave_size,
-			                      lookup_key.function_code);
+			static const bool fast = [] {
+				const char* value = std::getenv("KYTY_GAVE_UP_FAST");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (fast) {
+				gave_up_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
+				                                   params.hash ^ params.Base());
+				gave_up_key = XXH3_64bits_withSeed(
+				    lookup_key.static_state.data(),
+				    lookup_key.static_state.size() * sizeof(uint32_t), gave_up_key);
+				if (gave_up_fast.contains(gave_up_key)) {
+					Profiler::Add(Profiler::Counter::SkippedGaveUp);
+					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
+					                                StageLabel(stage), params.hash);
+					return ShaderProgram {};
+				}
+			}
+			// The same dispatch (shader, code address, static state, user data) as within the last
+			// 50 ms finds its program without expanding the functions or hashing the expanded code
+			// (~12 us a dispatch, 3 s in 20 s of the command thread in the jungle, 2026-10-16).
+			// Entries are never erased, so the pointer stays valid. KYTY_FAST_PROGRAM=0 turns it off.
+			static const bool fast_program = [] {
+				const char* value = std::getenv("KYTY_FAST_PROGRAM");
+				return value == nullptr || value[0] != '0';
+			}();
+			if (fast_program) {
+				fast_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
+				                                params.hash ^ params.Base() ^
+				                                    (static_cast<uint64_t>(input_info.wave_size) << 56u) ^
+				                                    (static_cast<uint64_t>(params.code.size()) << 32u));
+				fast_key = XXH3_64bits_withSeed(lookup_key.static_state.data(),
+				                                lookup_key.static_state.size() * sizeof(uint32_t),
+				                                fast_key) | 1u;
+				// A dispatch comes back once a frame (~100 ms at our frame rates), so the window is
+				// longer than the expansion reuse's 50 ms. KYTY_FAST_PROGRAM_MS sets it.
+				static const auto window = std::chrono::milliseconds([] {
+					const char* value = std::getenv("KYTY_FAST_PROGRAM_MS");
+					return value != nullptr ? std::strtoul(value, nullptr, 10) : 1000ul;
+				}());
+				if (const auto it = fast_entries.find(fast_key);
+				    it != fast_entries.end() &&
+				    std::chrono::steady_clock::now() - it->second.validated < window) {
+					fast_hit = it->second.entry;
+				}
+			}
+			if (fast_hit == nullptr) {
+				KYTY_PROFILER_BLOCK("ProgramCache::ExpandFunctions");
+				ExpandShaderFunctions(params, user_data, input_info.wave_size,
+				                      lookup_key.function_code);
+			}
 		}
-		if (unsupported.contains(lookup_key)) {
+		if (fast_hit == nullptr && unsupported.contains(lookup_key)) {
+			if (gave_up_key != 0) {
+				gave_up_fast.insert(gave_up_key);
+			}
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
 			                                StageLabel(stage), params.hash);
 			return ShaderProgram {};
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
-		auto                                         entry = programs.find(lookup_key);
+		ProgramsMap::value_type* entry = nullptr;
+		if (fast_hit) {
+			entry = fast_hit;
+		} else if (const auto found = programs.find(lookup_key); found != programs.end()) {
+			entry = &*found;
+			if (fast_key != 0) {
+				if (fast_entries.size() > 4096) {
+					fast_entries.clear();
+				}
+				fast_entries[fast_key] = {entry, std::chrono::steady_clock::now()};
+			}
+		}
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -1156,7 +1494,7 @@ struct PipelineCache::ProgramCache {
 				runtime.workgroup_size[axis] = input_info.threads_num[axis];
 			}
 		}
-		if (entry != programs.end()) {
+		if (entry != nullptr) {
 			{
 				// One zone per refresh, named by the program (kept with KYTY_PROFILE_ZONES=0).
 				Profiler::Phases refresh_zone;
@@ -1186,9 +1524,40 @@ struct PipelineCache::ProgramCache {
 				} else {
 					std::lock_guard walk_lock(entry->second.walk_mutex);
 					entry->second.prepared_serial = 0;
+					const auto walk_begin = std::chrono::steady_clock::now();
 					materialized = ShaderRecompiler::IR::MaterializeResources(
 					    entry->second.resource_plan, runtime, entry->second.resources,
 					    entry->second.specialization);
+					// KYTY_LOG_SLOW_SRT=1: refreshes over 1 ms (a guest read that waited for the GPU),
+					// by shader: the first 4 of each, for up to 64 shaders.
+					if (static const bool log_slow = std::getenv("KYTY_LOG_SLOW_SRT") != nullptr;
+					    log_slow) {
+						const auto ms = std::chrono::duration<double, std::milli>(
+						                    std::chrono::steady_clock::now() - walk_begin)
+						                    .count();
+						if (ms > 1.0) {
+							// Totals by shader; the top 12 every 300 slow refreshes.
+							static std::unordered_map<uint64_t, std::pair<uint32_t, double>> slow;
+							static uint32_t                                                  events = 0;
+							auto& [n, total] = slow[params.hash];
+							n++;
+							total += ms;
+							if (++events % 300 == 0) {
+								std::vector<std::pair<uint64_t, std::pair<uint32_t, double>>> top(
+								    slow.begin(), slow.end());
+								std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+									return a.second.second > b.second.second;
+								});
+								std::string text = fmt::format("[slow-srt] after {} events:\n", events);
+								for (size_t i = 0; i < top.size() && i < 12; i++) {
+									text += fmt::format("  {:016x} n={} total={:.0f} ms\n", top[i].first,
+									                    top[i].second.first, top[i].second.second);
+								}
+								std::fputs(text.c_str(), stderr);
+								std::fflush(stderr);
+							}
+						}
+					}
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
@@ -1211,6 +1580,19 @@ struct PipelineCache::ProgramCache {
 					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": resources unreadable",
 					                                StageLabel(stage), params.hash);
 					static std::atomic<uint32_t> reported = 0;
+					{
+						static std::mutex                   seen_mutex;
+						static std::unordered_set<uint64_t> seen;
+						std::lock_guard                     lock(seen_mutex);
+						if (seen.size() < 256 && seen.insert(params.hash).second) {
+							std::fprintf(stderr,
+							             "[skip-resources] refresh: %s 0x%016" PRIx64
+							             " (materialization line %d)\n",
+							             StageLabel(stage), params.hash,
+							             ShaderRecompiler::IR::LastIndirectImageFailureLine());
+							std::fflush(stderr);
+						}
+					}
 					if (reported.fetch_add(1) < 16) {
 						LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
 						     ": resource materialization failed (materialization line %d)\n",
@@ -1241,6 +1623,13 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		if (fast_hit != nullptr) {
+			// No permutation fits: the compile below needs the expanded code.
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				ExpandShaderFunctions(params, user_data, input_info.wave_size,
+				                      lookup_key.function_code);
+			}
+		}
 		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
 		if (!translating.empty()) {
 			if (const auto job = translating.find(lookup_key);
@@ -1311,7 +1700,7 @@ struct PipelineCache::ProgramCache {
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
 			BuildSourceKey(source_key, compile_code, params, options, input_info);
-			if (entry == programs.end()) {
+			if (entry == nullptr) {
 				CountDiskLookup();
 				std::vector<uint8_t>          payload;
 				ShaderDiskCache::SourceRecord record;
@@ -1326,6 +1715,12 @@ struct PipelineCache::ProgramCache {
 				} else {
 					disk->counters.source_hits++;
 					if (record.unsupported) {
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1) < 256) {
+							std::fprintf(stderr, "[gave-up] %s 0x%016" PRIx64 ": in an earlier run (disk cache)\n",
+							             stage_name, params.hash);
+							std::fflush(stderr);
+						}
 						Profiler::Add(Profiler::Counter::ShadersGaveUp);
 						Profiler::Message(Profiler::MessageFailure,
 						                  "Shader gave up: %s 0x%016" PRIx64 ": in an earlier run (disk cache)",
@@ -1340,14 +1735,14 @@ struct PipelineCache::ProgramCache {
 					}
 					{
 						std::unique_lock programs_lock(programs_mutex);
-						entry = programs.try_emplace(lookup_key, std::move(record.plan)).first;
+						entry = &*programs.try_emplace(lookup_key, std::move(record.plan)).first;
 					}
 					if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 						return ShaderProgram {};
 					}
 				}
 			}
-			if (entry != programs.end()) {
+			if (entry != nullptr) {
 				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
@@ -1417,7 +1812,7 @@ struct PipelineCache::ProgramCache {
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
-			if (disk != nullptr && entry == programs.end()) {
+			if (disk != nullptr && entry == nullptr) {
 				std::vector<uint8_t> payload;
 				if (ShaderDiskCache::EncodeSourceRecord(true, false, nullptr, payload)) {
 					StoreEntry(true, params.hash, source_key, cached_source, payload);
@@ -1428,7 +1823,7 @@ struct PipelineCache::ProgramCache {
 		}
 		const bool uses_clock = UsesShaderClock(translated.program);
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
-		if (entry == programs.end()) {
+		if (entry == nullptr) {
 			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 			if (disk != nullptr) {
 				std::vector<uint8_t> payload;
@@ -1446,10 +1841,10 @@ struct PipelineCache::ProgramCache {
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
-		if (entry == programs.end()) {
+		if (entry == nullptr) {
 			{
 				std::unique_lock programs_lock(programs_mutex);
-				entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
+				entry = &*programs.try_emplace(lookup_key, std::move(*plan)).first;
 			}
 			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 				return ShaderProgram {};
@@ -1540,13 +1935,51 @@ struct PipelineCache::ProgramCache {
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
 	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+		// Resolving the call targets and re-reading every callee to validate the kept expansion
+		// was ~7.6 us a dispatch, 13 000 dispatches a second (10 % of the GPU thread in the
+		// jungle, 2026-10-10). The same shader with the same user data reuses the result for
+		// 50 ms before it is validated again. KYTY_EXPAND_REUSE_MS=0 validates every time.
+		static const auto reuse = std::chrono::milliseconds([] {
+			const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
+			return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
+		}());
+		const auto now = std::chrono::steady_clock::now();
+		uint64_t   reuse_key = 0;
+		if (reuse.count() != 0) {
+			reuse_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
+			                                 params.hash ^ params.Base() ^
+			                                     (static_cast<uint64_t>(wave_size) << 56u) ^
+			                                     (static_cast<uint64_t>(params.code.size()) << 32u));
+			if (const auto it = expand_reuse.find(reuse_key);
+			    it != expand_reuse.end() && now - it->second.validated < reuse) {
+				expanded = it->second.code;
+				return;
+			}
+		}
+		struct Remember {
+			std::unordered_map<uint64_t, ExpandReused>& map;
+			uint64_t                               key;
+			std::chrono::steady_clock::time_point  now;
+			const std::vector<uint32_t>&           result;
+			~Remember() {
+				if (key == 0) {
+					return;
+				}
+				if (map.size() > 4096) {
+					map.clear();
+				}
+				auto& entry     = map[key];
+				entry.code      = result;
+				entry.validated = now;
+			}
+		} remember {expand_reuse, reuse_key, now, expanded};
 		std::string reason;
 		if (!function_expander.Expand(
 		        params.code, params.Base(), user_data,
 		        [](uint64_t address, std::span<uint32_t> words) {
 			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
 		        },
-		        expanded, reason, wave_size)) {
+		        expanded, reason, wave_size, params.hash)) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
@@ -1555,11 +1988,23 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>    programs;
+	using ProgramsMap = std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>;
+	ProgramsMap                                                    programs;
+	struct FastEntry {
+		ProgramsMap::value_type*              entry = nullptr;
+		std::chrono::steady_clock::time_point validated;
+	};
+	std::unordered_map<uint64_t, FastEntry>                        fast_entries;
 	// Taken exclusively by the GPU thread when it inserts into programs (entries are never
 	// erased, so pointers to them stay valid), shared by the draw-prep scanner's lookups.
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
+	std::unordered_set<uint64_t>                                   gave_up_fast;
+	struct ExpandReused {
+		std::vector<uint32_t>                 code;
+		std::chrono::steady_clock::time_point validated;
+	};
+	std::unordered_map<uint64_t, ExpandReused>                     expand_reuse;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
@@ -2202,10 +2647,16 @@ bool PipelineCache::DescribeGraphicsStages(
 			static std::unordered_set<uint64_t> logged;
 			std::lock_guard                     lock(logged_mutex);
 			if (logged.insert(vertex_params[0].hash).second) {
-				LOGF("mesh shader 0x%016" PRIx64 " exceeds host limits, draws skipped: wave%u "
-				     "threads=%u vertices=%u primitives=%u LDS=%u\n",
-				     vertex_params[0].hash, mesh.wave_size, mesh.HostThreads(), mesh.max_vertices,
-				     mesh.max_primitives, mesh.lds_size_dwords);
+				std::fprintf(stderr,
+				             "[mesh-limits] mesh shader 0x%016" PRIx64
+				             " exceeds host limits, draws skipped: wave%u threads=%u passes=%u "
+				             "vertices=%u/%u primitives=%u/%u LDS=%u/%u bytes fast=%d\n",
+				             vertex_params[0].hash, mesh.wave_size, mesh.HostThreads(), mesh.passes,
+				             mesh.max_vertices, limits.maxMeshOutputVertices, mesh.max_primitives,
+				             limits.maxMeshOutputPrimitives,
+				             static_cast<uint32_t>(mesh.lds_size_dwords * sizeof(uint32_t)),
+				             limits.maxMeshSharedMemorySize, mesh.fast_launch ? 1 : 0);
+				std::fflush(stderr);
 			}
 			return false;
 		}
@@ -2675,8 +3126,34 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// Stencil does not count: UI libraries clip their panels with stencil masks.
 	const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
 	                        vertex_words <= g_pipeline_sync_ui_vs_words;
-	if (may_defer && spirv_words > g_pipeline_sync_words && !layer_draw && m_compiler != nullptr &&
-	    !m_compiler->Stopped()) {
+	// A draw whose shaders store to memory (UAV buffers or images) produces data later work
+	// reads -- Wolverine's GPU-driven draws take their counts and instances from it. Skipping it
+	// while its pipeline compiles left that data unwritten: the next draws read garbage counts and
+	// faulted (device lost as the title scene first appeared, ~1 run in 4). These compile at once.
+	// KYTY_DEFER_WRITING_DRAWS=1 restores deferring them.
+	static const bool defer_writing = std::getenv("KYTY_DEFER_WRITING_DRAWS") != nullptr;
+	const auto stage_writes = [](const auto* program) {
+		if (program == nullptr) {
+			return false;
+		}
+		for (const auto& buffer: program->info.buffers) {
+			if (buffer.written || buffer.atomic) {
+				return true;
+			}
+		}
+		for (const auto& image: program->info.images) {
+			if (image.written || image.atomic) {
+				return true;
+			}
+		}
+		return false;
+	};
+	bool writes_memory = ps_active && stage_writes(ps_input_info->stage.program);
+	for (const auto& info: vertex_info) {
+		writes_memory = writes_memory || stage_writes(info.stage.program);
+	}
+	if (may_defer && (defer_writing || !writes_memory) && spirv_words > g_pipeline_sync_words &&
+	    !layer_draw && m_compiler != nullptr && !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
 		// the background, and its draws are skipped until it is ready.
 		auto job          = std::make_shared<PendingGraphicsPipeline>();

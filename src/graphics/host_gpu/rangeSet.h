@@ -106,7 +106,8 @@ public:
 		}
 	}
 
-	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	[[nodiscard]] bool   Empty() const { return m_ranges.empty(); }
+	[[nodiscard]] size_t Count() const { return m_ranges.size(); }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {

@@ -418,6 +418,9 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	// Downloads of the windows the game threads keep reading back, behind this submission's
+	// writes, in the recording about to be submitted (BufferCache::EagerDownloads).
+	m_renderer.GetBufferCache().EagerDownloads();
 	GetScheduler().Flush();
 }
 
@@ -661,6 +664,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	Common::PreferPerformanceCores("GPU thread");
+	Common::RaiseGpuThreadPriority();
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
@@ -1158,6 +1162,30 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+// The CP writes an indirect draw's start instance into the SH register START_INST_LOC names
+// before the draw, as hardware does: fast-launch mesh shaders add that SGPR to their instance
+// VGPR themselves (GPU-driven draws pick per-instance records, materials among them, with it).
+// KYTY_START_INSTANCE_SGPR=0 restores the old behaviour (the register keeps the guest's value).
+void CommandProcessor::WriteIndirectStartInstance(uint32_t start_instance) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_START_INSTANCE_SGPR");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto reg = m_start_instance_register;
+	if (static const bool log = std::getenv("KYTY_LOG_START_INST") != nullptr; log) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 40) {
+			std::fprintf(stderr, "[start-inst] cpu reg=0x%x value=%u func=%d\n", reg, start_instance,
+			             reg < Pm4::SH_NUM && g_hw_sh_indirect_func[reg] != nullptr ? 1 : 0);
+		}
+	}
+	if (!enabled || reg == 0 || reg >= Pm4::SH_NUM || g_hw_sh_indirect_func[reg] == nullptr) {
+		return;
+	}
+	SetUserDataMarker(HW::UserSgprType::Unknown);
+	g_hw_sh_indirect_func[reg](*this, reg, start_instance);
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
@@ -1172,8 +1200,30 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		// the whole GPU (6.7 % of the GPU thread in the jungle for the fast-launch draws,
 		// 2026-10-03, and 2.9 % for the rest, 2026-10-05).
 		m_num_instances_args = reinterpret_cast<uint64_t>(args_addr);
-		DrawIndexAuto({.offset_source    = DrawOffsetSource::IndirectArgs,
-		               .gpu_args_address = reinterpret_cast<uint64_t>(args_addr)});
+		// START_INST_LOC: the shader loads the start instance into that user SGPR itself.
+		uint32_t start_instance_sgpr = 0;
+		if (static const bool enabled = [] {
+			    const char* value = std::getenv("KYTY_START_INSTANCE_SGPR");
+			    return value == nullptr || value[0] != '0';
+		    }();
+		    enabled && m_start_instance_register >= Pm4::SPI_SHADER_USER_DATA_GS_0 &&
+		    m_start_instance_register <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
+			start_instance_sgpr = m_start_instance_register - Pm4::SPI_SHADER_USER_DATA_GS_0 + 1u;
+		}
+		if (static const bool log = std::getenv("KYTY_LOG_START_INST") != nullptr; log) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 40) {
+				std::fprintf(stderr, "[start-inst] gpu reg=0x%x sgpr=%u args=%u %u %u %u\n",
+				             m_start_instance_register, start_instance_sgpr,
+				             static_cast<const uint32_t*>(args_addr)[0],
+				             static_cast<const uint32_t*>(args_addr)[1],
+				             static_cast<const uint32_t*>(args_addr)[2],
+				             static_cast<const uint32_t*>(args_addr)[3]);
+			}
+		}
+		DrawIndexAuto({.offset_source       = DrawOffsetSource::IndirectArgs,
+		               .gpu_args_address    = reinterpret_cast<uint64_t>(args_addr),
+		               .start_instance_sgpr = start_instance_sgpr});
 		return;
 	}
 	if (!indexed) {
@@ -1186,6 +1236,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		}
 		m_num_instances = args.instance_count;
 		m_num_instances_args = 0;
+		WriteIndirectStartInstance(args.start_instance_location);
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
 		               .first_vertex   = args.start_vertex_location,
@@ -1290,6 +1341,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			auto* args      = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			m_num_instances = args->instance_count;
 			m_num_instances_args = 0;
+			WriteIndirectStartInstance(args->start_instance_location);
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,

@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <utility>
 
+#include <cstdio>
+#define TESS_LOG(...) do { LOGF(__VA_ARGS__); std::fprintf(stderr, "[tess] " __VA_ARGS__); } while (0)
+
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
 
@@ -85,8 +88,17 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 	for (const auto& inst: program.instructions) {
 		// Stage exits preserve the active path's definitions. An internal join
 		// would require merging register definitions.
-		if (IsDirectBranch(inst.opcode) && inst.branch_target != program.instructions.back().pc) {
-			LOGF("%s tessellation program has an internal branch at pc 0x%08x\n",
+		// KYTY_TESS_LINEAR=1 (default): scan through internal branches linearly; every ring
+		// access must still have an affine address and all of them must agree on one stride, so
+		// a definition mixed up across paths shows as a rejection. The terrain HS
+		// a9f31c39ad53f06c computes its ring addresses before its first internal branch.
+		static const bool linear = [] {
+			const char* value = std::getenv("KYTY_TESS_LINEAR");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!linear && IsDirectBranch(inst.opcode) &&
+		    inst.branch_target != program.instructions.back().pc) {
+			TESS_LOG("%s tessellation program has an internal branch at pc 0x%08x\n",
 			     local ? "LS" : "HS", inst.pc);
 			return std::nullopt;
 		}
@@ -103,7 +115,7 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
 			if (address.kind != Kind::Affine) {
-				LOGF("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
+				TESS_LOG("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
 				     inst.pc);
 				return std::nullopt;
 			}
@@ -111,7 +123,7 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 				const auto expected = control_read ? input_stride : stride;
 				if ((address.coefficient & 3u) != 0u ||
 				    (expected != 0u && expected != address.coefficient)) {
-					LOGF("%s tessellation stride %u at pc 0x%08x disagrees with %u\n",
+					TESS_LOG("%s tessellation stride %u at pc 0x%08x disagrees with %u\n",
 					     local ? "LS" : "HS", address.coefficient, inst.pc, expected);
 					return std::nullopt;
 				}
@@ -133,6 +145,16 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_AND_B32:
+				// The patch ordinal (low byte of the packed HS ID) as an AND instead of a BFE
+				// (Wolverine's terrain HS a9f31c39ad53f06c): one patch, so 0.
+				if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+				     rhs.coefficient == 0u && rhs.constant == 0xffu) ||
+				    (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine &&
+				     lhs.coefficient == 0u && lhs.constant == 0xffu))
+					value = constant(0u);
+				break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
 			case Opcode::V_LSHL_ADD_U32:
@@ -160,7 +182,7 @@ std::optional<uint32_t> ReflectTessellationStride(const Decoder::Program& progra
 		registers.at(inst.dst.reg) = value;
 	}
 	if (stride == 0u) {
-		LOGF("%s tessellation program has no attribute stride\n", local ? "LS" : "HS");
+		TESS_LOG("%s tessellation program has no attribute stride\n", local ? "LS" : "HS");
 		return std::nullopt;
 	}
 	return stride;
@@ -230,7 +252,7 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		return true;
 	}
 	const auto unsupported = [&](const char* what) {
-		LOGF("%s tessellation lowering does not model %s\n",
+		TESS_LOG("%s tessellation lowering does not model %s\n",
 		     options.stage == ShaderType::Local                 ? "LS"
 		     : options.stage == ShaderType::TessellationControl ? "HS"
 		                                                       : "TES",
@@ -238,6 +260,41 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		return false;
 	};
 	const auto& tess = options.input_info.vertex->tess;
+	// The HS ID is InvocationId << 8; its low byte (the patch ordinal) is 0 for the one patch
+	// an invocation group runs. The terrain HS a9f31c39ad53f06c reads it with an AND 0xff or a
+	// byte extract, which constant propagation does not fold: fold those to 0 here, so the
+	// patch-relative ring and factor addresses become immediates.
+	{
+		const auto shift_amount = [](const Value& value, uint32_t& amount) {
+			const auto* shl = value.Resolve().TryInstruction();
+			if (shl == nullptr || shl->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+			    !shl->Arg(1).Resolve().IsImmediate())
+				return false;
+			amount = shl->Arg(1).Resolve().U32();
+			return amount < 32u;
+		};
+		for (auto* block: program.blocks) {
+			for (auto& inst: *block) {
+				uint32_t amount = 0;
+				if (inst.GetOpcode() == ValueOpcode::BitwiseAnd32) {
+					for (uint32_t side = 0; side < 2u; side++) {
+						const auto mask = inst.Arg(side).Resolve();
+						if (mask.IsImmediate() && shift_amount(inst.Arg(1u - side), amount) &&
+						    (mask.U32() >> amount) == 0u) {
+							inst.ReplaceUsesWith(Value(0u));
+							break;
+						}
+					}
+				} else if (inst.GetOpcode() == ValueOpcode::BitFieldUExtract &&
+				           inst.Arg(1).Resolve().IsImmediate() &&
+				           inst.Arg(2).Resolve().IsImmediate() &&
+				           shift_amount(inst.Arg(0), amount) &&
+				           inst.Arg(1).Resolve().U32() + inst.Arg(2).Resolve().U32() <= amount) {
+					inst.ReplaceUsesWith(Value(0u));
+				}
+			}
+		}
+	}
 	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
 	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
 	for (auto* block: program.blocks) {

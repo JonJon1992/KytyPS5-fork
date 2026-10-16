@@ -5,6 +5,9 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <fmt/format.h>
+#include <string>
 #include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -536,6 +539,41 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         : sint_output ? TypeI32Vector(state, 4)
 		                                       : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output || sint_output);
+		// KYTY_DEBUG_MAGENTA_PS=<hash>: that pixel shader's float MRT0 export becomes magenta,
+		// to see where its draws land (diagnostic).
+		if (static const std::string magenta = [] {
+			    const char* env = std::getenv("KYTY_DEBUG_MAGENTA_PS");
+			    return env != nullptr ? std::string(env) : std::string();
+		    }();
+		    !magenta.empty() && mrt && !uint_output && !sint_output &&
+		    [&] {
+			    static std::atomic<uint32_t> printed {0};
+			    if (printed.fetch_add(1) < 400)
+				    std::fprintf(stderr, "[magenta] ps %016llx mrt%u uint=%d\n",
+				                 static_cast<unsigned long long>(state.program.shader_hash),
+				                 exp.index, uint_output ? 1 : 0);
+			    return true;
+		    }() &&
+		    magenta.find(fmt::format("{:016x}", state.program.shader_hash)) != std::string::npos) {
+			value = state.builder.AllocateId();
+			if (uint_output || sint_output) {
+				const auto all = ConstantU32(state, 0xffffffffu);
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), value,
+				                          all, ConstantU32(state, 0), all, all);
+			} else {
+				// The n-th hash in the list gets the n-th color (magenta, green, black, blue, ...),
+				// to tell several shaders apart in one run.
+				const auto pos   = magenta.find(fmt::format("{:016x}", state.program.shader_hash));
+				const auto index = static_cast<size_t>(
+				    std::count(magenta.begin(), magenta.begin() + static_cast<ptrdiff_t>(pos), ','));
+				static constexpr float Colors[][3] = {{1, 0, 1}, {0, 1, 0}, {0, 0, 0}, {0, 0, 1},
+				                                      {1, 1, 0}, {0, 1, 1}, {1, 1, 1}, {1, 0, 0}};
+				const auto& c = Colors[index % 8];
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), value,
+				                          ConstantF32(state, c[0]), ConstantF32(state, c[1]),
+				                          ConstantF32(state, c[2]), ConstantF32(state, 1.0f));
+			}
+		}
 		if (sint_output) {
 			const auto signed_value = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpBitcast, vector_type, signed_value, value);
@@ -839,6 +877,18 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// KYTY_RFL_IDENTITY_HASHES=<hash,...>: in those shaders each lane keeps its own value, for
+	// values the game expects to be wave-uniform that the host's lane packing makes divergent
+	// (experiment).
+	if (static const std::string identity = [] {
+		    const char* env = std::getenv("KYTY_RFL_IDENTITY_HASHES");
+		    return env != nullptr ? std::string(env) : std::string();
+	    }();
+	    !identity.empty() &&
+	    ((identity == "ps" && ctx.state.program.stage == ShaderType::Pixel) ||
+	     identity.find(fmt::format("{:016x}", ctx.state.program.shader_hash)) != std::string::npos)) {
+		return ctx.Def(inst.Arg(0));
+	}
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);
 	return ctx.Shuffle(inst, 0, lane);

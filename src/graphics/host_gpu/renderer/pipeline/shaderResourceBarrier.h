@@ -21,6 +21,17 @@ void ShaderWriteHazardBarrier(const CommandRecorder& vk_buffer,
                               vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(const CommandRecorder& vk_buffer, vk::PipelineStageFlags source_stages);
 
+// KYTY_DISPATCH_SYNC=0 (experiment, default 1): no barrier around every compute dispatch; the
+// guest's own sync points order dispatches instead (CS/PS partial flushes already emit a global
+// barrier, and ACQUIRE_MEM then emits one too).
+inline bool DispatchSyncEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_SYNC");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SHADERRESOURCEBARRIER_H_

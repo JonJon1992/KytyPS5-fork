@@ -157,6 +157,8 @@ public:
 	void               FlushFeedback(const Heap& heap);
 	[[nodiscard]] bool WasSampled(const Heap& heap, uint32_t key) const;
 	void                      CollectUnusedImages(std::vector<ImageId>& unused);
+	// The opposite, for the texture dump: images with a key some draw sampled since the marks.
+	void                      CollectSampledImages(std::vector<ImageId>& used);
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;

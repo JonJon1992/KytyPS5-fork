@@ -1335,8 +1335,17 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
 	std::error_code error;
 	const auto      dir = save_directory(get_title_id(), convert->src_dir_name->data,
 	                                     convert->user_id);
-	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT
-	                                           : SAVE_DATA_ERROR_NOT_FOUND;
+	if (std::filesystem::exists(dir, error)) {
+		return SAVE_DATA_ERROR_NO_NEED_CONVERT;
+	}
+	// Wolverine converts each slot onto itself before its first save and treats NOT_FOUND as a
+	// failure (error dialog, save abandoned). A missing save converted onto itself has nothing to
+	// convert: answer as for an existing one and leave creating it to the mount that follows.
+	const bool same_dir =
+	    convert->dst_dir_name == nullptr ||
+	    std::strncmp(convert->dst_dir_name->data, convert->src_dir_name->data,
+	                 sizeof(convert->src_dir_name->data)) == 0;
+	return same_dir ? SAVE_DATA_ERROR_NO_NEED_CONVERT : SAVE_DATA_ERROR_NOT_FOUND;
 }
 
 } // namespace SaveData

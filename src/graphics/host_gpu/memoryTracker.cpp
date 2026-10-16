@@ -134,6 +134,20 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	bool all = true;
+	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		if (manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+			all = false; // the CPU wrote here since: its bytes are newer than the GPU's
+			return;
+		}
+		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
+	});
+	return all;
+}
+
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

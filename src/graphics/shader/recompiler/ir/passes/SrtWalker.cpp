@@ -601,7 +601,37 @@ RawAddress ComputeRawAddress(bool const_buffer, int64_t immediate, uint64_t low,
 	                                                                  : RawAddress::Fail;
 }
 
+thread_local bool t_evaluating_condition = false;
+
 } // namespace
+
+bool SrtEvaluatingCondition() {
+	return t_evaluating_condition;
+}
+
+void SrtSetEvaluatingCondition(bool evaluating) {
+	t_evaluating_condition = evaluating;
+}
+
+namespace {
+thread_local uint64_t t_condition_refusals = 0;
+} // namespace
+
+uint64_t SrtConditionRefusals() {
+	return t_condition_refusals;
+}
+
+void SrtNoteConditionRefusal() {
+	t_condition_refusals++;
+}
+
+bool SrtConditionsNoWait() {
+	static const bool no_wait = [] {
+		const char* value = std::getenv("KYTY_SRT_CONDITIONS_WAIT");
+		return value == nullptr || value[0] != '1';
+	}();
+	return no_wait;
+}
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
@@ -992,16 +1022,38 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		case RawAddress::Zero: result = 0; return true;
 		case RawAddress::Read: break;
 	}
-	return ReadRawWord(address, base, result);
+	m_reading_inst = &inst;
+	const bool ok  = ReadRawWord(address, base, result);
+	m_reading_inst = nullptr;
+	return ok;
 }
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
-	if (m_fill_active && m_runtime.gpu_written(address, sizeof(uint32_t))) {
+	if (m_fill_active && (m_fill_any || m_reading_inst == m_fill_inst) &&
+	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
 		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
 		// the command (SrtGpuFill), where reading them here would wait for the GPU.
 		m_runtime.gpu_fills->push_back({m_fill_offset, address});
 		result = 0;
 		return true;
+	}
+	// KYTY_DEBUG_FILL_MISS=1: a read of GPU-written bytes the walker does not leave to the GPU
+	// (it waits for the GPU): the fill window's state, first 24.
+	if (static const bool debug_miss = std::getenv("KYTY_DEBUG_FILL_MISS") != nullptr;
+	    debug_miss && !t_evaluating_condition && m_runtime.gpu_written != nullptr &&
+	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
+		static std::atomic<uint32_t> printed {0};
+		if (printed.fetch_add(1) < 40) {
+			std::fprintf(stderr,
+			             "[fill-miss] %016llx addr=0x%llx active=%d any=%d same_inst=%d fill_inst=%d "
+			             "reading_inst=%d trace=%d cond=%d native=%d\n",
+			             static_cast<unsigned long long>(m_program.shader_hash),
+			             static_cast<unsigned long long>(address), m_fill_active ? 1 : 0,
+			             m_fill_any ? 1 : 0, m_reading_inst == m_fill_inst ? 1 : 0,
+			             m_fill_inst != nullptr ? 1 : 0, m_reading_inst != nullptr ? 1 : 0,
+			             m_trace != nullptr ? 1 : 0, t_evaluating_condition ? 1 : 0,
+			             m_native != nullptr ? 1 : 0);
+		}
 	}
 	uint32_t word = 0;
 	if (m_runtime.map_clean_page != nullptr) {
@@ -1228,8 +1280,21 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			// tables: ReadRawWord leaves GPU-written bytes to the GPU.
 			m_fill_active = true;
 			m_fill_offset = read.flat_offset;
+			m_fill_any    = m_program.gpu_fill_slots[slot] == 1u;
+			m_fill_inst   = read.value.Resolve().TryInstruction();
+			const auto fills_before = m_runtime.gpu_fills->size();
 			const bool ok = Evaluate(read.value, flat[read.flat_offset]);
 			m_fill_active = false;
+			m_fill_any    = true;
+			if (m_runtime.gpu_fills->size() != fills_before && m_fill_inst != nullptr) {
+				// The read left a placeholder (0) for the GPU to fill: forget it, so a host use of the
+				// same value in this walk (a branch condition) reads it again instead of taking 0.
+				const auto index = m_fill_inst->EvaluationIndex(m_program.evaluation_value_count);
+				if (index < m_context.values.size()) {
+					m_context.values[index].generation = 0;
+				}
+			}
+			m_fill_inst = nullptr;
 			return ok;
 		}
 		if (evaluator.UseNativeTables()) {
@@ -1255,6 +1320,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
 			return 2u;
 		}
+		struct ConditionScope {
+			ConditionScope() { t_evaluating_condition = true; }
+			~ConditionScope() { t_evaluating_condition = false; }
+		} scope;
 		uint32_t condition = 0;
 		bool     known     = false;
 		if (predicate.UseNativeTables()) {
@@ -1379,6 +1448,14 @@ namespace {
 bool TraceEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_TRACE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool TraceFillGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_TRACE_FILL_GUARD");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
@@ -1898,9 +1975,24 @@ bool SrtTraceSession::RunOps(uint32_t end) {
 						status = true;
 						value  = 0u;
 						break;
-					case RawAddress::Read:
-						status = m_walkers[op.walker]->ReadRawWord(address, base, value);
+					case RawAddress::Read: {
+						auto* reader           = m_walkers[op.walker];
+						// A replayed read of GPU-written bytes outside the walker's GPU-fill window
+						// (SrtGpuFill) would wait for the GPU here, where the interpreter reaches the
+						// same read inside the window and leaves it to the GPU: let Serve abandon the
+						// trace and the interpreter take this refresh. KYTY_SRT_TRACE_FILL_GUARD=0 off.
+						if (TraceFillGuardEnabled() && reader->m_runtime.gpu_written != nullptr &&
+						    reader->m_runtime.gpu_fills != nullptr &&
+						    !(reader->m_fill_active &&
+						      (reader->m_fill_any || op.inst == reader->m_fill_inst)) &&
+						    reader->m_runtime.gpu_written(address, sizeof(uint32_t))) {
+							return false;
+						}
+						reader->m_reading_inst = op.inst;
+						status                 = reader->ReadRawWord(address, base, value);
+						reader->m_reading_inst = nullptr;
 						break;
+					}
 				}
 				break;
 			}

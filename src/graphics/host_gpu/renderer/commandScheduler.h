@@ -206,6 +206,11 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
+	// KYTY_GPU_TIME (see commandScheduler.cpp).
+	struct GpuTimer;
+	std::unique_ptr<GpuTimer> m_gpu_timer;
+	uint32_t                  m_timer_slot = UINT32_MAX;
+
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;

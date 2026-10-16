@@ -31,6 +31,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -611,7 +612,9 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		     descriptor.MinLod(), descriptor.LastLevel());
 	}
 	const auto base_lod = view.base_level * 256u;
-	if (descriptor.MinLod() > base_lod) {
+	// KYTY_IGNORE_MIN_LOD=1: diagnostic, sample every mip regardless of the T#'s MIN_LOD clamp.
+	static const bool ignore_min_lod = std::getenv("KYTY_IGNORE_MIN_LOD") != nullptr;
+	if (!ignore_min_lod && descriptor.MinLod() > base_lod) {
 		view.min_lod = descriptor.MinLod() - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
@@ -1152,10 +1155,101 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 		case Prospero::ImageType::kColor2DArray:
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
 			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
-		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
+		// A cube's faces are a 2D array to the hardware: shaders that address faces themselves
+		// (a 2D-array sample of a cube T#) were left the transparent placeholder, ~10 % of the
+		// jungle's heap keys. KYTY_BINDLESS_CUBE_AS_ARRAY=0 restores that.
+		case Prospero::ImageType::kCube:
+			return binding == ShaderRecompiler::IR::BindlessImagesCube ||
+			       (binding == ShaderRecompiler::IR::BindlessImages2DArray && [] {
+				       static const bool enabled = [] {
+					       const char* value = std::getenv("KYTY_BINDLESS_CUBE_AS_ARRAY");
+					       return value == nullptr || value[0] != '0';
+				       }();
+				       return enabled;
+			       }());
 		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
 		default: return false;
 	}
+}
+
+// KYTY_BINDLESS_STATS=1: per-reason counts of bindless key resolutions, to stderr every 64 frames.
+enum BindlessStat : uint32_t {
+	StatOk,
+	StatNoBacking,
+	StatNullDesc,
+	StatNotFloat,
+	StatBadType,
+	StatEmptyImage,
+	StatUnregistered,
+	StatNoSlot,
+	StatBudgetHit,
+	StatRequested,
+	StatBaseLevel,
+	StatMinLod,
+	StatRevalidated,
+	StatCount
+};
+static std::atomic<uint64_t> g_bindless_stats[StatCount] {};
+static std::atomic<uint64_t> g_bindless_width_stats[16] {};
+static std::atomic<uint64_t> g_bindless_levels_stats[16] {};
+static std::atomic<uint64_t> g_bindless_minlod_stats[16] {};
+static std::atomic<uint64_t> g_bindless_type_stats[64] {};
+static bool BindlessStatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_BINDLESS_STATS") != nullptr;
+	return enabled;
+}
+static void BindlessStat(BindlessStat stat, uint64_t n = 1) {
+	if (BindlessStatsEnabled()) {
+		g_bindless_stats[stat].fetch_add(n, std::memory_order_relaxed);
+	}
+}
+static void BindlessStatsReport(uint64_t frame) {
+	if (!BindlessStatsEnabled() || (frame & 63u) != 0) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[bindless-stats] frame=%llu ok=%llu nobacking=%llu null=%llu notfloat=%llu "
+	             "badtype=%llu empty=%llu unregistered=%llu noslot=%llu budget=%llu requested=%llu",
+	             static_cast<unsigned long long>(frame),
+	             static_cast<unsigned long long>(g_bindless_stats[StatOk].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatNoBacking].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatNullDesc].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatNotFloat].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatBadType].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatEmptyImage].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatUnregistered].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatNoSlot].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatBudgetHit].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatRequested].load()));
+	std::fprintf(stderr, " baselevel=%llu minlod=%llu revalidated=%llu widthlog2:",
+	             static_cast<unsigned long long>(g_bindless_stats[StatBaseLevel].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatMinLod].load()),
+	             static_cast<unsigned long long>(g_bindless_stats[StatRevalidated].load()));
+	for (uint32_t i = 0; i < 16; i++) {
+		if (const auto n = g_bindless_width_stats[i].load(); n != 0) {
+			std::fprintf(stderr, " %u=%llu", i, static_cast<unsigned long long>(n));
+		}
+	}
+	std::fprintf(stderr, " minlodlevels:");
+	for (uint32_t i = 0; i < 16; i++) {
+		if (const auto n = g_bindless_minlod_stats[i].load(); n != 0) {
+			std::fprintf(stderr, " %u=%llu", i, static_cast<unsigned long long>(n));
+		}
+	}
+	std::fprintf(stderr, " lastlevel:");
+	for (uint32_t i = 0; i < 16; i++) {
+		if (const auto n = g_bindless_levels_stats[i].load(); n != 0) {
+			std::fprintf(stderr, " %u=%llu", i, static_cast<unsigned long long>(n));
+		}
+	}
+	std::fprintf(stderr, " types:");
+	for (uint32_t i = 0; i < 64; i++) {
+		if (const auto n = g_bindless_type_stats[i].load(); n != 0) {
+			std::fprintf(stderr, " %u=%llu", i, static_cast<unsigned long long>(n));
+		}
+	}
+	std::fprintf(stderr, "\n");
+	std::fflush(stderr);
 }
 
 bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key) {
@@ -1167,12 +1261,35 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.stale[key]    = 0;
 	heap.descriptors[key] = {};
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+		BindlessStat(StatNoBacking);
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	if (!BindlessCompatible(descriptor, heap.binding)) {
+		if (BindlessStatsEnabled()) {
+			if (descriptor.IsNull()) {
+				BindlessStat(StatNullDesc);
+			} else if (Prospero::SampledTextureNumericClass(descriptor.Format()) !=
+			           Prospero::TextureNumericClass::Float) {
+				BindlessStat(StatNotFloat);
+				std::fprintf(stderr,
+				             "[bindless-notfloat] key=%u binding=%u format=%u type=%u %ux%u "
+				             "resource_numeric=%u base=0x%llx\n",
+				             key, heap.binding, static_cast<uint32_t>(descriptor.Format()),
+				             static_cast<uint32_t>(descriptor.Type()),
+				             static_cast<uint32_t>(descriptor.Width5()) + 1u,
+				             static_cast<uint32_t>(descriptor.Height5()) + 1u,
+				             static_cast<uint32_t>(heap.resource.numeric_class),
+				             static_cast<unsigned long long>(descriptor.Base40()));
+			} else {
+				BindlessStat(StatBadType);
+				g_bindless_type_stats[(static_cast<uint32_t>(descriptor.Type()) & 15u) |
+				                      ((heap.binding & 3u) << 4u)]
+				    .fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -1180,6 +1297,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
+		BindlessStat(StatEmptyImage);
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -1190,13 +1308,32 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		// Dropped by the cache (its destruction waits for the GPU): a slot holding its view would
 		// outlive it, since its unregistration is over. The key is asked for again next frame.
 		heap.settled[key] = 0;
+		BindlessStat(StatUnregistered);
 		table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 		return false;
 	}
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
+		BindlessStat(StatNoSlot);
 		table.SetTranslation(heap, key, 0u);
 		return false;
+	}
+	BindlessStat(StatOk);
+	if (BindlessStatsEnabled()) {
+		// Width class, base level and min-LOD clamp of resolved textures: is streaming stuck low?
+		const uint32_t width = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+		uint32_t       log2  = 0;
+		while ((1u << (log2 + 1u)) <= width && log2 < 15u) log2++;
+		g_bindless_width_stats[log2].fetch_add(1, std::memory_order_relaxed);
+		if (descriptor.BaseLevel() != 0) BindlessStat(StatBaseLevel);
+		if (descriptor.MinLod() != 0) {
+			BindlessStat(StatMinLod);
+			// Clamp in whole levels below the top, bucketed: 0..15.
+			const uint32_t clamp_levels = std::min<uint32_t>(descriptor.MinLod() / 256u, 15u);
+			g_bindless_minlod_stats[clamp_levels].fetch_add(1, std::memory_order_relaxed);
+		}
+		g_bindless_levels_stats[std::min<uint32_t>(descriptor.LastLevel(), 15u)].fetch_add(
+		    1, std::memory_order_relaxed);
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -1682,7 +1819,20 @@ static void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
 void RenderExecutor::ResolveBindlessRequests() {
 	KYTY_PROFILER_FUNCTION();
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
-	if (frame == m_bindless_frame) {
+	// One feedback round a presented frame left newly seen textures transparent for several
+	// frames after a camera cut (a second or more at this title's frame rates): alpha-tested
+	// foliage, debris and characters vanished until then. While requests keep coming, further
+	// rounds run within the frame as soon as the previous snapshot has executed.
+	// KYTY_BINDLESS_ROUNDS=<n> caps the rounds a frame (default 4; 1 restores one a frame).
+	static const uint32_t max_rounds = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_ROUNDS");
+		const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 4ul;
+		return static_cast<uint32_t>(n < 1 ? 1 : n);
+	}();
+	static uint32_t rounds_this_frame = 0;
+	static uint32_t last_requested    = 0;
+	if (frame == m_bindless_frame &&
+	    (last_requested == 0 || rounds_this_frame >= max_rounds)) {
 		return;
 	}
 	auto& table     = m_context.GetBindlessTable();
@@ -1692,6 +1842,10 @@ void RenderExecutor::ResolveBindlessRequests() {
 	if (table.SnapshotRecorded() && !table.SnapshotReady(scheduler)) {
 		return;
 	}
+	if (frame != m_bindless_frame) {
+		rounds_this_frame = 0;
+	}
+	rounds_this_frame++;
 	m_bindless_frame = frame;
 	if (!table.SnapshotRecorded()) {
 		table.RecordFeedbackSnapshot(scheduler);
@@ -1726,6 +1880,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 				continue;
 			}
 			if (resolved >= Budget) {
+				BindlessStat(StatBudgetHit);
 				break; // still pending: the next frame flags it again
 			}
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
@@ -1753,6 +1908,31 @@ void RenderExecutor::ResolveBindlessRequests() {
 // back to pending, and a draw that samples one again asks for it anew. KYTY_BINDLESS_EVICT=0
 // disables the probe.
 void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame) {
+	// KYTY_DUMP_TEXTURES_TRIGGER (TextureCache::DumpTextureNote): the probe's marks also tell
+	// which bindless textures the frames after the trigger sample.
+	if (static const char* dump_trigger = std::getenv("KYTY_DUMP_TEXTURES_TRIGGER");
+	    dump_trigger != nullptr) {
+		static uint64_t dump_armed = 0;
+		auto&           dump_table = m_context.GetBindlessTable();
+		auto&           dump_cache = m_context.GetTextureCache();
+		if (dump_armed == 0) {
+			std::error_code error;
+			if (std::filesystem::exists(dump_trigger, error)) {
+				std::filesystem::remove(dump_trigger, error);
+				dump_table.ArmUsageProbe();
+				dump_armed = frame;
+				dump_cache.BeginTextureDump(frame);
+			}
+		} else if (dump_armed != UINT64_MAX && snapshot_frame >= dump_armed + 2) {
+			std::vector<ImageId> used;
+			dump_table.CollectSampledImages(used);
+			std::fprintf(stderr, "[texdump] bindless: %zu images sampled since frame %llu\n",
+			             used.size(), static_cast<unsigned long long>(dump_armed));
+			dump_cache.AddTextureDumpImages(used);
+			dump_armed = 0; // the next trigger file starts another dump
+		}
+		return; // no eviction probe meanwhile
+	}
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BINDLESS_EVICT");
 		return value == nullptr || value[0] != '0';

@@ -53,6 +53,9 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// MarkRegionAsGpuModified, atomically skipping the tracker regions that hold CPU-dirty pages
+	// there; false when one did. Pass a page for an all-or-nothing answer.
+	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Calls func(address, bytes) for each part of the range, one per tracker region, that may
 	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).

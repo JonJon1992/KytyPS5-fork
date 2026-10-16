@@ -706,7 +706,17 @@ static int CreateGuestStack(PthreadAttr attr) {
 		return OK;
 	}
 
-	const auto stack_size = RoundStackSize(attr->stack_size);
+	// Host code running on guest threads (HLE libraries, the SysV/Win64 transitions that save
+	// XMM6-15, logging) needs more stack than the console's libraries the game sized its stacks
+	// for: starting a new game in Wolverine overflowed a game thread inside AgcDcbAcquireMem
+	// (0xC00000FD). Every stack the emulator allocates gets this much headroom on top.
+	// KYTY_GUEST_STACK_EXTRA_KB=<n> overrides it (0 restores the game's sizes).
+	static const size_t extra = [] {
+		const char* value = std::getenv("KYTY_GUEST_STACK_EXTRA_KB");
+		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) * 1024u
+		                        : PTHREAD_STACK_EXTRA;
+	}();
+	const auto stack_size = RoundStackSize(attr->stack_size + extra);
 	const auto guard_size = RoundStackSize(attr->guard_size);
 	const auto map_size   = stack_size + guard_size;
 

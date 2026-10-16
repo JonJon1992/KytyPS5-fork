@@ -800,6 +800,22 @@ void BindlessTable::CollectUnusedImages(std::vector<ImageId>& unused) {
 	}
 }
 
+void BindlessTable::CollectSampledImages(std::vector<ImageId>& used) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	m_feedback_snapshot->Invalidate(0, vk::DeviceSize {m_next_region} * sizeof(uint32_t));
+	for (const auto& [image, refs]: m_image_refs) {
+		if (refs.empty()) {
+			continue;
+		}
+		const bool sampled = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) {
+			return snapshot[ref.first->region + ref.second] != ProbeMark;
+		});
+		if (sampled) {
+			used.push_back(refs.front().first->images[refs.front().second]);
+		}
+	}
+}
+
 void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
 }

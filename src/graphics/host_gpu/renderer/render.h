@@ -84,6 +84,9 @@ struct DrawAutoArgs {
 	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
 	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
 	uint64_t         gpu_instance_count_address = 0;
+	// With gpu_args_address: the user SGPR (index + 1, 0 = none) START_INST_LOC names, which
+	// the shader loads from the arguments' start instance (the CP writes it on hardware).
+	uint32_t         start_instance_sgpr        = 0;
 };
 
 struct SubmitInfo {
@@ -284,6 +287,8 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	// Created at the first indirect fast-launch mesh draw with counts on the GPU.
+	std::unique_ptr<MeshIndirectArgs>       m_mesh_args;
 	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
 	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
 	std::unique_ptr<Buffer>                 m_mesh_indirect;

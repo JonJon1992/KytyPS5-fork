@@ -8,6 +8,10 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -230,6 +234,13 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 }
 
 thread_local int g_indirect_failure_line = 0;
+} // namespace
+// Which part of MaterializeResources is reading (diagnostics: KYTY_LOG_GPU_OWNED_SRT).
+thread_local const char* g_materialize_phase = "";
+// The image descriptors as evaluated, before invalid ones are zeroed (KYTY_DEBUG_RESOURCES).
+thread_local std::vector<DescriptorValue> g_debug_raw_images;
+const char* MaterializePhase() { return g_materialize_phase; }
+namespace {
 
 bool FailIndirect(int line) {
 	if (g_indirect_failure_line == 0) {
@@ -261,6 +272,79 @@ bool MaterializeBindlessImage(const DescriptorSource::IndirectDescriptor& indire
 	root.indirect_mapping_offset    = mapping_offset;
 	root.indirect_search_iterations = 0;
 	root.bindless                   = true;
+	return true;
+}
+
+// A material table too large for the per-draw probe (Wolverine's terrain and scatter pick their
+// images by a key from a 20 MB, 1.3M-record table): read it in bulk, keep its unique keys, and
+// reuse them for KYTY_MATERIAL_KEYS_MS (default 2000; the table is asset data). Off with
+// KYTY_MATERIAL_PROBES=0.
+bool LargeMaterialKeys(const ShaderBufferResource& material, uint64_t first, uint64_t step,
+                       uint64_t count, const DescriptorSource::IndirectDescriptor& indirect,
+                       const SrtRuntime& runtime, std::vector<uint32_t>& keys, uint64_t hash) {
+	static const uint64_t max_probes = [] {
+		const char* env = std::getenv("KYTY_MATERIAL_PROBES");
+		// Off by default: the only tables seen this large pick store-only images (a per-material
+		// accumulation the null-image fallback drops), and their 536 candidates are incompatible.
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : uint64_t {0};
+	}();
+	static const int64_t reuse_ms = [] {
+		const char* env = std::getenv("KYTY_MATERIAL_KEYS_MS");
+		return env != nullptr ? std::strtoll(env, nullptr, 10) : int64_t {2000};
+	}();
+	if (count == 0u || count > max_probes || (step & 3u) != 0u) return false;
+	struct Entry {
+		std::vector<uint32_t>                 keys;
+		std::chrono::steady_clock::time_point time;
+	};
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, Entry>    cache;
+	uint64_t id = material.Base48() * 0x9e3779b97f4a7c15ull;
+	for (const uint64_t v: {material.GetSize(), first, step, uint64_t {indirect.key_shift},
+	                        uint64_t {indirect.key_mask}}) {
+		id = (id ^ v) * 0x100000001b3ull + (id >> 29u);
+	}
+	const auto now = std::chrono::steady_clock::now();
+	{
+		std::lock_guard lock(mutex);
+		if (auto it = cache.find(id); it != cache.end() &&
+		    now - it->second.time < std::chrono::milliseconds(reuse_ms)) {
+			keys = it->second.keys;
+			return true;
+		}
+	}
+	std::vector<uint32_t> found;
+	std::vector<uint32_t> chunk;
+	constexpr uint64_t    ChunkProbes = 65536u;
+	const uint64_t        stride_words = step / 4u;
+	for (uint64_t probe = 0; probe < count; probe += ChunkProbes) {
+		const auto n     = std::min(ChunkProbes, count - probe);
+		const auto words = (n - 1u) * stride_words + 1u;
+		chunk.resize(words);
+		if (!ReadScalarTable(material.Base48(), material.GetSize(), first + probe * step, runtime,
+		                     chunk)) {
+			return false;
+		}
+		for (uint64_t i = 0; i < n; ++i) {
+			found.push_back((chunk[i * stride_words] >> indirect.key_shift) & indirect.key_mask);
+		}
+		if ((probe / ChunkProbes) % 4u == 3u) {
+			std::ranges::sort(found);
+			found.erase(std::unique(found.begin(), found.end()), found.end());
+		}
+	}
+	std::ranges::sort(found);
+	found.erase(std::unique(found.begin(), found.end()), found.end());
+	static std::atomic<uint32_t> printed {0};
+	if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr, "[material-keys] %016llx probes=%llu unique=%zu\n",
+		             static_cast<unsigned long long>(hash), static_cast<unsigned long long>(count),
+		             found.size());
+	}
+	keys = found;
+	std::lock_guard lock(mutex);
+	if (cache.size() > 256u) cache.clear();
+	cache[id] = {std::move(found), now};
 	return true;
 }
 
@@ -399,10 +483,28 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			const auto size = material.GetSize();
 			const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
 			const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
-			if (probe_count > MaxIndirectDescriptorProbes) {
+			bool large_keys = false;
+			if (probe_count > MaxIndirectDescriptorProbes && dword_count == 8u &&
+			    LargeMaterialKeys(material, first, step, probe_count, indirect, runtime, keys,
+			                      program.shader_hash)) {
+				// Enumerated from the large-table cache (keys are unique and sorted).
+				large_keys = true;
+			} else if (probe_count > MaxIndirectDescriptorProbes) {
+				static std::atomic<uint32_t> printed {0};
+				if (printed.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::fprintf(stderr,
+					             "[probe-cap] %016llx dwords=%u size=%llu first=%llu step=%llu "
+					             "probes=%llu shift=%u mask=%08x sel_shift=%u tstride=%u toff=%u\n",
+					             static_cast<unsigned long long>(program.shader_hash), dword_count,
+					             (unsigned long long)size, (unsigned long long)first,
+					             (unsigned long long)step, (unsigned long long)probe_count,
+					             indirect.key_shift, indirect.key_mask, indirect.selector_shift,
+					             indirect.table_stride, indirect.table_offset);
+				}
 				return FailIndirect(__LINE__);
 			}
-			if (!read_keys(material, first, step, probe_count)) return FailIndirect(__LINE__);
+			if (!large_keys && !read_keys(material, first, step, probe_count))
+				return FailIndirect(__LINE__);
 			if (indirect.selector_shift == 0u) keys.push_back(0u);
 		}
 		if (indirect.material_source != UINT32_MAX) {
@@ -455,6 +557,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
 		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
+	}
+	if (key_count > 4096u) {
+		static std::atomic<uint32_t> printed {0};
+		if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
+			uint32_t nulls = 0;
+			for (auto d = children_begin; d < descriptors.size(); ++d)
+				nulls += std::ranges::all_of(descriptors[d].dwords, [](uint32_t w) { return w == 0u; });
+			std::fprintf(stderr, "[material-descs] %016llx keys=%zu distinct=%zu null=%u root_null=%d\n",
+			             static_cast<unsigned long long>(program.shader_hash), size_t(key_count),
+			             descriptors.size() - children_begin, nulls,
+			             std::ranges::all_of(descriptors[resource_index].dwords,
+			                                 [](uint32_t w) { return w == 0u; }) ? 1 : 0);
+		}
 	}
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
@@ -1064,6 +1179,52 @@ bool BoundableWriteOperand(const Program& program, Value value, Value predicate,
 
 } // namespace
 
+namespace {
+bool GpuSizedWrittenEnabled(uint64_t shader_hash);
+
+// KYTY_GPU_SIZED_ATOMIC_SHADERS=<hash>[,<hash>...] (hex): atomically updated buffers of the
+// listed shaders also bind a conservative record count when the GPU wrote theirs (with
+// KYTY_GPU_SIZED_WRITTEN on and the shader in its list): only for shaders whose atomics index
+// within the real count (the shader's own data), never ones that rely on out-of-range drops.
+bool GpuSizedAtomicEnabled(uint64_t shader_hash) {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_GPU_SIZED_ATOMIC_SHADERS");
+		if (value == nullptr) return result;
+		const std::string list = value;
+		size_t            at   = 0;
+		while (at < list.size()) {
+			const auto end = std::min(list.find_first_of(",; ", at), list.size());
+			if (end > at) result.push_back(std::strtoull(list.substr(at, end - at).c_str(), nullptr, 16));
+			at = end + 1;
+		}
+		return result;
+	}();
+	return !shaders.empty() && GpuSizedWrittenEnabled(shader_hash) &&
+	       std::find(shaders.begin(), shaders.end(), shader_hash) != shaders.end();
+}
+
+// KYTY_SRT_EXTENTS_NO_WAIT_SHADERS=<hash>[,<hash>...] (hex): KYTY_SRT_EXTENTS_NO_WAIT for the
+// listed shaders only. Their write extents are evaluated without waiting for the GPU (the whole
+// buffer when they cannot be), so the slots the extents read can be left to the GPU.
+bool ExtentsNoWaitShader(uint64_t shader_hash) {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_SRT_EXTENTS_NO_WAIT_SHADERS");
+		if (value == nullptr) return result;
+		const std::string list = value;
+		size_t            at   = 0;
+		while (at < list.size()) {
+			const auto end  = std::min(list.find_first_of(",; ", at), list.size());
+			if (end > at) result.push_back(std::strtoull(list.substr(at, end - at).c_str(), nullptr, 16));
+			at = end + 1;
+		}
+		return result;
+	}();
+	return !shaders.empty() && std::find(shaders.begin(), shaders.end(), shader_hash) != shaders.end();
+}
+} // namespace
+
 // Flat slots the host never needs, so their bytes can be left to the GPU when it wrote them
 // (SrtGpuFill): the slot's value is a raw scalar read whose address comes from user data and
 // immediates alone, and no value the host evaluates refers to the slot (descriptor dwords and
@@ -1074,6 +1235,37 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 	std::vector<uint8_t> host(count, 0u);
 	std::vector<Value>   pending;
 	std::unordered_set<const Inst*> visited;
+	// Why a slot stays on the host (KYTY_SRT_FILL_REASON="hash,..." prints it): D descriptor,
+	// C condition, U uniform fill, W write extent, A another read's address, S clean slot,
+	// K not a raw scalar read, M address depends on memory.
+	uint8_t    tag  = 'D';
+	// Sources only read-only, non-indirect buffers use: their record count (dword 2) is not a host
+	// need (GpuSizedBuffers binds a conservative count when the GPU wrote it).
+	std::vector<uint8_t> sized_sources(plan.descriptor_sources.size(), 0u);
+	{
+		std::vector<uint8_t> other(plan.descriptor_sources.size(), 0u);
+		for (const auto& buffer: plan.info.buffers) {
+			if (buffer.source >= sized_sources.size()) continue;
+			if ((!buffer.written || GpuSizedWrittenEnabled(plan.shader_hash)) &&
+			    (!buffer.atomic || GpuSizedAtomicEnabled(plan.shader_hash))) {
+				sized_sources[buffer.source] = 1u;
+			} else {
+				other[buffer.source] = 1u;
+			}
+		}
+		for (const auto& image: plan.info.images) {
+			if (image.source < other.size()) other[image.source] = 1u;
+		}
+		for (const auto& sampler: plan.info.samplers) {
+			if (sampler.source < other.size()) other[sampler.source] = 1u;
+		}
+		for (size_t i = 0; i < sized_sources.size(); ++i) {
+			if (other[i] != 0u || plan.descriptor_sources[i].dword_count != 4u ||
+			    plan.descriptor_sources[i].indirect_descriptor.has_value()) {
+				sized_sources[i] = 0u;
+			}
+		}
+	}
 	const auto mark = [&](Value root) {
 		pending.push_back(root);
 		while (!pending.empty()) {
@@ -1086,7 +1278,7 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 				const auto slot = inst->Arg(1).Resolve();
 				if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < count) {
-					host[slot.U32()] = 1u;
+					if (host[slot.U32()] == 0u) host[slot.U32()] = tag;
 					pending.push_back(plan.srt_reads[slot.U32()].value);
 				}
 				continue;
@@ -1096,8 +1288,12 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			}
 		}
 	};
-	for (const auto& source: plan.descriptor_sources) {
+	for (size_t source_index = 0; source_index < plan.descriptor_sources.size(); ++source_index) {
+		const auto& source = plan.descriptor_sources[source_index];
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			if (dword == 2u && sized_sources[source_index] != 0u) {
+				continue;
+			}
 			mark(source.dwords[dword]);
 		}
 		if (source.indirect_descriptor.has_value()) {
@@ -1106,19 +1302,37 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			mark(source.indirect_descriptor->selector_mask);
 		}
 	}
-	for (const auto& block: plan.control_flow) {
-		mark(block.condition);
+	// Branch conditions only choose which descriptor sources are active. With SrtConditionsNoWait
+	// a condition the host cannot read without waiting for the GPU is "not known" (both successors
+	// walked), so the slots it reads need not be on the host: the GPU fills them for the shader.
+	tag = 'C';
+	if (!SrtConditionsNoWait()) {
+		for (const auto& block: plan.control_flow) {
+			mark(block.condition);
+		}
 	}
+	tag = 'U';
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		mark(plan.uniform_fill.values[i]);
 	}
-	for (const auto& write: plan.buffer_writes) {
-		mark(write.index);
-		mark(write.offset);
-		mark(write.soffset);
-		mark(write.predicate);
+	tag = 'W';
+	if (std::getenv("KYTY_SRT_EXTENTS_NO_WAIT") == nullptr && !ExtentsNoWaitShader(plan.shader_hash)) {
+		for (const auto& write: plan.buffer_writes) {
+			// A GPU-sized buffer's extents are evaluated without waiting (t_gpu_sized_snapshot);
+			// they need no host slots.
+			if (write.buffer < plan.info.buffers.size() &&
+			    plan.info.buffers[write.buffer].source < sized_sources.size() &&
+			    sized_sources[plan.info.buffers[write.buffer].source] != 0u) {
+				continue;
+			}
+			mark(write.index);
+			mark(write.offset);
+			mark(write.soffset);
+			mark(write.predicate);
+		}
 	}
 	// Another read's address operands (the read itself is not a host use of its own slot).
+	tag = 'A';
 	for (const auto& read: plan.srt_reads) {
 		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
 			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
@@ -1156,22 +1370,45 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 	std::vector<uint8_t> fill(count, 0u);
 	for (size_t slot = 0; slot < count; slot++) {
 		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
-		if (inst == nullptr || host[slot] != 0u ||
-		    (slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u)) {
+		if (inst == nullptr) {
+			host[slot] = host[slot] != 0u ? host[slot] : 'K';
+			continue;
+		}
+		if (host[slot] != 0u) {
+			continue;
+		}
+		if (slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u) {
+			host[slot] = 'S';
 			continue;
 		}
 		const auto op    = inst->GetOpcode();
 		const auto index = inst->Flags<MemoryFlags>().index;
 		if ((op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) ||
 		    index >= plan.memory_info.size()) {
+			host[slot] = 'K';
 			continue;
 		}
 		const auto kind = plan.memory_info[index].kind;
 		if (!((op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
 		      (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer))) {
+			host[slot] = 'K';
 			continue;
 		}
-		fill[slot] = memory_free(*inst) ? 1u : 0u;
+		// 1: the slot's read is its only read. 2: its address comes from other reads; those are done
+		// on the host and only the slot's own read is left to the GPU (SrtWalker::m_fill_inst).
+		fill[slot] = memory_free(*inst) ? 1u : 2u;
+	}
+	if (const char* list = std::getenv("KYTY_SRT_FILL_REASON");
+	    list != nullptr &&
+	    std::string_view(list).find(fmt::format("{:016x}", plan.shader_hash)) != std::string_view::npos) {
+		std::string text;
+		for (size_t slot = 0; slot < count; slot++) {
+			const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+			text += fmt::format(" {}:{}({})", slot, fill[slot] != 0u ? 'G' : static_cast<char>(host[slot]),
+			                    inst != nullptr ? ValueOpcodeName(inst->GetOpcode()) : "-");
+		}
+		std::fprintf(stderr, "[srt-fill] %016llx slots=%zu%s\n",
+		             static_cast<unsigned long long>(plan.shader_hash), count, text.c_str());
 	}
 	return fill;
 }
@@ -1316,7 +1553,19 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
 		for (const auto& buffer: plan.info.buffers) {
-			if (buffer.written) MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
+			if (!buffer.written) continue;
+			const auto* source = Source(plan, buffer.source);
+			// A GPU-sized written buffer (KYTY_GPU_SIZED_WRITTEN_SHADERS) binds a conservative record
+			// count, so its dword 2 is no host need here either: the GPU fills the slots under it.
+			if (source != nullptr && source->dword_count == 4u &&
+			    !source->indirect_descriptor.has_value() && GpuSizedWrittenEnabled(plan.shader_hash) &&
+			    (!buffer.atomic || GpuSizedAtomicEnabled(plan.shader_hash))) {
+				for (const uint32_t dword: {0u, 1u, 3u}) {
+					MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, source->dwords[dword]);
+				}
+				continue;
+			}
+			MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
 		}
 		for (const auto& image: plan.info.images) {
 			if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
@@ -1498,14 +1747,34 @@ bool EvaluateWriteInterval(const ResourcePlan& program, const SrtRuntime& runtim
 	return out.hi <= Max32;
 }
 
+// Set while a snapshot has a GPU-sized buffer (GpuSizedRecords): its write extents are evaluated
+// without waiting, and one that needs GPU-written bytes covers the (bounded) binding.
+thread_local bool t_gpu_sized_snapshot = false;
+thread_local uint64_t t_extents_shader_hash = 0; // for OptionalScope below
+
 // See ResourceSnapshot::buffer_write_extents.
 void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& runtime,
                                SrtWalker& walker, ResourceSnapshot& snapshot) {
 	snapshot.buffer_write_extents.assign(program.info.buffers.size(), {});
+	t_extents_shader_hash = program.shader_hash;
 	if (program.buffer_writes.empty()) {
 		return;
 	}
 	std::vector<uint8_t> failed(program.info.buffers.size(), 0u);
+	// Extents only narrow the bytes marked GPU-written; one the host cannot evaluate without
+	// waiting for the GPU falls back to the whole buffer (SrtConditionsNoWait).
+	// Measured 2026-10-09: the whole-buffer fallback marks more memory GPU-written, and later SRT
+	// reads of it wait instead (CS 4e7f2c6bb9b158a1: 1.0 -> 4.4 s of waits per 20 s). Opt-in only.
+	struct OptionalScope {
+		bool active = t_gpu_sized_snapshot || std::getenv("KYTY_SRT_EXTENTS_NO_WAIT") != nullptr ||
+		              ExtentsNoWaitShader(t_extents_shader_hash);
+		OptionalScope() {
+			if (active) SrtSetEvaluatingCondition(true);
+		}
+		~OptionalScope() {
+			if (active) SrtSetEvaluatingCondition(false);
+		}
+	} scope;
 	for (const auto& write: program.buffer_writes) {
 		if (write.buffer >= failed.size() || failed[write.buffer] != 0u) {
 			continue;
@@ -1556,11 +1825,118 @@ int LastIndirectImageFailureLine() {
 
 namespace {
 
+// KYTY_GPU_SIZED_BUFFERS=0 waits for GPU-written record counts of read-only buffers, as before.
+bool GpuSizedBuffersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_BUFFERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The record count bound for a read-only buffer whose count the GPU wrote: KYTY_GPU_SIZED_BUFFER_KB
+// (default 256) bytes of records at the V#'s stride (dword 1, bits 16-29), or that many bytes for
+// a raw buffer. The binding is clamped to mapped guest memory like any other.
+uint32_t GpuSizedRecords(uint32_t dword1, bool written = false) {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_BUFFER_KB");
+		const auto  kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+		return (kb == 0 ? 256ull : kb) * 1024ull;
+	}();
+	static const uint64_t written_bytes = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN_KB");
+		const auto  kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 4096ull;
+		return (kb == 0 ? 4096ull : kb) * 1024ull;
+	}();
+	const auto     limit  = written ? written_bytes : bytes;
+	const uint32_t stride = (dword1 >> 16u) & 0x3fffu;
+	return static_cast<uint32_t>(stride != 0u ? limit / stride : limit);
+}
+
+// KYTY_GPU_SIZED_WRITTEN=0 waits for GPU-written record counts of written buffers, as before.
+// On: a written, non-atomic buffer whose count the GPU wrote is bound with a conservative count
+// (KYTY_GPU_SIZED_WRITTEN_KB, default 4096 KB of records) instead of waiting for the GPU. Its
+// shader tests its records against the count it reads itself (CS fb5ee753d43f3f0b, a sort of
+// GPU-counted keys: ~20 ms of GPU-thread wait a frame at the title menu, 2026-10-09).
+// Only for the shaders listed (KYTY_GPU_SIZED_WRITTEN_SHADERS, hex hashes, default the sort
+// above): applied to every written buffer, CS 380b6ffba703cef1's binding lost the device.
+bool GpuSizedWrittenEnabled(uint64_t shader_hash) {
+	// Opt-in (KYTY_GPU_SIZED_WRITTEN=1): on by default, the title menu lost the device at ~57 s in
+	// three runs of three (a DISPATCH_INDIRECT hung, 2026-10-09); off, it did not.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN");
+		return value != nullptr && value[0] == '1';
+	}();
+	static const std::vector<uint64_t> shaders = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN_SHADERS");
+		std::string list  = value != nullptr ? value : "fb5ee753d43f3f0b";
+		std::vector<uint64_t> result;
+		size_t                at = 0;
+		while (at < list.size()) {
+			const auto end = list.find_first_of(",; ", at);
+			const auto item =
+			    list.substr(at, end == std::string::npos ? std::string::npos : end - at);
+			if (!item.empty()) {
+				result.push_back(std::strtoull(item.c_str(), nullptr, 16));
+			}
+			if (end == std::string::npos) break;
+			at = end + 1;
+		}
+		return result;
+	}();
+	return enabled && std::find(shaders.begin(), shaders.end(), shader_hash) != shaders.end();
+}
+
+// Whether `value` reads a flat slot the GPU fills in this refresh (SrtGpuFill): the host's copy
+// of such a slot is a placeholder (0), not the value.
+bool DependsOnGpuFill(const ResourcePlan& program, Value value,
+                      const std::vector<SrtGpuFill>& fills) {
+	if (fills.empty()) {
+		return false;
+	}
+	std::vector<Value>              stack {value};
+	std::unordered_set<const Inst*> seen;
+	while (!stack.empty() && seen.size() < 256u) {
+		const auto* inst = stack.back().Resolve().TryInstruction();
+		stack.pop_back();
+		if (inst == nullptr || !seen.insert(inst).second) {
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < program.srt_reads.size()) {
+				const auto offset = program.srt_reads[slot.U32()].flat_offset;
+				for (const auto& fill: fills) {
+					if (fill.flat_offset == offset) {
+						return true;
+					}
+				}
+			}
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			stack.push_back(inst->Arg(arg));
+		}
+	}
+	// Too large to follow: not known.
+	return !stack.empty();
+}
+
+void NoteGpuSizedBuffer(uint64_t shader_hash) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n & (n - 1)) == 0) {
+		std::fprintf(stderr, "[gpu-sized-buffer] %llu bindings sized without waiting (last: %016llx)\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(shader_hash));
+	}
+}
+
 bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                               ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                               bool& served) {
 	served                  = false;
 	g_indirect_failure_line = 0;
+	t_gpu_sized_snapshot    = false;
 	snapshot.bindless_heaps.clear();
 	snapshot.bindless_sampler_heaps.clear();
 	if (!program.resource_tracking_complete ||
@@ -1584,7 +1960,30 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	SrtTraceSession trace(program, clean, walker, observed);
+	g_materialize_phase = "flat";
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+		if (static const bool debug = std::getenv("KYTY_DEBUG_RESOURCES") != nullptr; debug) {
+			static std::atomic<uint32_t> printed {0};
+			if (printed.fetch_add(1) < 12) {
+				std::fprintf(stderr,
+				             "[flat-fail] %016llx plan_complete=%d reads=%zu failure=%s addr=0x%llx "
+				             "clean_failure=%s clean_addr=0x%llx user_data=%zu\n",
+				             static_cast<unsigned long long>(program.shader_hash),
+				             program.srt_plan_complete ? 1 : 0, program.srt_reads.size(),
+				             walker.ReadFailure() ? walker.ReadFailure() : "-",
+				             static_cast<unsigned long long>(walker.ReadFailureAddress()),
+				             clean.ReadFailure() ? clean.ReadFailure() : "-",
+				             static_cast<unsigned long long>(clean.ReadFailureAddress()),
+				             runtime.user_data.size());
+				std::string text = "  user_data:";
+				for (size_t u = 0; u < runtime.user_data.size(); u++) {
+					text += fmt::format("{}{:08x}", u % 8 == 0 ? fmt::format("\n   s{:02}: ", u) : " ",
+					                    runtime.user_data[u]);
+				}
+				text += "\n";
+				std::fputs(text.c_str(), stderr);
+			}
+		}
 		return FailIndirect(__LINE__);
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
@@ -1611,6 +2010,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	g_materialize_phase = "buffers";
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1621,6 +2021,21 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		if (i < program.info.buffers.size()) {
 			const auto* source = Source(program, base.source);
 			if (source == nullptr) return false;
+			if (static const char* diag = std::getenv("KYTY_SRT_FILL_REASON");
+			    diag != nullptr &&
+			    std::string_view(diag).find(fmt::format("{:016x}", program.shader_hash)) !=
+			        std::string_view::npos) {
+				static std::atomic<uint32_t> printed {0};
+				if (printed.fetch_add(1, std::memory_order_relaxed) < 64) {
+					std::fprintf(stderr,
+					             "[gpu-sized-buffer] %016llx buffer %u source %u written=%d atomic=%d "
+					             "scalar=%d indirect=%d active=%d dwords=%u\n",
+					             static_cast<unsigned long long>(program.shader_hash), i, base.source,
+					             base.written ? 1 : 0, base.atomic ? 1 : 0, base.scalar ? 1 : 0,
+					             source->indirect_descriptor.has_value() ? 1 : 0,
+					             active.empty() || active[base.source] ? 1 : 0, source->dword_count);
+				}
+			}
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
@@ -1629,6 +2044,52 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
 					        NormalizeIndirectStoreBuffer))
 						return false;
+				}
+			} else if ((!base.written || GpuSizedWrittenEnabled(program.shader_hash)) &&
+			           (!base.atomic || GpuSizedAtomicEnabled(program.shader_hash)) &&
+			           GpuSizedBuffersEnabled() && (active.empty() || active[base.source])) {
+				// A read-only buffer whose record count (V# dword 2) the GPU wrote: binding it
+				// needs the base, stride and format, not the exact count. Read the descriptor
+				// refusing GPU-written bytes; when that fails, read dwords 0, 1 and 3 normally and
+				// give dword 2 a conservative count (GpuSizedRecords), so the GPU thread does not
+				// wait for the GPU. The shader keeps its own bounds tests (the count in its SGPRs
+				// comes from the flat buffer, which the GPU fills).
+				auto&       walker_ref = capture_reads && base.written ? clean : walker;
+				const auto& src        = program.descriptor_sources[base.source];
+				// A refused read can still let an evaluation succeed, with a value that is not
+				// known (a condition's): dwords 0, 1 and 3 are read normally, and dword 2 counts as
+				// refused when any read under it was (SrtConditionRefusals). Evaluating the whole
+				// descriptor refusing reads bound such a value as the count (the title menu lost
+				// the device in three runs of three, 2026-10-09).
+				bool ok = false;
+				if (src.dword_count != 4u) {
+					ok = evaluate(base.source, snapshot.buffers[i], base.written);
+				} else {
+					auto& value       = snapshot.buffers[i];
+					value             = {};
+					value.dword_count = 4u;
+					ok                = true;
+					bool sized        = false;
+					for (uint32_t d = 0; d < 4u && ok; ++d) {
+						if (d == 2u) {
+							const auto refusals = SrtConditionRefusals();
+							SrtSetEvaluatingCondition(true);
+							sized = !walker_ref.Evaluate(src.dwords[2], value.dwords[2]);
+							SrtSetEvaluatingCondition(false);
+							sized = sized || SrtConditionRefusals() != refusals ||
+							        DependsOnGpuFill(program, src.dwords[2], snapshot.gpu_fills);
+							continue;
+						}
+						ok = walker_ref.Evaluate(src.dwords[d], value.dwords[d]);
+					}
+					if (ok && sized) {
+						value.dwords[2] = GpuSizedRecords(value.dwords[1], base.written);
+						t_gpu_sized_snapshot = true;
+						NoteGpuSizedBuffer(program.shader_hash);
+					}
+				}
+				if (!ok) {
+					return false;
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
@@ -1666,11 +2127,14 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		// Write extents only size the GPU-written range; their reads do not specialize the
 		// shader, so they stay out of the specialization-read proof.
 		const auto captured = reads.size();
+		g_materialize_phase = "extents";
 		ComputeBufferWriteExtents(program, observed, walker, snapshot);
 		if (capture_reads) {
 			reads.resize(captured);
 		}
 	}
+	g_materialize_phase = "images";
+	g_debug_raw_images.assign(program.info.images.size(), DescriptorValue {});
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1705,6 +2169,10 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 				}
 				continue;
 			}
+			const auto srt_size        = snapshot.flattened_srt.size();
+			const auto image_count     = snapshot.images.size();
+			const auto spec_count      = specialization.images.size();
+			const auto failure_line    = g_indirect_failure_line;
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
@@ -1712,17 +2180,42 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
-				return FailIndirect(__LINE__);
+				// A store-only image picked per material from a table too large to enumerate
+				// (Wolverine's terrain and scatter write a per-material image from a 20 MB
+				// material table): bind a null image, dropping those stores, rather than
+				// skipping the draw itself.
+				static const bool null_writes = [] {
+					const char* env = std::getenv("KYTY_NULL_UNENUMERABLE_WRITES");
+					return env == nullptr || env[0] != '0';
+				}();
+				if (!null_writes || image.read || image.atomic || !image.written) {
+					return FailIndirect(__LINE__);
+				}
+				snapshot.flattened_srt.resize(srt_size);
+				snapshot.images.resize(image_count);
+				specialization.images.resize(spec_count);
+				snapshot.images[i] = {.dword_count = 8u};
+				g_indirect_failure_line = failure_line;
+				static std::atomic<uint32_t> printed {0};
+				if (printed.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr, "[null-write-image] %016llx image %u\n",
+					             static_cast<unsigned long long>(program.shader_hash), i);
+				}
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
 				return FailIndirect(__LINE__);
 			}
+			if (g_debug_raw_images.size() < snapshot.images.size()) {
+				g_debug_raw_images.resize(snapshot.images.size());
+			}
+			g_debug_raw_images[i] = snapshot.images[i];
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
 			}
 		}
 	}
+	g_materialize_phase = "samplers";
 	snapshot.samplers.resize(program.info.samplers.size());
 	specialization.samplers.assign(program.info.samplers.size(), {});
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
@@ -1769,6 +2262,54 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	// KYTY_DEBUG_RESOURCES=<hash,...>: print that shader's image and sampler descriptors
+	// (first 6 refreshes).
+	if (static const std::string debug = [] {
+		    const char* env = std::getenv("KYTY_DEBUG_RESOURCES");
+		    return env != nullptr ? std::string(env) : std::string();
+	    }();
+	    !debug.empty() && debug.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+		static std::mutex                             printed_mutex;
+		static std::unordered_map<uint64_t, uint32_t> printed_per_shader;
+		bool                                          print = false;
+		{
+			std::lock_guard lock(printed_mutex);
+			print = printed_per_shader[program.shader_hash]++ < 3;
+		}
+		if (print) {
+			std::string text = fmt::format("[debug-res] {:016x} images={} samplers={} buffers={}\n",
+			                               program.shader_hash, snapshot.images.size(),
+			                               snapshot.samplers.size(), snapshot.buffers.size());
+			for (size_t i = 0; i < snapshot.images.size(); i++) {
+				const auto& d = snapshot.images[i].dwords;
+				const auto  w = ((d[2] >> 14u) & 0x3fffu) + 1u;
+				const auto  h = ((d[2] >> 28u) | ((d[3] & 0x3ffu) << 4u)) + 1u;
+				text += fmt::format(
+				    "  img{} bindless={} indirect_root={} base=0x{:x} fmt={} {}x{} dw={:08x} {:08x} "
+				    "{:08x} {:08x} {:08x} {:08x} {:08x} {:08x}\n",
+				    i, specialization.images[i].bindless ? 1 : 0,
+				    specialization.images[i].indirect_root,
+				    (static_cast<uint64_t>(d[1] & 0xffu) << 40u) | (static_cast<uint64_t>(d[0]) << 8u),
+				    (d[1] >> 20u) & 0x1ffu, w, h, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+				if (i < g_debug_raw_images.size()) {
+					const auto& r = g_debug_raw_images[i].dwords;
+					text += fmt::format("    evaluated: {:08x} {:08x} {:08x} {:08x} {:08x} "
+					                    "{:08x} {:08x} {:08x} source={} active={}\n",
+					                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+					                    program.info.images[i].source,
+					                    program.active_sources.empty() ||
+					                            program.active_sources[program.info.images[i].source]
+					                        ? 1 : 0);
+				}
+			}
+			g_debug_raw_images.clear();
+			for (size_t i = 0; i < snapshot.buffers.size(); i++) {
+				const auto& d = snapshot.buffers[i].dwords;
+				text += fmt::format("  buf{} {:08x} {:08x} {:08x} {:08x}\n", i, d[0], d[1], d[2], d[3]);
+			}
+			std::fputs(text.c_str(), stderr);
+		}
+	}
 	if (!BuildResourceSpecialization(program, snapshot, specialization,
 	                                 runtime.float_image_atomics)) {
 		return FailIndirect(__LINE__);

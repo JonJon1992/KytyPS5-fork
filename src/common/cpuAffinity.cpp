@@ -23,6 +23,21 @@
 
 namespace Common {
 
+void RaiseGpuThreadPriority() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value != nullptr ? std::atoi(value) : 1;
+	}();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const int priority = level >= 2   ? THREAD_PRIORITY_HIGHEST
+	                     : level == 1 ? THREAD_PRIORITY_ABOVE_NORMAL
+	                                  : THREAD_PRIORITY_NORMAL;
+	SetThreadPriority(GetCurrentThread(), priority);
+#else
+	(void)level;
+#endif
+}
+
 static bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PCORE_AFFINITY");

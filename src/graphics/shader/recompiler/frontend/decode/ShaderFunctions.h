@@ -38,9 +38,11 @@ public:
 	ShaderFunctionExpander(const ShaderFunctionExpander&)            = delete;
 	ShaderFunctionExpander& operator=(const ShaderFunctionExpander&) = delete;
 
+	// code_hash, when nonzero, is the code's content hash (the program cache's shader hash): a
+	// shader decoded with the same hash and size is taken as unchanged without comparing its code.
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
-	            uint32_t wave_size);
+	            uint32_t wave_size, uint64_t code_hash = 0);
 
 private:
 	struct Impl;

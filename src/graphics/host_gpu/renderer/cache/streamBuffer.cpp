@@ -139,7 +139,110 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               void* host_pointer, vk::BufferUsageFlags flags, uint64_t size, ImportHostMemory)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	if (!graphics.external_memory_host_enabled || d.vkGetMemoryHostPointerPropertiesEXT == nullptr ||
+	    host_pointer == nullptr || size == 0) {
+		return;
+	}
+	const auto device = static_cast<VkDevice>(graphics.device);
+	VkMemoryHostPointerPropertiesEXT host_props {};
+	host_props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+	if (d.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+	                                          host_pointer, &host_props) != VK_SUCCESS ||
+	    host_props.memoryTypeBits == 0) {
+		return;
+	}
+	VkExternalMemoryBufferCreateInfo external {};
+	external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	VkBufferCreateInfo info {};
+	info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.pNext       = &external;
+	info.size        = size;
+	info.usage       = static_cast<VkBufferUsageFlags>(flags);
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkBuffer buffer  = VK_NULL_HANDLE;
+	if (d.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) {
+		return;
+	}
+	VkMemoryRequirements requirements {};
+	d.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+	const auto& memory = graphics.physical_device_memory_properties;
+	const auto  types  = requirements.memoryTypeBits & host_props.memoryTypeBits;
+	uint32_t    type   = UINT32_MAX;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		if ((types & (1u << i)) != 0) {
+			type = i;
+			break;
+		}
+	}
+	if (type == UINT32_MAX || requirements.size > size) {
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	VkImportMemoryHostPointerInfoEXT import {};
+	import.sType        = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+	import.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	import.pHostPointer = host_pointer;
+	VkMemoryAllocateFlagsInfo allocate_flags {};
+	allocate_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+	allocate_flags.pNext = &import;
+	allocate_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkMemoryAllocateInfo allocate {};
+	allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.pNext           = &allocate_flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	VkDeviceMemory device_memory = VK_NULL_HANDLE;
+	if (d.vkAllocateMemory(device, &allocate, nullptr, &device_memory) != VK_SUCCESS) {
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	if (d.vkBindBufferMemory(device, buffer, device_memory, 0) != VK_SUCCESS) {
+		d.vkFreeMemory(device, device_memory, nullptr);
+		d.vkDestroyBuffer(device, buffer, nullptr);
+		return;
+	}
+	m_buffer   = vk::Buffer(buffer);
+	m_imported = device_memory;
+	m_coherent = (static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[type].propertyFlags) &
+	              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+	}
+}
+
+void Buffer::ReleaseImport() noexcept {
+	if (m_imported == VK_NULL_HANDLE) {
+		return;
+	}
+	const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto  device = static_cast<VkDevice>(m_graphics->device);
+	if (m_buffer != nullptr) {
+		d.vkDestroyBuffer(device, static_cast<VkBuffer>(m_buffer), nullptr);
+	}
+	d.vkFreeMemory(device, m_imported, nullptr);
+	m_buffer         = nullptr;
+	m_imported       = VK_NULL_HANDLE;
+	m_device_address = 0;
+}
+
 Buffer::~Buffer() {
+	if (m_imported != VK_NULL_HANDLE) {
+		const auto& d      = VULKAN_HPP_DEFAULT_DISPATCHER;
+		const auto  device = static_cast<VkDevice>(m_graphics->device);
+		if (m_buffer != nullptr) {
+			d.vkDestroyBuffer(device, static_cast<VkBuffer>(m_buffer), nullptr);
+		}
+		d.vkFreeMemory(device, m_imported, nullptr);
+		return;
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}

@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1306,6 +1307,11 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	// With KYTY_DISPATCH_SYNC=0 dispatches carry no barriers of their own, so the guest's
+	// acquire (wait for prior writes, invalidate caches) becomes one.
+	if (!DispatchSyncEnabled()) {
+		cp.EmitGlobalBarrier();
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1442,6 +1448,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	cp.GetRenderContext().GetBufferCache().WaitSharedWrites(addr, sizeof(uint32_t));
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1643,6 +1650,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
 
+	cp.SetIndirectStartInstanceRegister(buffer[2] & 0xffffu);
 	cp.DrawIndirect(data_offset, draw_initiator, indexed);
 
 	return 4;
@@ -1669,6 +1677,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 		count_addr = nullptr;
 	}
 
+	cp.SetIndirectStartInstanceRegister(buffer[2] & 0xffffu);
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
 	                     draw_initiator, indexed, draw_index_register);
 

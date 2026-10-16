@@ -2200,6 +2200,17 @@ private:
 		});
 		const bool bindless = m_program.bindless_images && sampled_only &&
 		                      table_source.dword_count == 4u;
+		if (!bindless && table_source.dword_count == 4u) {
+			std::string uses;
+			for (const auto& use: handle.Uses()) {
+				uses += ValueOpcodeName(use.user->GetOpcode());
+				uses += ' ';
+			}
+			std::fprintf(stderr, "[not-bindless] %016llx %s enabled=%d uses: %s\n",
+			             static_cast<unsigned long long>(m_program.shader_hash),
+			             std::string(StageName(m_program.stage)).c_str(),
+			             m_program.bindless_images ? 1 : 0, uses.c_str());
+		}
 		// Enumerate the keys the table can reach (upstream's plan), or, when bindless images are
 		// enabled and the heap is a buffer, look the key up at run time: an enumeration that
 		// passes here can still fail per draw (a material table of more records than the probe

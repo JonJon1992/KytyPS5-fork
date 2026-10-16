@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -64,6 +65,13 @@ void ReportGaveUp(const CompileOptions& options, Profiler::Phases& phases, const
 	Profiler::Add(Profiler::Counter::ShadersGaveUp);
 	Profiler::Message(Profiler::MessageFailure, "Shader gave up: %s 0x%016" PRIx64 ": %s",
 	                  StageName(options.stage), options.shader_hash, reason);
+	// Also to stderr (first 256): a shader that gives up skips its draws or dispatches for good.
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1) < 256) {
+		std::fprintf(stderr, "[gave-up] %s 0x%016" PRIx64 ": %s\n", StageName(options.stage),
+		             options.shader_hash, reason);
+		std::fflush(stderr);
+	}
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {

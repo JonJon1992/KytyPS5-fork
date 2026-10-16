@@ -58,6 +58,10 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// Texture dump (KYTY_DUMP_TEXTURES_TRIGGER): textures bound in the frame after `frame`, plus
+	// the bindless images the usage probe saw sampled (AddTextureDumpImages), are written out.
+	void BeginTextureDump(uint64_t frame);
+	void AddTextureDumpImages(std::span<const ImageId> ids);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
@@ -201,6 +205,21 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
+	// KYTY_DUMP_TEXTURES_TRIGGER=<file>: the textures sampled in the frame after the file appears
+	// are copied out (mip 0, layer 0) and written to _ShaderDump/texdump with their guest layout.
+	struct TextureDump {
+		ImageId                 id;
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                bytes = 0;
+	};
+	void                     DumpTextureNote(ImageId id); // caller holds m_lock
+	uint64_t                 m_dump_checked_frame = UINT64_MAX;
+	uint64_t                 m_dump_frame         = UINT64_MAX;
+	uint64_t                 m_dump_tick          = 0;
+	bool                     m_dump_done          = false;
+	bool                     m_dump_wait_bindless = false;
+	std::vector<ImageId>     m_dump_ids;
+	std::vector<TextureDump> m_dumps;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;

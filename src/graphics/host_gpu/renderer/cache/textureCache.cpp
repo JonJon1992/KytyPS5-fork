@@ -17,7 +17,9 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
 
+#include <fmt/format.h>
 #include <algorithm>
+#include <filesystem>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -914,6 +916,42 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
+	// KYTY_LOG_IMAGE_OVERLAPS=1: each overlap of differently laid-out images, once per pair.
+	if (static const bool log_overlaps = std::getenv("KYTY_LOG_IMAGE_OVERLAPS") != nullptr;
+	    log_overlaps && (requested.tile_mode != cached.info.tile_mode ||
+	                     requested.pixel_format != cached.info.pixel_format ||
+	                     requested.extent != cached.info.extent ||
+	                     requested.data.address != cached.info.data.address)) {
+		static std::unordered_set<uint64_t> seen;
+		const uint64_t key = requested.data.address * 31u ^ cached.info.data.address * 17u ^
+		                     static_cast<uint64_t>(requested.tile_mode) << 56u ^
+		                     static_cast<uint64_t>(cached.info.tile_mode) << 48u ^
+		                     static_cast<uint64_t>(requested.pixel_format) << 32u ^
+		                     static_cast<uint64_t>(cached.info.pixel_format) << 40u;
+		if (seen.size() < 400 && seen.insert(key).second) {
+			std::fprintf(
+			    stderr,
+			    "[img-overlap] req 0x%llx+0x%llx %ux%ux%u fmt=%d tile=%u lv=%u ly=%u bind=%u | "
+			    "cached 0x%llx+0x%llx %ux%ux%u fmt=%d tile=%u lv=%u ly=%u target=%d bound=%d "
+			    "gpu_written=%d age_ticks=%llu safe=%d\n",
+			    static_cast<unsigned long long>(requested.data.address),
+			    static_cast<unsigned long long>(requested.data.size), requested.extent.width,
+			    requested.extent.height, requested.extent.depth,
+			    static_cast<int>(requested.pixel_format), static_cast<uint32_t>(requested.tile_mode),
+			    requested.resources.levels, requested.resources.layers,
+			    static_cast<uint32_t>(binding),
+			    static_cast<unsigned long long>(cached.info.data.address),
+			    static_cast<unsigned long long>(cached.info.data.size), cached.info.extent.width,
+			    cached.info.extent.height, cached.info.extent.depth,
+			    static_cast<int>(cached.info.pixel_format),
+			    static_cast<uint32_t>(cached.info.tile_mode), cached.info.resources.levels,
+			    cached.info.resources.layers, cached.binding.is_target ? 1 : 0,
+			    cached.binding.is_bound ? 1 : 0, cached.IsGpuModified() ? 1 : 0,
+			    static_cast<unsigned long long>(current_tick -
+			                                    std::min(current_tick, cached.tick_accessed_last)),
+			    safe_to_delete ? 1 : 0);
+		}
+	}
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
@@ -1542,8 +1580,126 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+void TextureCache::BeginTextureDump(uint64_t frame) {
+	std::scoped_lock lock {m_lock};
+	if (m_dump_frame == UINT64_MAX) {
+		m_dump_frame         = frame + 1;
+		m_dump_wait_bindless = true;
+	}
+}
+
+void TextureCache::AddTextureDumpImages(std::span<const ImageId> ids) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: ids) {
+		if (std::find(m_dump_ids.begin(), m_dump_ids.end(), id) == m_dump_ids.end()) {
+			m_dump_ids.push_back(id);
+		}
+	}
+	m_dump_wait_bindless = false;
+}
+
+void TextureCache::DumpTextureNote(ImageId id) {
+	if (m_dump_done || m_dump_frame == UINT64_MAX) {
+		return;
+	}
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (frame == m_dump_frame) {
+		if (std::find(m_dump_ids.begin(), m_dump_ids.end(), id) == m_dump_ids.end()) {
+			m_dump_ids.push_back(id);
+		}
+		return;
+	}
+	if (frame < m_dump_frame || m_dump_wait_bindless) {
+		return;
+	}
+	if (m_dumps.empty() && !m_dump_ids.empty()) {
+		// Record the copies; they land with the GPU's progress, no wait here.
+		uint64_t total = 0;
+		for (const auto dump_id: m_dump_ids) {
+			auto* image = m_slot_images.try_get(dump_id);
+			if (image == nullptr || m_dumps.size() >= 1500 || total >= (1ull << 30u)) {
+				continue;
+			}
+			// Material textures only: block-compressed, 512 or more on a side.
+			if (std::max(image->info.extent.width, image->info.extent.height) < 512 ||
+			    !image->info.IsBlock()) {
+				continue;
+			}
+			const auto& info = image->info;
+			const auto  w = info.extent.width, h = info.extent.height;
+			const auto  format = info.pixel_format;
+			const bool  depth  = format == vk::Format::eD16Unorm || format == vk::Format::eD32Sfloat ||
+			                   format == vk::Format::eD24UnormS8Uint ||
+			                   format == vk::Format::eD32SfloatS8Uint ||
+			                   format == vk::Format::eD16UnormS8Uint || format == vk::Format::eS8Uint ||
+			                   format == vk::Format::eX8D24UnormPack32;
+			if (w < 16 || h < 16 || info.extent.depth > 1 || info.bytes_per_block == 0 || depth) {
+				continue;
+			}
+			const uint64_t bytes = info.IsBlock()
+			                           ? uint64_t {(w + 3u) / 4u} * ((h + 3u) / 4u) * info.bytes_per_block
+			                           : uint64_t {w} * h * info.bytes_per_block;
+			if (bytes > (96ull << 20u)) {
+				continue;
+			}
+			TextureDump dump {dump_id,
+			                  std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                           vk::BufferUsageFlagBits::eTransferDst, bytes),
+			                  bytes};
+			vk::BufferImageCopy region {};
+			region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			region.imageExtent      = vk::Extent3D {w, h, 1};
+			image->Download(std::span {&region, 1}, dump.buffer->Handle(), 0, bytes);
+			m_dumps.push_back(std::move(dump));
+			total += bytes;
+		}
+		m_dump_tick = m_scheduler.CurrentTick();
+		std::fprintf(stderr, "[texdump] %zu textures sampled in frame %llu, %zu copies recorded\n",
+		             m_dump_ids.size(), static_cast<unsigned long long>(m_dump_frame),
+		             m_dumps.size());
+		return;
+	}
+	if (m_dumps.empty() || !m_scheduler.IsFree(m_dump_tick)) {
+		return;
+	}
+	static uint32_t dump_count = 0;
+	const auto      dir = std::filesystem::path("_ShaderDump") / fmt::format("texdump_{}", dump_count++);
+	std::error_code error;
+	std::filesystem::create_directories(dir, error);
+	FILE* index = std::fopen((dir / "index.txt").string().c_str(), "w");
+	for (size_t i = 0; i < m_dumps.size(); i++) {
+		auto&       dump  = m_dumps[i];
+		auto*       image = m_slot_images.try_get(dump.id);
+		dump.buffer->Invalidate(0, dump.bytes);
+		const auto name = fmt::format("tex_{:04}.bin", i);
+		if (FILE* file = std::fopen((dir / name).string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(dump.buffer->Mapped().data(), 1, dump.bytes, file);
+			std::fclose(file);
+		}
+		if (index != nullptr && image != nullptr) {
+			const auto& info = image->info;
+			std::fprintf(index, "%s guest=0x%llx size=0x%llx w=%u h=%u mips=%u layers=%u fmt=%d tile=%u bpb=%u block=%d\n",
+			             name.c_str(), static_cast<unsigned long long>(info.data.address),
+			             static_cast<unsigned long long>(info.data.size), info.extent.width,
+			             info.extent.height, info.resources.levels, info.resources.layers,
+			             static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.tile_mode),
+			             info.bytes_per_block, info.IsBlock() ? 1 : 0);
+		}
+	}
+	if (index != nullptr) {
+		std::fclose(index);
+	}
+	std::fprintf(stderr, "[texdump] wrote %zu textures to %s\n", m_dumps.size(),
+	             dir.string().c_str());
+	m_dumps.clear();
+	// Ready for the next trigger.
+	m_dump_ids.clear();
+	m_dump_frame = UINT64_MAX;
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
+	DumpTextureNote(id);
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
@@ -1960,14 +2116,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (image.info.IsVolume()) {
-		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
-		// every retained slice fits. Keep volume synchronization whole-image only.
-		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
-			return false;
-		}
+	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
+	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		// Array and volume slices are strided across the full mip chain.
+		return false;
 	} else {
 		for (; levels < image.info.resources.levels; ++levels) {
 			const auto& mip = image.info.mip_layout[levels];

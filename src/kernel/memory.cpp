@@ -533,6 +533,35 @@ public:
 		return clamped_size;
 	}
 
+	// ClampRangeSize over the merged spans without the lock: each thread keeps a copy of the spans,
+	// refreshed when committed coverage changes (the game maps memory hundreds of times a second,
+	// so per-call answers kept missing into the locked walk; one copy per change is cheaper).
+	uint64_t ClampRangeSizeSnapshot(uint64_t virtual_addr, uint64_t size) {
+		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
+			return 0;
+		}
+		thread_local std::vector<Span> local;
+		thread_local uint64_t          local_generation = 0;
+		if (local_generation != m_coverage_generation.load(std::memory_order_acquire)) {
+			Common::LockGuard lock(m_mutex);
+			const auto        generation = m_coverage_generation.load(std::memory_order_relaxed);
+			if (m_spans_generation != generation) {
+				RebuildSpansUnlocked();
+				m_spans_generation = generation;
+			}
+			local            = m_spans;
+			local_generation = generation;
+		}
+		auto span = std::upper_bound(
+		    local.begin(), local.end(), virtual_addr,
+		    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
+		if (span == local.begin()) {
+			return 0;
+		}
+		--span;
+		return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1065,7 +1094,14 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
 		return answer.clamped;
 	}
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	// KYTY_CLAMP_SNAPSHOT=0: the locked lookup, as before.
+	static const bool snapshot = [] {
+		const char* value  = std::getenv("KYTY_CLAMP_SNAPSHOT");
+		const char* spans  = std::getenv("KYTY_CLAMP_SPANS");
+		return (value == nullptr || value[0] != '0') && (spans == nullptr || spans[0] != '0');
+	}();
+	const auto clamped_size = snapshot ? g_virtual_ranges->ClampRangeSizeSnapshot(vaddr, size)
+	                                   : g_virtual_ranges->ClampRangeSize(vaddr, size);
 	answer                  = {generation, vaddr, size, clamped_size};
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64

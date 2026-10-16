@@ -10,9 +10,12 @@
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <mutex>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -115,8 +118,122 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+// KYTY_GPU_TIME=1 (ported from idxtri/wolverine-perf 4f42b798): every command buffer gets a
+// timestamp at its start and end. When its tick completes, the GPU time it covered (overlap with
+// the previous command buffer removed) is added up, and every 5 s the log reports how busy the GPU
+// was: whether the GPU or the GPU thread limits the frame rate. Begin/End run on the thread that
+// records (the recording thread when KYTY_RECORD_THREAD is on), Collect on the GPU thread.
+struct CommandScheduler::GpuTimer {
+	static constexpr uint32_t Slots = 4096;
+
+	explicit GpuTimer(GraphicContext& graphics): graphics(graphics) {
+		if (!Enabled()) return;
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = Slots * 2;
+		if (graphics.device.createQueryPool(&info, nullptr, &pool) != vk::Result::eSuccess) {
+			pool = nullptr;
+		}
+		period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	}
+	~GpuTimer() {
+		if (pool) graphics.device.destroyQueryPool(pool, nullptr);
+	}
+	KYTY_CLASS_NO_COPY(GpuTimer);
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_GPU_TIME");
+			return value != nullptr && value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	// The recording thread, a new command buffer: its slot, or UINT32_MAX.
+	uint32_t Begin(vk::CommandBuffer command) {
+		if (!pool) return UINT32_MAX;
+		{
+			std::lock_guard lock(mutex);
+			if (pending.size() + open >= Slots) return UINT32_MAX;
+			open++;
+		}
+		const auto slot = next_slot++ % Slots;
+		command.resetQueryPool(pool, slot * 2, 2);
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, pool, slot * 2);
+		return slot;
+	}
+
+	// The recording thread, before the command buffer ends.
+	void End(vk::CommandBuffer command, uint32_t slot) {
+		if (slot != UINT32_MAX) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, pool, slot * 2 + 1);
+		}
+	}
+
+	void Submitted(uint64_t tick, uint32_t slot) {
+		if (slot == UINT32_MAX) return;
+		std::lock_guard lock(mutex);
+		open--;
+		pending.push_back({tick, slot});
+	}
+
+	template <typename IsFree>
+	void Collect(IsFree&& is_free) {
+		if (!pool) return;
+		std::lock_guard lock(mutex);
+		while (!pending.empty() && is_free(pending.front().tick)) {
+			const auto              slot = pending.front().slot;
+			std::array<uint64_t, 2> stamps {};
+			if (graphics.device.getQueryPoolResults(pool, slot * 2, 2, sizeof(stamps), stamps.data(),
+			                                        sizeof(uint64_t), vk::QueryResultFlagBits::e64) ==
+			        vk::Result::eSuccess &&
+			    stamps[1] >= stamps[0]) {
+				const auto begin = std::max(stamps[0], last_end);
+				if (stamps[1] > begin) {
+					busy_ns += static_cast<double>(stamps[1] - begin) * period_ns;
+				}
+				last_end = std::max(last_end, stamps[1]);
+				buffers++;
+			}
+			pending.pop_front();
+		}
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - report).count();
+		if (elapsed >= 5.0) {
+			if (buffers != 0) {
+				const double busy_ms_per_s = busy_ns / 1e6 / elapsed;
+				std::fprintf(stderr, "[gpu-time] %.1f s: GPU busy %.1f ms/s (%.0f%%), %llu command buffers\n",
+				             elapsed, busy_ms_per_s, busy_ms_per_s / 10.0,
+				             static_cast<unsigned long long>(buffers));
+				std::fflush(stderr);
+			}
+			busy_ns = 0;
+			buffers = 0;
+			report  = now;
+		}
+	}
+
+	struct Pending {
+		uint64_t tick = 0;
+		uint32_t slot = 0;
+	};
+
+	GraphicContext&                       graphics;
+	vk::QueryPool                         pool      = nullptr;
+	float                                 period_ns = 1.0f;
+	uint32_t                              next_slot = 0; // recording thread only
+	uint32_t                              open      = 0;
+	std::mutex                            mutex;
+	std::deque<Pending>                   pending;
+	uint64_t                              last_end = 0;
+	double                                busy_ns  = 0;
+	uint64_t                              buffers  = 0;
+	std::chrono::steady_clock::time_point report   = std::chrono::steady_clock::now();
+};
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
+    : m_gpu_timer(std::make_unique<GpuTimer>(graphics)), m_master(graphics), m_context(context),
+      m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
@@ -299,6 +416,16 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		{
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
+			// KYTY_DRAIN_STACKS=1: a host stack for every 37th forced drain (up to 48), to name
+			// the paths that make the command thread wait for the whole GPU.
+			if (static const bool stacks = std::getenv("KYTY_DRAIN_STACKS") != nullptr; stacks) {
+				static std::atomic<uint32_t> drains {0};
+				const auto                   n = drains.fetch_add(1);
+				if (n % 37 == 0 && n / 37 < 48) {
+					std::fprintf(stderr, "[drain] #%u\n%s\n", n, Common::HostBacktrace().c_str());
+					std::fflush(stderr);
+				}
+			}
 			const auto submitted_tick = Submit();
 			EXIT_IF(submitted_tick != tick);
 			Timeline::Mark("drain-begin", tick);
@@ -455,6 +582,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.
 	const auto tick = m_master.CurrentTick();
+	m_gpu_timer->Collect([this](uint64_t done) { return m_master.IsFree(done); });
 	if (m_threaded) {
 		m_command.m_buffer = nullptr;
 		Record([this, tick](vk::CommandBuffer) {
@@ -462,11 +590,13 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			vk::CommandBufferBeginInfo begin_info {};
 			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+			m_timer_slot = m_gpu_timer->Begin(m_worker_buffer);
 		});
 		return m_command;
 	}
 	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
+	m_timer_slot = m_gpu_timer->Begin(m_command.Handle());
 	return m_command;
 }
 
@@ -476,6 +606,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (!m_threaded) {
+		m_gpu_timer->End(m_command.Handle(), m_timer_slot);
+	}
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
 	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
@@ -503,9 +636,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
 		Record([this, job](vk::CommandBuffer command) mutable {
+			m_gpu_timer->End(command, m_timer_slot);
 			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
 			job.buffer = command;
 			QueueSubmit(job);
+			m_gpu_timer->Submitted(job.tick, m_timer_slot);
+			m_timer_slot    = UINT32_MAX;
 			m_worker_buffer = nullptr;
 		});
 		DispatchChunk();
@@ -514,6 +650,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	if (!m_async_submit) {
 		QueueSubmit(job);
+		m_gpu_timer->Submitted(job.tick, m_timer_slot);
+		m_timer_slot = UINT32_MAX;
 		return job.tick;
 	}
 	{
@@ -524,6 +662,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		job.submit.AddSignal(m_master.Handle(), job.tick);
 		m_submit_jobs.push_back(job);
 	}
+	m_gpu_timer->Submitted(job.tick, m_timer_slot);
+	m_timer_slot = UINT32_MAX;
 	m_submit_available.notify_one();
 	return job.tick;
 }
@@ -671,6 +811,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::PreferPerformanceCores("Vulkan recording thread");
+	Common::RaiseGpuThreadPriority();
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;

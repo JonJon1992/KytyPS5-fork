@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
@@ -220,13 +221,16 @@ void Present(uint64_t frame) {
 				timed += stat.ms;
 			}
 		}
-		LOGF("GpuTiming frame %" PRIu64 ": span=%.1fms commands=%.1fms\n", frame, total, timed);
+		// stderr: test runs keep the log silent.
+		std::fprintf(stderr, "GpuTiming frame %" PRIu64 ": span=%.1fms commands=%.1fms\n", frame,
+		             total, timed);
 		for (size_t i = 0; i < sorted.size() && i < 20; i++) {
 			const auto& [key, stat] = sorted[i];
-			LOGF("GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
-			     key == 0 ? "between " : (stat.kind == Draw ? "draw    " : "dispatch"), key,
-			     stat.ms, stat.count);
+			std::fprintf(stderr, "GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
+			             key == 0 ? "between " : (stat.kind == Draw ? "draw    " : "dispatch"), key,
+			             stat.ms, stat.count);
 		}
+		std::fflush(stderr);
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;
 	Detail::g_active.store(active, std::memory_order_relaxed);

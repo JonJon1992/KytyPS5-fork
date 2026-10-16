@@ -138,7 +138,42 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			auto condition = ctx.Def(info.condition);
+			auto& st       = ctx.state;
+			if (st.loop_guard_variable != 0 && ctx.half == 0) {
+				const bool true_exits = std::ranges::find(st.loop_guard_merges, term.true_block) !=
+				                        st.loop_guard_merges.end();
+				const bool false_exits = std::ranges::find(st.loop_guard_merges, term.false_block) !=
+				                         st.loop_guard_merges.end();
+				if (true_exits != false_exits) {
+					// Count the decision; past the limit, take the exit. KYTY_LOOP_GUARD_LIMIT
+					// (default 65536) sets the limit (part of the shader cache key via getenv).
+					static const uint32_t LoopGuardLimit = [] {
+						const char* value = std::getenv("KYTY_LOOP_GUARD_LIMIT");
+						const auto  limit = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+						return limit != 0ul ? static_cast<uint32_t>(limit) : (1u << 16u);
+					}();
+					const auto         count          = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpLoad, TypeU32(st), count, st.loop_guard_variable);
+					const auto next = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpIAdd, TypeU32(st), next, count, ConstantU32(st, 1u));
+					st.builder.AddFunction(spv::OpStore, st.loop_guard_variable, next);
+					const auto exhausted = st.builder.AllocateId();
+					st.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(st), exhausted, next,
+					                       ConstantU32(st, LoopGuardLimit));
+					const auto guarded = st.builder.AllocateId();
+					if (true_exits) {
+						st.builder.AddFunction(spv::OpLogicalOr, TypeBool(st), guarded, condition,
+						                       exhausted);
+					} else {
+						const auto keep = st.builder.AllocateId();
+						st.builder.AddFunction(spv::OpLogicalNot, TypeBool(st), keep, exhausted);
+						st.builder.AddFunction(spv::OpLogicalAnd, TypeBool(st), guarded, condition,
+						                       keep);
+					}
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -1032,10 +1067,29 @@ void EmitProgram(EmitterState& state) {
 		EmitMeshEntryPoint(state);
 		return;
 	}
+	if (static const char* guard_list = std::getenv("KYTY_LOOP_GUARD_HASHES");
+	    guard_list != nullptr && !state.program.dispatcher_fallback &&
+	    std::string_view(guard_list).find(fmt::format("{:016x}", state.program.shader_hash)) !=
+	        std::string_view::npos) {
+		for (const auto& info: program.block_info) {
+			if (info.terminator.loop_header && info.terminator.merge_block != UINT32_MAX) {
+				state.loop_guard_merges.push_back(info.terminator.merge_block);
+			}
+		}
+		if (!state.loop_guard_merges.empty()) {
+			state.loop_guard_variable = state.builder.AllocateId();
+		}
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction,
+		                          ConstantU32(state, 0u));
+	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,

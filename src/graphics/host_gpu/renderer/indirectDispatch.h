@@ -51,6 +51,36 @@ private:
 	uint32_t                m_next            = 0;
 };
 
+// DRAW_INDIRECT of a fast-launch mesh draw: the guest's vertex and instance counts become the
+// mesh-tasks command on the GPU (MeshIndirectArgs::Convert), validated against the device's
+// limits there, instead of the command processor reading them, which drained the GPU per draw.
+class MeshIndirectArgs {
+public:
+	MeshIndirectArgs(GraphicContext& graphics, CommandScheduler& scheduler);
+	~MeshIndirectArgs();
+	KYTY_CLASS_NO_COPY(MeshIndirectArgs);
+
+	struct Result {
+		vk::Buffer     buffer;
+		vk::DeviceSize offset = 0;
+	};
+	// Records the conversion of the counts at `args` (vertex count, instance count) and returns
+	// the command's location, ready for drawMeshTasksIndirectEXT. Binds a compute pipeline and
+	// push state, so call it outside rendering and before committing the draw's bindings.
+	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress args);
+
+private:
+	static constexpr uint32_t Entries     = 4096;
+	static constexpr uint32_t EntryDwords = 4;
+
+	GraphicContext&         m_graphics;
+	Buffer                  m_commands;
+	vk::DescriptorSetLayout m_set_layout      = nullptr;
+	vk::PipelineLayout      m_pipeline_layout = nullptr;
+	vk::Pipeline            m_pipeline        = nullptr;
+	uint32_t                m_next            = 0;
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_INDIRECTDISPATCH_H_

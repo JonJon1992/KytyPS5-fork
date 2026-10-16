@@ -653,6 +653,7 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 	};
 	struct Shader {
+		uint64_t               code_hash = 0;
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
 	};
@@ -680,7 +681,7 @@ ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
-                                    std::string& reason, uint32_t wave_size) {
+                                    std::string& reason, uint32_t wave_size, uint64_t code_hash) {
 	expanded.clear();
 	reason.clear();
 	if (wave_size != 32u && wave_size != 64u) {
@@ -688,11 +689,16 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return false;
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
-	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+	// Comparing the whole code on every dispatch was ~4 us a dispatch (6 % of the GPU thread in
+	// the save's opening fight, 2026-10-09); the content hash names the same code.
+	const bool same_hash = code_hash != 0 && shader.code_hash == code_hash &&
+	                       shader.analysis.code.size() == code.size();
+	if (!same_hash && (shader.analysis.code.size() != code.size() ||
+	                   !std::equal(code.begin(), code.end(), shader.analysis.code.begin()))) {
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
+	shader.code_hash = code_hash;
 	const auto& analysis = shader.analysis;
 	if (!analysis.has_calls) return true;
 	if (analysis.has_setpc) {

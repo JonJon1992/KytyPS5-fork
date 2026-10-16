@@ -44,6 +44,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -674,11 +675,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (has_storage_writes) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 			// while allowing the queue to execute asynchronously.
-			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (DispatchSyncEnabled()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
+		{
+			// Name each compute shader once by its code address, so a device-fault checkpoint
+			// (which prints the address) can be matched to a hash for KYTY_SKIP_SHADER_HASHES.
+			static std::unordered_set<uint64_t> named;
+			if (named.insert(cs_regs.cs_regs.data_addr).second) {
+				std::fprintf(stderr, "[cs] addr=0x%016" PRIx64 " hash=0x%016" PRIx64 "\n",
+				             static_cast<uint64_t>(cs_regs.cs_regs.data_addr), program.shader_hash);
+			}
+		}
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuProfiler::End(buffer, gpu_zone);
@@ -688,7 +698,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (DispatchSyncEnabled()) ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();
 }
@@ -723,6 +733,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		LogSkippedDispatch(cs_regs, "indirect");
 		ResetBindings();
 		return;
+	}
+	{
+		static std::unordered_set<uint64_t> named;
+		if (named.insert(cs_regs.cs_regs.data_addr).second) {
+			std::fprintf(stderr, "[cs-indirect] addr=0x%016" PRIx64 " hash=0x%016" PRIx64 "\n",
+			             static_cast<uint64_t>(cs_regs.cs_regs.data_addr),
+			             input_info.stage.program->shader_hash);
+		}
 	}
 	if (use_thread_dimensions && m_indirect_groups == nullptr) {
 		m_indirect_groups = std::make_unique<IndirectDispatchGroups>(
@@ -781,7 +799,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			                                    ShaderRecompiler::IR::ImageResourceClass::Storage;
 		        });
 		if (has_storage_writes) {
-			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (DispatchSyncEnabled()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk::MemoryBarrier barrier {};
 		barrier.srcAccessMask =
@@ -799,7 +817,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (DispatchSyncEnabled()) ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();
 }

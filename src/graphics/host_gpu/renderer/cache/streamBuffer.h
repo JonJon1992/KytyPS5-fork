@@ -39,8 +39,18 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A buffer over host memory the guest also uses (VK_EXT_external_memory_host): the GPU reads and
+	// writes the guest's own bytes, so nothing is uploaded or read back. Handle() is null when the
+	// driver refuses the import.
+	struct ImportHostMemory {};
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       void* host_pointer, vk::BufferUsageFlags flags, uint64_t size, ImportHostMemory);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	[[nodiscard]] bool IsShared() const noexcept { return m_imported != VK_NULL_HANDLE; }
+	// Frees the import now (its host memory is about to go away); the GPU must be idle.
+	void ReleaseImport() noexcept;
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
@@ -92,6 +102,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	VkDeviceMemory                m_imported   = VK_NULL_HANDLE;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
