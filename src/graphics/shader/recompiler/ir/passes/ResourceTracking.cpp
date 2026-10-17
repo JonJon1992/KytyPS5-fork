@@ -9,6 +9,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <map>
@@ -520,6 +523,11 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		if (Frontend::TranslationNonFatal()) {
 			LOGF("%s\n", message.c_str());
+			// Also to stderr (first 64): the reason a shader gives up, which test runs keep.
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1) < 64) {
+				std::fprintf(stderr, "[gave-up-reason] %s\n", message.c_str());
+			}
 			Profiler::Message(Profiler::MessageWarning, "%s", message.c_str());
 			throw TrackingFailure {};
 		}
@@ -1216,7 +1224,71 @@ private:
 		    ? ScalarReadBase(read) : UINT32_MAX;
 		MakeSource(*handle, width, false, false, base, descriptor, flags.pc);
 		uint32_t bad_dword = 0;
-		return ValidateSource(descriptor, bad_dword);
+		const bool valid   = ValidateSource(descriptor, bad_dword);
+		// Diagnostics (stderr, first 8): what the rejected table descriptor dword is built from.
+		static std::atomic<uint32_t> diag {0};
+		if (!valid && diag.fetch_add(1) < 8) {
+			std::string tree;
+			const std::function<void(Value, uint32_t)> walk = [&](Value v, uint32_t depth) {
+				v = v.Resolve();
+				if (v.IsImmediate()) {
+					tree += fmt::format(" imm:{:x}", v.GetType() == Type::U32 ? v.U32() : 0u);
+					return;
+				}
+				const auto* inst = v.TryInstruction();
+				if (inst == nullptr) {
+					tree += " ?";
+					return;
+				}
+				tree += fmt::format(" {}(", ValueOpcodeName(inst->GetOpcode()));
+				if (depth < 5u) {
+					for (size_t i = 0; i < inst->NumArgs() && i < 5; i++) walk(inst->Arg(i), depth + 1u);
+				}
+				tree += ")";
+			};
+			walk(descriptor.dwords[bad_dword], 0u);
+			// The distinct non-phi leaves of every phi web under it.
+			std::unordered_set<const Inst*> seen;
+			std::vector<Value>              stack {descriptor.dwords[bad_dword]};
+			std::string                     leaves;
+			uint32_t                        listed = 0;
+			while (!stack.empty() && listed < 40) {
+				auto v = stack.back().Resolve();
+				stack.pop_back();
+				const auto* inst = v.TryInstruction();
+				if (inst == nullptr) continue;
+				if (!seen.insert(inst).second) continue;
+				if (inst->GetOpcode() == ValueOpcode::Phi) {
+					for (size_t i = 0; i < inst->NumArgs(); i++) {
+						const auto a = inst->Arg(i).Resolve();
+						const auto* ai = a.TryInstruction();
+						if (ai == nullptr) {
+							leaves += fmt::format(" [leaf imm {:x}]", a.IsImmediate() && a.GetType() == Type::U32 ? a.U32() : 0xdeadu);
+							listed++;
+						} else if (ai->GetOpcode() == ValueOpcode::Phi) {
+							stack.push_back(a);
+						} else if (seen.insert(ai).second) {
+							leaves += fmt::format(" [leaf {}#{:x}", ValueOpcodeName(ai->GetOpcode()),
+							                      reinterpret_cast<uintptr_t>(ai) & 0xffffu);
+							for (size_t j = 0; j < ai->NumArgs() && j < 3; j++) {
+								const auto b = ai->Arg(j).Resolve();
+								if (b.IsImmediate()) leaves += fmt::format(" i{:x}", b.GetType() == Type::U32 ? b.U32() : 0u);
+								else if (const auto* bi = b.TryInstruction()) leaves += fmt::format(" {}", ValueOpcodeName(bi->GetOpcode()));
+							}
+							leaves += "]";
+							listed++;
+						}
+					}
+				} else {
+					for (size_t i = 0; i < inst->NumArgs(); i++) stack.push_back(inst->Arg(i));
+				}
+			}
+			tree += " LEAVES:" + leaves;
+			std::fprintf(stderr, "[track-diag] hash=%016llx pc=0x%x table read kind=%u dword %u:%s\n",
+			             static_cast<unsigned long long>(m_program.shader_hash), flags.pc,
+			             static_cast<uint32_t>(kind), bad_dword, tree.c_str());
+		}
+		return valid;
 	}
 
 	// A value computed only from scalar sources is the same in every lane: every IR branch

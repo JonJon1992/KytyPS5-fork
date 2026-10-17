@@ -590,6 +590,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// KYTY_LOG_CS_IMAGES=1: each compute shader's written images (extent, format), once per shape.
+	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
+		static std::unordered_set<uint64_t> seen;
+		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+			if (!program.info.images[i].written) continue;
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const uint64_t key = program.shader_hash ^ (uint64_t {r.Width5()} << 1u) ^
+			                     (uint64_t {r.Height5()} << 17u) ^ (uint64_t {static_cast<uint32_t>(r.Format())} << 33u) ^ (uint64_t {i} << 45u);
+			if (seen.insert(key).second) {
+				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%u fmt=%u groups=%ux%ux%u\n",
+				             static_cast<unsigned long long>(program.shader_hash), i,
+				             static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				             static_cast<uint32_t>(r.Format()), thread_group_x, thread_group_y, thread_group_z);
+			}
+		}
+	}
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::TryConsumeClears");
 		if (resources.specialization_reads.empty() &&
@@ -865,6 +881,22 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
+		static std::unordered_set<uint64_t> seen;
+		const auto& resources = *input_info.stage.resources;
+		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+			if (!program.info.images[i].written) continue;
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const uint64_t key = program.shader_hash ^ (uint64_t {r.Width5()} << 1u) ^
+			                     (uint64_t {r.Height5()} << 17u) ^ (uint64_t {static_cast<uint32_t>(r.Format())} << 33u) ^ (uint64_t {i} << 45u);
+			if (seen.insert(key).second) {
+				std::fprintf(stderr, "[cs-image] hash=%016llx image[%u] %ux%u fmt=%u indirect\n",
+				             static_cast<unsigned long long>(program.shader_hash), i,
+				             static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				             static_cast<uint32_t>(r.Format()));
+			}
+		}
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

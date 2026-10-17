@@ -946,49 +946,73 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
+// One component of a formatted load through a GPU-selected descriptor: the format and the
+// component's destination select (DST_SEL_X/Y/Z/W) come from the descriptor's third word.
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IR::Inst& inst,
+                                        const IndirectBufferAccess& buffer, uint32_t component) {
+	auto&      state    = ctx.state;
+	const auto selector = component == 0u
+	                          ? buffer.selector
+	                          : EmitBitFieldUExtract(state, ctx.Arg(*inst.Arg(0).ResolveInstruction(), 3),
+	                                                 ConstantU32(state, component * 3u),
+	                                                 ConstantU32(state, 3u));
+	return EmitIndexSwitch(
+	    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
+	    TypeU32(state), [&](uint32_t format) {
+		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+		    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
+		    const auto constant = Select(
+		        state, TypeU32(state),
+		        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
+		        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
+		    return EmitValueOrDefaultIfCondition(
+		        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+		                      ConstantU32(state, 4)),
+		        TypeU32(state), constant, [&]() {
+			        const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
+			        const auto base = Binary(
+			            state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,
+			            ConstantDeviceAddress(state, ~(uint64_t(std::min(4u, info.byte_size)) - 1u)));
+			        const auto load = [&](uint32_t source, uint32_t bits) {
+				        const auto offset = Format::GetFormatComponentByteOffset(info, source);
+				        const auto address = offset == 0u ? base : Binary(
+				            state, spv::OpIAdd, TypeScalarU64(state), base,
+				            ConstantDeviceAddress(state, offset));
+				        return LoadBda(ctx, address, in_bounds, bits);
+			        };
+			        const auto emit_component = [&](uint32_t source) {
+				        return LoadFormattedComponent(
+				            ctx, info, {FormattedSourceKind::Memory, source},
+				            [&](uint32_t from) { return load(from, 32u); }, load);
+			        };
+			        if (info.component_count == 1u) return emit_component(0u);
+			        const auto source = Binary(
+			            state, spv::OpUMod, TypeU32(state),
+			            Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)),
+			            ConstantU32(state, info.component_count));
+			        return EmitIndexSwitch(state, source, info.component_count, TypeU32(state),
+			                               emit_component);
+		        });
+	    });
+}
+
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto buffer = PrepareIndirectBuffer(ctx, inst);
-		return EmitIndexSwitch(
-		    state, buffer.format, static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u,
-		    TypeU32(state), [&](uint32_t format) {
-			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
-			    const auto constant = Select(
-			        state, TypeU32(state),
-			        Binary(state, spv::OpIEqual, TypeBool(state), buffer.selector, ConstantU32(state, 1)),
-			        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
-			    return EmitValueOrDefaultIfCondition(
-			        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-			                      ConstantU32(state, 4)),
-			        TypeU32(state), constant, [&]() {
-				        const auto in_bounds = IndirectBufferInBounds(state, buffer, 0u, info.byte_size, true);
-				        const auto base = Binary(
-				            state, spv::OpBitwiseAnd, TypeScalarU64(state), buffer.address,
-				            ConstantDeviceAddress(state, ~(uint64_t(std::min(4u, info.byte_size)) - 1u)));
-				        const auto load = [&](uint32_t component, uint32_t bits) {
-					        const auto offset = Format::GetFormatComponentByteOffset(info, component);
-					        const auto address = offset == 0u ? base : Binary(
-					            state, spv::OpIAdd, TypeScalarU64(state), base,
-					            ConstantDeviceAddress(state, offset));
-					        return LoadBda(ctx, address, in_bounds, bits);
-				        };
-				        const auto emit_component = [&](uint32_t component) {
-					        return LoadFormattedComponent(
-					            ctx, info, {FormattedSourceKind::Memory, component},
-					            [&](uint32_t source) { return load(source, 32u); }, load);
-				        };
-				        if (info.component_count == 1u) return emit_component(0u);
-				        const auto component = Binary(
-				            state, spv::OpUMod, TypeU32(state),
-				            Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)),
-				            ConstantU32(state, info.component_count));
-				        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-				                               emit_component);
-			        });
-		    });
+		return LoadIndirectFormattedComponent(ctx, inst, buffer, 0u);
 	});
+}
+
+// BUFFER_LOAD_FORMAT_XY/XYZ/XYZW through a GPU-selected descriptor (the caller checks EXEC).
+uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto&                   state  = ctx.state;
+	const auto              buffer = PrepareIndirectBuffer(ctx, inst);
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		values[component] = LoadIndirectFormattedComponent(ctx, inst, buffer, component);
+	}
+	return ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -998,7 +1022,8 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    const auto mem = ctx.Memory(inst);
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-			    return LoadIndirectBuffer(ctx, inst, components);
+			    return mem.formatted ? LoadIndirectFormatted(ctx, inst, components)
+			                         : LoadIndirectBuffer(ctx, inst, components);
 		    }
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
 		    const auto info     = Format::GetFormatInfo(

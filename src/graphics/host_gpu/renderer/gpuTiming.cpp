@@ -250,7 +250,11 @@ void Present(uint64_t frame) {
 		// stderr: test runs keep the log silent.
 		std::fprintf(stderr, "GpuTiming frame %" PRIu64 ": span=%.1fms commands=%.1fms\n", frame,
 		             total, timed);
-		for (size_t i = 0; i < sorted.size() && i < 20; i++) {
+		static const size_t top = [] {
+			const char* value = std::getenv("KYTY_GPU_TIMING_TOP");
+			return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t {20};
+		}();
+		for (size_t i = 0; i < sorted.size() && i < top; i++) {
 			const auto& [key, stat] = sorted[i];
 			const bool split = std::find(split_keys.begin(), split_keys.end(), key) != split_keys.end();
 			std::fprintf(stderr, "GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
