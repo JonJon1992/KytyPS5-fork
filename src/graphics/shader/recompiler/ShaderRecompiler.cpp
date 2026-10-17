@@ -728,6 +728,20 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	ir.bindless_images        = options.bindless_images;
+	// KYTY_DUMP_IR_HASH=<hash>[,<hash>...] with KYTY_DUMP_GAVE_UP=<folder>: the IR before resource
+	// tracking of those shaders, to <folder>/<stage>_<hash>_ir.txt (also for shaders that give up).
+	if (const char* hashes = std::getenv("KYTY_DUMP_IR_HASH"); hashes != nullptr &&
+	    std::string_view(hashes).find(fmt::format("{:016x}", options.shader_hash)) != std::string_view::npos) {
+		if (const char* folder = std::getenv("KYTY_DUMP_GAVE_UP"); folder != nullptr) {
+			const auto path = fmt::format("{}/{}_{:016x}_ir.txt", folder, StageName(options.stage),
+			                              options.shader_hash);
+			if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				const auto dump = MakeIrDump(CFG::GraphToString(cfg), ir);
+				std::fwrite(dump.data(), 1, dump.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	KYTY_PROFILER_PHASE(phases, "Shader: resource tracking", profiler::colors::Amber300);
 	const auto tracking_begin = std::chrono::steady_clock::now();
 	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);

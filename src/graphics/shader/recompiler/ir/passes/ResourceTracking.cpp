@@ -3027,6 +3027,26 @@ private:
 				source = InternSource(descriptor);
 				return true;
 			}
+			// DIAGNOSTIC ONLY (KYTY_NULL_IMAGE_SHADERS=<hash>[,<hash>...]): an image this
+			// tracking cannot resolve samples a null image (zeros) instead of the shader giving
+			// up, to see what the rest of the shader contributes. Not a fix.
+			if (expected == ValueOpcode::GetImageResource && Frontend::TranslationNonFatal()) {
+				static const std::string listed = [] {
+					const char* value = std::getenv("KYTY_NULL_IMAGE_SHADERS");
+					return value != nullptr ? std::string(value) : std::string();
+				}();
+				if (!listed.empty() &&
+				    listed.find(fmt::format("{:016x}", m_program.shader_hash)) != std::string::npos) {
+					for (uint32_t dword = 0; dword < width; dword++) {
+						handle->SetArg(dword, Value(0u));
+						descriptor.dwords[dword] = Value(0u);
+					}
+					std::fprintf(stderr, "[null-image] %016llx pc=0x%x: unresolved image sampled as null\n",
+					             static_cast<unsigned long long>(m_program.shader_hash), pc);
+					source = InternSource(descriptor);
+					return true;
+				}
+			}
 			const auto reject = m_indirect_rejects.find(handle);
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value{}",
 			                     ValueOpcodeName(expected), bad_dword,
