@@ -135,6 +135,14 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
+static bool SingleRebind() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SINGLE_REBIND");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 class DispatchBufferRecovery {
 public:
 	DispatchBufferRecovery(RenderContext& context, const PreparedBindings& bindings,
@@ -652,7 +660,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
-	RebindBuffers(bindings);
+	// The dispatch loop below binds the buffers again before recording; this first pass only
+	// repeated every buffer's sync and the flattened SRT upload (KYTY_SINGLE_REBIND=0: as before).
+	if (!SingleRebind()) RebindBuffers(bindings);
 
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -902,8 +912,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
-	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	RebindBuffers(bindings);
+	// Acquiring arguments can merge cache buffers; the loop below finalizes the shader bindings
+	// afterward (KYTY_SINGLE_REBIND=0: also bind them here first, as before).
+	if (!SingleRebind()) RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
