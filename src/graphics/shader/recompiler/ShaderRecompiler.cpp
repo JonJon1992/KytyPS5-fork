@@ -740,6 +740,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 				std::fwrite(dump.data(), 1, dump.size(), file);
 				std::fclose(file);
 			}
+			// Our own decoding with pcs (llvm-mc's gfx1030 decoding drifts on this code).
+			const auto dec = fmt::format("{}/{}_{:016x}_dec.txt", folder, StageName(options.stage),
+			                             options.shader_hash);
+			if (FILE* file = std::fopen(dec.c_str(), "wb"); file != nullptr) {
+				const auto text = Decoder::ProgramToString(decoded);
+				std::fwrite(text.data(), 1, text.size(), file);
+				std::fclose(file);
+			}
 			// The guest code too, for llvm-mc disassembly.
 			const auto bin = fmt::format("{}/{}_{:016x}.bin", folder, StageName(options.stage),
 			                             options.shader_hash);

@@ -107,22 +107,34 @@ const ProbePc& ProbePcSetting() {
 		if (end != nullptr && *end == '@') {
 			result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
 		}
-		if (end != nullptr && end[0] == ':' && end[1] == 'v') {
-			result.vgpr = static_cast<uint32_t>(std::strtoul(end + 2, &end, 10));
+		if (end != nullptr && end[0] == ':') {
+			end++;
+			while (end != nullptr && end[0] == 'v' && result.count < 3u) {
+				result.vgprs[result.count++] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+				if (end != nullptr && *end == ',') {
+					end++;
+				}
+			}
 		}
 		return result;
 	}();
 	return setting;
 }
 
-void Translator::ProbeCopy(uint32_t vgpr) {
-	Decoder::Operand source;
-	source.kind = Decoder::OperandKind::Vgpr;
-	source.reg  = vgpr;
-	Decoder::Operand target;
-	target.kind = Decoder::OperandKind::Vgpr;
-	target.reg  = ProbeVgpr;
-	WriteRawU32(target, ReadRawU32(source));
+void Translator::ProbeCopy(const ProbePc& probe) {
+	std::array<IR::U32, 3> values;
+	for (uint32_t i = 0; i < 3u; i++) {
+		Decoder::Operand source;
+		source.kind = Decoder::OperandKind::Vgpr;
+		source.reg  = probe.vgprs[std::min(i, probe.count - 1u)];
+		values[i]   = ReadRawU32(source);
+	}
+	for (uint32_t i = 0; i < 3u; i++) {
+		Decoder::Operand target;
+		target.kind = Decoder::OperandKind::Vgpr;
+		target.reg  = ProbeVgpr + i;
+		WriteRawU32(target, values[i]);
+	}
 }
 
 void Translator::V_INTERP_P1_F32() {}
@@ -181,13 +193,12 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	const bool  probed = probe.hash != 0 && probe.hash == program.shader_hash &&
 	                    program.stage == ShaderType::Pixel && inst.exp.target == 0u;
 	if (probed) {
-		Decoder::Operand source;
-		source.kind   = Decoder::OperandKind::Vgpr;
-		source.reg    = ProbeVgpr;
-		const auto v  = ReadRawU32(source);
-		components[0] = v;
-		components[1] = v;
-		components[2] = v;
+		for (uint32_t i = 0; i < 3u; i++) {
+			Decoder::Operand source;
+			source.kind   = Decoder::OperandKind::Vgpr;
+			source.reg    = ProbeVgpr + i;
+			components[i] = ReadRawU32(source);
+		}
 		components[3] = IR::Value(0x3f800000u);
 	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,

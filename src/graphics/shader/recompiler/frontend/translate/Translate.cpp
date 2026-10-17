@@ -1447,8 +1447,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return result;
 	}();
-	// Diagnostics: KYTY_PROBE_PC=<shader hash>@<pc>:v<n> (hex hash/pc): after the instruction at
-	// <pc>, v<n> is copied to v255, and the pixel shader's MRT0 export writes v255 as grey (alpha
+	// Diagnostics: KYTY_PROBE_PC=<shader hash>@<pc>:v<a>[,v<b>,v<c>] (hex hash/pc): after the instruction at
+	// <pc>, the registers are copied to v253..v255 and the MRT0 export writes them as RGB (alpha
 	// 1, uncompressed), to see an intermediate value on screen. ProbeVgpr() names the copy.
 	const auto probe = ProbePcSetting();
 	if (probe.hash != 0 && probe.hash == result.shader_hash) {
@@ -1479,11 +1479,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			if (probe.hash != 0 && probe.hash == result.shader_hash && instruction.pc == 0u) {
 				// Sentinel grey 0.25: pixels whose path skips the probed instruction.
-				translator.ForceVectorRegisters(ProbeVgpr, {0x3e800000u});
+				translator.ForceVectorRegisters(ProbeVgpr, {0x3e800000u, 0x3e800000u, 0x3e800000u});
 			}
 			translator.TranslateInstruction(instruction);
-			if (probe.hash != 0 && probe.hash == result.shader_hash && probe.pc == instruction.pc) {
-				translator.ProbeCopy(probe.vgpr);
+			if (probe.hash != 0 && probe.hash == result.shader_hash && probe.pc == instruction.pc &&
+			    probe.count != 0) {
+				translator.ProbeCopy(probe);
 			}
 			if (forced.hash != 0 && forced.hash == result.shader_hash) {
 				for (const auto& forced_result: forced.results) {

@@ -11,11 +11,13 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 struct ProbePc {
 	uint64_t hash = 0;
 	uint32_t pc   = 0;
-	uint32_t vgpr = 0;
+	// Up to three registers, shown as red, green and blue (one register: grey).
+	uint32_t vgprs[3] = {0, 0, 0};
+	uint32_t count    = 0;
 };
 // KYTY_PROBE_PC (Translate.cpp).
 const ProbePc& ProbePcSetting();
-constexpr uint32_t ProbeVgpr = 255;
+constexpr uint32_t ProbeVgpr = 253; // 253..255
 
 class Translator {
 public:
@@ -32,8 +34,8 @@ public:
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
-	// Diagnostics (KYTY_PROBE_PC): copies v<vgpr> to the probe register.
-	void ProbeCopy(uint32_t vgpr);
+	// Diagnostics (KYTY_PROBE_PC): copies the probed registers to v253..v255.
+	void ProbeCopy(const ProbePc& probe);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

@@ -1,5 +1,11 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
+#include <cstdio>
+#include <cinttypes>
+#include <mutex>
+#include <set>
+#include <string>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -277,6 +283,35 @@ void BindlessTable::WriteDefaultSampler(vk::Sampler sampler) {
 	m_default_sampler_written = true;
 }
 
+// KYTY_LOG_BINDLESS_SAMPLERS=1: sampler heap mirroring on stderr ([bl-samp]): each heap update,
+// the array-full case, and every distinct sampler record decoded once.
+static bool LogBindlessSamplers() {
+	static const bool enabled = std::getenv("KYTY_LOG_BINDLESS_SAMPLERS") != nullptr;
+	return enabled;
+}
+
+static void LogSamplerRecord(uint64_t base, size_t key, const ShaderSamplerResource& r) {
+	static std::mutex                          mutex;
+	static std::set<std::array<uint32_t, 4>>   seen;
+	{
+		std::lock_guard lock(mutex);
+		if (seen.size() > 4096 || !seen.insert({r.fields[0], r.fields[1], r.fields[2], r.fields[3]}).second) {
+			return;
+		}
+	}
+	std::fprintf(stderr,
+	             "[bl-samp] rec heap=0x%012" PRIx64 " key=%zu %08x %08x %08x %08x clamp=%u%u%u aniso=%u"
+	             " cmp=%u unorm=%d mag=%u min=%u zf=%u mip=%u minlod=%u maxlod=%u bias=%d biassec=%u"
+	             " perfmip=%u filtermode=%u border=%u/%u trunc=%d\n",
+	             base, key, r.fields[0], r.fields[1], r.fields[2], r.fields[3], r.ClampX(),
+	             r.ClampY(), r.ClampZ(), r.MaxAnisoRatio(), r.DepthCompareFunc(),
+	             r.ForceUnormCoords() ? 1 : 0, r.XyMagFilter(), r.XyMinFilter(), r.ZFilter(),
+	             r.MipFilter(), r.MinLod(), r.MaxLod(),
+	             static_cast<int>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)),
+	             r.LodBiasSec(), r.PerfMip(), r.FilterMode(), r.BorderColorType(),
+	             r.BorderColorPtr(), r.TruncCoord() ? 1 : 0);
+}
+
 bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              heap,
                                       std::span<const std::array<uint32_t, 4>> records,
                                       SamplerCache&                             cache) {
@@ -291,6 +326,12 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 		const auto capacity = std::max<uint32_t>(64u, static_cast<uint32_t>(records.size()) * 2u);
 		if (m_samplers_per_array <= 1u || capacity > m_samplers_per_array - m_next_sampler_slot) {
 			static std::atomic<uint32_t> reported = 0;
+			if (LogBindlessSamplers() && reported.load() < 64) {
+				std::fprintf(stderr, "[bl-samp] array full (%u of %u slots) heap 0x%012" PRIx64
+				             " keeps %zu records, wanted %zu\n",
+				             m_next_sampler_slot, m_samplers_per_array, heap.base,
+				             heap.records.size(), records.size());
+			}
 			if (reported.fetch_add(1) < 8) {
 				LOGF("Bindless samplers: array full (%u of %u slots), heap 0x%016" PRIx64
 				     " keeps %zu records\n",
@@ -308,6 +349,50 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 	for (size_t key = first; key < records.size(); key++) {
 		ShaderSamplerResource descriptor;
 		std::copy(records[key].begin(), records[key].end(), descriptor.fields);
+		if (LogBindlessSamplers()) {
+			LogSamplerRecord(heap.base, key, descriptor);
+		}
+		// Diagnostics: KYTY_BL_SAMP_FORCE=<letters> edits the mirrored game samplers to bisect a
+		// wrong surface: w = wrap on every axis, b = no LOD bias, a = no anisotropy, l = no min/max
+		// LOD clamp, k = first key's sampler (key 0) for every key.
+		static const std::string force = [] {
+			const char* value = std::getenv("KYTY_BL_SAMP_FORCE");
+			return value != nullptr ? std::string(value) : std::string();
+		}();
+		// KYTY_BL_SAMP_FORCE_KEYS=<lo>-<hi>: only those keys (inclusive).
+		static const std::pair<size_t, size_t> force_keys = [] {
+			std::pair<size_t, size_t> range {0, SIZE_MAX};
+			if (const char* value = std::getenv("KYTY_BL_SAMP_FORCE_KEYS"); value != nullptr) {
+				char* end    = nullptr;
+				range.first  = std::strtoull(value, &end, 10);
+				range.second = (end != nullptr && *end == '-') ? std::strtoull(end + 1, nullptr, 10)
+				                                               : range.first;
+			}
+			return range;
+		}();
+		if (!force.empty() && key >= force_keys.first && key <= force_keys.second) {
+			if (force.find('k') != std::string::npos) {
+				std::copy(records[0].begin(), records[0].end(), descriptor.fields);
+			}
+			if (force.find('w') != std::string::npos) {
+				descriptor.fields[0] &= ~0x1ffu;
+			}
+			if (force.find('b') != std::string::npos) {
+				descriptor.fields[2] &= ~0x3fffu;
+			}
+			if (force.find('a') != std::string::npos) {
+				descriptor.fields[0] &= ~(0x7u << 9u);
+				if (descriptor.XyMagFilter() >= 2u) {
+					descriptor.fields[2] = (descriptor.fields[2] & ~(0x3u << 20u)) | (1u << 20u);
+				}
+				if (descriptor.XyMinFilter() >= 2u) {
+					descriptor.fields[2] = (descriptor.fields[2] & ~(0x3u << 22u)) | (1u << 22u);
+				}
+			}
+			if (force.find('l') != std::string::npos) {
+				descriptor.fields[1] = (descriptor.fields[1] & ~0xffffffu) | (0xfffu << 12u);
+			}
+		}
 		if ((heap.flags & SamplerDepthCompare) == 0u) {
 			descriptor.fields[0] &= ~(0x7u << 12u);
 		}
@@ -326,6 +411,17 @@ bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              
 		write.descriptorType  = vk::DescriptorType::eSampler;
 		write.pImageInfo      = infos.data();
 		m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	}
+	if (LogBindlessSamplers()) {
+		static std::atomic<uint32_t> printed = 0;
+		if (printed.fetch_add(1) < 256) {
+			std::fprintf(stderr,
+			             "[bl-samp] heap 0x%012" PRIx64 "+0x%x flags=%u region=%u records=%zu (%u new)"
+			             " same_prefix=%d next_slot=%u\n",
+			             heap.base, heap.table_offset, heap.flags, heap.region, records.size(),
+			             static_cast<uint32_t>(infos.size()), same_prefix ? 1 : 0,
+			             m_next_sampler_slot);
+		}
 	}
 	static std::atomic<uint32_t> logged = 0;
 	if (logged.fetch_add(1) < 32) {

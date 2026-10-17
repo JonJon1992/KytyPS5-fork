@@ -2803,6 +2803,38 @@ private:
 				BindlessSamplerPlan plan;
 				if (TryMakeBindlessSampler(*sampler, plan)) {
 					m_bindless_samplers.push_back(plan);
+					// KYTY_LOG_BINDLESS_SAMPLERS=1: what each bindless sampler key is made of.
+					if (std::getenv("KYTY_LOG_BINDLESS_SAMPLERS") != nullptr) {
+						std::string what;
+						Value       cursor = plan.key;
+						for (int depth = 0; depth < 6; depth++) {
+							cursor = cursor.Resolve();
+							if (cursor.IsImmediate()) {
+								what += fmt::format(" imm=0x{:x}", cursor.U32());
+								break;
+							}
+							const auto* key_inst = cursor.TryInstruction();
+							if (key_inst == nullptr) {
+								what += " ?";
+								break;
+							}
+							what += fmt::format(" {}", ValueOpcodeName(key_inst->GetOpcode()));
+							if (key_inst->NumArgs() == 0u) {
+								break;
+							}
+							for (uint32_t a = 1; a < key_inst->NumArgs() && a < 3u; a++) {
+								const auto arg = key_inst->Arg(a).Resolve();
+								if (arg.IsImmediate()) {
+									what += fmt::format("[{}]=0x{:x}", a, arg.U32());
+								}
+							}
+							cursor = key_inst->Arg(0);
+						}
+						std::fprintf(stderr, "[bl-samp-key] %s %016llx pc=0x%x key:%s\n",
+						             StageName(m_program.stage),
+						             static_cast<unsigned long long>(m_program.shader_hash), flags.pc,
+						             what.c_str());
+					}
 				}
 			}
 		}
