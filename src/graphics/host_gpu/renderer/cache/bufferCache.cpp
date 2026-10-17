@@ -1284,6 +1284,60 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		// The buffer is guest memory itself: no upload, and GPU writes need no tracking.
 		return false;
 	}
+	// KYTY_SYNC_SKIP=1: the same sync (buffer, range, written) as one done while no page anywhere
+	// became CPU-dirty or stopped being GPU-dirty finds nothing to upload and marks nothing new:
+	// skip the tracker walk. The title syncs ~500,000 buffer ranges a second, most of them
+	// repeats within a submission (the per-record dispatch chains bind the same buffers).
+	static const bool skip_repeats = [] {
+		const char* value = std::getenv("KYTY_SYNC_SKIP");
+		return value != nullptr && value[0] == '1';
+	}();
+	struct SyncMemo {
+		const Buffer* buffer     = nullptr;
+		uint64_t      vaddr      = 0;
+		uint64_t      size       = 0;
+		uint64_t      cpu_epoch  = 0;
+		uint64_t      gpu_epoch  = 0;
+		bool          written    = false;
+	};
+	static std::array<SyncMemo, 4096> memo {};
+	static uint64_t                   memo_hits = 0, memo_calls = 0;
+	SyncMemo*                         slot      = nullptr;
+	if (skip_repeats && !is_texel_buffer) {
+		const auto index = static_cast<size_t>(
+		    ((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull) ^ (is_written ? 0x5bd1e995u : 0u)) %
+		    memo.size());
+		slot = &memo[index];
+		memo_calls++;
+		if (slot->buffer == &buffer && slot->vaddr == vaddr && slot->size == size &&
+		    slot->written == is_written &&
+		    slot->cpu_epoch == g_cpu_dirty_epoch.load(std::memory_order_acquire) &&
+		    slot->gpu_epoch == g_gpu_clean_epoch.load(std::memory_order_acquire)) {
+			memo_hits++;
+			return false;
+		}
+		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+		    log && (memo_calls & ((1u << 20u) - 1u)) == 0) {
+			std::fprintf(stderr, "[sync-skip] %llu of %llu syncs skipped\n",
+			             static_cast<unsigned long long>(memo_hits),
+			             static_cast<unsigned long long>(memo_calls));
+		}
+	}
+	// The epochs as they were before the walk: a page that changes state during it (another
+	// thread's write fault) moves them, and the next sync walks again.
+	struct MemoStore {
+		SyncMemo*     slot;
+		const Buffer* buffer;
+		uint64_t      vaddr, size;
+		bool          written;
+		uint64_t      cpu_epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+		uint64_t      gpu_epoch = g_gpu_clean_epoch.load(std::memory_order_acquire);
+		~MemoStore() {
+			if (slot != nullptr) {
+				*slot = {buffer, vaddr, size, cpu_epoch, gpu_epoch, written};
+			}
+		}
+	} memo_store {slot, &buffer, vaddr, size, is_written};
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
 	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;

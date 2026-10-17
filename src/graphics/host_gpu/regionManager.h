@@ -68,6 +68,11 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 // all buffers for global-memory shaders, can skip its walk while this has not moved.
 inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 
+// Bumped whenever pages stop being GPU-dirty anywhere (a download, a release of pages the GPU
+// write bitmap shows unwritten). With g_cpu_dirty_epoch, an unchanged pair means no page changed
+// state in a way a repeated identical sync would act on (BufferCache::SynchronizeBuffer).
+inline std::atomic<uint64_t> g_gpu_clean_epoch {1};
+
 // Bumped by the GPU thread when it starts a guest submission (its first slice).
 inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
@@ -124,6 +129,9 @@ public:
 			bits.UnsetRange(start, end);
 			if (bits.None()) {
 				StoreSummary<source>(false);
+			}
+			if constexpr (source == DirtySource::Gpu) {
+				g_gpu_clean_epoch.fetch_add(1, std::memory_order_release);
 			}
 		}
 		if constexpr (source == DirtySource::Cpu) {

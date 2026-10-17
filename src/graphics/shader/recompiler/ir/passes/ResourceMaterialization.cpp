@@ -1192,7 +1192,8 @@ bool GpuSizedAtomicEnabled(uint64_t shader_hash) {
 	// past it is dropped as on the console (CS 48ba2226632e8209 waited for its atomic buffer's
 	// count every frame on the title screen, ~20 % of the GPU thread). KYTY_GPU_SIZED_ATOMIC_SHADERS
 	// still limits it to the listed shaders.
-	if (GpuSizedDynamicEnabled() && std::getenv("KYTY_GPU_SIZED_ATOMIC_SHADERS") == nullptr) {
+	static const bool listed = std::getenv("KYTY_GPU_SIZED_ATOMIC_SHADERS") != nullptr;
+	if (GpuSizedDynamicEnabled() && !listed) {
 		return GpuSizedWrittenEnabled(shader_hash);
 	}
 	static const std::vector<uint64_t> shaders = [] {
@@ -1799,8 +1800,9 @@ void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& ru
 	// waiting for the GPU falls back to the whole buffer (SrtConditionsNoWait).
 	// Measured 2026-10-09: the whole-buffer fallback marks more memory GPU-written, and later SRT
 	// reads of it wait instead (CS 4e7f2c6bb9b158a1: 1.0 -> 4.4 s of waits per 20 s). Opt-in only.
+	static const bool extents_no_wait = std::getenv("KYTY_SRT_EXTENTS_NO_WAIT") != nullptr;
 	struct OptionalScope {
-		bool active = t_gpu_sized_snapshot || std::getenv("KYTY_SRT_EXTENTS_NO_WAIT") != nullptr ||
+		bool active = t_gpu_sized_snapshot || extents_no_wait ||
 		              ExtentsNoWaitShader(t_extents_shader_hash);
 		OptionalScope() {
 			if (active) SrtSetEvaluatingCondition(true);

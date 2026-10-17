@@ -4,6 +4,8 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <array>
 #include <cstddef>
 #include <limits>
@@ -651,6 +653,8 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		// When StillReads last confirmed the callee code.
+		std::chrono::steady_clock::time_point validated;
 	};
 	struct Shader {
 		uint64_t               code_hash = 0;
@@ -718,10 +722,23 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
 		return false;
 	}
-	for (const auto& expansion: shader.expansions) {
+	// Re-reading every callee to confirm the kept expansion was ~2 us a dispatch for a shader
+	// whose call targets depend on per-dispatch data (title CS c4df2a00067e0666, ~16,000
+	// dispatches a second, all with different user data): once confirmed, the same targets reuse
+	// it for KYTY_EXPAND_REUSE_MS (default 50) before the callees are read again.
+	static const auto reuse = std::chrono::milliseconds([] {
+		const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
+		return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
+	}());
+	const auto now = std::chrono::steady_clock::now();
+	for (auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
-		    m_impl->StillReads(expansion, read)) {
+		    ((reuse.count() != 0 && now - expansion.validated < reuse) ||
+		     m_impl->StillReads(expansion, read))) {
+			if (now - expansion.validated >= reuse) {
+				expansion.validated = now;
+			}
 			expanded = expansion.code;
 			reason   = expansion.reason;
 			return expansion.ok;
@@ -741,6 +758,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.reason);
 	MergeReads(expansion.reads);
+	expansion.validated = now;
 	expanded = expansion.code;
 	reason   = expansion.reason;
 	if (shader.expansions.size() >= Impl::MaxExpansions) {

@@ -1031,50 +1031,66 @@ static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBuffe
 	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
 	                         nullptr);
-	// One copy command per source buffer, with a region per dword. The buffers are obtained once
-	// before any copy is recorded: obtaining one can merge buffers obtained before it.
-	if (fills.size() + verify.size() > 1u) {
-		for (const auto& fill: fills) {
-			(void)cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
+	// The dwords to copy (guest address, flat offset), by address. Near ones share one obtained
+	// range (one buffer lookup and sync for a descriptor's dwords, not one each), and each source
+	// buffer gets one copy command with a region per dword. Every range is obtained before any
+	// copy is recorded: obtaining one can merge buffers obtained before it.
+	struct Item {
+		uint64_t address;
+		uint64_t flat_offset;
+	};
+	thread_local std::vector<Item> items;
+	items.clear();
+	for (const auto& fill: fills) {
+		items.push_back({fill.address, uint64_t {fill.flat_offset}});
+	}
+	for (size_t i = 0; i < verify.size(); i++) {
+		items.push_back({verify[i].address, uint64_t {verify_base} + 2u * i + 1u});
+	}
+	std::sort(items.begin(), items.end(),
+	          [](const Item& a, const Item& b) { return a.address < b.address; });
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges; // begin, end
+	ranges.clear();
+	for (const auto& item: items) {
+		if (!ranges.empty() && item.address <= ranges.back().second + 256u &&
+		    (item.address >> 12u) == (ranges.back().first >> 12u)) {
+			ranges.back().second = std::max(ranges.back().second, item.address + sizeof(uint32_t));
+		} else {
+			ranges.emplace_back(item.address, item.address + sizeof(uint32_t));
 		}
-		for (const auto& entry: verify) {
-			(void)cache.ObtainBuffer(entry.address, sizeof(uint32_t), false);
+	}
+	if (ranges.size() > 1u) {
+		for (const auto& [begin, end_address]: ranges) {
+			(void)cache.ObtainBuffer(begin, end_address - begin, false);
 		}
 	}
 	thread_local std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
 	copies.clear();
-	for (const auto& fill: fills) {
-		auto [buffer, offset] = cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
+	size_t next = 0;
+	for (const auto& [begin, end_address]: ranges) {
+		auto [buffer, offset] = cache.ObtainBuffer(begin, end_address - begin, false);
 		(void)offset;
-		copies.emplace_back(buffer->Handle(),
-		                    vk::BufferCopy {buffer->Offset(fill.address),
-		                                    flat.offset + uint64_t {fill.flat_offset} * sizeof(uint32_t),
-		                                    sizeof(uint32_t)});
-	}
-	// KYTY_SRT_VERIFY: the GPU's copy of each value the host used, next to it.
-	for (size_t i = 0; i < verify.size(); i++) {
-		auto [buffer, offset] = cache.ObtainBuffer(verify[i].address, sizeof(uint32_t), false);
-		(void)offset;
-		copies.emplace_back(
-		    buffer->Handle(),
-		    vk::BufferCopy {buffer->Offset(verify[i].address),
-		                    flat.offset + (uint64_t {verify_base} + 2u * i + 1u) * sizeof(uint32_t),
-		                    sizeof(uint32_t)});
+		for (; next < items.size() && items[next].address < end_address; next++) {
+			copies.emplace_back(buffer->Handle(),
+			                    vk::BufferCopy {buffer->Offset(items[next].address),
+			                                    flat.offset + items[next].flat_offset * sizeof(uint32_t),
+			                                    sizeof(uint32_t)});
+		}
 	}
 	std::stable_sort(copies.begin(), copies.end(), [](const auto& a, const auto& b) {
 		return static_cast<VkBuffer>(a.first) < static_cast<VkBuffer>(b.first);
 	});
 	thread_local std::vector<vk::BufferCopy> regions;
 	for (size_t i = 0; i < copies.size();) {
-		size_t end = i;
+		size_t end_index = i;
 		regions.clear();
-		while (end < copies.size() && copies[end].first == copies[i].first) {
-			regions.push_back(copies[end].second);
-			end++;
+		while (end_index < copies.size() && copies[end_index].first == copies[i].first) {
+			regions.push_back(copies[end_index].second);
+			end_index++;
 		}
 		recorder.copyBuffer(copies[i].first, flat.buffer, static_cast<uint32_t>(regions.size()),
 		                    regions.data());
-		i = end;
+		i = end_index;
 	}
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;

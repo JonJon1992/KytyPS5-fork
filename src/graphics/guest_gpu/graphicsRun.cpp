@@ -1790,7 +1790,9 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	run.packet             = packet;
 	run.continues          = packet == g_run_expected_next;
 	// KYTY_FPS_LOG: run lengths by the shader of each dispatch (addr -> {dispatches, runs started}).
-	{
+	// (getenv once: on Windows each call locks and scans the environment, ~1 us a dispatch.)
+	static const bool run_log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	if (run_log) {
 		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_shader;
 		static uint64_t                                                   run_len = 0;
 		static auto last = std::chrono::steady_clock::now();
@@ -1798,7 +1800,7 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 		e.first++;
 		if (!run.continues) e.second++;
 		const auto now = std::chrono::steady_clock::now();
-		if (std::getenv("KYTY_FPS_LOG") != nullptr && now - last > std::chrono::seconds(5)) {
+		if (now - last > std::chrono::seconds(5)) {
 			last = now;
 			std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> list(by_shader.begin(),
 			                                                                      by_shader.end());
