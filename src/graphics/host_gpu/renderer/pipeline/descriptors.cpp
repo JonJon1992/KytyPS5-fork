@@ -2222,6 +2222,115 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			     r.Base48(), words.size() * 4u});
 		}
 	}
+	// Diagnostics: KYTY_TRACE_READERS=<hash>[,<hash>...]: the buffer ranges those shaders write
+	// are recorded, and every other shader bound with a buffer overlapping one is printed once
+	// ([readers] lines on stderr). Finds the consumers of a shader's output.
+	{
+		static const std::vector<uint64_t> sources = [] {
+			std::vector<uint64_t> result;
+			if (const char* value = std::getenv("KYTY_TRACE_READERS"); value != nullptr) {
+				std::string_view list(value);
+				size_t           start = 0;
+				while (start < list.size()) {
+					const auto end = std::min(list.find(',', start), list.size());
+					if (end > start) {
+						result.push_back(std::strtoull(
+						    std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
+					}
+					start = end + 1;
+				}
+			}
+			return result;
+		}();
+		if (!sources.empty()) {
+			struct Range {
+				uint64_t base, size, source;
+				int      level;
+			};
+			static std::mutex                             trace_mutex;
+			static std::vector<Range>                     ranges;
+			static std::unordered_set<uint64_t>           printed;
+			// The consumers that write buffers become sources too (KYTY_TRACE_READERS_DEPTH
+			// levels, default 2), so a chain (settings -> simulation -> rendering) shows up.
+			static std::unordered_map<uint64_t, int>      levels;
+			static const int max_level = [] {
+				const char* value = std::getenv("KYTY_TRACE_READERS_DEPTH");
+				return value != nullptr ? std::atoi(value) : 2;
+			}();
+			std::lock_guard lock(trace_mutex);
+			if (levels.empty()) {
+				for (const auto hash: sources) {
+					levels[hash] = 0;
+				}
+			}
+			const auto level_it  = levels.find(program.shader_hash);
+			const bool is_source = level_it != levels.end();
+			const int  level     = is_source ? level_it->second : -1;
+			if (level == 0) {
+				static std::atomic<uint32_t> source_logs {0};
+				if (source_logs.fetch_add(1) < 4u) {
+					std::string user;
+					for (size_t k = 0; k < snapshot.user_data.size() && k < 16; k++) {
+						user += fmt::format(" {:08x}", snapshot.user_data[k]);
+					}
+					std::fprintf(stderr, "[readers] source %016" PRIx64 " buffers=%zu/%zu dma=%d user:%s\n",
+					             program.shader_hash, program.info.buffers.size(),
+					             snapshot.buffers.size(), program.info.uses_dma ? 1 : 0, user.c_str());
+					for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+						const auto r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+						std::fprintf(stderr,
+						             "[readers]   buffer[%zu] base=0x%012" PRIx64 " stride=%u records=%u written=%d\n",
+						             i, r.Base48(), r.Stride(), r.NumRecords(),
+						             program.info.buffers[i].written ? 1 : 0);
+					}
+				}
+			}
+			for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+				const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+				const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) *
+				                       static_cast<uint64_t>(r.NumRecords());
+				if (r.Base48() == 0 || bytes == 0) {
+					continue;
+				}
+				if (is_source) {
+					// Huge arenas: only their first 64 KB (a writer of a fixed record at the base).
+					const uint64_t traced = std::min<uint64_t>(bytes, 64u << 10u);
+					if (program.info.buffers[i].written &&
+					    std::ranges::none_of(ranges, [&](const Range& x) {
+						    return x.base == r.Base48() && x.size == traced;
+					    })) {
+						ranges.push_back({r.Base48(), traced, program.shader_hash, level});
+						std::fprintf(stderr,
+						             "[readers] source L%d %016" PRIx64 " writes 0x%012" PRIx64
+						             "+0x%" PRIx64 " stage=%u\n",
+						             level, program.shader_hash, r.Base48(), bytes,
+						             static_cast<uint32_t>(program.stage));
+					}
+				}
+				for (size_t k = 0; k < ranges.size(); k++) {
+					const auto x = ranges[k];
+					if (x.source == program.shader_hash) {
+						continue;
+					}
+					if (r.Base48() < x.base + x.size && x.base < r.Base48() + bytes &&
+					    printed.insert(program.shader_hash ^ (static_cast<uint64_t>(i) << 56u)).second) {
+						std::fprintf(stderr,
+						             "[readers] L%d %016" PRIx64 " stage=%u buffer[%zu] base=0x%012" PRIx64
+						             "+0x%" PRIx64 " written=%d overlaps %016" PRIx64
+						             " 0x%012" PRIx64 "+0x%" PRIx64 " images=%zu\n",
+						             x.level + 1, program.shader_hash,
+						             static_cast<uint32_t>(program.stage), i, r.Base48(), bytes,
+						             program.info.buffers[i].written ? 1 : 0,
+						             x.source, x.base, x.size, program.info.images.size());
+						std::fflush(stderr);
+						if (!is_source && x.level + 1 <= max_level) {
+							levels.emplace(program.shader_hash, x.level + 1);
+						}
+					}
+				}
+			}
+		}
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};

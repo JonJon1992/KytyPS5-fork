@@ -8,6 +8,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+struct ProbePc {
+	uint64_t hash = 0;
+	uint32_t pc   = 0;
+	uint32_t vgpr = 0;
+};
+// KYTY_PROBE_PC (Translate.cpp).
+const ProbePc& ProbePcSetting();
+constexpr uint32_t ProbeVgpr = 255;
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
@@ -23,6 +32,8 @@ public:
 	// with constants after it is translated.
 	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
 	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
+	// Diagnostics (KYTY_PROBE_PC): copies v<vgpr> to the probe register.
+	void ProbeCopy(uint32_t vgpr);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

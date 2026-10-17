@@ -1000,6 +1000,51 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 			std::fflush(stderr);
 		}
 	}
+	// KYTY_LOG_DRAW_PAIRS=1: each new (es, gs, ps) combination once, with its first draw's shape.
+	if (static const bool log_pairs = std::getenv("KYTY_LOG_DRAW_PAIRS") != nullptr; log_pairs) {
+		static std::mutex                   pairs_mutex;
+		static std::unordered_set<uint64_t> pairs;
+		const auto& sh = buffer.GetShaders();
+		const auto  h  = [](uint64_t addr) { return addr != 0 ? ShaderDeclaredHash(addr) : 0ull; };
+		const uint64_t es = h(sh.GetVs().es_regs.data_addr);
+		const uint64_t gs = h(sh.GetVs().gs_regs.data_addr);
+		const uint64_t ps = h(sh.GetPs().ps_regs.data_addr);
+		bool fresh = false;
+		{
+			std::lock_guard lock(pairs_mutex);
+			fresh = pairs.insert(es ^ (gs * 31u) ^ (ps * 0x9e3779b97f4a7c15ull)).second;
+		}
+		if (fresh) {
+			const auto& regs = buffer.GetRegisters();
+			std::fprintf(stderr,
+			             "[draw-pair] %s es=%016" PRIx64 " gs=%016" PRIx64 " ps=%016" PRIx64
+			             " count=%u instances=%u vs_program=%d ps_program=%d ps_active=%d rt_mask=0x%x"
+			             " cb_shader_mask=0x%x\n",
+			             kind, es, gs, ps, count, instances, vs_program, ps_program, ps_active,
+			             regs.GetRenderTargetMask(), regs.GetShaderRegisters().m_cbShaderMask);
+			for (uint32_t i = 0; i < 8; i++) {
+				const auto& rt = regs.GetRenderTarget(i);
+				const auto& bc = regs.GetBlendControl(i);
+				if (rt.base.addr == 0 || ((regs.GetRenderTargetMask() >> (i * 4u)) & 0xfu) == 0) {
+					continue;
+				}
+				std::fprintf(stderr,
+				             "[draw-pair]   rt%u addr=0x%010" PRIx64 " fmt=%u nfmt=%u order=%u %ux%u bypass=%d"
+				             " blend=%d src=%u dst=%u comb=%u sep=%d asrc=%u adst=%u acomb=%u\n",
+				             i, rt.base.addr, static_cast<uint32_t>(rt.info.format),
+				             static_cast<uint32_t>(rt.info.channel_type),
+				             static_cast<uint32_t>(rt.info.channel_order), rt.attrib2.width + 1,
+				             rt.attrib2.height + 1, rt.info.blend_bypass ? 1 : 0, bc.enable ? 1 : 0,
+				             bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
+				             bc.separate_alpha_blend ? 1 : 0, bc.alpha_srcblend, bc.alpha_destblend,
+				             bc.alpha_comb_fcn);
+			}
+			const auto& dc = regs.GetDepthControl();
+			std::fprintf(stderr, "[draw-pair]   depth z=%d zw=%d zfunc=%u\n", dc.z_enable ? 1 : 0,
+			             dc.z_write_enable ? 1 : 0, static_cast<uint32_t>(dc.zfunc));
+			std::fflush(stderr);
+		}
+	}
 	if (setting.count == 0) {
 		return;
 	}

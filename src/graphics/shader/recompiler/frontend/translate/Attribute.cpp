@@ -95,6 +95,36 @@ void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t
 	}
 }
 
+const ProbePc& ProbePcSetting() {
+	static const ProbePc setting = [] {
+		ProbePc result;
+		const char* value = std::getenv("KYTY_PROBE_PC");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(value, &end, 16);
+		if (end != nullptr && *end == '@') {
+			result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		if (end != nullptr && end[0] == ':' && end[1] == 'v') {
+			result.vgpr = static_cast<uint32_t>(std::strtoul(end + 2, &end, 10));
+		}
+		return result;
+	}();
+	return setting;
+}
+
+void Translator::ProbeCopy(uint32_t vgpr) {
+	Decoder::Operand source;
+	source.kind = Decoder::OperandKind::Vgpr;
+	source.reg  = vgpr;
+	Decoder::Operand target;
+	target.kind = Decoder::OperandKind::Vgpr;
+	target.reg  = ProbeVgpr;
+	WriteRawU32(target, ReadRawU32(source));
+}
+
 void Translator::V_INTERP_P1_F32() {}
 
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
@@ -147,9 +177,27 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	    forced.target == inst.exp.target && forced.component < 4u) {
 		components[forced.component] = IR::Value(forced.value);
 	}
+	const auto& probe = ProbePcSetting();
+	const bool  probed = probe.hash != 0 && probe.hash == program.shader_hash &&
+	                    program.stage == ShaderType::Pixel && inst.exp.target == 0u;
+	if (probed) {
+		Decoder::Operand source;
+		source.kind   = Decoder::OperandKind::Vgpr;
+		source.reg    = ProbeVgpr;
+		const auto v  = ReadRawU32(source);
+		components[0] = v;
+		components[1] = v;
+		components[2] = v;
+		components[3] = IR::Value(0x3f800000u);
+	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});
-	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, AddExportInfo(inst));
+	const auto flags = AddExportInfo(inst);
+	if (probed) {
+		program.export_info[flags.index].compr = false;
+		program.export_info[flags.index].en    = 0xfu;
+	}
+	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, flags);
 }
 
 void Translator::EmitInterpolation(const Decoder::Instruction& inst) {

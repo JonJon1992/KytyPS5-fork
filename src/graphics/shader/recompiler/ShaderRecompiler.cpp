@@ -740,6 +740,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 				std::fwrite(dump.data(), 1, dump.size(), file);
 				std::fclose(file);
 			}
+			// The guest code too, for llvm-mc disassembly.
+			const auto bin = fmt::format("{}/{}_{:016x}.bin", folder, StageName(options.stage),
+			                             options.shader_hash);
+			if (FILE* file = std::fopen(bin.c_str(), "wb"); file != nullptr) {
+				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+				std::fclose(file);
+			}
 		}
 	}
 	KYTY_PROFILER_PHASE(phases, "Shader: resource tracking", profiler::colors::Amber300);

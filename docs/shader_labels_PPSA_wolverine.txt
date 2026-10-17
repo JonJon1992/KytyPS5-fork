@@ -1,0 +1,20 @@
+# Marvel's Wolverine: guest shader hash -> role (title screen).
+# Format: <hash> <stage> <role>   (found 2026-10-17 by skip tests, the [readers] tracer
+# KYTY_TRACE_READERS and the [draw-pair] log KYTY_LOG_DRAW_PAIRS)
+8443f40978026b18 CS per-frame constants upload (128 B to the start of the shared constants arena 0x11a8d10000)
+f2f81fa4e946c837 CS particle simulation (writes the 20 MB particle buffer read by the particle VS)
+96e606211e972f4f CS particle buffer update (writes the arena and the particle buffer)
+4efbcf79c36d8adf VS particles (camera-facing quads, packed f16 UVs / byte colours in params 0-3)
+99c8e1b70aba14c4 PS particles (custom interpolation: reads raw P0/P10/P20 of packed params)
+fc1ce31cfb55211b PS particle-system single quad (paired with 4efbcf79, 6 indices)
+9624ac5a3699f070 CS instance culling (writes the visible-instance list + count read by the scene mesh shaders)
+c8202066634a4c62 MS scene instanced geometry (trees, foliage)
+7804337a0bac48f6 MS scene instanced geometry
+832fb60fd70f1a79 MS scene instanced geometry
+33d13a8442f8b78b MS scene instanced geometry
+8fb896cb9412ab56 MS scene instanced geometry
+2cfed0baa24760a8 CS TAA / temporal resolve (8x8 tiles, neighbourhood clamp, history)
+dc76e1223a9bf673 CS large lighting pass (loop-guarded)
+e6d76d24f59f8015 CS ray tracing (BVH intersect, bindless material table): gives up; likely reflections
+a3d125901e21a064 CS title-frame post (in the first 8 of the last 41 dispatches)
+be5f678f806a4370 CS one of the 9 that cause the dark arch at the top when skipped (with 91e7, 2e9f, 338c, 893b, 8582, d5f3, 9a2a, f9b9)

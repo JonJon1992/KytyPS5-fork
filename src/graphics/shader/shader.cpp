@@ -546,7 +546,16 @@ static void ShaderGetStaticInputInfoPS(
 	                     i < ShaderMappedData::MaxInputSemantics;
 	     i++) {
 		const auto& semantic = data.input_semantics_snapshot[i];
-		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
+		// Custom (explicit vertex) parameters reach the pixel shader as raw per-vertex values:
+		// v_interp_mov P0/P10/P20 return vertex 0/1/2 as written. Packed 16-bit ones too: the
+		// particle pixel shader (99c8e1b70aba14c4) unpacks P10/P20 halves and bytes itself and
+		// interpolates with the barycentrics, so a float P1-P0 delta of the packed bits gave
+		// garbage (square red particles). KYTY_CUSTOM_F16_RAW=0: the old split.
+		static const bool f16_raw = [] {
+			const char* value = std::getenv("KYTY_CUSTOM_F16_RAW");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (semantic.is_custom != 0 && (f16_raw || semantic.is_f16 == 0)) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
 	}
@@ -569,6 +578,26 @@ static void ShaderGetStaticInputInfoPS(
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
+	}
+	// KYTY_LOG_PS_INPUTS=<hash>: that pixel shader's input semantics and SPI_PS_INPUT_CNTL
+	// values, once.
+	if (static const char* watch = std::getenv("KYTY_LOG_PS_INPUTS"); watch != nullptr) {
+		static std::atomic_bool done {false};
+		if (!done && ShaderDeclaredHash(regs.ps_regs.data_addr) == std::strtoull(watch, nullptr, 16) &&
+		    !done.exchange(true)) {
+			std::fprintf(stderr, "[ps-inputs] %s num=%u semantics=%u custom_mask=0x%x ena=0x%x addr=0x%x\n",
+			             watch, ps_info.input_num, data.num_input_semantics,
+			             ps_info.custom_interpolation_mask, sh.ps_input_ena, sh.ps_input_addr);
+			for (uint32_t i = 0; i < ps_info.input_num; i++) {
+				const auto& sem = data.input_semantics_snapshot[i];
+				std::fprintf(stderr,
+				             "[ps-inputs]   %u: cntl=0x%08x semantic=%u hw=%u size=%u f16=%u flat=%u linear=%u custom=%u\n",
+				             i, ps_info.interpolator_settings[i], sem.semantic, sem.hardware_mapping,
+				             sem.size_in_elements, sem.is_f16, sem.is_flat_shaded, sem.is_linear,
+				             sem.is_custom);
+			}
+			std::fflush(stderr);
+		}
 	}
 
 	for (int i = 0; i < 8; i++) {

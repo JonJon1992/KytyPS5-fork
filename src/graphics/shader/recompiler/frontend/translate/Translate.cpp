@@ -1447,6 +1447,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		return result;
 	}();
+	// Diagnostics: KYTY_PROBE_PC=<shader hash>@<pc>:v<n> (hex hash/pc): after the instruction at
+	// <pc>, v<n> is copied to v255, and the pixel shader's MRT0 export writes v255 as grey (alpha
+	// 1, uncompressed), to see an intermediate value on screen. ProbeVgpr() names the copy.
+	const auto probe = ProbePcSetting();
+	if (probe.hash != 0 && probe.hash == result.shader_hash) {
+		vector_limit = IR::NumVectorRegs;
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
@@ -1470,7 +1477,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
+			if (probe.hash != 0 && probe.hash == result.shader_hash && instruction.pc == 0u) {
+				// Sentinel grey 0.25: pixels whose path skips the probed instruction.
+				translator.ForceVectorRegisters(ProbeVgpr, {0x3e800000u});
+			}
 			translator.TranslateInstruction(instruction);
+			if (probe.hash != 0 && probe.hash == result.shader_hash && probe.pc == instruction.pc) {
+				translator.ProbeCopy(probe.vgpr);
+			}
 			if (forced.hash != 0 && forced.hash == result.shader_hash) {
 				for (const auto& forced_result: forced.results) {
 					if (forced_result.pc != instruction.pc) {
