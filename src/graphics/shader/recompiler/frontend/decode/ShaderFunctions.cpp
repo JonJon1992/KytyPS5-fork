@@ -678,6 +678,14 @@ struct ShaderFunctionExpander::Impl {
 ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
 ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 
+bool ShaderFunctionExpander::HasCalls(std::span<const uint32_t> code) const {
+	const auto found = m_impl->shaders.find(reinterpret_cast<uint64_t>(code.data()));
+	if (found == m_impl->shaders.end() || found->second.analysis.code.size() != code.size()) {
+		return true;
+	}
+	return found->second.analysis.has_calls || found->second.analysis.has_setpc;
+}
+
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,

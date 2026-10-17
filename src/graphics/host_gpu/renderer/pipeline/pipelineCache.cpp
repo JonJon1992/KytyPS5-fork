@@ -1502,7 +1502,15 @@ struct PipelineCache::ProgramCache {
 		} else if (const auto found = programs.find(lookup_key); found != programs.end()) {
 			entry = &*found;
 			if (fast_key != 0) {
-				if (fast_entries.size() > 4096) {
+				// The title's async chains alone dispatch ~2,800 programs a frame, each with its own
+				// user data: at 4,096 entries the map was cleared every frame or two and most
+				// dispatches expanded their functions again. KYTY_FAST_PROGRAM_ENTRIES sets the cap.
+				static const size_t fast_cap = [] {
+					const char* value = std::getenv("KYTY_FAST_PROGRAM_ENTRIES");
+					return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+					                        : size_t {65536};
+				}();
+				if (fast_entries.size() > fast_cap) {
 					fast_entries.clear();
 				}
 				fast_entries[fast_key] = {entry, std::chrono::steady_clock::now()};
@@ -1989,6 +1997,16 @@ struct PipelineCache::ProgramCache {
 			const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
 			return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
 		}());
+		// Code without calls expands to nothing whatever the user data: once the expander has
+		// found none in this code (named by its content hash and size), skip the user-data hash,
+		// the reuse map and the expander (most of the title's ~25,000 dispatches a second).
+		const uint64_t no_call_key =
+		    params.hash ^ (static_cast<uint64_t>(params.code.size()) << 32u) ^
+		    (static_cast<uint64_t>(wave_size) << 56u);
+		if (params.hash != 0 && no_call_shaders.contains(no_call_key)) {
+			expanded.clear();
+			return;
+		}
 		const auto now = std::chrono::steady_clock::now();
 		uint64_t   reuse_key = 0;
 		if (reuse.count() != 0) {
@@ -2020,12 +2038,17 @@ struct PipelineCache::ProgramCache {
 			}
 		} remember {expand_reuse, reuse_key, now, expanded};
 		std::string reason;
-		if (!function_expander.Expand(
-		        params.code, params.Base(), user_data,
-		        [](uint64_t address, std::span<uint32_t> words) {
-			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
-		        },
-		        expanded, reason, wave_size, params.hash)) {
+		const bool  expanded_ok = function_expander.Expand(
+		     params.code, params.Base(), user_data,
+		     [](uint64_t address, std::span<uint32_t> words) {
+			     return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		     },
+		     expanded, reason, wave_size, params.hash);
+		if (expanded_ok && expanded.empty() && reason.empty() && params.hash != 0 &&
+		    !function_expander.HasCalls(params.code)) {
+			no_call_shaders.insert(no_call_key);
+		}
+		if (!expanded_ok) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
@@ -2051,6 +2074,7 @@ struct PipelineCache::ProgramCache {
 		std::chrono::steady_clock::time_point validated;
 	};
 	std::unordered_map<uint64_t, ExpandReused>                     expand_reuse;
+	std::unordered_set<uint64_t>                                   no_call_shaders;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;

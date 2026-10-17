@@ -43,6 +43,8 @@ public:
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size, uint64_t code_hash = 0);
+	// Whether the code Expand last analyzed at this address contains calls (true when unknown).
+	[[nodiscard]] bool HasCalls(std::span<const uint32_t> code) const;
 
 private:
 	struct Impl;
