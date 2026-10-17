@@ -53,6 +53,9 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// KYTY_READ_SNAPSHOT (RegionManager::SetReadLift).
+	void               LiftReads(uint64_t vaddr, uint64_t size);
+	void               RestoreReads(uint64_t vaddr, uint64_t size);
 	// MarkRegionAsGpuModified, atomically skipping the tracker regions that hold CPU-dirty pages
 	// there; false when one did. Pass a page for an all-or-nothing answer.
 	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

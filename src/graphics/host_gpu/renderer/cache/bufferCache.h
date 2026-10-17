@@ -318,7 +318,15 @@ private:
 		uint64_t                    window_end     = 0;
 		uint64_t                    total_size     = 0;
 		std::vector<vk::BufferCopy> copies;
+		bool                        snapshot       = false; // KYTY_READ_SNAPSHOT
 	};
+	// KYTY_READ_SNAPSHOT: the GPU's current bytes of a window whose writers are still running,
+	// copied without waiting for them; and the windows whose snapshot is in guest memory, waiting
+	// for the GPU thread to let reads through.
+	[[nodiscard]] uint64_t TrySnapshotReadback(Buffer& buffer, uint64_t window_begin,
+	                                           uint64_t window_end);
+	std::mutex                                        m_snapshot_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_snapshots_ready;
 	static constexpr uint32_t CopyReadbackSlots = 8;
 	std::array<CopyReadbackSlot, CopyReadbackSlots>   m_copy_slots;
 	std::atomic<uint32_t>                             m_copy_in_flight {0};

@@ -613,12 +613,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		int      rm_reason = 0;
 		rm_iters++;
 		const auto step_begin = std::chrono::steady_clock::now();
+		std::chrono::steady_clock::time_point exec_begin;
 		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &rm_reason] {
+		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &rm_reason,
+		     &exec_begin] {
+			    exec_begin  = std::chrono::steady_clock::now();
 			    t_rm_reason = 0;
 			    wait_tick   = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
 			    rm_reason   = t_rm_reason;
 		    });
+		slow.Add("queue",
+		         std::chrono::duration<double, std::milli>(exec_begin - step_begin).count(), 0, 0,
+		         0);
 		g_rm_iters[rm_reason].fetch_add(1, std::memory_order_relaxed);
 		slow.Add("step", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_begin).count(),
 		         rm_reason, wait_tick & ~CopyReadbackMarker, m_scheduler.CurrentTick());
@@ -920,6 +926,28 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		const bool      dirty  = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
 		(dirty ? exact : shared)++;
 		static uint32_t logged = 0;
+		static uint32_t shared_seen = 0;
+		static const bool shared_stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		if (!dirty && shared_stats && !from_gpu_thread && (shared_seen++ % 256) == 0 &&
+		    shared_seen < 256u * 120u) {
+			std::string dirty_ranges;
+			const auto  page  = vaddr & ~uint64_t {0xfff};
+			uint64_t    begin = 0;
+			bool        open  = false;
+			for (uint64_t at = page; at <= page + 0x1000; at += 16) {
+				const bool here = at < page + 0x1000 && HasGpuDirtyBytes(at, 16);
+				if (here && !open) {
+					begin = at;
+					open  = true;
+				} else if (!here && open) {
+					dirty_ranges += fmt::format(" {:x}-{:x}", begin - page, at - page);
+					open = false;
+				}
+			}
+			std::fprintf(stderr, "[readback] shared %s 0x%llx+%llu: page GPU-written bytes%s\n",
+			             is_write ? "write" : "read", static_cast<unsigned long long>(vaddr),
+			             static_cast<unsigned long long>(size), dirty_ranges.c_str());
+		}
 		if (!dirty && logged < 32) {
 			logged++;
 			// Which bytes of the 4 KiB page the GPU did write, in 16-byte steps.
@@ -943,6 +971,37 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		if ((exact + shared) % 1024 == 0) {
 			LOGF("ReadMemory faults: gpu_written=%" PRIu64 " false_sharing=%" PRIu64 "\n", exact,
 			     shared);
+			if (static const bool stats = std::getenv("KYTY_READBACK_STATS") != nullptr; stats) {
+				std::fprintf(stderr, "[readback] faults: bytes GPU-written %llu, page shared %llu\n",
+				             static_cast<unsigned long long>(exact),
+				             static_cast<unsigned long long>(shared));
+			}
+		}
+		// KYTY_READBACK_STATS: the bytes of the page that count as GPU-written, for game reads of
+		// GPU-written bytes, the first 48.
+		if (static const bool stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		    stats && dirty && !from_gpu_thread) {
+			static std::atomic<uint32_t> seen_reads {0};
+			static std::atomic<uint32_t> shown {0};
+			if (seen_reads.fetch_add(1) % 256 == 0 && shown.fetch_add(1) < 120) {
+				std::string dirty_ranges;
+				const auto  page  = vaddr & ~uint64_t {0xfff};
+				uint64_t    begin = 0;
+				bool        open  = false;
+				for (uint64_t at = page; at <= page + 0x1000; at += 16) {
+					const bool here = at < page + 0x1000 && HasGpuDirtyBytes(at, 16);
+					if (here && !open) {
+						begin = at;
+						open  = true;
+					} else if (!here && open) {
+						dirty_ranges += fmt::format(" {:x}-{:x}", begin - page, at - page);
+						open = false;
+					}
+				}
+				std::fprintf(stderr, "[readback] game %s 0x%llx+%llu: page GPU-written bytes%s\n",
+				             is_write ? "write" : "read", static_cast<unsigned long long>(vaddr),
+				             static_cast<unsigned long long>(size), dirty_ranges.c_str());
+			}
 		}
 	}
 
@@ -1070,6 +1129,48 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
+	// KYTY_READ_SNAPSHOT=1: a game-thread read of bytes whose GPU writers are still running does
+	// not wait for them. On the console the CPU reads memory as it is: bytes the running work has
+	// not written yet read as before, and a game polling for a GPU result keeps polling. Here the
+	// GPU's current bytes of the window are copied on the second queue (behind finished work
+	// only) into guest memory, and CPU reads of the window go through until the work recorded so
+	// far has finished; then the pages fault again, and a read downloads the final bytes (cheap:
+	// the writers are done). Writes still fault and wait, and the bytes stay GPU-written for the
+	// GPU thread's own reads, so nothing the GPU writes is lost or overwritten.
+	if (static const bool snapshots = [] {
+		    const char* value = std::getenv("KYTY_READ_SNAPSHOT");
+		    return value != nullptr && value[0] == '1';
+	    }();
+	    snapshots && async && !is_write && !from_gpu_thread) {
+		constexpr uint64_t SnapshotWindow = 64u * 1024u;
+		const auto snap_begin = std::max(Common::AlignDown(vaddr, SnapshotWindow), buffer.CpuAddress());
+		const auto snap_end   = std::min(std::max(snap_begin + SnapshotWindow,
+		                                          Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE)),
+		                                 buffer.CpuAddress() + buffer.Size());
+		bool ready = false;
+		{
+			std::lock_guard lock(m_snapshot_mutex);
+			for (auto it = m_snapshots_ready.begin(); it != m_snapshots_ready.end(); ++it) {
+				if (it->first <= page_begin && page_end <= it->second) {
+					ready = true;
+					const auto [b, e] = *it;
+					m_snapshots_ready.erase(it);
+					m_memory_tracker.LiftReads(b, e - b);
+					m_scheduler.DeferOperation([this, b, e] { m_memory_tracker.RestoreReads(b, e - b); });
+					break;
+				}
+			}
+		}
+		if (ready) {
+			{ t_rm_reason = 6; return 0; }
+		}
+		const auto latest = LatestGpuWriteTick(snap_begin, snap_end);
+		if (latest != 0 && !m_scheduler.IsFree(latest)) {
+			if (const auto marker = TrySnapshotReadback(buffer, snap_begin, snap_end); marker != 0) {
+				{ t_rm_reason = 7; return marker; }
+			}
+		}
+	}
 	if (async) {
 		NoteHotReadback(vaddr);
 		// The writers of the window have finished: copy it on the second queue, behind nothing,
@@ -3174,6 +3275,7 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	slot.window_end     = window_end;
 	slot.total_size     = total_size;
 	slot.copies         = std::move(copies);
+	slot.snapshot       = false;
 	slot.generation     = (slot.generation + 1u) & 0xffffffu;
 	m_copy_in_flight.fetch_add(1, std::memory_order_acq_rel);
 	slot.busy.store(1, std::memory_order_release);
@@ -3184,6 +3286,120 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 		             "[copy-readback] taken=%" PRIu64 " writers_running=%" PRIu64
 		             " slots_busy=%" PRIu64 "\n",
 		             m_copy_taken, m_copy_running, m_copy_busy);
+	}
+	return CopyReadbackMarker | (uint64_t {slot.generation} << 8u) | index;
+}
+
+uint64_t BufferCache::TrySnapshotReadback(Buffer& buffer, uint64_t window_begin,
+                                          uint64_t window_end) {
+	constexpr uint64_t StagingSize = 8ull * 1024 * 1024;
+	if (m_graphics.readback_queue == nullptr || window_begin >= window_end) {
+		return 0;
+	}
+	// The window's GPU-written bytes, leaving out bytes a download is publishing (that
+	// publication writes the newer bytes, and must not be overwritten).
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		RangeSet wanted;
+		m_gpu_modified_ranges.ForEachInRange(window_begin, window_end - window_begin,
+		                                     [&](uint64_t start, uint64_t end) {
+			                                     wanted.Add(start, end - start);
+		                                     });
+		m_downloading_ranges.ForEachInRange(window_begin, window_end - window_begin,
+		                                    [&](uint64_t start, uint64_t end) {
+			                                    wanted.Subtract(start, end - start);
+		                                    });
+		wanted.ForEach([&](uint64_t start, uint64_t end) {
+			copies.emplace_back(start - buffer_address, total_size, end - start);
+			total_size += Common::AlignUp(end - start, 64);
+		});
+	}
+	if (copies.empty() || total_size > StagingSize) {
+		return 0;
+	}
+	uint32_t index = CopyReadbackSlots;
+	for (uint32_t i = 0; i < CopyReadbackSlots; i++) {
+		if (m_copy_slots[i].busy.load(std::memory_order_acquire) == 0) {
+			index = i;
+			break;
+		}
+	}
+	if (index == CopyReadbackSlots) {
+		m_copy_busy++;
+		return 0;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::SnapshotReadback");
+	auto& slot   = m_copy_slots[index];
+	auto  device = m_graphics.device;
+	if (slot.pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		RequireVulkanSuccess(device.createCommandPool(&pool_info, nullptr, &slot.pool),
+		                     "create readback command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = slot.pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		RequireVulkanSuccess(device.allocateCommandBuffers(&allocate, &slot.command),
+		                     "allocate readback command buffer");
+		vk::FenceCreateInfo fence_info {};
+		RequireVulkanSuccess(device.createFence(&fence_info, nullptr, &slot.fence),
+		                     "create readback fence");
+		slot.staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                        vk::BufferUsageFlagBits::eTransferDst,
+		                                        StagingSize);
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(slot.command.begin(&begin), "begin readback command buffer");
+	slot.command.copyBuffer(buffer.Handle(), slot.staging->Handle(),
+	                        static_cast<uint32_t>(copies.size()), copies.data());
+	vk::BufferMemoryBarrier to_host {};
+	to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_host.buffer              = slot.staging->Handle();
+	to_host.offset              = 0;
+	to_host.size                = total_size;
+	slot.command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                             vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &to_host, 0,
+	                             nullptr);
+	RequireVulkanSuccess(slot.command.end(), "end readback command buffer");
+	// Behind the work the GPU has finished (its writes are visible to the copy), not behind the
+	// work still running: that work's writes to these bytes land when they land, as on the console.
+	const uint64_t                  reached    = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	const vk::Semaphore             master     = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &reached;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &master;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &slot.command;
+	RequireVulkanSuccess(m_graphics.readback_queue.submit(1, &submit, slot.fence),
+	                     "submit snapshot readback");
+	slot.buffer_address = buffer_address;
+	slot.window_begin   = window_begin;
+	slot.window_end     = window_end;
+	slot.total_size     = total_size;
+	slot.copies         = std::move(copies);
+	slot.snapshot       = true;
+	slot.generation     = (slot.generation + 1u) & 0xffffffu;
+	m_copy_in_flight.fetch_add(1, std::memory_order_acq_rel);
+	slot.busy.store(1, std::memory_order_release);
+	static uint64_t snapshots = 0;
+	if (++snapshots % 1024 == 1) {
+		std::fprintf(stderr, "[read-snapshot] %llu snapshot reads\n",
+		             static_cast<unsigned long long>(snapshots));
 	}
 	return CopyReadbackMarker | (uint64_t {slot.generation} << 8u) | index;
 }
@@ -3207,7 +3423,15 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 		Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
 		                                      mapped + copy.dstOffset, copy.size);
 	}
-	{
+	if (slot.snapshot) {
+		// The bytes stay GPU-written; the GPU thread lets reads of the window through.
+		std::lock_guard lock(m_snapshot_mutex);
+		m_snapshots_ready.emplace_back(Common::AlignDown(slot.window_begin, TRACKER_PAGE_SIZE),
+		                               Common::AlignUp(slot.window_end, TRACKER_PAGE_SIZE));
+		if (m_snapshots_ready.size() > 64) {
+			m_snapshots_ready.erase(m_snapshots_ready.begin());
+		}
+	} else {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: slot.copies) {
 			m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);

@@ -141,6 +141,21 @@ public:
 		}
 	}
 
+	// KYTY_READ_SNAPSHOT: let CPU reads of these GPU-dirty pages through without a fault (they
+	// read the snapshot published there), or fault again (restore). The GPU-dirty state is kept:
+	// writes still fault and wait, and the GPU thread's reads still download.
+	template <bool lift>
+	void SetReadLift(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if constexpr (lift) {
+			m_read_lift.SetRange(start, end);
+			UpdateProtection<false, true>();
+		} else {
+			m_read_lift.UnsetRange(start, end);
+			UpdateProtection<true, true>();
+		}
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -193,7 +208,9 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		// m_read_lift: GPU-dirty pages the CPU may read as guest memory holds them
+		// (BufferCache snapshot reads, KYTY_READ_SNAPSHOT).
+		const auto protection = is_read ? (~m_gpu_dirty | m_read_lift) : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -260,6 +277,7 @@ private:
 	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	RegionBits   m_read_lift;
 };
 
 } // namespace Libs::Graphics
