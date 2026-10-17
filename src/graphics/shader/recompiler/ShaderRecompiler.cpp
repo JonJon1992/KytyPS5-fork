@@ -761,6 +761,39 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	const auto tracking_begin = std::chrono::steady_clock::now();
 	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);
 	const auto tracking_ms    = ms_since(tracking_begin);
+	// KYTY_DUMP_IR_HASH (with KYTY_DUMP_GAVE_UP): every scalar read after resource tracking, with
+	// its memory info, to <folder>/<stage>_<hash>_mem.txt.
+	if (const char* hashes = std::getenv("KYTY_DUMP_IR_HASH"); tracked && hashes != nullptr &&
+	    std::string_view(hashes).find(fmt::format("{:016x}", options.shader_hash)) != std::string_view::npos) {
+		if (const char* folder = std::getenv("KYTY_DUMP_GAVE_UP"); folder != nullptr) {
+			const auto path = fmt::format("{}/{}_{:016x}_mem.txt", folder, StageName(options.stage),
+			                              options.shader_hash);
+			if (FILE* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+				for (auto* block: ir.blocks) {
+					for (auto& inst: *block) {
+						if (inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer &&
+						    inst.GetOpcode() != IR::ValueOpcode::LoadAddressU32) {
+							continue;
+						}
+						const auto flags = inst.Flags<IR::MemoryFlags>();
+						if (flags.index >= ir.memory_info.size()) {
+							continue;
+						}
+						const auto& memory  = ir.memory_info[flags.index];
+						const auto  dynamic = inst.NumArgs() > 1u ? inst.Arg(1).Resolve() : IR::Value(0u);
+						const auto line = fmt::format(
+						    "pc=0x{:04x} {} index={} kind={} resource={} offset={} planning_only={} uses={} dynamic={}\n",
+						    flags.pc, IR::ValueOpcodeName(inst.GetOpcode()), flags.index,
+						    static_cast<uint32_t>(memory.kind), memory.resource, memory.offset,
+						    memory.planning_only ? 1 : 0, inst.Uses().size(),
+						    dynamic.IsImmediate() && dynamic.GetType() == IR::Type::U32 ? fmt::format("imm 0x{:x}", dynamic.U32()) : std::string("value"));
+						std::fputs(line.c_str(), file);
+					}
+				}
+				std::fclose(file);
+			}
+		}
+	}
 	// The IR passes after translation, resource tracking among them, which the phases above miss.
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR passes tracking_ms=%" PRIu64
 	     " passes_ms=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
@@ -847,7 +880,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
 				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
-			} else if (op != IR::ValueOpcode::GetSamplerResource) {
+			} else if (op == IR::ValueOpcode::GetSamplerResource) {
+				// A bindless sampler handle carries its GPU-computed key in dword 0 (the shader
+				// indexes the mirrored sampler heap with it, BindlessSamplerSlot), as a bindless
+				// image handle does. Zeroing it made every bindless sample use heap record 0.
+				const auto resource = inst.Flags<uint32_t>();
+				first = resource < ir.info.samplers.size() && ir.info.samplers[resource].bindless ? 1u : 0u;
+			} else {
 				continue;
 			}
 			// A buffer bounded by its own count (gpu_records_ssa) keeps dword 2.

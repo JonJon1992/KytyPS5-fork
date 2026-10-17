@@ -2855,6 +2855,49 @@ void BufferCache::WaitSharedWrites(uint64_t vaddr, uint64_t size) {
 	m_scheduler.Wait(tick);
 }
 
+bool BufferCache::PeekGpuCopy(uint64_t vaddr, uint64_t size, std::vector<uint32_t>& out) {
+	auto it = m_buffers.upper_bound(vaddr);
+	if (it == m_buffers.begin()) {
+		return false;
+	}
+	--it;
+	auto& buffer = m_slot_buffers[it->second];
+	if (vaddr < buffer.CpuAddress() || vaddr + size > buffer.CpuAddress() + buffer.Size() || size == 0) {
+		return false;
+	}
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                          vk::BufferUsageFlagBits::eTransferDst, size);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Recorder();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 0, nullptr, 1, &before, 0, nullptr);
+	const vk::BufferCopy copy {vaddr - buffer.CpuAddress(), 0, size};
+	native.copyBuffer(buffer.Handle(), temporary->Handle(), 1, &copy);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = temporary->Handle();
+	after.size          = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+	                       nullptr, 1, &after, 0, nullptr);
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Flush();
+	m_scheduler.Wait(tick);
+	temporary->Invalidate(0, size);
+	out.resize(static_cast<size_t>(size / 4u));
+	std::memcpy(out.data(), temporary->Mapped().data(), out.size() * 4u);
+	return true;
+}
+
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 	std::vector<std::pair<uint64_t, uint64_t>> downloaded;
 	auto                                       it = m_buffers.upper_bound(vaddr);

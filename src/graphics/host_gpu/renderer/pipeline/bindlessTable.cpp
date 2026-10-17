@@ -785,7 +785,9 @@ void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot
 
 void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	// Regions are allocated contiguously after word 0, so one copy covers every heap.
-	const vk::DeviceSize size = vk::DeviceSize {m_next_region} * sizeof(uint32_t);
+	static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr;
+	const vk::DeviceSize size = vk::DeviceSize {capture ? TranslationEntries : m_next_region} *
+	                            sizeof(uint32_t);
 	scheduler.EndRendering();
 	auto                    command = scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier flags_written {};
@@ -833,6 +835,24 @@ void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) 
 	}
 	if (cleared) {
 		m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+	}
+}
+
+void BindlessTable::TakeCapture(uint32_t first, uint32_t count,
+                                std::vector<std::pair<uint32_t, uint32_t>>& marked) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(first * sizeof(uint32_t), count * sizeof(uint32_t));
+	bool cleared = false;
+	for (uint32_t i = 0; i < count; i++) {
+		if (snapshot[first + i] != 0u) {
+			marked.emplace_back(i, snapshot[first + i]);
+			feedback[first + i] = 0;
+			cleared             = true;
+		}
+	}
+	if (cleared) {
+		m_feedback->Flush(first * sizeof(uint32_t), count * sizeof(uint32_t));
 	}
 }
 

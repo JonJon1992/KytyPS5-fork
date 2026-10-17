@@ -11,8 +11,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 struct ProbePc {
 	uint64_t hash = 0;
 	uint32_t pc   = 0;
-	// Up to three registers, shown as red, green and blue (one register: grey).
+	// Up to three registers, shown as red, green and blue (one register: grey). v<n> raw bits;
+	// u<n> (VGPR) and s<n> (SGPR, vcc = s106) as unsigned integers scaled by 1/8.
 	uint32_t vgprs[3] = {0, 0, 0};
+	char     kinds[3] = {'v', 'v', 'v'};
 	uint32_t count    = 0;
 };
 // KYTY_PROBE_PC (Translate.cpp).

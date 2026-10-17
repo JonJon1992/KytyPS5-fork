@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
+#include <string>
 #include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -926,6 +929,80 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state.program.info.samplers[mem.sampler].bindless) {
 		state.bindless_sampler_slot =
 		    BindlessSamplerSlot(ctx, state.program.info.samplers[mem.sampler], inst.Arg(1));
+	}
+	// Diagnostics: KYTY_KEY_CAPTURE=<hash> marks the keys this shader samples (BindlessCapture*).
+	static const uint64_t capture_hash = [] {
+		const char* value = std::getenv("KYTY_KEY_CAPTURE");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	if (capture_hash != 0 && state.program.shader_hash == capture_hash &&
+	    state.bindless_feedback_variable != 0) {
+		const auto Mark = [&](IR::Value handle_arg, uint32_t first, uint32_t value) {
+			const auto* handle = handle_arg.ResolveInstruction();
+			if (handle == nullptr || handle->NumArgs() == 0u) {
+				return;
+			}
+			const auto key    = ctx.Def(handle->Arg(0));
+			const auto low    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), key,
+			                           ConstantU32(state, 0xffffu));
+			const auto index  = Binary(state, spv::OpIAdd, TypeU32(state), low, ConstantU32(state, first));
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+			                          index);
+			state.builder.AddFunction(spv::OpStore, pointer, value);
+		};
+		// Compile time: every image instruction, its sampler and what the sampler handle's key is.
+		{
+			std::string what = "none";
+			if (inst.NumArgs() > 1u) {
+				if (const auto* handle = inst.Arg(1).Resolve().TryInstruction();
+				    handle != nullptr && handle->NumArgs() != 0u) {
+					const auto key = handle->Arg(0).Resolve();
+					if (key.IsImmediate()) {
+						what = key.GetType() == IR::Type::U32 ? fmt::format("immediate 0x{:x}", key.U32()) : "immediate";
+					} else if (const auto* key_inst = key.TryInstruction(); key_inst != nullptr) {
+						what = std::string(IR::ValueOpcodeName(key_inst->GetOpcode()));
+					}
+				}
+			}
+			const bool sampler_bindless = image_info.needs_sampler && mem.sampler < state.program.info.samplers.size() &&
+			                              state.program.info.samplers[mem.sampler].bindless;
+			std::fprintf(stderr,
+			             "[key-capture] emit pc=0x%x op=%s image=%u bindless_image=%d sampler=%u bindless_sampler=%d slot=%u key=%s\n",
+			             inst.Flags<IR::MemoryFlags>().pc, std::string(IR::ValueOpcodeName(op)).c_str(), mem.resource,
+			             image.bindless ? 1 : 0, mem.sampler, sampler_bindless ? 1 : 0, state.bindless_sampler_slot,
+			             what.c_str());
+		}
+		uint32_t sampler_key = ConstantU32(state, 0xffffu);
+		if (state.bindless_sampler_slot != 0u) {
+
+			if (const auto* handle = inst.Arg(1).ResolveInstruction();
+			    handle != nullptr && handle->NumArgs() != 0u) {
+				sampler_key = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Def(handle->Arg(0)),
+				                     ConstantU32(state, 0xffffu));
+			}
+			// The raw dword the sampler key is cut from (before its shift or mask), at the image
+			// key's word, to compare with the material data in memory.
+			if (image.bindless) {
+				const auto* sampler_handle = inst.Arg(1).ResolveInstruction();
+				const auto* key_inst =
+				    sampler_handle != nullptr && sampler_handle->NumArgs() != 0u
+				        ? sampler_handle->Arg(0).Resolve().TryInstruction()
+				        : nullptr;
+				if (key_inst != nullptr && key_inst->NumArgs() == 2u &&
+				    (key_inst->GetOpcode() == IR::ValueOpcode::ShiftRightLogical32 ||
+				     key_inst->GetOpcode() == IR::ValueOpcode::BitwiseAnd32)) {
+					const auto raw = ctx.Def(key_inst->Arg(0));
+					Mark(image_arg, IR::BindlessCaptureSamplers, raw);
+				}
+			}
+		}
+		if (image.bindless) {
+			const auto value = Binary(state, spv::OpBitwiseOr, TypeU32(state), sampler_key,
+			                          ConstantU32(state, 0x40000000u | ((mem.resource & 0xffu) << 16u)));
+			Mark(image_arg, IR::BindlessCaptureImages, value);
+		}
 	}
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {

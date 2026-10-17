@@ -1154,6 +1154,35 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	}
 }
 
+// Diagnostics: every virtual mapping of the direct memory behind [vaddr, vaddr + size), as
+// (virtual address, size) pairs; empty when the range is not direct memory.
+std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> result;
+	if (g_physical_memory == nullptr) {
+		return result;
+	}
+	uint64_t phys = 0;
+	bool     found = false;
+	{
+		g_physical_memory->GetMutex().Lock();
+		for (const auto& b: g_physical_memory->GetMappings()) {
+			if (b.map_vaddr != 0 && vaddr >= b.map_vaddr && vaddr < b.map_vaddr + b.map_size) {
+				phys  = b.start_addr + (vaddr - b.map_vaddr);
+				found = true;
+				break;
+			}
+		}
+		g_physical_memory->GetMutex().Unlock();
+	}
+	if (!found) {
+		return result;
+	}
+	for (const auto& m: g_physical_memory->FindMappings(phys, size)) {
+		result.emplace_back(m.map_vaddr, m.map_size);
+	}
+	return result;
+}
+
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;

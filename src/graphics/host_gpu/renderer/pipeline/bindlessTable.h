@@ -143,6 +143,9 @@ public:
 	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set) in the snapshot,
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
+	// Diagnostics (KYTY_KEY_CAPTURE): the non-zero snapshot words of [first, first + count), as
+	// (index - first, word); cleared.
+	void TakeCapture(uint32_t first, uint32_t count, std::vector<std::pair<uint32_t, uint32_t>>& marked);
 	// Usage probe. Every draw that samples a key stores its feedback word (0 for a resident
 	// texture, 1 for a pending one), so marking every resident key's word with ProbeMark and
 	// reading a snapshot some frames later shows which keys no draw sampled in between.

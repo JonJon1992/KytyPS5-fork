@@ -539,6 +539,23 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
 
+// Diagnostics: KYTY_TRACE_WRITERS=<hex address>[:<hex size>]: CP writes (DMA_DATA, WRITE_DATA)
+// overlapping that range are printed with their source ([cp-writers] on stderr).
+static bool CpWriteTraced(uint64_t dst, uint64_t bytes) {
+	static const std::pair<uint64_t, uint64_t> target = [] {
+		std::pair<uint64_t, uint64_t> range {0, 0};
+		if (const char* value = std::getenv("KYTY_TRACE_WRITERS"); value != nullptr) {
+			char* end    = nullptr;
+			range.first  = std::strtoull(value, &end, 16);
+			range.second = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 16) : 4u;
+		}
+		return range;
+	}();
+	static std::atomic<uint32_t> printed {0};
+	return target.first != 0 && dst < target.first + target.second && target.first < dst + bytes &&
+	       printed.fetch_add(1) < 200u;
+}
+
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
@@ -554,6 +571,10 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 	if (dw_num == 0) {
 		return;
+	}
+	if (CpWriteTraced(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4u)) {
+		std::fprintf(stderr, "[cp-writers] WRITE_DATA dst=0x%012" PRIx64 " dwords=%u first=%08x one_addr=%d\n",
+		             reinterpret_cast<uint64_t>(dst), dw_num, src[0], write_one_address ? 1 : 0);
 	}
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
@@ -629,6 +650,18 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	if (!dst_gds && CpWriteTraced(dst_address_or_offset, num_bytes)) {
+		uint32_t words[8] {};
+		const bool src_mem = src_sel == 0 || src_sel == 3;
+		const bool read = src_mem && Libs::LibKernel::Memory::TryReadBacking(
+		                                 src_address_or_offset_or_immediate, words, std::min<uint32_t>(num_bytes, 32u));
+		std::fprintf(stderr,
+		             "[cp-writers] DMA_DATA dst=0x%012" PRIx64 " bytes=0x%x src_sel=%u src=0x%012" PRIx64
+		             " src_gpu_dirty=%d src_words(%d)=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+		             dst_address_or_offset, num_bytes, src_sel, src_address_or_offset_or_immediate,
+		             src_mem && buffer_cache.HasGpuDirtyBytes(src_address_or_offset_or_immediate, num_bytes) ? 1 : 0,
+		             read ? 1 : 0, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+	}
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,

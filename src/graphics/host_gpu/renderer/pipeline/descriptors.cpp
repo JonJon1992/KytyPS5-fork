@@ -55,6 +55,10 @@
 
 namespace Libs::Graphics {
 
+// Diagnostics (KYTY_KEY_CAPTURE): the buffers the captured shader binds, as (base, bytes).
+static std::mutex                                 g_capture_buffers_mutex;
+static std::vector<std::pair<uint64_t, uint64_t>> g_capture_buffers;
+
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -1922,6 +1926,130 @@ void RenderExecutor::ResolveBindlessRequests() {
 			     word0 & 0x7fffffffu, word0);
 		}
 	}
+	// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the image and sampler keys that shader sampled since the
+	// last print, every 60th snapshot, up to 12 prints.
+	if (static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr; capture) {
+		static uint32_t rounds  = 0;
+		static uint32_t printed = 0;
+		if (++rounds % 60u == 0u && printed < 12u) {
+			std::vector<std::pair<uint32_t, uint32_t>> images;
+			std::vector<std::pair<uint32_t, uint32_t>> samplers;
+			auto& table = m_context.GetBindlessTable();
+			table.TakeCapture(ShaderRecompiler::IR::BindlessCaptureImages, 0x10000u, images);
+			table.TakeCapture(ShaderRecompiler::IR::BindlessCaptureSamplers, 0x10000u, samplers);
+			printed += (images.empty() && samplers.empty()) ? 0u : 1u;
+			std::string line;
+			char        item[48];
+			if (!images.empty() || !samplers.empty()) {
+			for (const auto& [key, word]: images) {
+				std::snprintf(item, sizeof(item), " %u(img%u,s%u)", key, (word >> 16u) & 0xffu,
+				              word & 0xffffu);
+				line += item;
+				if (line.size() > 3000) break;
+			}
+			std::fprintf(stderr, "[key-capture] frame=%" PRIu64 " image keys=%zu:%s\n", frame,
+			             images.size(), line.c_str());
+			line.clear();
+			for (const auto& [key, word]: samplers) {
+				std::snprintf(item, sizeof(item), " tex%u:%08x", key, word);
+				line += item;
+				if (line.size() > 3000) break;
+			}
+			std::fprintf(stderr, "[key-capture] frame=%" PRIu64 " raw sampler dwords by texture key=%zu:%s\n", frame,
+			             samplers.size(), line.c_str());
+			std::fflush(stderr);
+			// Once: search the bound buffers' CPU copies for the first captured keys' records.
+			static bool scanned = false;
+			std::vector<std::pair<uint64_t, uint64_t>> buffers;
+			{
+				std::lock_guard lock(g_capture_buffers_mutex);
+				buffers = g_capture_buffers;
+			}
+			// KYTY_KEY_SCAN_EXTRA=<hex address>:<hex size>: one more range to search (a source the
+			// shader does not bind).
+			if (const char* extra = std::getenv("KYTY_KEY_SCAN_EXTRA"); extra != nullptr) {
+				char*          end  = nullptr;
+				const uint64_t base = std::strtoull(extra, &end, 16);
+				const uint64_t size = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0u;
+				buffers.emplace_back(base, size);
+			}
+			if (!scanned && !images.empty() && !buffers.empty()) {
+				scanned = true;
+				for (size_t b = 0; b < buffers.size(); b++) {
+					const auto [base, size] = buffers[b];
+					const uint64_t bytes    = std::min<uint64_t>(size, 32u << 20u) & ~uint64_t {3};
+					const bool     dirty    = base != 0 && bytes != 0 &&
+					                   m_context.GetBufferCache().HasGpuDirtyBytes(base, bytes);
+					std::fprintf(stderr, "[key-scan] buffer[%zu] base=0x%012" PRIx64 " bytes=0x%" PRIx64 " gpu_dirty=%d\n",
+					             b, base, size, dirty ? 1 : 0);
+					{
+						std::string aliases;
+						for (const auto& [alias, alias_size]: Libs::LibKernel::Memory::FindDirectMemoryAliases(base, 0x1000u)) {
+							aliases += fmt::format(" 0x{:x}+0x{:x}", alias, alias_size);
+						}
+						std::fprintf(stderr, "[key-scan]   mappings of its first page:%s\n", aliases.c_str());
+					}
+					if (base == 0 || bytes < 16u) continue;
+					std::vector<uint32_t> words(bytes / 4u);
+					// Chunk by chunk: the readable prefix (a growing store may end before its bound).
+					uint64_t readable = 0;
+					while (readable < bytes) {
+						const uint64_t chunk = std::min<uint64_t>(bytes - readable, 0x10000u);
+						if (!Libs::LibKernel::Memory::TryReadBacking(base + readable, words.data() + readable / 4u, chunk)) {
+							break;
+						}
+						readable += chunk;
+					}
+					words.resize(readable / 4u);
+					if (readable != bytes) {
+						std::fprintf(stderr, "[key-scan]   readable 0x%" PRIx64 " of 0x%" PRIx64 "\n", readable, bytes);
+					}
+					for (size_t k = 0; k < std::min<size_t>(images.size(), 3u); k++) {
+						const uint32_t key  = images[k].first;
+						uint32_t       hits = 0;
+						for (size_t w = 0; w < words.size() && hits < 3u; w++) {
+							if (!(((w & 3u) == 1u && (words[w] >> 16u) == key) ||
+							      ((w & 3u) == 2u && (words[w] & 0xffffu) == key))) continue;
+							hits++;
+							std::string around;
+							char        item[16];
+							const size_t from = w >= 2 ? w - 2 : 0;
+							for (size_t j = from; j < std::min(words.size(), from + 24); j++) {
+								std::snprintf(item, sizeof(item), " %08x", words[j]);
+								around += item;
+							}
+							const uint32_t plus64 = w + 16 < words.size() ? words[w + 16] : 0xdeadbeefu;
+							std::fprintf(stderr, "[key-scan]   key %u at +0x%zx (%08x), +64 -> %08x; from +0x%zx:%s\n",
+							             key, w * 4u, words[w], plus64, from * 4u, around.c_str());
+							// KYTY_KEY_PEEK=<hex source>:<hex destination>: for a hit in the copy source,
+							// the GPU copies of its record (rows 0..4) in the source and in the destination.
+							if (const char* peek = std::getenv("KYTY_KEY_PEEK"); peek != nullptr && base != 0) {
+								char*          end = nullptr;
+								const uint64_t src = std::strtoull(peek, &end, 16);
+								const uint64_t dst = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0u;
+								if (base == src && dst != 0) {
+									const uint64_t row = base + (w * 4u & ~uint64_t {15});
+									for (const uint64_t at: {row, dst + (row - src)}) {
+										std::vector<uint32_t> gpu;
+										std::string           text;
+										if (m_context.GetBufferCache().PeekGpuCopy(at, 0x50u, gpu)) {
+											for (const auto value: gpu) {
+												text += fmt::format(" {:08x}", value);
+											}
+										} else {
+											text = " (no single buffer)";
+										}
+										std::fprintf(stderr, "[key-scan]   GPU copy at 0x%012" PRIx64 ":%s\n", at, text.c_str());
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			}
+		}
+	}
 	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
 		m_bindless_requests.clear();
 		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
@@ -2076,6 +2204,28 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 			}
 			region  = heap->region;
 			entries = region != 0 ? static_cast<uint32_t>(heap->records.size()) : 0u;
+			// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the sampler heaps that shader indexes and the
+			// S# its key 0 selects, a few times.
+			static const uint64_t capture_hash = [] {
+				const char* value = std::getenv("KYTY_KEY_CAPTURE");
+				return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+			}();
+			static std::atomic<uint32_t> capture_printed {0};
+			if (capture_hash != 0 && program.shader_hash == capture_hash && capture_printed.fetch_add(1) < 24u) {
+				const uint64_t address = use.base + use.table_offset;
+				const bool     dirty   = m_context.GetBufferCache().HasGpuDirtyBytes(address, 64u);
+				std::array<uint32_t, 4> rec {};
+				const bool read = Libs::LibKernel::Memory::TryReadBacking(address, rec.data(), sizeof(rec));
+				ShaderSamplerResource r;
+				std::ranges::copy(rec, r.fields);
+				std::fprintf(stderr,
+				             "[key-capture] sampler use=%u heap=0x%012" PRIx64 "+0x%x size=0x%" PRIx64
+				             " gpu_dirty=%d read=%d region=%u entries=%u rec0=%08x %08x %08x %08x clamp=%u%u%u"
+				             " mag=%u min=%u mip=%u aniso=%u\n",
+				             use.sampler, use.base, use.table_offset, use.size, dirty ? 1 : 0, read ? 1 : 0,
+				             region, entries, rec[0], rec[1], rec[2], rec[3], r.ClampX(), r.ClampY(),
+				             r.ClampZ(), r.XyMagFilter(), r.XyMinFilter(), r.MipFilter(), r.MaxAnisoRatio());
+			}
 		}
 		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
 	}
@@ -2222,6 +2372,160 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			     r.Base48(), words.size() * 4u});
 		}
 	}
+	// Diagnostics: KYTY_TRACE_WRITERS=<hex address>[:<hex size>]: every shader bound with a
+	// written buffer overlapping that range, once per (shader, buffer) ([writers] on stderr).
+	{
+		static const std::pair<uint64_t, uint64_t> target = [] {
+			std::pair<uint64_t, uint64_t> range {0, 0};
+			if (const char* value = std::getenv("KYTY_TRACE_WRITERS"); value != nullptr) {
+				char* end    = nullptr;
+				range.first  = std::strtoull(value, &end, 16);
+				range.second = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 16) : 4u;
+			}
+			return range;
+		}();
+		// KYTY_TRACE_ORDER_FRAME=<n>: in presented frames n and n+1 every write is printed with a
+		// sequence number, and so is every use of KYTY_TRACE_ORDER_HASH=<hash> (the consumer), to see
+		// the order the GPU runs them in.
+		static const uint64_t order_frame = [] {
+			const char* value = std::getenv("KYTY_TRACE_ORDER_FRAME");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
+		}();
+		static const uint64_t order_hash = [] {
+			const char* value = std::getenv("KYTY_TRACE_ORDER_HASH");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		static std::atomic<uint64_t> order_seq {0};
+		const uint64_t frame_now = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+		static const uint64_t order_frames = [] {
+			const char* value = std::getenv("KYTY_TRACE_ORDER_FRAMES");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : 2ull;
+		}();
+		const bool in_order_window = order_frame != UINT64_MAX && frame_now >= order_frame &&
+		                             frame_now < order_frame + order_frames;
+		// Diagnostics: KYTY_TRACE_COPY=<hash>: every use of that shader prints each buffer's range,
+		// whether its bytes are GPU-written, and dwords 0..2 and 16..18 of its CPU copy ([copy] lines,
+		// up to KYTY_TRACE_COPY_MAX, default 400).
+		{
+			static const uint64_t copy_hash = [] {
+				const char* value = std::getenv("KYTY_TRACE_COPY");
+				return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+			}();
+			static const uint32_t copy_max = [] {
+				const char* value = std::getenv("KYTY_TRACE_COPY_MAX");
+				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 400u;
+			}();
+			static std::atomic<uint32_t> copy_logs {0};
+			if (copy_hash != 0 && program.shader_hash == copy_hash && copy_logs.fetch_add(1) < copy_max) {
+				std::string line;
+				for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+					const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+					const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) * r.NumRecords();
+					uint32_t       w[20] {};
+					const bool     read  = r.Base48() != 0 && bytes >= 4u &&
+					                  Libs::LibKernel::Memory::TryReadBacking(r.Base48(), w, std::min<uint64_t>(bytes, 80u));
+					line += fmt::format(" | b{}{} 0x{:x}+0x{:x} dirty={} cpu[0..2]={:08x} {:08x} {:08x} cpu[16..18]={:08x} {:08x} {:08x}{}",
+					                    i, program.info.buffers[i].written ? "w" : "r", r.Base48(), bytes,
+					                    r.Base48() != 0 && bytes != 0 && m_context.GetBufferCache().HasGpuDirtyBytes(r.Base48(), bytes) ? 1 : 0,
+					                    w[0], w[1], w[2], w[16], w[17], w[18], read ? "" : " (unread)");
+				}
+				std::fprintf(stderr, "[copy] frame=%llu %016" PRIx64 "%s\n",
+				             static_cast<unsigned long long>(frame_now), program.shader_hash, line.c_str());
+			}
+		}
+		// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the buffers that shader binds (from frame 2100), which
+		// the [key-capture] print searches for the material records of the keys it captured.
+		{
+			static const uint64_t capture_hash = [] {
+				const char* value = std::getenv("KYTY_KEY_CAPTURE");
+				return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+			}();
+			if (capture_hash != 0 && program.shader_hash == capture_hash && frame_now >= 2100u) {
+				std::lock_guard lock(g_capture_buffers_mutex);
+				if (g_capture_buffers.empty()) {
+					// KYTY_KEY_CAPTURE_SRT=<user reg>:<off1>:<off2>: follow user[reg..reg+1] -> V# at
+					// +off1 -> V# at its base +off2, and print both (the terrain's material block is
+					// 28:80:1376).
+					if (const char* chain = std::getenv("KYTY_KEY_CAPTURE_SRT"); chain != nullptr) {
+						char*          end  = nullptr;
+						const auto     reg  = std::strtoul(chain, &end, 10);
+						const uint32_t off1 = end != nullptr && *end == ':' ? std::strtoul(end + 1, &end, 10) : 0u;
+						const uint32_t off2 = end != nullptr && *end == ':' ? std::strtoul(end + 1, &end, 10) : 0u;
+						if (reg + 1u < snapshot.user_data.size()) {
+							const uint64_t root = (static_cast<uint64_t>(snapshot.user_data[reg + 1u] & 0xffffu) << 32u) |
+							                      snapshot.user_data[reg];
+							ShaderBufferResource v1 {};
+							ShaderBufferResource v2 {};
+							const bool r1 = Libs::LibKernel::Memory::TryReadBacking(root + off1, v1.fields, 16u);
+							const bool r2 = r1 && Libs::LibKernel::Memory::TryReadBacking(v1.Base48() + off2, v2.fields, 16u);
+							auto& cache = m_context.GetBufferCache();
+							std::fprintf(stderr,
+							             "[key-scan] srt root=0x%012" PRIx64 " (dirty=%d) V#1@+%u read=%d base=0x%012" PRIx64
+							             " stride=%u records=%u (dirty=%d) V#2@+%u read=%d base=0x%012" PRIx64
+							             " stride=%u records=%u fmt=%u\n",
+							             root, cache.HasGpuDirtyBytes(root + off1, 16u) ? 1 : 0, off1, r1 ? 1 : 0,
+							             v1.Base48(), v1.Stride(), v1.NumRecords(),
+							             r1 && cache.HasGpuDirtyBytes(v1.Base48() + off2, 16u) ? 1 : 0, off2,
+							             r2 ? 1 : 0, v2.Base48(), v2.Stride(), v2.NumRecords(), v2.RawFormat());
+						}
+					}
+					for (size_t i = 0; i < snapshot.buffers.size(); i++) {
+						const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+						const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) * static_cast<uint64_t>(r.NumRecords());
+						g_capture_buffers.emplace_back(r.Base48(), bytes);
+					}
+				}
+			}
+		}
+		if (in_order_window && order_hash != 0 && program.shader_hash == order_hash) {
+			std::fprintf(stderr, "[order] #%llu frame=%llu consumer %016" PRIx64 "\n",
+			             static_cast<unsigned long long>(order_seq.fetch_add(1)),
+			             static_cast<unsigned long long>(frame_now), program.shader_hash);
+		}
+		if (target.first != 0) {
+			static std::mutex                   writers_mutex;
+			static std::unordered_set<uint64_t> writers_printed;
+			if (in_order_window) {
+				for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+					if (!program.info.buffers[i].written) {
+						continue;
+					}
+					const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+					const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) *
+					                       static_cast<uint64_t>(r.NumRecords());
+					if (r.Base48() != 0 && r.Base48() < target.first + target.second &&
+					    target.first < r.Base48() + bytes) {
+						std::fprintf(stderr,
+						             "[order] #%llu frame=%llu writer %016" PRIx64 " 0x%012" PRIx64 "+0x%" PRIx64 "\n",
+						             static_cast<unsigned long long>(order_seq.fetch_add(1)),
+						             static_cast<unsigned long long>(frame_now), program.shader_hash,
+						             r.Base48(), bytes);
+					}
+				}
+			}
+			for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+				if (!program.info.buffers[i].written) {
+					continue;
+				}
+				const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+				const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) *
+				                       static_cast<uint64_t>(r.NumRecords());
+				if (r.Base48() == 0 || r.Base48() >= target.first + target.second ||
+				    target.first >= r.Base48() + bytes) {
+					continue;
+				}
+				std::lock_guard lock(writers_mutex);
+				if (writers_printed.insert(program.shader_hash ^ (static_cast<uint64_t>(i) << 56u)).second) {
+					std::fprintf(stderr,
+					             "[writers] %016" PRIx64 " stage=%u buffer[%zu] base=0x%012" PRIx64 "+0x%" PRIx64
+					             " stride=%u formatted=%d fmt=%u\n",
+					             program.shader_hash, static_cast<uint32_t>(program.stage), i, r.Base48(),
+					             bytes, r.Stride(), program.info.buffers[i].formatted ? 1 : 0, r.RawFormat());
+					std::fflush(stderr);
+				}
+			}
+		}
+	}
 	// Diagnostics: KYTY_TRACE_READERS=<hash>[,<hash>...]: the buffer ranges those shaders write
 	// are recorded, and every other shader bound with a buffer overlapping one is printed once
 	// ([readers] lines on stderr). Finds the consumers of a shader's output.
@@ -2266,9 +2570,23 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			const auto level_it  = levels.find(program.shader_hash);
 			const bool is_source = level_it != levels.end();
 			const int  level     = is_source ? level_it->second : -1;
-			if (level == 0) {
+			// With KYTY_TRACE_WRITERS set, only the dispatches that write into that range are logged.
+			bool writes_target = true;
+			if (const char* value = std::getenv("KYTY_TRACE_WRITERS"); value != nullptr && level == 0) {
+				char*          end   = nullptr;
+				const uint64_t first = std::strtoull(value, &end, 16);
+				const uint64_t size  = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 16) : 4u;
+				writes_target        = false;
+				for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+					const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+					const uint64_t bytes = std::max<uint64_t>(r.Stride(), 1u) * r.NumRecords();
+					writes_target |= program.info.buffers[i].written && r.Base48() < first + size &&
+					                 first < r.Base48() + bytes;
+				}
+			}
+			if (level == 0 && writes_target) {
 				static std::atomic<uint32_t> source_logs {0};
-				if (source_logs.fetch_add(1) < 4u) {
+				if (source_logs.fetch_add(1) < 6u) {
 					std::string user;
 					for (size_t k = 0; k < snapshot.user_data.size() && k < 16; k++) {
 						user += fmt::format(" {:08x}", snapshot.user_data[k]);
@@ -2279,9 +2597,37 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 					for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
 						const auto r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 						std::fprintf(stderr,
-						             "[readers]   buffer[%zu] base=0x%012" PRIx64 " stride=%u records=%u written=%d\n",
+						             "[readers]   buffer[%zu] base=0x%012" PRIx64 " stride=%u records=%u written=%d"
+						             " formatted=%d fmt=%u dst_sel=%u%u%u%u words=%08x %08x %08x %08x gpu_written=%d\n",
 						             i, r.Base48(), r.Stride(), r.NumRecords(),
-						             program.info.buffers[i].written ? 1 : 0);
+						             program.info.buffers[i].written ? 1 : 0,
+						             program.info.buffers[i].formatted ? 1 : 0, r.RawFormat(), r.DstSelX(),
+						             r.DstSelY(), r.DstSelZ(), r.DstSelW(), r.fields[0], r.fields[1],
+						             r.fields[2], r.fields[3],
+						             r.Base48() != 0 && m_context.GetBufferCache().HasGpuDirtyBytes(
+						                                    r.Base48(), std::max<uint64_t>(r.Stride(), 1u) *
+						                                                    std::max<uint32_t>(r.NumRecords(), 1u))
+						                 ? 1
+						                 : 0);
+						// KYTY_TRACE_READERS_DATA=<dwords>: the start of each read-only buffer's CPU copy.
+						static const uint32_t data_dwords = [] {
+							const char* value = std::getenv("KYTY_TRACE_READERS_DATA");
+							return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+						}();
+						if (data_dwords != 0u && !program.info.buffers[i].written && r.Base48() != 0) {
+							std::vector<uint32_t> data(std::min<uint64_t>(
+							    data_dwords, std::max<uint64_t>(r.Stride(), 1u) * r.NumRecords() / 4u));
+							if (!data.empty() &&
+							    Libs::LibKernel::Memory::TryReadBacking(r.Base48(), data.data(), data.size() * 4u)) {
+								for (size_t row = 0; row < data.size(); row += 8) {
+									std::string line;
+									for (size_t k = row; k < std::min(data.size(), row + 8); k++) {
+										line += fmt::format(" {:08x}", data[k]);
+									}
+									std::fprintf(stderr, "[readers]     +0x%03zx:%s\n", row * 4u, line.c_str());
+								}
+							}
+						}
 					}
 				}
 			}
