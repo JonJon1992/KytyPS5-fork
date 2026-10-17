@@ -1232,7 +1232,15 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 			graphic_ctx.external_memory_host_enabled = true;
 		}
-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+		// A checkpoint is recorded before every draw and dispatch to name the work a lost device was
+		// running. KYTY_NV_CHECKPOINTS=0 leaves them out (they may keep the GPU from overlapping
+		// back-to-back dispatches).
+		static const bool checkpoints = [] {
+			const char* value = std::getenv("KYTY_NV_CHECKPOINTS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (checkpoints &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 			graphic_ctx.diagnostic_checkpoints_enabled = true;
 		}

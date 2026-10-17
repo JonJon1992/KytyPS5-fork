@@ -140,8 +140,22 @@ void EmitMemoryOffsets(EmitterState& state) {
 			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
 			                          ConstantU32(state, buffer.gpu_records_flat));
-			const auto records = state.builder.AllocateId();
+			uint32_t records = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpLoad, u32, records, pointer);
+			if (buffer.gpu_records_add_flat != IR::BufferResource::NoGpuRecords) {
+				const auto add_pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+				                          add_pointer, state.flattened_srt_variable,
+				                          ConstantU32(state, 0),
+				                          ConstantU32(state, buffer.gpu_records_add_flat));
+				const auto added = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, u32, added, add_pointer);
+				records = EmitBinaryU32(state, spv::OpIAdd, records, added);
+			}
+			if (buffer.gpu_records_add != 0u) {
+				records = EmitBinaryU32(state, spv::OpIAdd, records,
+				                        ConstantU32(state, buffer.gpu_records_add));
+			}
 			const uint32_t stride = buffer.packed_stride & 0x3fffu;
 			uint32_t       bytes  = records;
 			if (stride > 1u) {

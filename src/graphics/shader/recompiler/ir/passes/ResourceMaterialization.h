@@ -22,6 +22,8 @@ struct ResourceSpecialization {
 		uint32_t               indirect_search_iterations      = 0;
 		// KYTY_GPU_SIZED_DYNAMIC: see BufferResource::gpu_records_flat.
 		uint32_t               gpu_records_flat                = BufferResource::NoGpuRecords;
+		uint32_t               gpu_records_add_flat            = BufferResource::NoGpuRecords;
+		uint32_t               gpu_records_add                 = 0;
 		bool                   operator==(const Buffer&) const = default;
 	};
 

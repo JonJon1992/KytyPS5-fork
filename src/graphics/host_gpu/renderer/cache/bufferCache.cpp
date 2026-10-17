@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/timeline.h"
@@ -523,6 +524,8 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+static thread_local int t_rm_reason = 0;
+static std::atomic<uint64_t> g_rm_iters[6] {};
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -582,26 +585,90 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	ReadbackTimer timer {readback_stats, from_gpu_thread ? 2 : (is_write ? 1 : 0), vaddr,
 	                     readback_stats ? std::chrono::steady_clock::now()
 	                                    : std::chrono::steady_clock::time_point {}};
+	uint64_t rm_iters = 0;
+	// KYTY_READBACK_STATS: the steps of slow readbacks (where a game thread waits).
+	struct SlowTrace {
+		bool        enabled;
+		uint64_t    vaddr;
+		bool        is_write;
+		std::chrono::steady_clock::time_point start;
+		std::string steps;
+		void Add(const char* what, double ms, int reason, uint64_t tick, uint64_t cur) {
+			if (!enabled || steps.size() > 600) return;
+			steps += fmt::format(" [{} {:.2f}ms r{} t{} c{}]", what, ms, reason, tick, cur);
+		}
+		~SlowTrace() {
+			if (!enabled) return;
+			const double total = std::chrono::duration<double, std::milli>(
+			                         std::chrono::steady_clock::now() - start).count();
+			static std::atomic<uint32_t> logged {0};
+			if (total >= 8.0 && logged.fetch_add(1) < 300) {
+				std::fprintf(stderr, "[readback-slow] %s 0x%llx %.1fms:%s\n", is_write ? "W" : "R",
+				             static_cast<unsigned long long>(vaddr), total, steps.c_str());
+			}
+		}
+	} slow {readback_stats && !from_gpu_thread, vaddr, is_write, std::chrono::steady_clock::now(), {}};
 	for (;;) {
 		uint64_t wait_tick = 0;
+		int      rm_reason = 0;
+		rm_iters++;
+		const auto step_begin = std::chrono::steady_clock::now();
 		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick] {
-			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick, &rm_reason] {
+			    t_rm_reason = 0;
+			    wait_tick   = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+			    rm_reason   = t_rm_reason;
 		    });
+		g_rm_iters[rm_reason].fetch_add(1, std::memory_order_relaxed);
+		slow.Add("step", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_begin).count(),
+		         rm_reason, wait_tick & ~CopyReadbackMarker, m_scheduler.CurrentTick());
+		if (readback_stats && (rm_iters & (rm_iters - 1)) == 0 && rm_iters >= 1024) {
+			std::fprintf(stderr,
+			             "[readback-spin] vaddr=0x%llx iters=%llu reason=%d tick=0x%llx free=%d cur=%llu "
+			             "last_async=%llu | iters by reason: bitmap=%llu copyfind=%llu lastasync=%llu "
+			             "copyq=%llu dl=%llu done=%llu\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(rm_iters),
+			             rm_reason, static_cast<unsigned long long>(wait_tick),
+			             ((wait_tick & CopyReadbackMarker) == 0 && wait_tick != 0) ? (m_scheduler.IsFree(wait_tick) ? 1 : 0) : -1,
+			             static_cast<unsigned long long>(m_scheduler.CurrentTick()),
+			             static_cast<unsigned long long>(m_last_async_download_tick),
+			             static_cast<unsigned long long>(g_rm_iters[1].load()),
+			             static_cast<unsigned long long>(g_rm_iters[2].load()),
+			             static_cast<unsigned long long>(g_rm_iters[3].load()),
+			             static_cast<unsigned long long>(g_rm_iters[4].load()),
+			             static_cast<unsigned long long>(g_rm_iters[5].load()),
+			             static_cast<unsigned long long>(g_rm_iters[0].load()));
+		}
 		if (wait_tick == 0) {
 			return;
 		}
+		const auto wait_begin = std::chrono::steady_clock::now();
 		if ((wait_tick & CopyReadbackMarker) != 0) {
 			CompleteCopyReadback(wait_tick);
+			slow.Add("copywait", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count(),
+			         rm_reason, 0, 0);
 			continue;
 		}
+		// WaitPriorityOperations only waits for publications queued at or before the tick; a
+		// tick with none (a pending write-bitmap writer) returned at once and this loop went
+		// through the GPU thread again, ~500k times a second on the title screen. Wait for the
+		// host GPU to reach the tick first (KYTY_READBACK_SPIN_FIX=0: as before).
+		static const bool spin_fix = [] {
+			const char* value = std::getenv("KYTY_READBACK_SPIN_FIX");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (spin_fix && wait_tick < m_scheduler.CurrentTick() && !m_scheduler.IsFree(wait_tick)) {
+			m_scheduler.GetMasterSemaphore().Wait(wait_tick);
+		}
 		m_scheduler.WaitPriorityOperations(wait_tick);
+		slow.Add("wait", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count(),
+		         rm_reason, wait_tick, m_scheduler.CurrentTick());
 	}
 }
 
 uint32_t BufferCache::PeekDword(uint64_t vaddr) {
 	KYTY_PROFILER_FUNCTION();
-	static constexpr uint32_t PeekSlots = 4096;
+	static constexpr uint32_t PeekSlots = 65536;
 	if (!GuestGpu::IsGpuThread() || (vaddr & 3u) != 0u || !GuestRange {vaddr, 4}.Valid()) {
 		return 0;
 	}
@@ -886,8 +953,9 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// labels.
 	// GPU write bitmap: pages of tracked bindings the GPU did not write lose their GPU-written
 	// bytes here, so the window below downloads only what was written, or nothing.
+	m_narrow_window = false;
 	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
-		return wait_tick;
+		{ t_rm_reason = 1; return wait_tick; }
 	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
@@ -905,7 +973,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			if (const auto marker = FindCopyReadback(page_begin, page_end - page_begin);
 			    marker != 0) {
 				if (async) {
-					return marker;
+					{ t_rm_reason = 2; return marker; }
 				}
 				CompleteCopyReadback(marker);
 				std::shared_lock lock(m_dirty_ranges_mutex);
@@ -914,11 +982,11 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 		if (downloading && m_last_async_download_tick != 0) {
 			if (async) {
-				return m_last_async_download_tick;
+				{ t_rm_reason = 3; return m_last_async_download_tick; }
 			}
 			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
 		}
-		if (async && ReadbackWindow() != 0) {
+		if (async && ReadbackWindow() != 0 && !m_narrow_window) {
 			// The whole download window, as the synchronous path lifts it: page by page, each
 			// page of the window faulted on its own and went through the GPU thread again.
 			const auto window = ReadbackWindow();
@@ -988,11 +1056,17 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// Attack prompt, each its own fault and download that way (7.5 fps against 20.3).
 	auto window_begin = vaddr;
 	auto window_end   = vaddr + size;
-	if (const auto window = ReadbackWindow(); window != 0) {
+	if (const auto window = ReadbackWindow(); window != 0 && !m_narrow_window) {
 		const auto buffer_begin = buffer.CpuAddress();
 		const auto buffer_end   = buffer_begin + buffer.Size();
 		window_begin = std::max(Common::AlignDown(vaddr, window), buffer_begin);
 		window_end   = std::min(std::max(window_begin + window, vaddr + size), buffer_end);
+	} else if (m_narrow_window) {
+		// Writers still running elsewhere in the window: only the faulting pages, whose writers
+		// have finished, download (the rest of the window keeps its protection).
+		window_begin = std::max(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), buffer.CpuAddress());
+		window_end   = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE),
+		                        buffer.CpuAddress() + buffer.Size());
 	}
 
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
@@ -1002,7 +1076,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		// and let the caller wait for that copy alone.
 		if (const auto marker = TryCopyQueueReadback(buffer, window_begin, window_end);
 		    marker != 0) {
-			return marker;
+			{ t_rm_reason = 4; return marker; }
 		}
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
@@ -1019,7 +1093,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			}
 			m_scheduler.Flush();
 			m_last_async_download_tick = tick;
-			return tick;
+			{ t_rm_reason = 5; return tick; }
 		}
 	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -1410,6 +1484,14 @@ constexpr uint64_t WriteBitmapPage     = uint64_t {1} << WriteBitmapPageBits;
 constexpr uint64_t WriteBitmapLimit    = uint64_t {1} << 40u; // guest addresses it covers
 constexpr uint64_t WriteBitmapBytes    = WriteBitmapLimit / WriteBitmapPage / 8u;
 constexpr uint64_t WriteBitmapRegionBits = 22; // ticks per 4 MiB: a multiple of a bitmap word's span
+
+bool BitmapRangeTicks() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BITMAP_RANGE_TICKS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 // KYTY_WRITE_BITMAP_MIN_KB (default 1024): smaller unbounded written bindings keep downloading
 // whole, as before; the bitmap pays off where a binding spans much more than it writes.
@@ -1803,6 +1885,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 				m_bitmap_ticks[region] = tick;
 				m_region_era[region]   = m_bitmap_era;
 			}
+			if (BitmapRangeTicks() && vaddr < last) {
+				m_pending_bitmap_writes.push_back({vaddr, last, tick});
+			}
 			m_predicted.ForEachInRange(vaddr, size, [&](uint64_t from, uint64_t to) {
 				ranges.emplace_back(from, to);
 			});
@@ -1845,6 +1930,70 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 		if (const auto found = m_bitmap_ticks.find(region); found != m_bitmap_ticks.end()) {
 			tick = std::max(tick, found->second);
 		}
+	}
+	static std::atomic<uint64_t> s_range_narrowed {0}, s_range_kept {0};
+	if (tick != 0 && BitmapRangeTicks() && !m_scheduler.IsFree(tick)) {
+		// The region has a writer still to run; wait only if one of the pending writers covers
+		// this window. Pages of a region whose bits are not processed yet count as written below
+		// and download (their writers have finished), instead of waiting for the region's tick.
+		while (!m_pending_bitmap_writes.empty() &&
+		       m_scheduler.IsFree(m_pending_bitmap_writes.front().tick)) {
+			m_pending_bitmap_writes.pop_front();
+		}
+		uint64_t window_tick = 0;
+		for (const auto& w: m_pending_bitmap_writes) {
+			if (w.begin < end && begin < w.end) {
+				window_tick = std::max(window_tick, w.tick);
+			}
+		}
+		static std::atomic<uint64_t> s_page_narrowed {0};
+		if (window_tick != 0) {
+			const auto pb = Common::AlignDown(vaddr, WriteBitmapPage);
+			const auto pe = Common::AlignUp(vaddr + size, WriteBitmapPage);
+			uint64_t   page_tick = 0;
+			const PendingBitmapWrite* cover = nullptr;
+			for (const auto& w: m_pending_bitmap_writes) {
+				if (w.begin < pe && pb < w.end && w.tick >= page_tick) {
+					page_tick = w.tick;
+					cover     = &w;
+				}
+			}
+			if (page_tick == 0) {
+				begin           = pb;
+				end             = pe;
+				m_narrow_window = true;
+				window_tick     = 0;
+				s_page_narrowed++;
+			} else if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr; log) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged++ < 32) {
+					std::fprintf(stderr,
+					             "[bitmap-range] page 0x%llx covered by pending write 0x%llx-0x%llx tick %llu\n",
+					             static_cast<unsigned long long>(pb),
+					             static_cast<unsigned long long>(cover->begin),
+					             static_cast<unsigned long long>(cover->end),
+					             static_cast<unsigned long long>(cover->tick));
+				}
+			}
+		}
+		(window_tick == 0 ? s_range_narrowed : s_range_kept)++;
+		if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr; log) {
+			static std::atomic<uint32_t> logged {0};
+			if ((s_range_narrowed + s_range_kept) % 64 == 1 && logged++ < 64) {
+				std::fprintf(stderr,
+				             "[bitmap-range] window 0x%llx+0x%llx region tick %llu: %s (narrowed %llu, "
+				             "kept %llu, page-narrowed %llu, pending writes %zu)\n",
+				             static_cast<unsigned long long>(begin),
+				             static_cast<unsigned long long>(end - begin),
+				             static_cast<unsigned long long>(tick),
+				             window_tick == 0 ? "no pending writer covers it" : "a pending writer covers it",
+				             static_cast<unsigned long long>(s_range_narrowed.load()),
+				             static_cast<unsigned long long>(s_range_kept.load()),
+				             static_cast<unsigned long long>(s_page_narrowed.load()),
+				             m_pending_bitmap_writes.size());
+			}
+		}
+		tick = window_tick;
 	}
 	static std::atomic<uint64_t> s_refines {0}, s_refine_waits {0}, s_refine_gpu {0},
 	    s_refine_written {0}, s_refine_dropped {0};
@@ -2181,6 +2330,9 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			     region <= (last - 1) >> WriteBitmapRegionBits; region++) {
 				m_bitmap_ticks[region] = tick;
 				m_region_era[region]   = m_bitmap_era; // its bits go to this era's epoch
+			}
+			if (BitmapRangeTicks()) {
+				m_pending_bitmap_writes.push_back({first, last, tick});
 			}
 		} else if (!m_bitmap_tracked.Empty()) {
 			m_bitmap_tracked.Subtract(first, last - first);

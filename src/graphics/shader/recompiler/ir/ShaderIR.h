@@ -132,6 +132,9 @@ struct BufferResource {
 	// Bound with a conservative record count (KYTY_GPU_SIZED_DYNAMIC): the flattened SRT dword that
 	// holds the exact count (V# dword 2); the shader bounds its accesses by it.
 	uint32_t               gpu_records_flat           = NoGpuRecords;
+	// The count is flat[gpu_records_flat] + flat[gpu_records_add_flat] (when set) + gpu_records_add.
+	uint32_t               gpu_records_add_flat       = NoGpuRecords;
+	uint32_t               gpu_records_add            = 0;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;

@@ -34,8 +34,12 @@ public:
 	// Records the conversion of the three thread counts at `threads` and returns the workgroup
 	// counts' location, ready for dispatchIndirect. Binds a compute pipeline and push state, so
 	// call it before committing the guest dispatch's bindings.
+	// pre_barrier false: the caller has already ordered the counts' writers (and the entry's
+	// previous indirect read) before this conversion. post_barrier false: the caller orders the
+	// groups before their indirect read (a batch of conversions, KYTY_DISPATCH_RUNS).
 	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress threads,
-	                             const std::array<uint32_t, 3>& local_size);
+	                             const std::array<uint32_t, 3>& local_size, bool pre_barrier = true,
+	                             bool post_barrier = true);
 
 private:
 	// Ring of converted counts. An entry is rewritten only after 4096 later conversions, each

@@ -72,20 +72,23 @@ IndirectDispatchGroups::~IndirectDispatchGroups() {
 
 IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
     const CommandRecorder& command, vk::DeviceAddress threads,
-    const std::array<uint32_t, 3>& local_size) {
+    const std::array<uint32_t, 3>& local_size, bool pre_barrier, bool post_barrier) {
 	const auto entry  = m_next;
 	m_next            = (m_next + 1u) % Entries;
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
 
 	// The counts come from earlier shader or transfer writes; the entry's previous indirect read
 	// must finish before it is rewritten.
-	vk::MemoryBarrier counts_ready {};
-	counts_ready.srcAccessMask =
-	    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	counts_ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &counts_ready, 0,
-	                        nullptr, 0, nullptr);
+	if (pre_barrier) {
+		vk::MemoryBarrier counts_ready {};
+		counts_ready.srcAccessMask =
+		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		counts_ready.dstAccessMask =
+		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &counts_ready, 0,
+		                        nullptr, 0, nullptr);
+	}
 
 	const vk::DescriptorBufferInfo info {m_groups.Handle(), 0, VK_WHOLE_SIZE};
 	vk::WriteDescriptorSet         write {};
@@ -101,6 +104,10 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(1, 1, 1);
+	if (!post_barrier) {
+		return {m_groups.Handle(), offset,
+		        m_groups.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
+	}
 
 	vk::MemoryBarrier groups_ready {};
 	groups_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;

@@ -351,6 +351,15 @@ private:
 	bool                                               m_write_bitmap_failed = false;
 	RangeSet                                           m_bitmap_tracked;
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
+	// Tracked written bindings whose ticks may still run, in tick order (KYTY_BITMAP_RANGE_TICKS):
+	// a readback waits for the writers of its window, not for any writer of its 4 MiB region.
+	struct PendingBitmapWrite {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t tick;
+	};
+	std::deque<PendingBitmapWrite>                     m_pending_bitmap_writes;
+	bool m_narrow_window = false; // RefineWithWriteBitmap: download only the faulting pages
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.

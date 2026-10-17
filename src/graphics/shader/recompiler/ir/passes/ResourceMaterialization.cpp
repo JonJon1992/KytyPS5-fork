@@ -1188,6 +1188,13 @@ bool GpuSizedDynamicEnabled();
 // KYTY_GPU_SIZED_WRITTEN on and the shader in its list): only for shaders whose atomics index
 // within the real count (the shader's own data), never ones that rely on out-of-range drops.
 bool GpuSizedAtomicEnabled(uint64_t shader_hash) {
+	// KYTY_GPU_SIZED_DYNAMIC: the shader bounds its atomics by the exact count too, so an atomic
+	// past it is dropped as on the console (CS 48ba2226632e8209 waited for its atomic buffer's
+	// count every frame on the title screen, ~20 % of the GPU thread). KYTY_GPU_SIZED_ATOMIC_SHADERS
+	// still limits it to the listed shaders.
+	if (GpuSizedDynamicEnabled() && std::getenv("KYTY_GPU_SIZED_ATOMIC_SHADERS") == nullptr) {
+		return GpuSizedWrittenEnabled(shader_hash);
+	}
 	static const std::vector<uint64_t> shaders = [] {
 		std::vector<uint64_t> result;
 		const char*           value = std::getenv("KYTY_GPU_SIZED_ATOMIC_SHADERS");
@@ -1959,9 +1966,9 @@ bool DependsOnGpuFill(const ResourcePlan& program, Value value,
 // the largest count seen so far, from copies of the count that never make the host wait
 // (SrtRuntime::peek_gpu_dword), at least KYTY_GPU_SIZED_DYNAMIC_MIN_KB (default 256) and at most
 // KYTY_GPU_SIZED_DYNAMIC_MAX_KB (default 262144) of records; the fixed bound until a copy lands.
-uint32_t LearnedRecords(uint64_t shader_hash, uint32_t buffer, uint32_t flat_offset, uint32_t dword1,
-                        uint32_t fallback, const SrtRuntime& runtime,
-                        const std::vector<SrtGpuFill>& fills) {
+uint32_t LearnedRecords(uint64_t shader_hash, uint32_t buffer, uint32_t flat_offset,
+                        uint32_t add_flat, uint32_t add, uint32_t dword1, uint32_t fallback,
+                        const SrtRuntime& runtime, const ResourceSnapshot& snapshot) {
 	static const uint64_t min_bytes = [] {
 		const char* value = std::getenv("KYTY_GPU_SIZED_DYNAMIC_MIN_KB");
 		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) * 1024ull;
@@ -1973,17 +1980,25 @@ uint32_t LearnedRecords(uint64_t shader_hash, uint32_t buffer, uint32_t flat_off
 	if (runtime.peek_gpu_dword == nullptr) {
 		return fallback;
 	}
-	uint64_t address = 0;
-	for (const auto& fill: fills) {
-		if (fill.flat_offset == flat_offset) {
-			address = fill.address;
-			break;
+	// A slot the GPU fills: its last seen value; one the host read: its value.
+	bool       any       = false;
+	const auto slot_value = [&](uint32_t offset) -> uint64_t {
+		for (const auto& fill: snapshot.gpu_fills) {
+			if (fill.flat_offset == offset) {
+				any = true;
+				return runtime.peek_gpu_dword(fill.address);
+			}
 		}
+		return offset < snapshot.flattened_srt.size() ? snapshot.flattened_srt[offset] : 0u;
+	};
+	uint64_t total = slot_value(flat_offset) + add;
+	if (add_flat != BufferResource::NoGpuRecords) {
+		total += slot_value(add_flat);
 	}
-	if (address == 0) {
+	if (!any) {
 		return fallback;
 	}
-	const uint32_t seen = runtime.peek_gpu_dword(address);
+	const auto seen = static_cast<uint32_t>(std::min<uint64_t>(total, UINT32_MAX));
 	static std::mutex                             mutex;
 	static std::unordered_map<uint64_t, uint32_t> largest;
 	uint32_t                                      most = 0;
@@ -2103,6 +2118,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		// KYTY_GPU_SIZED_DYNAMIC: the flat SRT dword holding this buffer's exact record count.
 		uint32_t gpu_records_flat = BufferResource::NoGpuRecords;
+		uint32_t gpu_records_add_flat = BufferResource::NoGpuRecords;
+		uint32_t gpu_records_add      = 0;
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
@@ -2175,14 +2192,43 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 						// The count must be one flat slot read as it is, so the shader can read
 						// it there; bounds of swizzled or lane-indexed buffers are not a plain
 						// length. Otherwise a written buffer waits for its exact count.
+						// Also flat + flat and flat + immediate (CS 380b6ffba703cef1, f8eeaa7f21b1450a).
+						const auto flat_of = [&](Value v) -> uint32_t {
+							const auto* inst = v.Resolve().TryInstruction();
+							if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst) {
+								return BufferResource::NoGpuRecords;
+							}
+							const auto slot = inst->Arg(1).Resolve();
+							return slot.IsImmediate() && slot.GetType() == Type::U32 &&
+							               slot.U32() < program.srt_reads.size()
+							           ? program.srt_reads[slot.U32()].flat_offset
+							           : BufferResource::NoGpuRecords;
+						};
+						const auto imm_of = [](Value v, uint32_t& out) {
+							v = v.Resolve();
+							if (!v.IsImmediate() || v.GetType() != Type::U32) return false;
+							out = v.U32();
+							return true;
+						};
 						const auto* read = src.dwords[2].Resolve().TryInstruction();
-						if (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
-						    ((value.dwords[1] >> 31u) & 1u) == 0u &&
+						if (read != nullptr && ((value.dwords[1] >> 31u) & 1u) == 0u &&
 						    ((value.dwords[3] >> 23u) & 1u) == 0u) {
-							const auto slot = read->Arg(1).Resolve();
-							if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
-							    slot.U32() < program.srt_reads.size()) {
-								gpu_records_flat = program.srt_reads[slot.U32()].flat_offset;
+							if (read->GetOpcode() == ValueOpcode::ReadConst) {
+								gpu_records_flat = flat_of(src.dwords[2]);
+							} else if (read->GetOpcode() == ValueOpcode::IAdd32) {
+								const auto a = flat_of(read->Arg(0));
+								const auto b = flat_of(read->Arg(1));
+								uint32_t   imm = 0;
+								if (a != BufferResource::NoGpuRecords && b != BufferResource::NoGpuRecords) {
+									gpu_records_flat     = a;
+									gpu_records_add_flat = b;
+								} else if (a != BufferResource::NoGpuRecords && imm_of(read->Arg(1), imm)) {
+									gpu_records_flat = a;
+									gpu_records_add  = imm;
+								} else if (b != BufferResource::NoGpuRecords && imm_of(read->Arg(0), imm)) {
+									gpu_records_flat = b;
+									gpu_records_add  = imm;
+								}
 							}
 						}
 						if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
@@ -2234,8 +2280,9 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 						value.dwords[2] = GpuSizedRecords(value.dwords[1], base.written);
 						if (gpu_records_flat != BufferResource::NoGpuRecords) {
 							value.dwords[2] = LearnedRecords(program.shader_hash, i, gpu_records_flat,
+							                                 gpu_records_add_flat, gpu_records_add,
 							                                 value.dwords[1], value.dwords[2],
-							                                 runtime, snapshot.gpu_fills);
+							                                 runtime, snapshot);
 						}
 						t_gpu_sized_snapshot = true;
 						NoteGpuSizedBuffer(program.shader_hash);
@@ -2272,6 +2319,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.gpu_records_flat   = gpu_records_flat;
+		buffer.gpu_records_add_flat = gpu_records_add_flat;
+		buffer.gpu_records_add      = gpu_records_add;
 		buffer.write_tracked      = WriteBitmapEnabled() && i < program.info.buffers.size() &&
 		                            base.written && base.image_alias == BufferResource::NoImageAlias &&
 		                            i < program.buffer_writes_bounded.size() &&
@@ -2585,6 +2634,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
 		buffer.gpu_records_flat           = source.gpu_records_flat;
+		buffer.gpu_records_add_flat       = source.gpu_records_add_flat;
+		buffer.gpu_records_add            = source.gpu_records_add;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {

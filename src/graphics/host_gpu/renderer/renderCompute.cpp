@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/dispatchRun.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
@@ -42,6 +43,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -444,10 +446,48 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+// KYTY_DISPATCH_RUNS: the run's last dispatch orders the whole run for what follows, also when it
+// records nothing itself (skipped, empty).
+class DispatchRunPost {
+public:
+	DispatchRunPost(RenderContext& context, CommandBuffer& buffer)
+	    : m_context(context), m_buffer(buffer),
+	      m_enabled(DispatchRunsEnabled() && DispatchSyncEnabled()) {}
+	~DispatchRunPost() {
+		if (!m_enabled) return;
+		auto& run = DispatchRun();
+		if (run.more || !run.pending_post) return;
+		run.pending_post = false;
+		Common::LockGuard lock(m_context.GetMutex());
+		if (!m_buffer.IsInvalid()) {
+			ShaderAccessBarrier(m_buffer.Recorder(), vk::PipelineStageFlagBits::eComputeShader);
+		}
+	}
+	KYTY_CLASS_NO_COPY(DispatchRunPost);
+
+private:
+	RenderContext& m_context;
+	CommandBuffer& m_buffer;
+	bool           m_enabled;
+};
+
+// Whether the barrier before this dispatch can be left out (an earlier dispatch of its run was
+// recorded last), and the one after it (another dispatch of the run follows).
+static bool RunSkipsBarrierBefore() {
+	return DispatchRunsEnabled() && DispatchRun().continues;
+}
+static bool RunSkipsBarrierAfter() {
+	if (!DispatchRunsEnabled() || !DispatchRun().more) return false;
+	DispatchRun().pending_post = true;
+	DispatchRun().skipped_barriers++;
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
+	DispatchRunPost run_post(m_context, buffer);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -680,7 +720,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (has_storage_writes) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 			// while allowing the queue to execute asynchronously.
-			if (DispatchSyncEnabled()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (DispatchSyncEnabled() && !RunSkipsBarrierBefore()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
@@ -703,14 +743,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		if (DispatchSyncEnabled()) ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (DispatchSyncEnabled() && !RunSkipsBarrierAfter()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (DispatchRunsEnabled()) DispatchRun().pending_post = false;
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
+	static const bool merged_barriers = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_MERGED_BARRIERS");
+		return value != nullptr && value[0] == '1';
+	}();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	DispatchRunPost run_post(m_context, buffer);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
 	const bool use_thread_dimensions =
@@ -757,6 +805,61 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
 	buffer.EndRendering();
+	// KYTY_DISPATCH_RUNS: the thread counts of the run's indirect dispatches are converted together
+	// at its first one, between one barrier before and one after, instead of a conversion and its
+	// barriers per dispatch.
+	std::optional<DispatchRunConverted> run_converted;
+	if (use_thread_dimensions && DispatchRunsEnabled() && DispatchSyncEnabled()) {
+		auto& run = DispatchRun();
+		if (const auto found = run.converted.find(run.packet);
+		    run.packet != nullptr && found != run.converted.end()) {
+			run_converted = found->second;
+		} else if (run.upcoming.size() > 1 && run.upcoming.front().packet == run.packet) {
+			run.converted.clear();
+			const std::array<uint32_t, 3> current {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			                                       std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			                                       std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+			vk::MemoryBarrier ready {};
+			ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+			                      vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderRead;
+			ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                      vk::AccessFlagBits::eIndirectCommandRead;
+			buffer.Recorder().pipelineBarrier(
+			    vk::PipelineStageFlagBits::eAllCommands,
+			    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			    {}, 1, &ready, 0, nullptr, 0, nullptr);
+			for (const auto& entry: run.upcoming) {
+				auto local = entry.local;
+				for (uint32_t i = 0; i < 3; i++) {
+					if (local[i] == 0) local[i] = current[i];
+				}
+				const auto [entry_buffer, entry_offset] = m_context.GetBufferCache().ObtainBuffer(
+				    entry.args, sizeof(vk::DispatchIndirectCommand), false, false, {}, true);
+				if (entry_buffer == nullptr || (entry_offset & 3u) != 0 ||
+				    !entry_buffer->HasDeviceAddress()) {
+					break;
+				}
+				const auto converted = m_indirect_groups->Convert(
+				    buffer.Recorder(), entry_buffer->BufferDeviceAddress() + entry_offset, local,
+				    false, false);
+				run.converted[entry.packet] = {converted.groups_buffer, converted.groups_offset,
+				                               converted.threads};
+			}
+			vk::MemoryBarrier groups_ready {};
+			groups_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			groups_ready.dstAccessMask =
+			    vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead;
+			buffer.Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                                  vk::PipelineStageFlagBits::eDrawIndirect |
+			                                      vk::PipelineStageFlagBits::eComputeShader,
+			                                  {}, 1, &groups_ready, 0, nullptr, 0, nullptr);
+			run.batched += run.converted.size();
+			run.upcoming.clear();
+			if (const auto again = run.converted.find(run.packet); again != run.converted.end()) {
+				run_converted = again->second;
+			}
+		}
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
@@ -772,20 +875,49 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
+		vk::Buffer     indirect_buffer = nullptr;
+		vk::DeviceSize indirect_offset = 0;
+		if (run_converted) {
+			indirect_buffer  = run_converted->groups_buffer;
+			indirect_offset  = run_converted->groups_offset;
+			const auto dword = program.bindings.dispatch_thread_dword;
+			if (dword != ShaderRecompiler::IR::PushData::NoStart) {
+				bindings.shader_data[dword]      = static_cast<uint32_t>(run_converted->threads);
+				bindings.shader_data[dword + 1u] = static_cast<uint32_t>(run_converted->threads >> 32u);
+			}
+		} else {
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false, false, {},
 		    use_thread_dimensions);
 		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
-		vk::Buffer     indirect_buffer = args_buffer->Handle();
-		vk::DeviceSize indirect_offset = args_offset;
+		indirect_buffer = args_buffer->Handle();
+		indirect_offset = args_offset;
 		if (use_thread_dimensions) {
 			EXIT_IF(!args_buffer->HasDeviceAddress());
 			const std::array<uint32_t, 3> local_size {
 			    std::max(cs_regs.cs_regs.num_thread_x, 1u),
 			    std::max(cs_regs.cs_regs.num_thread_y, 1u),
 			    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+			// KYTY_INDIRECT_MERGED_BARRIERS=1: one barrier orders the thread counts' writers and the
+			// guest dispatch's write hazards before the conversion, and the conversion's own barrier
+			// orders the groups before the indirect read, instead of four barriers around the pair
+			// (the async ray-tracing chain: ~1,300 tiny indirect dispatches a frame on the title).
+			if (merged_barriers) {
+				vk::MemoryBarrier ready {};
+				ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+				                      vk::AccessFlagBits::eTransferWrite |
+				                      vk::AccessFlagBits::eShaderRead;
+				ready.dstAccessMask = vk::AccessFlagBits::eShaderRead |
+				                      vk::AccessFlagBits::eShaderWrite |
+				                      vk::AccessFlagBits::eIndirectCommandRead;
+				buffer.Recorder().pipelineBarrier(
+				    vk::PipelineStageFlagBits::eAllCommands,
+				    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+				    {}, 1, &ready, 0, nullptr, 0, nullptr);
+			}
 			const auto converted = m_indirect_groups->Convert(
-			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
+			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size,
+			    !merged_barriers);
 			indirect_buffer = converted.groups_buffer;
 			indirect_offset = converted.groups_offset;
 			// The shader reads the thread counts through this device address (upstream's
@@ -795,6 +927,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 				bindings.shader_data[dword]      = static_cast<uint32_t>(converted.threads);
 				bindings.shader_data[dword + 1u] = static_cast<uint32_t>(converted.threads >> 32u);
 			}
+		}
 		}
 		RebindBuffers(bindings);
 		PreparedBindings* descriptor_stage = &bindings;
@@ -808,17 +941,20 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			        return image.written && image.resource_class ==
 			                                    ShaderRecompiler::IR::ImageResourceClass::Storage;
 		        });
-		if (has_storage_writes) {
-			if (DispatchSyncEnabled()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		const bool merged = (merged_barriers && use_thread_dimensions) || run_converted.has_value();
+		if (has_storage_writes && !merged) {
+			if (DispatchSyncEnabled() && !RunSkipsBarrierBefore()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
-		vk::MemoryBarrier barrier {};
-		barrier.srcAccessMask =
-		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-		vk_buffer.pipelineBarrier(
-		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
-		        vk::PipelineStageFlagBits::eTransfer,
-		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		if (!merged) {
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask =
+			    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+			        vk::PipelineStageFlagBits::eTransfer,
+			    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
@@ -827,7 +963,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		if (DispatchSyncEnabled()) ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (DispatchSyncEnabled() && !RunSkipsBarrierAfter()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			if (DispatchRunsEnabled()) DispatchRun().pending_post = false;
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
