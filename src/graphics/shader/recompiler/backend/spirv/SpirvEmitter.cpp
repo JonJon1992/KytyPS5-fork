@@ -72,7 +72,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	if (IR::UsesFlattenedSrt(program)) {
+	if (IR::UsesFlattenedSrt(program) || program.bindings.srt_verify) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {

@@ -1015,8 +1015,10 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 // writes that produced them. Reading them on the host instead waited for the GPU (2.8 ms a frame
 // for one dispatch in the jungle).
 static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBufferInfo& flat,
-                               std::span<const ShaderRecompiler::IR::SrtGpuFill> fills) {
-	if (fills.empty()) {
+                               std::span<const ShaderRecompiler::IR::SrtGpuFill> fills,
+                               std::span<const ShaderRecompiler::IR::SrtVerify>  verify = {},
+                               uint32_t                                          verify_base = 0) {
+	if (fills.empty() && verify.empty()) {
 		return;
 	}
 	auto& cache   = context.GetBufferCache();
@@ -1029,13 +1031,50 @@ static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBuffe
 	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
 	                         nullptr);
+	// One copy command per source buffer, with a region per dword. The buffers are obtained once
+	// before any copy is recorded: obtaining one can merge buffers obtained before it.
+	if (fills.size() + verify.size() > 1u) {
+		for (const auto& fill: fills) {
+			(void)cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
+		}
+		for (const auto& entry: verify) {
+			(void)cache.ObtainBuffer(entry.address, sizeof(uint32_t), false);
+		}
+	}
+	thread_local std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
+	copies.clear();
 	for (const auto& fill: fills) {
 		auto [buffer, offset] = cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
 		(void)offset;
-		const vk::BufferCopy copy {buffer->Offset(fill.address),
-		                           flat.offset + uint64_t {fill.flat_offset} * sizeof(uint32_t),
-		                           sizeof(uint32_t)};
-		recorder.copyBuffer(buffer->Handle(), flat.buffer, 1, &copy);
+		copies.emplace_back(buffer->Handle(),
+		                    vk::BufferCopy {buffer->Offset(fill.address),
+		                                    flat.offset + uint64_t {fill.flat_offset} * sizeof(uint32_t),
+		                                    sizeof(uint32_t)});
+	}
+	// KYTY_SRT_VERIFY: the GPU's copy of each value the host used, next to it.
+	for (size_t i = 0; i < verify.size(); i++) {
+		auto [buffer, offset] = cache.ObtainBuffer(verify[i].address, sizeof(uint32_t), false);
+		(void)offset;
+		copies.emplace_back(
+		    buffer->Handle(),
+		    vk::BufferCopy {buffer->Offset(verify[i].address),
+		                    flat.offset + (uint64_t {verify_base} + 2u * i + 1u) * sizeof(uint32_t),
+		                    sizeof(uint32_t)});
+	}
+	std::stable_sort(copies.begin(), copies.end(), [](const auto& a, const auto& b) {
+		return static_cast<VkBuffer>(a.first) < static_cast<VkBuffer>(b.first);
+	});
+	thread_local std::vector<vk::BufferCopy> regions;
+	for (size_t i = 0; i < copies.size();) {
+		size_t end = i;
+		regions.clear();
+		while (end < copies.size() && copies[end].first == copies[i].first) {
+			regions.push_back(copies[end].second);
+			end++;
+		}
+		recorder.copyBuffer(copies[i].first, flat.buffer, static_cast<uint32_t>(regions.size()),
+		                    regions.data());
+		i = end;
 	}
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -2310,11 +2349,63 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
 	}
+	// KYTY_SRT_VERIFY: the values the host used in place of GPU-written bytes, each followed by
+	// a slot the GPU fills with its own copy (FillFlatSlotsOnGpu); the shader compares them.
+	std::span<const ShaderRecompiler::IR::SrtVerify> verify;
+	if (layout.srt_verify) {
+		auto& cache = m_context.GetBufferCache();
+		// The last values each shader used, to name the one that differed in a report.
+		static std::unordered_map<uint64_t, std::vector<ShaderRecompiler::IR::SrtVerify>> last_used;
+		std::array<uint32_t, 3> detail {};
+		if (const auto missed = cache.TakeSrtVerifyReport(&detail); missed != 0) {
+			const auto found = last_used.find(missed);
+			const auto* used = found != last_used.end() && detail[0] < found->second.size()
+			                       ? &found->second[detail[0]]
+			                       : nullptr;
+			std::fprintf(stderr,
+			             "[srt-verify] CS %016llx pair %u: host 0x%08x gpu 0x%08x at 0x%llx\n",
+			             static_cast<unsigned long long>(missed), detail[0], detail[1], detail[2],
+			             static_cast<unsigned long long>(used != nullptr ? used->address : 0));
+			SrtVerifyReportMiss(missed);
+		}
+		static const bool keep_used = std::getenv("KYTY_FPS_LOG") != nullptr;
+		if (keep_used && !snapshot.srt_verify.empty()) {
+			auto& kept = last_used[program.shader_hash];
+			kept.assign(snapshot.srt_verify.begin(), snapshot.srt_verify.end());
+		}
+		const auto report = cache.SrtVerifyReportAddress();
+		verify            = snapshot.srt_verify;
+		if (report == 0) {
+			EXIT_IF(!verify.empty());
+		}
+		prepared.shader_data[layout.VerifyDword() + 1u] = static_cast<uint32_t>(verify.size());
+		prepared.shader_data[layout.VerifyDword() + 2u] = static_cast<uint32_t>(report);
+		prepared.shader_data[layout.VerifyDword() + 3u] = static_cast<uint32_t>(report >> 32u);
+	} else if (!snapshot.srt_verify.empty()) {
+		EXIT("SRT verification values for shader %016" PRIx64 " without a verifying program\n",
+		     program.shader_hash);
+	}
+	const auto with_verify = [&](std::span<const uint32_t> flat) -> std::span<const uint32_t> {
+		if (layout.srt_verify) {
+			prepared.shader_data[layout.VerifyDword()] = static_cast<uint32_t>(flat.size());
+		}
+		if (verify.empty()) {
+			return flat;
+		}
+		m_verify_srt.assign(flat.begin(), flat.end());
+		for (const auto& entry: verify) {
+			m_verify_srt.push_back(entry.expected);
+			m_verify_srt.push_back(~entry.expected); // replaced on the GPU
+		}
+		return m_verify_srt;
+	};
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		if (prepared.bindless_patches.empty()) {
-			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
-			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
+			const auto flat = with_verify(snapshot.flattened_srt);
+			prepared.flattened_srt = NativeUpload(m_context, flat);
+			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills, verify,
+			                   static_cast<uint32_t>(snapshot.flattened_srt.size()));
 		} else {
 			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
 			for (const auto& [offset, region, entries]: prepared.bindless_patches) {
@@ -2339,8 +2430,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					     entries, m_bindless_srt.size());
 				}
 			}
-			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
-			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
+			const auto base = static_cast<uint32_t>(m_bindless_srt.size());
+			const auto flat = with_verify(m_bindless_srt);
+			prepared.flattened_srt = NativeUpload(m_context, flat);
+			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills, verify, base);
 		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(

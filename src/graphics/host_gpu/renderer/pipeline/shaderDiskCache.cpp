@@ -200,6 +200,7 @@ void Visit(Io& io, T& v) {
 	io(v.memory_offset_dword);
 	io(v.memory_offset_count);
 	io(v.write_tracking);
+	io(v.srt_verify);
 	io(v.user_data_registers);
 	io(v.descriptors);
 }

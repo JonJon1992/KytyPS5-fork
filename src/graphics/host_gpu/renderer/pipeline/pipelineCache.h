@@ -36,6 +36,10 @@ namespace DrawPrep {
 struct PacketResult;
 } // namespace DrawPrep
 
+// KYTY_SRT_VERIFY (ResourceSnapshot.h): a verifying shader reported a value the host used that
+// differed from the GPU's. Its refreshes read GPU-written bytes exactly from now on.
+void SrtVerifyReportMiss(uint64_t shader_hash);
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {

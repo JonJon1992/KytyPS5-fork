@@ -476,6 +476,9 @@ struct BindingLayout {
 	// (2 dwords), then the guest address of each memory binding's range start (2 dwords each; 0 =
 	// not tracked in this draw).
 	bool                           write_tracking      = false;
+	// KYTY_SRT_VERIFY (ResourceSnapshot.h, SrtVerify): VerifyDword() holds the flattened SRT dword
+	// where the pairs start, their count, and the device address of the report buffer (2 dwords).
+	bool                           srt_verify          = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -485,8 +488,11 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t WriteTrackDword() const {
 		return BufferLengthDword() + memory_offset_count;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t VerifyDword() const {
 		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return VerifyDword() + (srt_verify ? 4u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

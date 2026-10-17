@@ -211,6 +211,133 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // Diagnostics: the shader whose resources are being evaluated, and how often its SRT reads
 // hit memory the GPU owns (each such read drains the GPU).
 thread_local uint64_t t_srt_shader_hash = 0;
+
+// KYTY_SRT_VERIFY (ResourceSnapshot.h, SrtVerify): where the refresh running on this thread
+// records the values it used in place of GPU-written bytes (null: read them exactly).
+thread_local std::vector<ShaderRecompiler::IR::SrtVerify>* t_srt_verify = nullptr;
+
+// A shader's values are used in place of GPU-written bytes only once the host has seen them equal
+// what it then read exactly in SrtVerifyQualifyWalks refreshes in a row that read such bytes (the
+// GPU thread reads both while it still waits): a value the GPU produces (a count, an offset it
+// writes) never qualifies, so no dispatch is lost to a difference the shader would report. A
+// shader that reported one anyway, or failed SrtVerifyGiveUp times, reads exactly from then on.
+constexpr uint32_t SrtVerifyQualifyWalks = 32;
+constexpr uint32_t SrtVerifyGiveUp       = 16;
+struct SrtVerifyState {
+	uint32_t clean    = 0; // refreshes in a row whose host values all matched
+	uint32_t failures = 0;
+	bool     qualified = false;
+	bool     blocked   = false;
+};
+std::shared_mutex                              g_srt_verify_mutex;
+std::unordered_map<uint64_t, SrtVerifyState>   g_srt_verify_states;
+
+bool SrtVerifyQualified(uint64_t shader_hash) {
+	std::shared_lock lock(g_srt_verify_mutex);
+	const auto       found = g_srt_verify_states.find(shader_hash);
+	return found != g_srt_verify_states.end() && found->second.qualified && !found->second.blocked;
+}
+
+bool SrtVerifyCandidate(uint64_t shader_hash) {
+	std::shared_lock lock(g_srt_verify_mutex);
+	const auto       found = g_srt_verify_states.find(shader_hash);
+	return found == g_srt_verify_states.end() || !found->second.blocked;
+}
+
+bool SrtVerifyPlan(const ShaderRecompiler::IR::ResourcePlan& plan, ShaderType stage) {
+	return ShaderRecompiler::IR::SrtVerifyEnabled() && stage == ShaderType::Compute &&
+	       plan.stage == ShaderType::Compute && !plan.srt_reads.empty();
+}
+
+// The refresh of this program uses (and records) host values in place of GPU-written bytes.
+bool SrtVerifyProgram(const ShaderRecompiler::IR::ResourcePlan& plan, ShaderType stage,
+                      uint64_t shader_hash) {
+	return SrtVerifyPlan(plan, stage) && SrtVerifyQualified(shader_hash);
+}
+
+// Qualifying refresh on the GPU thread: GPU-written bytes are read exactly, and compared with
+// what the host held before.
+thread_local bool t_srt_qualify      = false;
+thread_local bool t_srt_qualify_read = false; // a GPU-written read happened
+thread_local bool t_srt_qualify_diff = false; // and differed
+
+void SrtVerifyNoteWalk(uint64_t shader_hash) {
+	if (!t_srt_qualify_read) {
+		return;
+	}
+	std::unique_lock lock(g_srt_verify_mutex);
+	auto&            state = g_srt_verify_states[shader_hash];
+	if (state.blocked || state.qualified) {
+		return;
+	}
+	if (t_srt_qualify_diff) {
+		state.clean = 0;
+		if (++state.failures >= SrtVerifyGiveUp) {
+			state.blocked = true;
+		}
+		return;
+	}
+	if (++state.clean >= SrtVerifyQualifyWalks) {
+		state.qualified = true;
+		std::fprintf(stderr, "[srt-verify] CS %016llx: host values matched %u refreshes, verified "
+		                     "on the GPU from now on\n",
+		             static_cast<unsigned long long>(shader_hash), state.clean);
+	}
+}
+
+// Around an exact read during a qualifying refresh: the host's bytes before it.
+struct SrtQualifyRead {
+	std::array<uint32_t, 64> stale {};
+	bool                     active = false;
+	SrtQualifyRead(uint64_t address, std::span<const uint32_t> values) {
+		active = t_srt_qualify && !values.empty() && values.size() <= stale.size() &&
+		         !ShaderRecompiler::IR::SrtEvaluatingCondition() &&
+		         Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes()) &&
+		         Libs::LibKernel::Memory::TryReadBacking(address, stale.data(), values.size_bytes());
+	}
+	void Finish(bool ok, std::span<const uint32_t> values) const {
+		if (!active || !ok) {
+			return;
+		}
+		t_srt_qualify_read = true;
+		if (std::memcmp(stale.data(), values.data(), values.size_bytes()) != 0) {
+			t_srt_qualify_diff = true;
+		}
+	}
+};
+
+// A read of GPU-written bytes during a verifying refresh: the bytes the host holds, recorded.
+// False when the bytes are not GPU-written (the ordinary read serves them) or cannot be recorded.
+bool SrtVerifyRead(uint64_t address, std::span<uint32_t> values) {
+	auto* verify = t_srt_verify;
+	// A read that may be refused (a condition, a GPU-sized record count: SrtConditionReadRefused)
+	// stays refused: what refusing it means (both branches, a conservative count) needs no value.
+	if (verify == nullptr || values.empty() || ShaderRecompiler::IR::SrtEvaluatingCondition() ||
+	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		return false;
+	}
+	if ((address & 3u) != 0u ||
+	    verify->size() + values.size() > ShaderRecompiler::IR::SrtVerifyMaxEntries) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	for (size_t i = 0; i < values.size(); i++) {
+		const uint64_t at    = address + i * sizeof(uint32_t);
+		bool           known = false;
+		for (const auto& entry: *verify) {
+			if (entry.address == at) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
+			verify->push_back({.address = at, .expected = values[i]});
+		}
+	}
+	return true;
+}
 void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 	struct Entry {
 		uint64_t count   = 0;
@@ -480,12 +607,15 @@ bool SrtSpeculativeRead(uint64_t address, std::span<uint32_t> values) {
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
-bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemoryRawImpl(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
 	}
 	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
 	    cache != nullptr && cache->Read(address, values)) {
+		return true;
+	}
+	if (SrtVerifyRead(address, values)) {
 		return true;
 	}
 	if (SrtConditionReadRefused(address, values)) {
@@ -539,12 +669,15 @@ bool SrtBytesGpuWritten(uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::IsGpuBufferWritten(address, size);
 }
 
-bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemoryImpl(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
 	}
 	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
 	    cache != nullptr && cache->Read(address, values)) {
+		return true;
+	}
+	if (SrtVerifyRead(address, values)) {
 		return true;
 	}
 	if (SrtConditionReadRefused(address, values)) {
@@ -580,6 +713,20 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
+}
+
+bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const SrtQualifyRead qualify(address, values);
+	const bool           ok = ReadShaderGuestMemoryRawImpl(userdata, address, values);
+	qualify.Finish(ok, values);
+	return ok;
+}
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const SrtQualifyRead qualify(address, values);
+	const bool           ok = ReadShaderGuestMemoryImpl(userdata, address, values);
+	qualify.Finish(ok, values);
+	return ok;
 }
 
 // The reader of a stage walked in the parallel window (StagePrepWorker): bytes no GPU work has
@@ -1551,6 +1698,11 @@ struct PipelineCache::ProgramCache {
 					runtime.gpu_written = SrtBytesGpuWritten;
 					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
 				}
+				// KYTY_SRT_VERIFY: GPU-written bytes the host needs are read as the host holds
+				// them and verified by the shader (SrtVerifyRead), not waited for. Cleared only
+				// for a walk here: a prepared refresh brings its own.
+				const bool verify_walk =
+				    SrtVerifyProgram(entry->second.resource_plan, stage, params.hash);
 				runtime.peek_gpu_dword = +[](uint64_t address) {
 					return Libs::LibKernel::Memory::PeekGpuDword(address);
 				};
@@ -1572,9 +1724,23 @@ struct PipelineCache::ProgramCache {
 					std::lock_guard walk_lock(entry->second.walk_mutex);
 					entry->second.prepared_serial = 0;
 					const auto walk_begin = std::chrono::steady_clock::now();
+					entry->second.resources.srt_verify.clear();
+					t_srt_verify = verify_walk ? &entry->second.resources.srt_verify : nullptr;
+					t_srt_qualify = !verify_walk &&
+					                SrtVerifyPlan(entry->second.resource_plan, stage) &&
+					                SrtVerifyCandidate(params.hash);
+					t_srt_qualify_read = false;
+					t_srt_qualify_diff = false;
 					materialized = ShaderRecompiler::IR::MaterializeResources(
 					    entry->second.resource_plan, runtime, entry->second.resources,
 					    entry->second.specialization);
+					t_srt_verify = nullptr;
+					if (t_srt_qualify) {
+						t_srt_qualify = false;
+						if (materialized) {
+							SrtVerifyNoteWalk(params.hash);
+						}
+					}
 					// KYTY_LOG_SLOW_SRT=1: refreshes over 1 ms (a guest read that waited for the GPU),
 					// by shader: the first 4 of each, for up to 64 shaders.
 					if (static const bool log_slow = std::getenv("KYTY_LOG_SLOW_SRT") != nullptr;
@@ -2350,7 +2516,8 @@ struct PipelineCache::ProgramCache {
 	// certificate cannot cover a read it did not record.
 	static bool ReadRecorded(void* userdata, uint64_t address, std::span<uint32_t> values) {
 		auto& reader = *static_cast<RecordingReader*>(userdata);
-		if (!ReadShaderGuestMemoryProbe(&reader.cache, address, values)) {
+		if (!ReadShaderGuestMemoryProbe(&reader.cache, address, values) &&
+		    !SrtVerifyRead(address, values)) {
 			reader.failed = true;
 			// KYTY_FPS_LOG: the first refused reads of each shader, and why.
 			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
@@ -2423,8 +2590,13 @@ struct PipelineCache::ProgramCache {
 		bool ok = false;
 		{
 			std::lock_guard walk_lock(entry->walk_mutex);
+			result.resources.srt_verify.clear();
+			t_srt_verify = SrtVerifyProgram(entry->resource_plan, stage, params.hash)
+			                   ? &result.resources.srt_verify
+			                   : nullptr;
 			ok = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, runtime,
 			                                                result.resources, result.specialization);
+			t_srt_verify = nullptr;
 		}
 		if (!ok || reader.failed) {
 			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && !reader.failed) {
@@ -2466,6 +2638,7 @@ struct PipelineCache::ProgramCache {
 		if (a.bindless_sampler_heaps != b.bindless_sampler_heaps) return "bindless_sampler_heaps";
 		if (!(a.uniform_fill == b.uniform_fill)) return "uniform_fill";
 		if (a.gpu_fills != b.gpu_fills) return "gpu_fills";
+		if (a.srt_verify != b.srt_verify) return "srt_verify";
 		if (sorted(a.specialization_reads) != sorted(b.specialization_reads)) {
 			return "specialization_reads";
 		}
@@ -2483,6 +2656,12 @@ struct PipelineCache::ProgramCache {
 		}
 		if (result->entry != &entry) {
 			DrawPrep::Add(DrawPrep::Counter::MissEntry);
+			return false;
+		}
+		// Verified values only while the shader verifies (it may have reported since the scan).
+		if (!result->resources.srt_verify.empty() &&
+		    !SrtVerifyProgram(entry.resource_plan, stage, hash)) {
+			DrawPrep::Add(DrawPrep::Counter::MissInputs);
 			return false;
 		}
 		// Used already by an earlier draw of this packet: the entry must still hold its refresh.
@@ -3434,4 +3613,21 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	return *iter->second;
 }
+void SrtVerifyReportMiss(uint64_t shader_hash) {
+	bool inserted = false;
+	{
+		std::unique_lock lock(g_srt_verify_mutex);
+		auto&            state = g_srt_verify_states[shader_hash];
+		inserted               = !state.blocked;
+		state.blocked          = true;
+	}
+	if (inserted) {
+		std::fprintf(stderr,
+		             "[srt-verify] CS %016llx: a value the host read differed from the GPU's; "
+		             "that dispatch did nothing, exact reads for this shader from now on\n",
+		             static_cast<unsigned long long>(shader_hash));
+		LOGF("SRT verify: shader 0x%016" PRIx64 " differed, exact reads from now on\n", shader_hash);
+	}
+}
+
 } // namespace Libs::Graphics

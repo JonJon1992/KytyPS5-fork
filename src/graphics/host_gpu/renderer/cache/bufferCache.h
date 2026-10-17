@@ -101,6 +101,12 @@ public:
 	// guest page below 1 TiB, set by shaders through bindings whose writes the host cannot bound.
 	// Its device address, or 0 when it is off or unavailable.
 	[[nodiscard]] vk::DeviceAddress WriteBitmapAddress();
+	// KYTY_SRT_VERIFY: the report buffer verifying shaders write when a value the host used
+	// differs from the GPU's (count, hash low, hash high), host-coherent; 0 when unavailable.
+	[[nodiscard]] vk::DeviceAddress SrtVerifyReportAddress();
+	// The shader the report names when its count changed since the last call, or 0; `detail`
+	// gets the first differing pair's index, the host's value and the GPU's.
+	[[nodiscard]] uint64_t TakeSrtVerifyReport(std::array<uint32_t, 3>* detail = nullptr);
 	// ObtainBuffer for such a written binding: its pages become bitmap-tracked, so a guest read
 	// of a page the GPU did not write needs no download (ReadMemoryStep).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
@@ -349,6 +355,9 @@ private:
 	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
 	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.
 	std::unique_ptr<Buffer>                            m_write_bitmap;
+	std::unique_ptr<Buffer>                            m_srt_verify_report;
+	bool                                               m_srt_verify_report_failed = false;
+	uint32_t                                           m_srt_verify_reports_seen  = 0;
 	bool                                               m_write_bitmap_failed = false;
 	RangeSet                                           m_bitmap_tracked;
 	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;

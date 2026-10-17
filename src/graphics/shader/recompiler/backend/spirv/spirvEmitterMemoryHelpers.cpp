@@ -195,6 +195,113 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
+// KYTY_SRT_VERIFY (ResourceSnapshot.h, SrtVerify): before anything else, compare the pairs the
+// renderer appended to the flattened SRT (the value the host used, the value the GPU copied
+// behind the work that wrote it). When any pair differs, report the shader in the buffer at the
+// address the shader data holds (count, hash low, hash high) and return: the dispatch has no
+// effect, and the host stops using such values for this shader.
+void EmitSrtVerify(EmitterState& state) {
+	if (!state.program.bindings.srt_verify || state.flattened_srt_variable == 0) {
+		return;
+	}
+	const auto u32       = TypeU32(state);
+	const auto bool_type = TypeBool(state);
+	const auto first     = state.program.bindings.VerifyDword();
+	const auto base      = EmitShaderDataDwordLoad(state, first);
+	const auto count     = EmitShaderDataDwordLoad(state, first + 1u);
+	const auto load_flat = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, value, pointer);
+		return value;
+	};
+	// for (i = 0; i < count; i++) miss |= flat[base + 2i] != flat[base + 2i + 1];
+	const auto entry_label  = state.builder.AllocateId();
+	const auto header_label = state.builder.AllocateId();
+	const auto body_label   = state.builder.AllocateId();
+	const auto cont_label   = state.builder.AllocateId();
+	const auto merge_label  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, entry_label);
+	EmitLabel(state, entry_label);
+	state.builder.AddFunction(spv::OpBranch, header_label);
+	EmitLabel(state, header_label);
+	const auto index    = state.builder.AllocateId();
+	const auto miss     = state.builder.AllocateId();
+	const auto next     = state.builder.AllocateId();
+	const auto miss_out = state.builder.AllocateId();
+	const auto bad      = state.builder.AllocateId(); // the first pair that differed
+	const auto bad_out  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, u32, index, ConstantU32(state, 0), entry_label, next,
+	                          cont_label);
+	state.builder.AddFunction(spv::OpPhi, bool_type, miss, ConstantBool(state, false), entry_label,
+	                          miss_out, cont_label);
+	state.builder.AddFunction(spv::OpPhi, u32, bad, ConstantU32(state, 0), entry_label, bad_out,
+	                          cont_label);
+	state.builder.AddFunction(spv::OpLoopMerge, merge_label, cont_label,
+	                          spv::LoopControlMaskNone);
+	const auto more = Binary(state, spv::OpULessThan, bool_type, index, count);
+	state.builder.AddFunction(spv::OpBranchConditional, more, body_label, merge_label);
+	EmitLabel(state, body_label);
+	const auto at       = EmitBinaryU32(state, spv::OpIAdd, base,
+	                                    EmitBinaryU32(state, spv::OpShiftLeftLogical, index,
+	                                                  ConstantU32(state, 1)));
+	const auto expected = load_flat(at);
+	const auto actual   = load_flat(EmitBinaryU32(state, spv::OpIAdd, at, ConstantU32(state, 1)));
+	const auto differs  = Binary(state, spv::OpINotEqual, bool_type, expected, actual);
+	state.builder.AddFunction(spv::OpLogicalOr, bool_type, miss_out, miss, differs);
+	const auto first_bad = Binary(state, spv::OpLogicalAnd, bool_type, differs,
+	                              Unary(state, spv::OpLogicalNot, bool_type, miss));
+	state.builder.AddFunction(spv::OpSelect, u32, bad_out, first_bad, index, bad);
+	state.builder.AddFunction(spv::OpBranch, cont_label);
+	EmitLabel(state, cont_label);
+	state.builder.AddFunction(spv::OpIAdd, u32, next, index, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpBranch, header_label);
+	EmitLabel(state, merge_label);
+	// At the merge the loop's miss is the header's value (the only edge into the merge).
+	const auto report_label = state.builder.AllocateId();
+	const auto after_label  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, after_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, miss, report_label, after_label);
+	EmitLabel(state, report_label);
+	{
+		const auto u64     = TypeScalarU64(state);
+		const auto lo      = Unary(state, spv::OpUConvert, u64,
+		                           EmitShaderDataDwordLoad(state, first + 2u));
+		const auto hi      = Unary(state, spv::OpUConvert, u64,
+		                           EmitShaderDataDwordLoad(state, first + 3u));
+		const auto address = Binary(state, spv::OpBitwiseOr, u64, lo,
+		                            Binary(state, spv::OpShiftLeftLogical, u64, hi,
+		                                   ConstantDeviceAddress(state, 32)));
+		const auto word    = [&](uint32_t dword) {
+			const auto at_address = dword == 0u ? address
+			                                    : Binary(state, spv::OpIAdd, u64, address,
+			                                             ConstantDeviceAddress(state, dword * 4u));
+			return Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), at_address);
+		};
+		const auto hash  = state.program.shader_hash;
+		const auto atom  = [&](spv::Op op, uint32_t pointer, uint32_t value) {
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(op, u32, result, pointer, ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, 0), value);
+		};
+		const auto bad_at = EmitBinaryU32(state, spv::OpIAdd, base,
+		                                  EmitBinaryU32(state, spv::OpShiftLeftLogical, bad,
+		                                                ConstantU32(state, 1)));
+		atom(spv::OpAtomicExchange, word(1u), ConstantU32(state, static_cast<uint32_t>(hash)));
+		atom(spv::OpAtomicExchange, word(2u), ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+		atom(spv::OpAtomicExchange, word(3u), bad);
+		atom(spv::OpAtomicExchange, word(4u), load_flat(bad_at));
+		atom(spv::OpAtomicExchange, word(5u),
+		     load_flat(EmitBinaryU32(state, spv::OpIAdd, bad_at, ConstantU32(state, 1))));
+		atom(spv::OpAtomicIAdd, word(0u), ConstantU32(state, 1));
+	}
+	state.builder.AddFunction(spv::OpReturn);
+	EmitLabel(state, after_label);
+}
+
 // Rework Phase 2, first step: a store or atomic through a write-tracked binding sets the bit of
 // its guest page (4 KiB) in the GPU write bitmap; the host then downloads only pages that were
 // written. A binding the host does not track in this draw has a base of 0 and skips it.

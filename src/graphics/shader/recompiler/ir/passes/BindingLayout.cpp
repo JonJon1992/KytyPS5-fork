@@ -132,6 +132,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		           return resource < program.info.buffers.size() &&
 		                  program.info.buffers[resource].write_tracked;
 	           });
+	next.srt_verify = SrtVerifyEnabled() && program.stage == ShaderType::Compute &&
+	                  !program.srt_reads.empty();
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -183,7 +185,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	if (UsesFlattenedSrt(program)) {
+	if (UsesFlattenedSrt(program) || next.srt_verify) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

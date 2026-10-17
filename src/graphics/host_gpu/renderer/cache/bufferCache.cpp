@@ -1504,6 +1504,43 @@ uint64_t WriteBitmapMinBytes() {
 }
 } // namespace
 
+vk::DeviceAddress BufferCache::SrtVerifyReportAddress() {
+	if (m_srt_verify_report_failed) {
+		return 0;
+	}
+	if (m_srt_verify_report == nullptr) {
+		m_srt_verify_report = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    256);
+		if (!m_srt_verify_report->IsCoherent() || m_srt_verify_report->Mapped().size() < 32 ||
+		    !m_srt_verify_report->HasDeviceAddress()) {
+			LOGF("BufferCache: SRT verification reports unavailable (no host-coherent device memory)\n");
+			m_srt_verify_report.reset();
+			m_srt_verify_report_failed = true;
+			return 0;
+		}
+		std::memset(m_srt_verify_report->Mapped().data(), 0, 32);
+	}
+	return m_srt_verify_report->BufferDeviceAddress();
+}
+
+uint64_t BufferCache::TakeSrtVerifyReport(std::array<uint32_t, 3>* detail) {
+	if (m_srt_verify_report == nullptr) {
+		return 0;
+	}
+	const auto* words = reinterpret_cast<const volatile uint32_t*>(m_srt_verify_report->Mapped().data());
+	const uint32_t count = words[0];
+	if (count == m_srt_verify_reports_seen) {
+		return 0;
+	}
+	m_srt_verify_reports_seen = count;
+	if (detail != nullptr) {
+		*detail = {words[3], words[4], words[5]};
+	}
+	return (uint64_t {words[2]} << 32u) | words[1];
+}
+
 vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 	if (!ShaderRecompiler::IR::WriteBitmapEnabled() || m_write_bitmap_failed) {
 		return 0;

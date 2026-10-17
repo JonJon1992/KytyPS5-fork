@@ -281,6 +281,7 @@ private:
 	std::vector<ImageId>                  m_bindless_unused;
 	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
 	std::vector<uint32_t>                 m_bindless_srt;
+	std::vector<uint32_t>                 m_verify_srt; // KYTY_SRT_VERIFY: flat SRT with pairs
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
