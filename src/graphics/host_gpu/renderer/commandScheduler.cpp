@@ -407,6 +407,20 @@ void RecordWait(double seconds, bool drained) {
 void CommandScheduler::Wait(uint64_t tick) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
+	// KYTY_WAIT_STACKS=1: a host stack for every 23rd wait that has to block (up to 60), to name
+	// the paths that make the command thread wait for the GPU.
+	if (static const bool stacks = std::getenv("KYTY_WAIT_STACKS") != nullptr;
+	    stacks && !m_master.IsFree(tick)) {
+		static std::atomic<uint32_t> waits {0};
+		const auto                   n = waits.fetch_add(1);
+		if (n % 23 == 0 && n / 23 < 60) {
+			std::fprintf(stderr, "[wait-stack] #%u tick=%llu current=%llu\n%s\n", n,
+			             static_cast<unsigned long long>(tick),
+			             static_cast<unsigned long long>(CurrentTick()),
+			             Common::HostBacktrace().c_str());
+			std::fflush(stderr);
+		}
+	}
 	Common::Timer timer;
 	timer.Start();
 	if (tick == CurrentTick()) {

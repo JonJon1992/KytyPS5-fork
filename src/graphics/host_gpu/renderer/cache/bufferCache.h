@@ -246,6 +246,7 @@ private:
 	RangeSet                               m_predicted;
 	uint64_t                               m_predicted_generation = 0;
 	std::unordered_map<uint64_t, uint64_t> m_predict_seen; // page -> last era written
+	std::unordered_map<uint64_t, uint64_t> m_predict_seen_blocks; // 32-page block -> last era
 	struct BindingPrediction {
 		uint64_t era        = 0; // era + 1 it was last marked in
 		uint64_t generation = 0; // of m_predicted then

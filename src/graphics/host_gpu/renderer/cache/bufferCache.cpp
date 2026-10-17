@@ -1703,23 +1703,56 @@ void BufferCache::ProcessBitmapCopy(BitmapCopy& copy) {
 			const auto [word_begin, word_end] = copy.spans[i];
 			const auto* span_words            = words + copy.offsets[i];
 			for (uint64_t k = 0; k < word_end - word_begin; k++) {
-				for (uint32_t bits = span_words[k]; bits != 0; bits &= bits - 1u) {
-					const auto page = (((word_begin + k) << 5u) +
-					                   static_cast<uint64_t>(std::countr_zero(bits)))
-					                  << WriteBitmapPageBits;
-					written++;
-					if (const auto [it, inserted] = m_predict_seen.try_emplace(page, copy.era);
-					    inserted) {
-						m_predicted.Add(page, WriteBitmapPage);
-						m_predicted_generation++;
-						fresh++;
-					} else {
-						it->second = copy.era;
+				// Runs of written pages: the title writes ~33,000 pages an era, mostly whole words
+				// (32 pages), and page by page the set operations below were ~5 ms of the command
+				// thread an era. A whole word is one predicted block and one range operation.
+				uint32_t bits = span_words[k];
+				while (bits != 0) {
+					const uint32_t first = static_cast<uint32_t>(std::countr_zero(bits));
+					const uint32_t rest  = first + 1u < 32u ? (~bits >> (first + 1u)) : 0u;
+					uint32_t       count = 1u;
+					if (first + 1u < 32u) {
+						count += rest == 0u ? 31u - first
+						                    : static_cast<uint32_t>(std::countr_zero(rest));
 					}
-					if (m_gpu_modified_ranges.Intersects(page, WriteBitmapPage)) {
-						m_bitmap_written.Add(page, WriteBitmapPage);
+					count = std::min(count, 32u - first);
+					bits &= count == 32u ? 0u : ~(((1u << count) - 1u) << first);
+					const auto run_begin = (((word_begin + k) << 5u) + first) << WriteBitmapPageBits;
+					const auto run_bytes = uint64_t {count} << WriteBitmapPageBits;
+					written += count;
+					if (count == 32u) {
+						if (const auto [it, inserted] = m_predict_seen_blocks.try_emplace(run_begin, copy.era);
+						    inserted) {
+							m_predicted.Add(run_begin, run_bytes);
+							m_predicted_generation++;
+							fresh += 32u;
+						} else {
+							it->second = copy.era;
+						}
 					} else {
-						protect.push_back(page); // marked below, outside the lock
+						for (uint32_t i = 0; i < count; i++) {
+							const auto page = run_begin + (uint64_t {i} << WriteBitmapPageBits);
+							if (const auto [it, inserted] = m_predict_seen.try_emplace(page, copy.era);
+							    inserted) {
+								m_predicted.Add(page, WriteBitmapPage);
+								m_predicted_generation++;
+								fresh++;
+							} else {
+								it->second = copy.era;
+							}
+						}
+					}
+					if (m_gpu_modified_ranges.Contains(run_begin, run_bytes)) {
+						m_bitmap_written.Add(run_begin, run_bytes);
+					} else {
+						for (uint32_t i = 0; i < count; i++) {
+							const auto page = run_begin + (uint64_t {i} << WriteBitmapPageBits);
+							if (m_gpu_modified_ranges.Intersects(page, WriteBitmapPage)) {
+								m_bitmap_written.Add(page, WriteBitmapPage);
+							} else {
+								protect.push_back(page); // marked below, outside the lock
+							}
+						}
 					}
 				}
 			}
@@ -1776,6 +1809,15 @@ void BufferCache::ProcessBitmapCopy(BitmapCopy& copy) {
 			released += (to - from) >> WriteBitmapPageBits;
 		}
 		if (copy.era % 64 == 0) {
+			for (auto it = m_predict_seen_blocks.begin(); it != m_predict_seen_blocks.end();) {
+				if (it->second + PredictKeepEras < copy.era) {
+					m_predicted.Subtract(it->first, WriteBitmapPage * 32u);
+					m_predicted_generation++;
+					it = m_predict_seen_blocks.erase(it);
+				} else {
+					++it;
+				}
+			}
 			for (auto it = m_predict_seen.begin(); it != m_predict_seen.end();) {
 				if (it->second + PredictKeepEras < copy.era) {
 					m_predicted.Subtract(it->first, WriteBitmapPage);
