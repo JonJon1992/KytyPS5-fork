@@ -122,6 +122,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // waiting for it (KYTY_SRT_DEFER). Returns the scheduler tick whose completion (and priority
 // operations) publish them, or 0 when nothing is pending and an ordinary read may proceed.
 [[nodiscard]] uint64_t StartGpuBufferReadback(uint64_t vaddr, uint64_t size);
+// GPU thread: the value of a dword as of an earlier, already completed copy (it never waits; 0
+// before the first copy lands), and a new copy of its current value is recorded (KYTY_GPU_SIZED_DYNAMIC).
+[[nodiscard]] uint32_t PeekGpuDword(uint64_t vaddr);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
 // work has written any of them, else nullptr. Current until the GPU thread marks them

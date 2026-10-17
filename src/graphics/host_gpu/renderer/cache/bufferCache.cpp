@@ -599,6 +599,76 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 }
 
+uint32_t BufferCache::PeekDword(uint64_t vaddr) {
+	KYTY_PROFILER_FUNCTION();
+	static constexpr uint32_t PeekSlots = 4096;
+	if (!GuestGpu::IsGpuThread() || (vaddr & 3u) != 0u || !GuestRange {vaddr, 4}.Valid()) {
+		return 0;
+	}
+	if (m_peek_buffer == nullptr) {
+		m_peek_buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst,
+		                                         uint64_t {PeekSlots} * sizeof(uint32_t));
+	}
+	auto found = m_peek_slots.find(vaddr);
+	if (found == m_peek_slots.end()) {
+		if (m_peek_slots.size() >= PeekSlots) {
+			return 0;
+		}
+		found = m_peek_slots.emplace(vaddr, PeekSlot {.index = static_cast<uint32_t>(m_peek_slots.size())})
+		            .first;
+	}
+	auto& slot = found->second;
+	if (slot.tick != 0) {
+		if (!m_scheduler.IsFree(slot.tick)) {
+			return slot.value; // the last copy is still in flight
+		}
+		m_peek_buffer->Invalidate(uint64_t {slot.index} * sizeof(uint32_t), sizeof(uint32_t));
+		std::memcpy(&slot.value, m_peek_buffer->Mapped().data() + uint64_t {slot.index} * sizeof(uint32_t),
+		            sizeof(uint32_t));
+		slot.tick = 0;
+	}
+	if (!HasGpuDirtyBytes(vaddr, sizeof(uint32_t))) {
+		uint32_t value = 0;
+		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, &value, sizeof(value))) {
+			slot.value = value;
+		}
+		return slot.value;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, sizeof(uint32_t))) {
+		return slot.value;
+	}
+	const auto& source  = m_slot_buffers[*owner];
+	if (source.IsShared() || !source.Handle()) {
+		// Its bytes live in guest memory: the GPU's writes land there.
+		uint32_t value = 0;
+		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, &value, sizeof(value))) {
+			slot.value = value;
+		}
+		return slot.value;
+	}
+	auto&       command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Recorder();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {source.Offset(vaddr), uint64_t {slot.index} * sizeof(uint32_t),
+	                           sizeof(uint32_t)};
+	native.copyBuffer(source.Handle(), m_peek_buffer->Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+	slot.tick = m_scheduler.CurrentTick();
+	return slot.value;
+}
+
 uint64_t BufferCache::StartSrtReadback(uint64_t vaddr, uint64_t size) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid()) {

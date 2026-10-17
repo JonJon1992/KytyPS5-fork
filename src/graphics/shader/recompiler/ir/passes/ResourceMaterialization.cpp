@@ -1951,6 +1951,64 @@ bool DependsOnGpuFill(const ResourcePlan& program, Value value,
 	return !stack.empty();
 }
 
+// KYTY_GPU_SIZED_DYNAMIC: the bound record count of a buffer the shader bounds by its exact count
+// (gpu_records_flat). A fixed bound is either too small (CS fb5ee753d43f3f0b's count passed 4 MB of
+// records: its keys past the bound were dropped and a later draw, 618eca57f179de7d, cost 25-80 ms
+// of GPU time a frame) or binds, and marks GPU-written, far more memory than the shader touches (64
+// MB: other shaders then waited for those bytes, and the game crashed once). The bound is twice
+// the largest count seen so far, from copies of the count that never make the host wait
+// (SrtRuntime::peek_gpu_dword), at least KYTY_GPU_SIZED_DYNAMIC_MIN_KB (default 256) and at most
+// KYTY_GPU_SIZED_DYNAMIC_MAX_KB (default 262144) of records; the fixed bound until a copy lands.
+uint32_t LearnedRecords(uint64_t shader_hash, uint32_t buffer, uint32_t flat_offset, uint32_t dword1,
+                        uint32_t fallback, const SrtRuntime& runtime,
+                        const std::vector<SrtGpuFill>& fills) {
+	static const uint64_t min_bytes = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_DYNAMIC_MIN_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull) * 1024ull;
+	}();
+	static const uint64_t max_bytes = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_DYNAMIC_MAX_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 262144ull) * 1024ull;
+	}();
+	if (runtime.peek_gpu_dword == nullptr) {
+		return fallback;
+	}
+	uint64_t address = 0;
+	for (const auto& fill: fills) {
+		if (fill.flat_offset == flat_offset) {
+			address = fill.address;
+			break;
+		}
+	}
+	if (address == 0) {
+		return fallback;
+	}
+	const uint32_t seen = runtime.peek_gpu_dword(address);
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint32_t> largest;
+	uint32_t                                      most = 0;
+	{
+		std::lock_guard lock(mutex);
+		auto&           entry = largest[shader_hash ^ (uint64_t {buffer} << 48u)];
+		const bool      grew  = seen > entry;
+		entry                 = std::max(entry, seen);
+		most                  = entry;
+		if (grew) {
+			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+				std::fprintf(stderr, "[gpu-sized-dyn] %016llx buffer %u: largest count %u\n",
+				             static_cast<unsigned long long>(shader_hash), buffer, most);
+			}
+		}
+	}
+	if (most == 0) {
+		return fallback;
+	}
+	const uint64_t stride = (dword1 >> 16u) & 0x3fffu;
+	const uint64_t unit   = stride == 0u ? 1u : stride;
+	const uint64_t bytes  = std::clamp<uint64_t>(uint64_t {most} * unit * 2u, min_bytes, max_bytes);
+	return static_cast<uint32_t>(std::min<uint64_t>(bytes / unit, UINT32_MAX));
+}
+
 void NoteGpuSizedBuffer(uint64_t shader_hash) {
 	static std::atomic<uint64_t> count {0};
 	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2132,13 +2190,39 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 							static std::unordered_set<uint64_t> seen;
 							std::lock_guard                     lock(mutex);
 							if (seen.insert(program.shader_hash ^ (uint64_t {i} << 56u)).second) {
+								// The count's expression, two levels deep, when it is not a flat slot.
+								std::string shape;
+								const std::function<void(Value, int)> describe = [&](Value v, int depth) {
+									v = v.Resolve();
+									if (v.IsImmediate()) {
+										shape += fmt::format("#{:x}", v.GetType() == Type::U32 ? v.U32() : 0u);
+										return;
+									}
+									const auto* inst = v.TryInstruction();
+									if (inst == nullptr) {
+										shape += "?";
+										return;
+									}
+									shape += ValueOpcodeName(inst->GetOpcode());
+									if (depth == 0 || inst->NumArgs() == 0) return;
+									shape += "(";
+									for (size_t a = 0; a < inst->NumArgs(); a++) {
+										if (a != 0) shape += ",";
+										describe(inst->Arg(a), depth - 1);
+									}
+									shape += ")";
+								};
+								if (gpu_records_flat == BufferResource::NoGpuRecords) {
+									describe(src.dwords[2], 3);
+								}
 								std::fprintf(stderr,
-								             "[gpu-sized-dyn] %016llx buffer %u written=%d flat=%d\n",
+								             "[gpu-sized-dyn] %016llx buffer %u written=%d flat=%d %s\n",
 								             static_cast<unsigned long long>(program.shader_hash),
 								             i, base.written ? 1 : 0,
 								             gpu_records_flat == BufferResource::NoGpuRecords
 								                 ? -1
-								                 : static_cast<int>(gpu_records_flat));
+								                 : static_cast<int>(gpu_records_flat),
+								             shape.c_str());
 							}
 						}
 						if (gpu_records_flat == BufferResource::NoGpuRecords && base.written) {
@@ -2148,6 +2232,11 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 					}
 					if (ok && sized) {
 						value.dwords[2] = GpuSizedRecords(value.dwords[1], base.written);
+						if (gpu_records_flat != BufferResource::NoGpuRecords) {
+							value.dwords[2] = LearnedRecords(program.shader_hash, i, gpu_records_flat,
+							                                 value.dwords[1], value.dwords[2],
+							                                 runtime, snapshot.gpu_fills);
+						}
 						t_gpu_sized_snapshot = true;
 						NoteGpuSizedBuffer(program.shader_hash);
 					}

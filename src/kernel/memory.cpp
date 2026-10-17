@@ -1030,6 +1030,14 @@ uint64_t StartGpuBufferReadback(uint64_t vaddr, uint64_t size) {
 	return GetGpuResources().GetBufferCache().StartSrtReadback(vaddr, size);
 }
 
+uint32_t PeekGpuDword(uint64_t vaddr) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, sizeof(uint32_t)) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return 0;
+	}
+	return GetGpuResources().GetBufferCache().PeekDword(vaddr);
+}
+
 static thread_local bool t_gpu_read_delegate = false;
 
 bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {

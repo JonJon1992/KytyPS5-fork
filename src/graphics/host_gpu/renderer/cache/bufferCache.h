@@ -121,6 +121,8 @@ public:
 	// [vaddr, vaddr + size) without waiting. Returns the tick to wait for (its completion and
 	// priority operations publish the bytes), or 0 when the bytes can be read now.
 	[[nodiscard]] uint64_t StartSrtReadback(uint64_t vaddr, uint64_t size);
+	// GPU thread (KYTY_GPU_SIZED_DYNAMIC): see Memory::PeekGpuDword.
+	[[nodiscard]] uint32_t PeekDword(uint64_t vaddr);
 	// Diagnostics: the write-tracking state of the page holding vaddr.
 	[[nodiscard]] std::string DescribeWriteState(uint64_t vaddr);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
@@ -353,6 +355,14 @@ private:
 	uint64_t                                           m_bitmap_written_pages = 0;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	// PeekDword: a small host-visible buffer of dword copies, one slot per guest address.
+	struct PeekSlot {
+		uint32_t index = 0;
+		uint64_t tick  = 0;
+		uint32_t value = 0;
+	};
+	std::unique_ptr<Buffer>                            m_peek_buffer;
+	std::unordered_map<uint64_t, PeekSlot>             m_peek_slots;
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;

@@ -1543,6 +1543,9 @@ struct PipelineCache::ProgramCache {
 					runtime.gpu_written = SrtBytesGpuWritten;
 					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
 				}
+				runtime.peek_gpu_dword = +[](uint64_t address) {
+					return Libs::LibKernel::Memory::PeekGpuDword(address);
+				};
 				t_srt_shader_hash = params.hash;
 				bool materialized = false;
 				if (TakePrepared(&entry->second)) {

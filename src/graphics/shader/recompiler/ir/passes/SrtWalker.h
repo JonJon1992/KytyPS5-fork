@@ -43,6 +43,10 @@ struct SrtRuntime {
 	// lists the slots it left to the GPU. Both null: every slot is read on the host.
 	bool (*gpu_written)(uint64_t address, uint64_t size) = nullptr;
 	std::vector<SrtGpuFill>* gpu_fills                    = nullptr;
+	// KYTY_GPU_SIZED_DYNAMIC: the last value of a GPU-written dword the host has seen, from an
+	// earlier copy that did not make the host wait (0 when none landed yet). Bounds a binding
+	// whose exact record count the shader reads on the GPU.
+	uint32_t (*peek_gpu_dword)(uint64_t address) = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
