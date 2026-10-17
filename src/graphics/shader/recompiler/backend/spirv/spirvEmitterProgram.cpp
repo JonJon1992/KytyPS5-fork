@@ -290,8 +290,14 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto access = IR::BufferAccessOf(inst.GetOpcode());
 	struct WriteScope {
 		EmitterState& state;
-		~WriteScope() { state.emitting_write = false; }
+		~WriteScope() {
+			state.emitting_write = false;
+			state.emitting_inst  = nullptr;
+			state.emitting_ctx   = nullptr;
+		}
 	} write_scope {ctx.state};
+	ctx.state.emitting_inst = &inst;
+	ctx.state.emitting_ctx  = &ctx;
 	ctx.state.emitting_write = access == IR::BufferAccess::Write || access == IR::BufferAccess::Atomic;
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \

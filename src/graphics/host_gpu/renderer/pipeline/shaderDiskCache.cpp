@@ -99,6 +99,7 @@ void Visit(Io& io, T& v) {
 	io(v.gpu_records_flat);
 	io(v.gpu_records_add_flat);
 	io(v.gpu_records_add);
+	io(v.gpu_records_ssa);
 	io(v.indirect_resources);
 }
 
@@ -313,6 +314,7 @@ void Visit(Io& io, T& v) {
 	io(v.gpu_records_flat);
 	io(v.gpu_records_add_flat);
 	io(v.gpu_records_add);
+	io(v.gpu_records_ssa);
 }
 
 template <typename Io, typename T>
@@ -395,7 +397,7 @@ static_assert(sizeof(IR::SrtRead) == 24);
 static_assert(sizeof(IR::BufferWrite) == 72);
 static_assert(sizeof(IR::UniformFill) == 28);
 static_assert(sizeof(IR::UniformFillPlan) == 96);
-static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 40);
+static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 44);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);

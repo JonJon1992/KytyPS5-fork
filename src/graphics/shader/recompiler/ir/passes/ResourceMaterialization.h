@@ -24,6 +24,7 @@ struct ResourceSpecialization {
 		uint32_t               gpu_records_flat                = BufferResource::NoGpuRecords;
 		uint32_t               gpu_records_add_flat            = BufferResource::NoGpuRecords;
 		uint32_t               gpu_records_add                 = 0;
+		bool                   gpu_records_ssa                 = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 

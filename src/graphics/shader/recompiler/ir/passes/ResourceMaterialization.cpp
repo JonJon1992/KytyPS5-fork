@@ -2146,6 +2146,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		uint32_t gpu_records_flat = BufferResource::NoGpuRecords;
 		uint32_t gpu_records_add_flat = BufferResource::NoGpuRecords;
 		uint32_t gpu_records_add      = 0;
+		bool     gpu_records_ssa      = false;
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
@@ -2297,7 +2298,19 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 								             shape.c_str());
 							}
 						}
-						if (gpu_records_flat == BufferResource::NoGpuRecords && base.written) {
+						// No flat slot: the shader bounds its accesses by the count its own
+						// descriptor computes (KYTY_GPU_SIZED_SSA=0 waits for the count instead).
+						static const bool ssa = [] {
+							const char* env = std::getenv("KYTY_GPU_SIZED_SSA");
+							return env == nullptr || env[0] != '0';
+						}();
+						if (gpu_records_flat == BufferResource::NoGpuRecords && ssa &&
+						    ((value.dwords[1] >> 31u) & 1u) == 0u &&
+						    ((value.dwords[3] >> 23u) & 1u) == 0u) {
+							gpu_records_ssa = true;
+						}
+						if (gpu_records_flat == BufferResource::NoGpuRecords && !gpu_records_ssa &&
+						    base.written) {
 							ok    = walker_ref.Evaluate(src.dwords[2], value.dwords[2]);
 							sized = false;
 						}
@@ -2347,6 +2360,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		buffer.gpu_records_flat   = gpu_records_flat;
 		buffer.gpu_records_add_flat = gpu_records_add_flat;
 		buffer.gpu_records_add      = gpu_records_add;
+		buffer.gpu_records_ssa      = gpu_records_ssa;
 		buffer.write_tracked      = WriteBitmapEnabled() && i < program.info.buffers.size() &&
 		                            base.written && base.image_alias == BufferResource::NoImageAlias &&
 		                            i < program.buffer_writes_bounded.size() &&
@@ -2662,6 +2676,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.gpu_records_flat           = source.gpu_records_flat;
 		buffer.gpu_records_add_flat       = source.gpu_records_add_flat;
 		buffer.gpu_records_add            = source.gpu_records_add;
+		buffer.gpu_records_ssa            = source.gpu_records_ssa;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {

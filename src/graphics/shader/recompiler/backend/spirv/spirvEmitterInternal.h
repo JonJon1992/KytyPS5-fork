@@ -87,6 +87,8 @@ SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 // KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
 bool FloatControlsDisabled(uint64_t shader_hash);
 
+struct ValueEmitContext;
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -142,6 +144,9 @@ struct EmitterState {
 	uint32_t                                         write_bitmap_address    = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_track_bases {};
 	bool                                             emitting_write          = false;
+	// The instruction EmitDirectInstruction is emitting, and its lane (gpu_records_ssa bounds).
+	const IR::Inst*                                  emitting_inst           = nullptr;
+	ValueEmitContext*                                emitting_ctx            = nullptr;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;

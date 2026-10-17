@@ -441,7 +441,39 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
 	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
 	// byte index dropped every access past the first quarter of the buffer.
-	const auto dwords = state.memory_dword_lengths[array_index];
+	auto dwords = state.memory_dword_lengths[array_index];
+	// gpu_records_ssa: also within the count of the descriptor this access names (the handle's
+	// dword 2, which the shader computes), from the guest base; sums saturate.
+	if ((mem.kind == IR::ResourceKind::Buffer || mem.kind == IR::ResourceKind::ScalarBuffer) &&
+	    mem.resource < state.program.info.buffers.size() &&
+	    state.program.info.buffers[mem.resource].gpu_records_ssa && state.emitting_inst != nullptr &&
+	    state.emitting_ctx != nullptr && state.emitting_inst->NumArgs() != 0) {
+		const auto* handle = state.emitting_inst->Arg(0).Resolve().TryInstruction();
+		if (handle != nullptr && handle->GetOpcode() == IR::ValueOpcode::GetBufferResource &&
+		    handle->Flags<uint32_t>() == mem.resource && handle->NumArgs() > 2u) {
+			const auto bool_type = TypeBool(state);
+			const auto u32       = TypeU32(state);
+			const auto max_u32   = ConstantU32(state, UINT32_MAX);
+			const auto records   = state.emitting_ctx->Arg(*handle, 2);
+			const uint32_t stride = state.program.info.buffers[mem.resource].packed_stride & 0x3fffu;
+			uint32_t       bytes  = records;
+			if (stride > 1u) {
+				const auto overflow = Binary(state, spv::OpUGreaterThan, bool_type, records,
+				                             ConstantU32(state, UINT32_MAX / stride));
+				bytes = Select(state, u32, overflow, max_u32,
+				               EmitBinaryU32(state, spv::OpIMul, records, ConstantU32(state, stride)));
+			}
+			const auto offset    = access.byte_offset;
+			const auto saturated = Binary(state, spv::OpUGreaterThan, bool_type, bytes,
+			                              EmitBinaryU32(state, spv::OpISub, max_u32, offset));
+			const auto end       = Select(state, u32, saturated, max_u32,
+			                              EmitBinaryU32(state, spv::OpIAdd, bytes, offset));
+			const auto own       = EmitBinaryU32(state, spv::OpShiftRightLogical, end,
+			                                     ConstantU32(state, 2u));
+			dwords = Select(state, u32, Binary(state, spv::OpULessThan, bool_type, own, dwords), own,
+			                dwords);
+		}
+	}
 	switch (element_bits) {
 		case 8u:
 		case 16u: {

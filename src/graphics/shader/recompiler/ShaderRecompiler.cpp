@@ -821,7 +821,15 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			} else if (op != IR::ValueOpcode::GetSamplerResource) {
 				continue;
 			}
+			// A buffer bounded by its own count (gpu_records_ssa) keeps dword 2.
+			const bool keep_records =
+			    op == IR::ValueOpcode::GetBufferResource &&
+			    inst.Flags<uint32_t>() < ir.info.buffers.size() &&
+			    ir.info.buffers[inst.Flags<uint32_t>()].gpu_records_ssa;
 			for (size_t index = first; index < inst.NumArgs(); index++) {
+				if (keep_records && index == 2u) {
+					continue;
+				}
 				inst.SetArg(index, IR::Value(0u));
 			}
 		}

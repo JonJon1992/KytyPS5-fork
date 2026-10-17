@@ -140,6 +140,9 @@ struct BufferResource {
 	// The count is flat[gpu_records_flat] + flat[gpu_records_add_flat] (when set) + gpu_records_add.
 	uint32_t               gpu_records_add_flat       = NoGpuRecords;
 	uint32_t               gpu_records_add            = 0;
+	// KYTY_GPU_SIZED_DYNAMIC, a count no flat slot holds: the shader bounds its accesses by the
+	// count its own descriptor carries (the handle's dword 2, computed in the shader).
+	bool                   gpu_records_ssa            = false;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
