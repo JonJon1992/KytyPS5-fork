@@ -2311,6 +2311,48 @@ void BufferCache::SettleWriteBitmap(uint64_t completed_tick) {
 	}
 }
 
+static void WatchGpuWriteDiag(uint64_t vaddr, uint64_t size, bool shared) {
+	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
+	// the bindings that mark bytes of those ranges GPU-written: the first write of each
+	// (range, shader), with a host stack when no shader is being bound (copies, fills).
+	static const std::vector<std::pair<uint64_t, uint64_t>> watches = [] {
+		std::vector<std::pair<uint64_t, uint64_t>> result;
+		const char*                                value = std::getenv("KYTY_WATCH_GPU_WRITE");
+		while (value != nullptr && *value != '\0') {
+			char*      end   = nullptr;
+			const auto begin = std::strtoull(value, &end, 16);
+			uint64_t   bytes = 1;
+			if (end != nullptr && *end == '+') {
+				bytes = std::strtoull(end + 1, &end, 16);
+			}
+			result.emplace_back(begin, bytes);
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	static std::atomic<uint32_t> watched {0};
+	for (size_t index = 0; index < watches.size(); index++) {
+		const auto& [watch_begin, watch_size] = watches[index];
+		if (watch_size == 0 || vaddr >= watch_begin + watch_size ||
+		    watch_begin >= vaddr + size) {
+			continue;
+		}
+		static std::mutex                             seen_mutex;
+		static std::set<std::pair<size_t, uint64_t>> seen;
+		bool                                          first = false;
+		{
+			std::lock_guard lock(seen_mutex);
+			first = seen.emplace(index, BufferCache::s_diag_shader_hash).second;
+		}
+		if (first && watched.fetch_add(1) < 128) {
+			std::fprintf(stderr, "GPU write%s covers watched #%zu 0x%016" PRIx64 "+0x%" PRIx64
+			     ": range=0x%016" PRIx64 " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
+			     shared ? " (shared)" : "", index, watch_begin, watch_size, vaddr, size, BufferCache::s_diag_shader_hash,
+			     BufferCache::s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
+		}
+	}
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	if (IsShared(vaddr, size) && m_shared_ranges.Contains(vaddr, size)) {
@@ -2328,6 +2370,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 				std::unique_lock lock(m_dirty_ranges_mutex);
 				m_gpu_modified_ranges.Add(vaddr, size);
 			}
+			WatchGpuWriteDiag(vaddr, size, true);
 			m_scheduler.DeferOperation([this, begin, bytes, tick] {
 				const auto found = m_shared_write_ticks.find(begin);
 				if (found == m_shared_write_ticks.end() || found->second != tick) {
@@ -2397,45 +2440,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 			             static_cast<unsigned long long>(huge[s_diag_shader_hash]));
 		}
 	}
-	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
-	// the bindings that mark bytes of those ranges GPU-written: the first write of each
-	// (range, shader), with a host stack when no shader is being bound (copies, fills).
-	static const std::vector<std::pair<uint64_t, uint64_t>> watches = [] {
-		std::vector<std::pair<uint64_t, uint64_t>> result;
-		const char*                                value = std::getenv("KYTY_WATCH_GPU_WRITE");
-		while (value != nullptr && *value != '\0') {
-			char*      end   = nullptr;
-			const auto begin = std::strtoull(value, &end, 16);
-			uint64_t   bytes = 1;
-			if (end != nullptr && *end == '+') {
-				bytes = std::strtoull(end + 1, &end, 16);
-			}
-			result.emplace_back(begin, bytes);
-			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
-		}
-		return result;
-	}();
-	static std::atomic<uint32_t> watched {0};
-	for (size_t index = 0; index < watches.size(); index++) {
-		const auto& [watch_begin, watch_size] = watches[index];
-		if (watch_size == 0 || vaddr >= watch_begin + watch_size ||
-		    watch_begin >= vaddr + size) {
-			continue;
-		}
-		static std::mutex                             seen_mutex;
-		static std::set<std::pair<size_t, uint64_t>> seen;
-		bool                                          first = false;
-		{
-			std::lock_guard lock(seen_mutex);
-			first = seen.emplace(index, s_diag_shader_hash).second;
-		}
-		if (first && watched.fetch_add(1) < 128) {
-			std::fprintf(stderr, "GPU write covers watched #%zu 0x%016" PRIx64 "+0x%" PRIx64
-			     ": range=0x%016" PRIx64 " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
-			     index, watch_begin, watch_size, vaddr, size, s_diag_shader_hash,
-			     s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
-		}
-	}
+	WatchGpuWriteDiag(vaddr, size, false);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {

@@ -2048,6 +2048,24 @@ struct PipelineCache::ProgramCache {
 		    !function_expander.HasCalls(params.code)) {
 			no_call_shaders.insert(no_call_key);
 		}
+		// The draw-prep scanner cannot run the expander (GPU-thread state), and a program key
+		// without the expanded functions never finds the entry of a shader with calls (the
+		// title's 0xc4df2a00067e0666, ~16 000 dispatches a second, all refreshed on the GPU
+		// thread). Keep the last expansion by shader and code address for it; the GPU thread
+		// checks that the scanner's entry is the one it finds itself (TakeScanned).
+		if (expanded_ok && !expanded.empty()) {
+			const uint64_t   scan_key = ScanExpandKey(params, wave_size);
+			std::lock_guard  lock(scan_expand_mutex);
+			auto&            kept = scan_expansions[scan_key];
+			if (kept != expanded) {
+				if (scan_expansions.size() > 4096) {
+					scan_expansions.clear();
+					scan_expansions[scan_key] = expanded;
+				} else {
+					kept = expanded;
+				}
+			}
+		}
 		if (!expanded_ok) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
@@ -2075,6 +2093,13 @@ struct PipelineCache::ProgramCache {
 	};
 	std::unordered_map<uint64_t, ExpandReused>                     expand_reuse;
 	std::unordered_set<uint64_t>                                   no_call_shaders;
+	// The last function expansion by shader and code address, for the draw-prep scanner.
+	std::mutex                                                     scan_expand_mutex;
+	std::unordered_map<uint64_t, std::vector<uint32_t>>            scan_expansions;
+	static uint64_t ScanExpandKey(const ShaderParams& params, uint32_t wave_size) {
+		return params.hash ^ params.Base() ^ (static_cast<uint64_t>(wave_size) << 56u) ^
+		       (static_cast<uint64_t>(params.code.size()) << 32u);
+	}
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
@@ -2248,9 +2273,69 @@ struct PipelineCache::ProgramCache {
 		key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, key.static_state);
 		key.function_code.clear();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			std::lock_guard lock(scan_expand_mutex);
+			if (const auto it = scan_expansions.find(ScanExpandKey(params, input_info.wave_size));
+			    it != scan_expansions.end()) {
+				key.function_code = it->second;
+			}
+		}
 		std::shared_lock programs_lock(programs_mutex);
 		const auto       entry = programs.find(key);
+		// KYTY_FPS_LOG: why a scanned program has no entry (first miss of each shader): the
+		// fields of the keys the GPU thread inserted for the same shader that differ.
+		if (entry == programs.end()) {
+			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			static std::mutex                   diag_mutex;
+			static std::unordered_set<uint64_t> diag_seen;
+			if (log) {
+				std::lock_guard diag_lock(diag_mutex);
+				if (diag_seen.size() < 32 && diag_seen.insert(params.hash).second) {
+					for (const auto& [other, value]: programs) {
+						if (other.hash != key.hash || other.stage != key.stage) continue;
+						std::string diff;
+						if (other.user_data_count != key.user_data_count) diff += fmt::format(" ud {}!={}", other.user_data_count, key.user_data_count);
+						if (other.code_size != key.code_size) diff += fmt::format(" size {}!={}", other.code_size, key.code_size);
+						if (!other.function_code.empty()) diff += fmt::format(" function_code {} dwords", other.function_code.size());
+						for (size_t i = 0; i < std::max(other.static_state.size(), key.static_state.size()); i++) {
+							const uint32_t a = i < other.static_state.size() ? other.static_state[i] : 0xdeadu;
+							const uint32_t b = i < key.static_state.size() ? key.static_state[i] : 0xdeadu;
+							if (a != b) diff += fmt::format(" static[{}] {:x}!={:x}", i, a, b);
+						}
+						std::fprintf(stderr, "[draw-prep-key] %016llx entry differs:%s\n",
+						             static_cast<unsigned long long>(params.hash), diff.c_str());
+					}
+				}
+			}
+		}
 		return entry != programs.end() ? &entry->second : nullptr;
+	}
+
+	// KYTY_FPS_LOG: the shaders the scanner could not prepare most often (no entry / walk failed),
+	// every 10 s.
+	static void NoteScanMiss(uint64_t hash, bool walk) {
+		static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+		if (!log) return;
+		static std::mutex                                                  mutex;
+		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> misses;
+		static auto                                                        last = std::chrono::steady_clock::now();
+		std::lock_guard                                                    lock(mutex);
+		auto&                                                              m = misses[hash];
+		(walk ? m.second : m.first)++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(10)) return;
+		last = now;
+		std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> list(misses.begin(), misses.end());
+		std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+			return a.second.first + a.second.second > b.second.first + b.second.second;
+		});
+		for (size_t i = 0; i < list.size() && i < 10; i++) {
+			std::fprintf(stderr, "[draw-prep-miss] %016llx noentry %llu walkfail %llu\n",
+			             static_cast<unsigned long long>(list[i].first),
+			             static_cast<unsigned long long>(list[i].second.first),
+			             static_cast<unsigned long long>(list[i].second.second));
+		}
+		misses.clear();
 	}
 
 	// The probe reader (bytes no GPU work has written, nothing else), recording what it read.
@@ -2258,6 +2343,7 @@ struct PipelineCache::ProgramCache {
 		GuestPageReadCache  cache;
 		DrawPrep::ReadSet*  reads  = nullptr;
 		bool                failed = false;
+		uint64_t            hash   = 0;
 	};
 	// A read the probe refuses fails the preparation even where the walk tolerates it (a guarded
 	// read through a null base reads zero): the GPU thread's walk would read those bytes, and the
@@ -2266,6 +2352,22 @@ struct PipelineCache::ProgramCache {
 		auto& reader = *static_cast<RecordingReader*>(userdata);
 		if (!ReadShaderGuestMemoryProbe(&reader.cache, address, values)) {
 			reader.failed = true;
+			// KYTY_FPS_LOG: the first refused reads of each shader, and why.
+			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			if (log) {
+				static std::mutex                                 diag_mutex;
+				static std::unordered_map<uint64_t, uint32_t>     diag_seen;
+				std::lock_guard                                   diag_lock(diag_mutex);
+				if (auto& n = diag_seen[reader.hash]; n < 4 && diag_seen.size() < 64) {
+					n++;
+					std::fprintf(stderr,
+					             "[draw-prep-read] %016llx refused 0x%llx dwords=%zu gpu_written=%d cond=%d\n",
+					             static_cast<unsigned long long>(reader.hash),
+					             static_cast<unsigned long long>(address), values.size(),
+					             SrtBytesGpuWritten(address, values.size_bytes()) ? 1 : 0,
+					             ShaderRecompiler::IR::SrtEvaluatingCondition() ? 1 : 0);
+				}
+			}
 			return false;
 		}
 		reader.reads->Add(address, values.data(), static_cast<uint32_t>(values.size_bytes()));
@@ -2281,6 +2383,7 @@ struct PipelineCache::ProgramCache {
 		auto*                   entry = FindForScan(params, input_info, stage, key);
 		if (entry == nullptr) {
 			DrawPrep::Add(DrawPrep::Counter::SkipNoEntry);
+			NoteScanMiss(params.hash, false);
 			return false;
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
@@ -2289,7 +2392,7 @@ struct PipelineCache::ProgramCache {
 		result.shader_base = params.Base();
 		result.user_data.assign(user_data.begin(), user_data.end());
 		result.reads.Clear();
-		RecordingReader                  reader {.reads = &result.reads};
+		RecordingReader                  reader {.reads = &result.reads, .hash = params.hash};
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -2324,7 +2427,15 @@ struct PipelineCache::ProgramCache {
 			                                                result.resources, result.specialization);
 		}
 		if (!ok || reader.failed) {
+			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && !reader.failed) {
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1) < 16) {
+					std::fprintf(stderr, "[draw-prep-walk] %016llx walk failed without a refused read\n",
+					             static_cast<unsigned long long>(params.hash));
+				}
+			}
 			DrawPrep::Add(DrawPrep::Counter::FailWalk);
+			NoteScanMiss(params.hash, true);
 			return false;
 		}
 		static std::atomic<uint64_t> serials {0};

@@ -1250,6 +1250,9 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 	// Sources only read-only, non-indirect buffers use: their record count (dword 2) is not a host
 	// need (GpuSizedBuffers binds a conservative count when the GPU wrote it).
 	std::vector<uint8_t> sized_sources(plan.descriptor_sources.size(), 0u);
+	// For KYTY_SRT_FILL_REASON: why a source's record count stays on the host (w written,
+	// a atomic, i image, s sampler).
+	std::vector<std::string> source_why(plan.descriptor_sources.size());
 	{
 		std::vector<uint8_t> other(plan.descriptor_sources.size(), 0u);
 		for (const auto& buffer: plan.info.buffers) {
@@ -1259,13 +1262,20 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 				sized_sources[buffer.source] = 1u;
 			} else {
 				other[buffer.source] = 1u;
+				source_why[buffer.source] += buffer.atomic ? 'a' : 'w';
 			}
 		}
 		for (const auto& image: plan.info.images) {
-			if (image.source < other.size()) other[image.source] = 1u;
+			if (image.source < other.size()) {
+				other[image.source] = 1u;
+				source_why[image.source] += 'i';
+			}
 		}
 		for (const auto& sampler: plan.info.samplers) {
-			if (sampler.source < other.size()) other[sampler.source] = 1u;
+			if (sampler.source < other.size()) {
+				other[sampler.source] = 1u;
+				source_why[sampler.source] += 's';
+			}
 		}
 		for (size_t i = 0; i < sized_sources.size(); ++i) {
 			if (other[i] != 0u || plan.descriptor_sources[i].dword_count != 4u ||
@@ -1274,6 +1284,8 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			}
 		}
 	}
+	std::vector<int64_t> host_desc(count, -1);
+	int64_t              current_desc = -1;
 	const auto mark = [&](Value root) {
 		pending.push_back(root);
 		while (!pending.empty()) {
@@ -1286,7 +1298,10 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 				const auto slot = inst->Arg(1).Resolve();
 				if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < count) {
-					if (host[slot.U32()] == 0u) host[slot.U32()] = tag;
+					if (host[slot.U32()] == 0u) {
+						host[slot.U32()]       = tag;
+						host_desc[slot.U32()]  = tag == 'D' ? current_desc : -1;
+					}
 					pending.push_back(plan.srt_reads[slot.U32()].value);
 				}
 				continue;
@@ -1302,8 +1317,10 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			if (dword == 2u && sized_sources[source_index] != 0u) {
 				continue;
 			}
+			current_desc = static_cast<int64_t>(source_index * 16u + dword);
 			mark(source.dwords[dword]);
 		}
+		current_desc = static_cast<int64_t>(source_index * 16u + 15u);
 		if (source.indirect_descriptor.has_value()) {
 			mark(source.indirect_descriptor->key_count);
 			mark(source.indirect_descriptor->selector_first);
@@ -1414,6 +1431,15 @@ static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
 			const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
 			text += fmt::format(" {}:{}({})", slot, fill[slot] != 0u ? 'G' : static_cast<char>(host[slot]),
 			                    inst != nullptr ? ValueOpcodeName(inst->GetOpcode()) : "-");
+			if (fill[slot] == 0u && host[slot] == 'D' && host_desc[slot] >= 0) {
+				const auto  src    = static_cast<size_t>(host_desc[slot] / 16);
+				const auto  dw     = host_desc[slot] % 16;
+				const auto& source = plan.descriptor_sources[src];
+				text += fmt::format("[src{} {} n={} ind={} why={}]", src,
+				                    dw == 15 ? std::string("key") : fmt::format("d{}", dw),
+				                    source.dword_count, source.indirect_descriptor.has_value() ? 1 : 0,
+				                    source_why[src]);
+			}
 		}
 		std::fprintf(stderr, "[srt-fill] %016llx slots=%zu%s\n",
 		             static_cast<unsigned long long>(plan.shader_hash), count, text.c_str());

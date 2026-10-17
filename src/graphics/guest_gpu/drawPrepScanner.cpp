@@ -211,6 +211,17 @@ void DrawPrepScanner::ScanDispatch(uint64_t seq, uint32_t ordinal, const uint32_
 		DrawPrep::Add(DrawPrep::Counter::SkipBehind);
 		return;
 	}
+	// As CommandProcessor::DispatchDirect / DispatchIndirect: the dispatch initiator selects the
+	// wave size, which is part of the program key (without it, wave32 dispatches found no entry).
+	{
+		uint32_t mode = 0;
+		if (opcode == Pm4::IT_DISPATCH_DIRECT) {
+			mode = KYTY_PM4_LEN(packet[0]) == 5u ? packet[4] : 0u;
+		} else {
+			mode = packet[0] == 0xc0021600u ? packet[3] : packet[2];
+		}
+		m_state->cp->GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	}
 	const auto& cs = m_state->cp->GetShCtx().GetCs();
 	if (cs.cs_regs.data_addr == 0 || PipelineCache::IsSkipListed(cs.cs_regs.data_addr)) {
 		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);

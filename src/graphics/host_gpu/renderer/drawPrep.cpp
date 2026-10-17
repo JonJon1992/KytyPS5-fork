@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -287,6 +288,19 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
+	static const bool to_stderr = std::getenv("KYTY_FPS_LOG") != nullptr;
+	if (to_stderr) {
+		std::fprintf(stderr,
+		             "[draw-prep] 10 s: scanned %llu prepared %llu skip behind %llu unknown %llu "
+		             "unsupported %llu noentry %llu walkfail %llu tainted %llu (indirect %llu "
+		             "context %llu) takes %llu used %llu miss none %llu entry %llu inputs %llu reads %llu\n",
+		             c(Counter::Scanned), c(Counter::Prepared), c(Counter::SkipBehind),
+		             c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported), c(Counter::SkipNoEntry),
+		             c(Counter::FailWalk), c(Counter::Tainted), c(Counter::TaintIndirect),
+		             c(Counter::TaintContext), c(Counter::Takes), c(Counter::Used) + c(Counter::Reused),
+		             c(Counter::MissNone), c(Counter::MissEntry), c(Counter::MissInputs),
+		             c(Counter::MissReads));
+	}
 	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
 	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
 	     "context %llu); GPU takes %llu, "
