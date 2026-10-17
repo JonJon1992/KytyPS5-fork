@@ -432,16 +432,28 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
 	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (indirect_args != 0) {
+		// The group counts are GPU data: reading them here made the GPU thread submit and wait
+		// for the GPU (CommandScheduler::Wait, forced) on every such dispatch. The shader indexes
+		// the buffer by its workgroup id; bind the whole range instead (KYTY_LDS_INDIRECT_READ=1:
+		// read the counts as before).
+		static const bool read_counts = [] {
+			const char* value = std::getenv("KYTY_LDS_INDIRECT_READ");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (!read_counts) {
+			bindings.shared_memory = {storage.Handle(), 0, limit & ~uint64_t {3}};
+			return;
+		}
+		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
+		            sizeof(input.workgroup_counts));
+	}
 	uint64_t size = sizeof(uint32_t);
 	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);

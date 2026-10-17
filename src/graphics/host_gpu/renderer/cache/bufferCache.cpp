@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <fmt/format.h>
+#include <unordered_map>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -481,8 +483,27 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
+		KYTY_PROFILER_BLOCK("ReadMemory: CPU write over GPU-written bytes");
+		// KYTY_FPS_LOG: on the GPU thread, which pages its own writes flush most (every 10 s).
+		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && GuestGpu::IsGpuThread()) {
+			static std::unordered_map<uint64_t, uint64_t> pages;
+			static auto                                  last = std::chrono::steady_clock::now();
+			pages[vaddr & ~uint64_t {0xfff}]++;
+			if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(10)) {
+				last = now;
+				std::vector<std::pair<uint64_t, uint64_t>> list(pages.begin(), pages.end());
+				std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+				std::string text;
+				for (size_t i = 0; i < list.size() && i < 8; i++) {
+					text += fmt::format(" 0x{:x}x{}", list[i].first, list[i].second);
+				}
+				std::fprintf(stderr, "[gpu-thread-write-flush] pages=%zu top:%s\n", list.size(), text.c_str());
+				pages.clear();
+			}
+		}
+		ReadMemory(vaddr, size, true);
+	});
 }
 
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {

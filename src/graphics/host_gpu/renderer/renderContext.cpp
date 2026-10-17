@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/profiler.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -109,6 +111,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
+		KYTY_PROFILER_BLOCK("ReadMemory: read fault");
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
