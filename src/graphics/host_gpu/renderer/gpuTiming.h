@@ -38,6 +38,10 @@ inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, u
 // Called once per presented frame.
 void Present(uint64_t frame);
 
+// Profiling buckets: a compute shader that emulates its 64-lane wave as two lanes per host
+// invocation (32-lane host subgroups) is reported apart from the native ones.
+void NoteComputeLanes(uint64_t hash, uint32_t lanes);
+
 } // namespace GpuTiming
 } // namespace Libs::Graphics
 

@@ -115,6 +115,54 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_dword_lengths[i] =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
+	// A buffer bound with a conservative record count (KYTY_GPU_SIZED_DYNAMIC): its length is the
+	// smaller of the bound range and the exact count's, read from the flattened SRT dword the GPU
+	// filled before the dispatch (BufferResource::gpu_records_flat). Lengths count dwords from the
+	// aligned binding start, so the byte offset of the guest base is added first; sums saturate.
+	if (const auto* group =
+	        IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Buffers);
+	    group != nullptr && state.flattened_srt_variable != 0) {
+		const auto bool_type = TypeBool(state);
+		const auto u32       = TypeU32(state);
+		const auto max_u32   = ConstantU32(state, UINT32_MAX);
+		const auto count     = std::min<size_t>(group->resources.size(),
+		                                        state.program.bindings.memory_offset_count);
+		for (uint32_t i = 0; i < count; i++) {
+			const auto resource = group->resources[i];
+			if (resource >= state.program.info.buffers.size()) {
+				continue;
+			}
+			const auto& buffer = state.program.info.buffers[resource];
+			if (buffer.gpu_records_flat == IR::BufferResource::NoGpuRecords) {
+				continue;
+			}
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+			                          ConstantU32(state, buffer.gpu_records_flat));
+			const auto records = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, u32, records, pointer);
+			const uint32_t stride = buffer.packed_stride & 0x3fffu;
+			uint32_t       bytes  = records;
+			if (stride > 1u) {
+				const auto overflow = Binary(state, spv::OpUGreaterThan, bool_type, records,
+				                             ConstantU32(state, UINT32_MAX / stride));
+				bytes = Select(state, u32, overflow, max_u32,
+				               EmitBinaryU32(state, spv::OpIMul, records, ConstantU32(state, stride)));
+			}
+			const auto offset    = state.memory_byte_offsets[i];
+			const auto saturated = Binary(state, spv::OpUGreaterThan, bool_type, bytes,
+			                              EmitBinaryU32(state, spv::OpISub, max_u32, offset));
+			const auto end       = Select(state, u32, saturated, max_u32,
+			                              EmitBinaryU32(state, spv::OpIAdd, bytes, offset));
+			const auto dwords    = EmitBinaryU32(state, spv::OpShiftRightLogical, end,
+			                                     ConstantU32(state, 2u));
+			const auto bound     = state.memory_dword_lengths[i];
+			state.memory_dword_lengths[i] =
+			    Select(state, u32, Binary(state, spv::OpULessThan, bool_type, dwords, bound), dwords,
+			           bound);
+		}
+	}
 	if (state.program.bindings.write_tracking) {
 		const auto load64 = [&](uint32_t dword) {
 			const auto u64 = TypeScalarU64(state);

@@ -599,6 +599,52 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 }
 
+uint64_t BufferCache::StartSrtReadback(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
+	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	const auto flushed = [this](uint64_t tick) {
+		if (tick >= m_scheduler.CurrentTick()) {
+			m_scheduler.Flush();
+		}
+		return tick;
+	};
+	if (!HasGpuDirtyBytes(vaddr, size)) {
+		bool downloading = false;
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			downloading = m_downloading_ranges.Intersects(vaddr, size);
+		}
+		// A download in flight publishes these bytes when its tick completes. A copy-queue
+		// readback is left to the ordinary (waiting) path: its caller publishes it.
+		if (downloading && FindCopyReadback(vaddr, size) == 0 && m_last_async_download_tick != 0 &&
+		    !m_scheduler.IsFree(m_last_async_download_tick)) {
+			return flushed(m_last_async_download_tick);
+		}
+		return 0;
+	}
+	const auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	if (buffer.IsShared()) {
+		// Its bytes live in guest memory: they are current once the writes recorded so far land.
+		if (const auto found = m_shared_write_ticks.find(buffer.CpuAddress());
+		    found != m_shared_write_ticks.end() && !m_scheduler.IsFree(found->second)) {
+			return flushed(found->second);
+		}
+		return 0;
+	}
+	const auto tick = ReadMemoryStep(vaddr, size, false, true, true);
+	if (tick == 0) {
+		return 0;
+	}
+	if ((tick & CopyReadbackMarker) != 0) {
+		// The writers had finished: the copy queue's readback waits for nothing else.
+		CompleteCopyReadback(tick);
+		return 0;
+	}
+	return flushed(tick);
+}
+
 // Runs on the GPU thread. Returns 0 when the access may proceed, or (asynchronous readback only)
 // the tick whose download publication the caller must wait for before asking again.
 // The readback window (KYTY_READBACK_WINDOW_KB, default 4096; 0 reads only the requested pages,

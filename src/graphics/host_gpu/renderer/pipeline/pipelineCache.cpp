@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
@@ -286,6 +287,35 @@ bool SrtConditionReadRefused(uint64_t address, std::span<const uint32_t> values)
 	return true;
 }
 
+// KYTY_SRT_DEFER=1: a dispatch's SRT refresh that would read bytes the GPU wrote does not wait
+// for the GPU. Each such read starts its download (submitted, not waited for) and fails; the
+// refresh is discarded and the command processor suspends the dispatch packet until the
+// download's tick completes, running the other guest queues meanwhile (the console runs them in
+// parallel). Before, the GPU thread sat idle in two such waits a frame, ~40 % of its time in
+// gameplay (2ea3957af2daf690 on the graphics queue, fb5ee753d43f3f0b on an async queue).
+thread_local bool     t_srt_defer_allowed = false;
+thread_local uint64_t t_srt_defer_tick    = 0;
+thread_local uint32_t t_srt_defer_reads   = 0;
+
+bool SrtDeferRead(uint64_t address, std::span<const uint32_t> values) {
+	if (!t_srt_defer_allowed || !Libs::Graphics::GuestGpu::IsGpuThread() ||
+	    !Libs::LibKernel::Memory::IsGpuBufferWritten(address, values.size_bytes())) {
+		// Bytes already downloading (not GPU-written any more) are left to the ordinary path,
+		// unless this refresh is deferred anyway: then their tick is waited for too.
+		if (!t_srt_defer_allowed || t_srt_defer_tick == 0) {
+			return false;
+		}
+	}
+	const auto tick =
+	    Libs::LibKernel::Memory::StartGpuBufferReadback(address, values.size_bytes());
+	if (tick == 0) {
+		return false;
+	}
+	t_srt_defer_tick = std::max(t_srt_defer_tick, tick);
+	t_srt_defer_reads++;
+	return true;
+}
+
 } // namespace
 namespace ShaderRecompiler::IR {
 const char* MaterializePhase(); // ResourceMaterialization.cpp
@@ -461,6 +491,9 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	if (SrtConditionReadRefused(address, values)) {
 		return false;
 	}
+	if (SrtDeferRead(address, values)) {
+		return false;
+	}
 	if (SrtSpeculativeRead(address, values)) {
 		return true;
 	}
@@ -515,6 +548,9 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 		return true;
 	}
 	if (SrtConditionReadRefused(address, values)) {
+		return false;
+	}
+	if (SrtDeferRead(address, values)) {
 		return false;
 	}
 	if (SrtSpeculativeRead(address, values)) {
@@ -1568,6 +1604,13 @@ struct PipelineCache::ProgramCache {
 					     " instructions, %" PRIu64 " through the interpreter\n",
 					     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
 					     stats.interpreted);
+				}
+				if (t_srt_defer_tick != 0) {
+					// KYTY_SRT_DEFER: bytes this refresh reads are downloading; the dispatch is
+					// suspended and refreshed again once they land (SrtDeferRead).
+					Profiler::CommandZone::Annotate("deferred %s %016" PRIx64 ": SRT bytes downloading",
+					                                StageLabel(stage), params.hash);
+					return ShaderProgram {};
 				}
 				if (!materialized) {
 					// A descriptor source that cannot be read right now (memory the guest has
@@ -2827,6 +2870,29 @@ bool PipelineCache::DrawPrepGraphics(
 	return out.stage_count != 0;
 }
 
+bool PipelineCache::SrtDeferEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_DEFER");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void PipelineCache::BeginSrtDefer(bool allowed) {
+	t_srt_defer_allowed = allowed;
+	t_srt_defer_tick    = 0;
+	t_srt_defer_reads   = 0;
+}
+
+uint64_t PipelineCache::EndSrtDefer() {
+	t_srt_defer_allowed = false;
+	return std::exchange(t_srt_defer_tick, 0);
+}
+
+bool PipelineCache::SrtDeferPending() {
+	return t_srt_defer_tick != 0;
+}
+
 bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
 }
@@ -2840,6 +2906,11 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	if (program && input_info.stage.program != nullptr) {
+		const auto* compiled = input_info.stage.program;
+		GpuTiming::NoteComputeLanes(compiled->shader_hash,
+		                            compiled->wave_size == 64u && input_info.host_subgroup_size == 32u ? 2u : 1u);
+	}
 	if (program && DrawPrep::Enabled()) {
 		// Compute shaders join the known-good list with a vertex identity no draw has.
 		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);

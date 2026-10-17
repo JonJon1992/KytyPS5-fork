@@ -110,6 +110,7 @@ struct ExportInfo {
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	static constexpr uint32_t NoGpuRecords     = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
@@ -128,6 +129,9 @@ struct BufferResource {
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
+	// Bound with a conservative record count (KYTY_GPU_SIZED_DYNAMIC): the flattened SRT dword that
+	// holds the exact count (V# dword 2); the shader bounds its accesses by it.
+	uint32_t               gpu_records_flat           = NoGpuRecords;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;

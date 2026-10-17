@@ -5,6 +5,8 @@
 #include "graphics/shader/recompiler/ir/passes/SrtNativeAsm.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <mutex>
+#include <unordered_set>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -108,12 +110,20 @@ struct SrtNativeHelpers {
 		if (static const bool debug_miss = std::getenv("KYTY_DEBUG_FILL_MISS") != nullptr;
 		    debug_miss && !SrtEvaluatingCondition() && walker.m_runtime.gpu_written != nullptr &&
 		    walker.m_runtime.gpu_written(address, sizeof(uint32_t))) {
-			static std::atomic<uint32_t> printed {0};
-			if (printed.fetch_add(1) < 24) {
-				std::fprintf(stderr, "[fill-miss-native] %016llx addr=0x%llx active=%d any=%d\n",
+			static std::mutex                   seen_mutex;
+			static std::unordered_set<uint64_t> seen;
+			bool                                first = false;
+			{
+				std::lock_guard lock(seen_mutex);
+				first = seen.size() < 2000 &&
+				        seen.insert(walker.m_program.shader_hash * 1000003u + walker.m_debug_slot).second;
+			}
+			if (first) {
+				std::fprintf(stderr, "[fill-miss-native] %016llx addr=0x%llx slot=%d active=%d any=%d\n",
 				             static_cast<unsigned long long>(walker.m_program.shader_hash),
-				             static_cast<unsigned long long>(address), walker.m_fill_active ? 1 : 0,
-				             walker.m_fill_any ? 1 : 0);
+				             static_cast<unsigned long long>(address),
+				             walker.m_debug_slot == UINT32_MAX ? -1 : static_cast<int>(walker.m_debug_slot),
+				             walker.m_fill_active ? 1 : 0, walker.m_fill_any ? 1 : 0);
 			}
 		}
 		if (walker.m_runtime.read_memory != nullptr) {

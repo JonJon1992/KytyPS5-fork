@@ -24,7 +24,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 2;
+constexpr uint32_t FormatVersion = 3;
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -96,6 +96,7 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_root);
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
+	io(v.gpu_records_flat);
 	io(v.indirect_resources);
 }
 
@@ -306,6 +307,7 @@ void Visit(Io& io, T& v) {
 	io(v.indirect_root);
 	io(v.indirect_mapping_offset);
 	io(v.indirect_search_iterations);
+	io(v.gpu_records_flat);
 }
 
 template <typename Io, typename T>
@@ -370,7 +372,7 @@ void VisitPlanFields(Io& io, T& v) {
 // After updating the Visit, update the size. ResourcePlan's covers its scratch members too.
 #if defined(_MSC_VER) && defined(_M_X64)
 static_assert(sizeof(IR::MemoryInfo) == 72);
-static_assert(sizeof(IR::BufferResource) == 72);
+static_assert(sizeof(IR::BufferResource) == 80);
 static_assert(sizeof(IR::ImageResource) == 88);
 static_assert(sizeof(IR::SamplerResource) == 24);
 static_assert(sizeof(IR::SampledResourcePair) == 12);
@@ -388,7 +390,7 @@ static_assert(sizeof(IR::SrtRead) == 24);
 static_assert(sizeof(IR::BufferWrite) == 72);
 static_assert(sizeof(IR::UniformFill) == 28);
 static_assert(sizeof(IR::UniformFillPlan) == 96);
-static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
+static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 32);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);

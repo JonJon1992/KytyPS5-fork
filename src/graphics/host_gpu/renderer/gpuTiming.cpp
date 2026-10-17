@@ -54,6 +54,7 @@ struct State {
 	std::mutex                           stats_mutex;
 	std::unordered_map<uint64_t, Stat>   stats; // key 0: GPU time between timed commands
 	double                               total_ms = 0.0;
+	std::unordered_map<uint64_t, uint32_t> lanes; // compute shader hash -> lanes per invocation
 };
 
 State& GetState() {
@@ -207,13 +208,38 @@ void Present(uint64_t frame) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
 		double                                 timed = 0.0;
 		double                                 total = 0.0;
+		// Buckets: draws, native compute, two-lane (64 on 32) compute, gaps.
+		double   bucket_ms[4] {};
+		uint64_t bucket_n[4] {};
+		std::vector<uint64_t> split_keys;
 		{
 			std::lock_guard lock(state.stats_mutex);
 			sorted.assign(state.stats.begin(), state.stats.end());
 			state.stats.clear();
 			total          = state.total_ms;
 			state.total_ms = 0.0;
+			for (const auto& [key, stat]: sorted) {
+				size_t b = 3;
+				if (key != 0) {
+					if (stat.kind == Draw) {
+						b = 0;
+					} else {
+						const auto it = state.lanes.find(key);
+						b             = it != state.lanes.end() && it->second == 2u ? 2 : 1;
+					}
+				}
+				bucket_ms[b] += stat.ms;
+				bucket_n[b] += stat.count;
+				if (b == 2) {
+					split_keys.push_back(key);
+				}
+			}
 		}
+		std::fprintf(stderr,
+		             "GpuBuckets frame %" PRIu64 ": span=%.1f draws=%.2f/%" PRIu64
+		             " cs_native=%.2f/%" PRIu64 " cs_split=%.2f/%" PRIu64 " gaps=%.2f/%" PRIu64 "\n",
+		             frame, total, bucket_ms[0], bucket_n[0], bucket_ms[1], bucket_n[1], bucket_ms[2],
+		             bucket_n[2], bucket_ms[3], bucket_n[3]);
 		std::sort(sorted.begin(), sorted.end(),
 		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
 		for (const auto& [key, stat]: sorted) {
@@ -226,14 +252,24 @@ void Present(uint64_t frame) {
 		             total, timed);
 		for (size_t i = 0; i < sorted.size() && i < 20; i++) {
 			const auto& [key, stat] = sorted[i];
+			const bool split = std::find(split_keys.begin(), split_keys.end(), key) != split_keys.end();
 			std::fprintf(stderr, "GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
-			             key == 0 ? "between " : (stat.kind == Draw ? "draw    " : "dispatch"), key,
-			             stat.ms, stat.count);
+			             key == 0 ? "between " : (stat.kind == Draw ? "draw    " : (split ? "cs_split" : "cs_nativ")),
+			             key, stat.ms, stat.count);
 		}
 		std::fflush(stderr);
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;
 	Detail::g_active.store(active, std::memory_order_relaxed);
+}
+
+void NoteComputeLanes(uint64_t hash, uint32_t lanes) {
+	if (GetWindow().count == 0) {
+		return;
+	}
+	auto&           state = GetState();
+	std::lock_guard lock(state.stats_mutex);
+	state.lanes[hash] = lanes;
 }
 
 } // namespace Libs::Graphics::GpuTiming

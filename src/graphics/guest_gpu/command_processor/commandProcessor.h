@@ -50,6 +50,10 @@ private:
 	uint32_t                  m_prep_queue    = 0;
 	uint32_t                  m_prep_ordinal  = 0;
 	const uint32_t*           m_prep_packet   = nullptr; // the last numbered packet
+	// KYTY_SRT_DEFER: the dispatch packet last suspended for SRT bytes to land, and how often.
+	const uint32_t*           m_deferred_packet = nullptr;
+	uint32_t                  m_defer_count     = 0;
+	uint64_t                  m_deferred_tick   = 0;
 };
 
 class CommandProcessor {
@@ -174,6 +178,12 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// KYTY_SRT_DEFER: around a dispatch's RenderExecutor call. EndDispatchDefer suspends the
+	// packet when its SRT refresh was deferred (PipelineCache::SrtDeferRead).
+	// BeginDispatchDefer returns true when the packet is still waiting: it is suspended again and
+	// the dispatch is not attempted.
+	[[nodiscard]] bool BeginDispatchDefer();
+	void               EndDispatchDefer();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

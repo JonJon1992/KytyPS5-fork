@@ -1042,13 +1042,22 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 	if (static const bool debug_miss = std::getenv("KYTY_DEBUG_FILL_MISS") != nullptr;
 	    debug_miss && !t_evaluating_condition && m_runtime.gpu_written != nullptr &&
 	    m_runtime.gpu_written(address, sizeof(uint32_t))) {
-		static std::atomic<uint32_t> printed {0};
-		if (printed.fetch_add(1) < 40) {
+		static std::mutex                   seen_mutex;
+		static std::unordered_set<uint64_t> seen;
+		bool                                first = false;
+		{
+			std::lock_guard lock(seen_mutex);
+			first = seen.size() < 2000 &&
+			        seen.insert(m_program.shader_hash * 1000003u + m_debug_slot).second;
+		}
+		if (first) {
 			std::fprintf(stderr,
-			             "[fill-miss] %016llx addr=0x%llx active=%d any=%d same_inst=%d fill_inst=%d "
+			             "[fill-miss] %016llx addr=0x%llx slot=%d active=%d any=%d same_inst=%d fill_inst=%d "
 			             "reading_inst=%d trace=%d cond=%d native=%d\n",
 			             static_cast<unsigned long long>(m_program.shader_hash),
-			             static_cast<unsigned long long>(address), m_fill_active ? 1 : 0,
+			             static_cast<unsigned long long>(address),
+			             m_debug_slot == UINT32_MAX ? -1 : static_cast<int>(m_debug_slot),
+			             m_fill_active ? 1 : 0,
 			             m_fill_any ? 1 : 0, m_reading_inst == m_fill_inst ? 1 : 0,
 			             m_fill_inst != nullptr ? 1 : 0, m_reading_inst != nullptr ? 1 : 0,
 			             m_trace != nullptr ? 1 : 0, t_evaluating_condition ? 1 : 0,
@@ -1267,6 +1276,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
+		m_debug_slot = slot;
 		const auto& read = m_program.srt_reads[slot];
 		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
@@ -1283,7 +1293,19 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			m_fill_any    = m_program.gpu_fill_slots[slot] == 1u;
 			m_fill_inst   = read.value.Resolve().TryInstruction();
 			const auto fills_before = m_runtime.gpu_fills->size();
-			const bool ok = Evaluate(read.value, flat[read.flat_offset]);
+			bool       ok           = false;
+			if (!m_fill_any && m_fill_inst != nullptr &&
+			    (m_fill_inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			     m_fill_inst->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+				// Its own read through the interpreter: the native tables cannot tell it from the
+				// reads of its address, so they read every one on the host and waited for the GPU
+				// when it wrote the slot's bytes (CS 2ea3957af2daf690's last slot, every frame).
+				uint64_t wide = 0;
+				ok            = EvaluateRawRead(*m_fill_inst, wide);
+				flat[read.flat_offset] = static_cast<uint32_t>(wide);
+			} else {
+				ok = Evaluate(read.value, flat[read.flat_offset]);
+			}
 			m_fill_active = false;
 			m_fill_any    = true;
 			if (m_runtime.gpu_fills->size() != fills_before && m_fill_inst != nullptr) {

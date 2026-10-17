@@ -84,6 +84,7 @@ private:
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
+		uint64_t                  srt_wait_tick     = 0; // KYTY_SRT_DEFER: run again once free
 	};
 
 	void              Enqueue(Submission submission);

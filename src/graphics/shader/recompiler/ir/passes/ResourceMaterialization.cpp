@@ -1181,6 +1181,7 @@ bool BoundableWriteOperand(const Program& program, Value value, Value predicate,
 
 namespace {
 bool GpuSizedWrittenEnabled(uint64_t shader_hash);
+bool GpuSizedDynamicEnabled();
 
 // KYTY_GPU_SIZED_ATOMIC_SHADERS=<hash>[,<hash>...] (hex): atomically updated buffers of the
 // listed shaders also bind a conservative record count when the GPU wrote theirs (with
@@ -1860,16 +1861,44 @@ uint32_t GpuSizedRecords(uint32_t dword1, bool written = false) {
 // GPU-counted keys: ~20 ms of GPU-thread wait a frame at the title menu, 2026-10-09).
 // Only for the shaders listed (KYTY_GPU_SIZED_WRITTEN_SHADERS, hex hashes, default the sort
 // above): applied to every written buffer, CS 380b6ffba703cef1's binding lost the device.
+// KYTY_GPU_SIZED_DYNAMIC=1: a buffer bound with a conservative record count (its count, V#
+// dword 2, was written by the GPU) keeps its exact bounds on the GPU: the shader reads the count
+// from the flattened SRT (the GPU fills that slot before the dispatch) and bounds its accesses by
+// it (BufferResource::gpu_records_flat). Written buffers then size without waiting too: the
+// conservative count alone let stores past the real count land (KYTY_GPU_SIZED_WRITTEN lost the
+// device), with the exact bound they are dropped as on the console. Default shaders: the two whose
+// counts made the GPU thread wait for the GPU every frame in gameplay (fb5ee753d43f3f0b, an async
+// sort, and 380b6ffba703cef1); every shader unless KYTY_GPU_SIZED_WRITTEN_SHADERS lists some.
+bool GpuSizedDynamicEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_DYNAMIC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool GpuSizedWrittenEnabled(uint64_t shader_hash) {
 	// Opt-in (KYTY_GPU_SIZED_WRITTEN=1): on by default, the title menu lost the device at ~57 s in
 	// three runs of three (a DISPATCH_INDIRECT hung, 2026-10-09); off, it did not.
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN");
-		return value != nullptr && value[0] == '1';
+		return (value != nullptr && value[0] == '1') || GpuSizedDynamicEnabled();
 	}();
+	// Dynamic bounds make the conservative count safe, so every shader by default: the GPU-thread
+	// wait otherwise moves to the next shader reading the same GPU-written counts (CS
+	// 380b6ffba703cef1 once fb5ee753d43f3f0b no longer waited, 2026-10-17).
+	static const bool all = [] {
+		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN_SHADERS");
+		return value != nullptr ? std::string_view(value) == "all" : GpuSizedDynamicEnabled();
+	}();
+	if (all) {
+		return enabled;
+	}
 	static const std::vector<uint64_t> shaders = [] {
 		const char* value = std::getenv("KYTY_GPU_SIZED_WRITTEN_SHADERS");
-		std::string list  = value != nullptr ? value : "fb5ee753d43f3f0b";
+		std::string list  = value != nullptr ? value
+		                    : GpuSizedDynamicEnabled() ? "fb5ee753d43f3f0b,2ea3957af2daf690"
+		                                               : "fb5ee753d43f3f0b";
 		std::vector<uint64_t> result;
 		size_t                at = 0;
 		while (at < list.size()) {
@@ -2014,6 +2043,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
+		// KYTY_GPU_SIZED_DYNAMIC: the flat SRT dword holding this buffer's exact record count.
+		uint32_t gpu_records_flat = BufferResource::NoGpuRecords;
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
@@ -2082,6 +2113,39 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 						}
 						ok = walker_ref.Evaluate(src.dwords[d], value.dwords[d]);
 					}
+					if (ok && sized && GpuSizedDynamicEnabled()) {
+						// The count must be one flat slot read as it is, so the shader can read
+						// it there; bounds of swizzled or lane-indexed buffers are not a plain
+						// length. Otherwise a written buffer waits for its exact count.
+						const auto* read = src.dwords[2].Resolve().TryInstruction();
+						if (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+						    ((value.dwords[1] >> 31u) & 1u) == 0u &&
+						    ((value.dwords[3] >> 23u) & 1u) == 0u) {
+							const auto slot = read->Arg(1).Resolve();
+							if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+							    slot.U32() < program.srt_reads.size()) {
+								gpu_records_flat = program.srt_reads[slot.U32()].flat_offset;
+							}
+						}
+						if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+							static std::mutex                   mutex;
+							static std::unordered_set<uint64_t> seen;
+							std::lock_guard                     lock(mutex);
+							if (seen.insert(program.shader_hash ^ (uint64_t {i} << 56u)).second) {
+								std::fprintf(stderr,
+								             "[gpu-sized-dyn] %016llx buffer %u written=%d flat=%d\n",
+								             static_cast<unsigned long long>(program.shader_hash),
+								             i, base.written ? 1 : 0,
+								             gpu_records_flat == BufferResource::NoGpuRecords
+								                 ? -1
+								                 : static_cast<int>(gpu_records_flat));
+							}
+						}
+						if (gpu_records_flat == BufferResource::NoGpuRecords && base.written) {
+							ok    = walker_ref.Evaluate(src.dwords[2], value.dwords[2]);
+							sized = false;
+						}
+					}
 					if (ok && sized) {
 						value.dwords[2] = GpuSizedRecords(value.dwords[1], base.written);
 						t_gpu_sized_snapshot = true;
@@ -2118,6 +2182,7 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		buffer.gpu_records_flat   = gpu_records_flat;
 		buffer.write_tracked      = WriteBitmapEnabled() && i < program.info.buffers.size() &&
 		                            base.written && base.image_alias == BufferResource::NoImageAlias &&
 		                            i < program.buffer_writes_bounded.size() &&
@@ -2430,6 +2495,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.gpu_records_flat           = source.gpu_records_flat;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {

@@ -529,6 +529,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
+	if (!compute_program && PipelineCache::SrtDeferPending()) {
+		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
+		ResetBindings();
+		return;
+	}
 	if (!compute_program) {
 		char groups[48];
 		std::snprintf(groups, sizeof(groups), "%ux%ux%u", thread_group_x, thread_group_y,
@@ -729,6 +734,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program && PipelineCache::SrtDeferPending()) {
+		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
+		ResetBindings();
+		return;
+	}
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
 		ResetBindings();

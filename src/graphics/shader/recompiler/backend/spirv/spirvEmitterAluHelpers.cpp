@@ -233,6 +233,16 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	// Experiment (2026-10-17): KYTY_DENORM_FLUSH=0 leaves FP32 denormals to the host instead of
+	// flushing them in software around every MAD, conversion and flushing compare (about half
+	// the instructions of the heaviest shaders).
+	static const bool software_flush = [] {
+		const char* v = std::getenv("KYTY_DENORM_FLUSH");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!software_flush) {
+		return value;
+	}
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();

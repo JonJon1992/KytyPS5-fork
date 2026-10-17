@@ -1022,6 +1022,14 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+uint64_t StartGpuBufferReadback(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return 0;
+	}
+	return GetGpuResources().GetBufferCache().StartSrtReadback(vaddr, size);
+}
+
 static thread_local bool t_gpu_read_delegate = false;
 
 bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {

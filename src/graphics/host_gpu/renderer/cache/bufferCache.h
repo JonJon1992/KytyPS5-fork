@@ -117,6 +117,10 @@ public:
 	// buffers are not page-protected, so a read there does not fault into a sync. Waits for the
 	// GPU writes to them recorded so far.
 	void WaitSharedWrites(uint64_t vaddr, uint64_t size);
+	// GPU thread (KYTY_SRT_DEFER): records and submits the download of the GPU-written bytes of
+	// [vaddr, vaddr + size) without waiting. Returns the tick to wait for (its completion and
+	// priority operations publish the bytes), or 0 when the bytes can be read now.
+	[[nodiscard]] uint64_t StartSrtReadback(uint64_t vaddr, uint64_t size);
 	// Diagnostics: the write-tracking state of the page holding vaddr.
 	[[nodiscard]] std::string DescribeWriteState(uint64_t vaddr);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest

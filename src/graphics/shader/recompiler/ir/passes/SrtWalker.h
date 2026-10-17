@@ -263,6 +263,7 @@ private:
 	// instruction) is left to the GPU; the reads that make its address are done on the host.
 	bool           m_fill_any     = true;
 	const Inst*    m_fill_inst    = nullptr;
+	uint32_t       m_debug_slot   = UINT32_MAX; // KYTY_DEBUG_FILL_MISS: the flat slot being refreshed
 	// The read instruction ReadRawWord serves (EvaluateRawRead or a replayed RawRead op).
 	const Inst*    m_reading_inst = nullptr;
 	const uint8_t* m_mapped_bytes = nullptr;
