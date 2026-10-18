@@ -137,6 +137,21 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// Diagnostics (KYTY_TRACE_GS_SLOT with KYTY_TRACE_GS_SLOT_SEQ): the last write to the traced GS
+// user-data slot on this thread. source: 0 none, 1 SET_SH_REG, 2 SET_SH_REG_INDIRECT table entry,
+// 3 other register-list write. where: the dword in the command buffer or table.
+struct GsSlotWriter {
+	uint32_t        source = 0;
+	const uint32_t* where  = nullptr;
+	uint32_t        value  = 0;
+	uint64_t        seq    = 0;
+	uint32_t        start  = 0; // SET_SH_REG: first slot and register count
+	uint32_t        count  = 0;
+};
+GsSlotWriter GetGsSlotLastWriter();
+// Lines left for the [gs-seq] trace (0 when it is off); counts one down.
+bool TakeGsSlotSeqLine();
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

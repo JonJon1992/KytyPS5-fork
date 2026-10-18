@@ -163,6 +163,14 @@ struct MapCost {
 	uint64_t backing_ns   = 0; // host mapping of the backing view
 	uint64_t steps[8] {};      // can-map, query, physical map, find, publish (to the end of the
 	                           // map), set physical type, set range type
+	uint64_t munmap_ns = 0;    // KernelMunmap, all of it
+	uint64_t munmaps   = 0;
+	uint64_t unmap_steps[6] {}; // lock wait, query, backing unmap, owner (physical/flexible/pooled)
+	                            // release, range table, free callback
+	uint64_t splits      = 0; // partial unmaps of a host view: count, bytes mapped again, time
+	uint64_t split_bytes = 0;
+	uint64_t split_ns    = 0;
+	uint64_t resync_ns   = 0; // page-tracker protection of the parts mapped again
 };
 MapCost MapCostSnapshot();
 

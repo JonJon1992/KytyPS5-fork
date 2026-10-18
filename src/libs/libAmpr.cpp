@@ -1694,13 +1694,19 @@ static void AmmDiagDone(uint64_t token) {
 	}
 }
 
+// This thread's total time in batch waits (address and counter), for the [amm-batch] report.
+static thread_local uint64_t t_wait_total_us = 0;
+static thread_local uint64_t t_wait_begin_us = 0;
+
 static void AmmDiagWaitBegin(bool counter, uint64_t target, uint64_t ref, uint32_t compare,
                              size_t maps_behind) {
+	t_wait_begin_us = AmmDiagMicros();
 	std::scoped_lock lock(g_amm_diag_mutex);
 	g_current_waits.push_back({t_ampr_engine, counter, target, ref, compare, AmmDiagMicros(), maps_behind});
 }
 
 static void AmmDiagWaitEnd() {
+	t_wait_total_us += AmmDiagMicros() - t_wait_begin_us;
 	std::scoped_lock lock(g_amm_diag_mutex);
 	for (auto it = g_current_waits.begin(); it != g_current_waits.end(); ++it) {
 		if (it->engine == t_ampr_engine) {
@@ -1820,6 +1826,7 @@ private:
 		LOGF("AMPRTRACE begin %s id=%u (%s)\n", m_name, submission.id, where);
 		const auto batch_begin   = std::chrono::steady_clock::now();
 		const auto cost_begin    = LibKernel::Memory::MapCostSnapshot();
+		const auto wait_begin_us = t_wait_total_us;
 		const auto submit_result = ExecuteCommandBufferState(submission.state, m_amm_engine,
 		                                                     &execution_result, &error_offset);
 		const auto cost_end      = LibKernel::Memory::MapCostSnapshot();
@@ -1834,6 +1841,23 @@ private:
 					unmaps += map.kind == AmmCommandKind::Unmap ? 1u : 0u;
 				}
 				const auto d = [](uint64_t a, uint64_t b) { return static_cast<double>(b - a) / 1e6; };
+				std::fprintf(stderr,
+				             "[amm-batch]   view splits %llu (%.1f MB mapped again) %.1f ms, protection resync %.1f ms\n",
+				             static_cast<unsigned long long>(cost_end.splits - cost_begin.splits),
+				             static_cast<double>(cost_end.split_bytes - cost_begin.split_bytes) / 1048576.0,
+				             d(cost_begin.split_ns, cost_end.split_ns), d(cost_begin.resync_ns, cost_end.resync_ns));
+				std::fprintf(stderr,
+				             "[amm-batch]   waits %.1f, munmap %.1f (%llu calls: lock wait %.1f, query %.1f, "
+				             "backing %.1f, owner %.1f, range table %.1f, free callback %.1f) ms\n",
+				             static_cast<double>(t_wait_total_us - wait_begin_us) / 1e3,
+				             d(cost_begin.munmap_ns, cost_end.munmap_ns),
+				             static_cast<unsigned long long>(cost_end.munmaps - cost_begin.munmaps),
+				             d(cost_begin.unmap_steps[0], cost_end.unmap_steps[0]),
+				             d(cost_begin.unmap_steps[1], cost_end.unmap_steps[1]),
+				             d(cost_begin.unmap_steps[2], cost_end.unmap_steps[2]),
+				             d(cost_begin.unmap_steps[3], cost_end.unmap_steps[3]),
+				             d(cost_begin.unmap_steps[4], cost_end.unmap_steps[4]),
+				             d(cost_begin.unmap_steps[5], cost_end.unmap_steps[5]));
 				std::fprintf(stderr,
 				             "[amm-batch]   lock wait %.1f, replace %.1f, host backing %.1f, can-map %.1f, "
 				             "query %.1f, physical map %.1f, find %.1f, publish+ %.1f, set physical type %.1f, "

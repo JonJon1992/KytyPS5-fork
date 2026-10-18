@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -52,6 +53,61 @@
 #define KYTY_CP_OP_PARSER(f) uint32_t f(KYTY_CP_OP_PARSER_ARGS)
 
 namespace Libs::Graphics {
+
+// KYTY_TRACE_GS_SLOT_SEQ=<lines>: with KYTY_TRACE_GS_SLOT, every write to that slot, zero
+// included, in command order ([gs-seq] lines), and the draws that see it (renderDraw).
+static int32_t TracedGsSlot() {
+	static const int32_t traced = [] {
+		const char* value = std::getenv("KYTY_TRACE_GS_SLOT");
+		return value != nullptr ? static_cast<int32_t>(std::strtol(value, nullptr, 10)) : -1;
+	}();
+	return traced;
+}
+static std::atomic<int64_t> g_gs_seq_lines {[] {
+	const char* value = std::getenv("KYTY_TRACE_GS_SLOT_SEQ");
+	return value != nullptr ? static_cast<int64_t>(std::strtoll(value, nullptr, 10)) : int64_t {0};
+}()};
+static thread_local GsSlotWriter    t_gs_slot_writer;
+static thread_local const uint32_t* t_sh_indirect_entry = nullptr;
+static thread_local const uint32_t* t_sh_list_entry     = nullptr;
+static std::atomic<uint64_t>        g_gs_seq_counter {0};
+
+// KYTY_TRACE_GS_SLOT_SEQ_AFTER=<seconds>: start the trace that long after the emulator started.
+static const auto g_gs_seq_start = std::chrono::steady_clock::now();
+
+bool TakeGsSlotSeqLine() {
+	if (g_gs_seq_lines.load(std::memory_order_relaxed) <= 0) {
+		return false;
+	}
+	static const auto after = [] {
+		const char* value = std::getenv("KYTY_TRACE_GS_SLOT_SEQ_AFTER");
+		return std::chrono::seconds(value != nullptr ? std::strtoll(value, nullptr, 10) : 0);
+	}();
+	if (std::chrono::steady_clock::now() - g_gs_seq_start < after) {
+		return false;
+	}
+	return g_gs_seq_lines.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+GsSlotWriter GetGsSlotLastWriter() {
+	return t_gs_slot_writer;
+}
+
+static void NoteGsSlotWrite(uint32_t source, const uint32_t* where, uint32_t value, uint32_t start = 0,
+                            uint32_t count = 0) {
+	t_gs_slot_writer = {source, where, value, g_gs_seq_counter.fetch_add(1) + 1, start, count};
+	// KYTY_TRACE_GS_SLOT_VALUE: SET_SH_REG writes are logged only with that value.
+	static const uint32_t only = [] {
+		const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+		return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0u;
+	}();
+	if ((source != 1 || only == 0 || value == only) && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr, "[gs-seq] #%llu %s value=%08x at=%p\n",
+		             static_cast<unsigned long long>(t_gs_slot_writer.seq),
+		             source == 1 ? "set" : source == 2 ? "indirect" : "list", value,
+		             static_cast<const void*>(where));
+	}
+}
 
 namespace {
 
@@ -997,7 +1053,9 @@ KYTY_HW_SH_PARSER(HwShSetRegisters) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		const auto offset = cmd_offset + i;
 		EXIT_NOT_IMPLEMENTED(offset >= Pm4::SH_NUM || g_hw_sh_indirect_func[offset] == nullptr);
+		t_sh_list_entry = &buffer[i];
 		g_hw_sh_indirect_func[offset](cp, offset, buffer[i]);
+		t_sh_list_entry = nullptr;
 	}
 
 	return reg_num;
@@ -1162,6 +1220,11 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 			             static_cast<const void*>(&buffer[static_cast<uint32_t>(traced) - slot]),
 			             words.c_str());
 		}
+	}
+	if (const auto traced = TracedGsSlot(); traced >= 0 && static_cast<uint32_t>(traced) >= slot &&
+	                                        static_cast<uint32_t>(traced) < slot + write_num) {
+		NoteGsSlotWrite(1, &buffer[static_cast<uint32_t>(traced) - slot],
+		                buffer[static_cast<uint32_t>(traced) - slot], slot, write_num);
 	}
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1684,6 +1747,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
 
+	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr, "[gs-seq] draw-indirect indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x args=%p\n",
+		             indexed ? 1 : 0, buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+		             reinterpret_cast<const void*>(static_cast<uintptr_t>(data_offset)));
+	}
 	cp.SetIndirectStartInstanceRegister(buffer[2] & 0xffffu);
 	cp.DrawIndirect(data_offset, draw_initiator, indexed);
 
@@ -1711,6 +1780,14 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 		count_addr = nullptr;
 	}
 
+	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
+		std::fprintf(stderr,
+		             "[gs-seq] draw-indirect-multi indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x draw_index_loc=0x%x "
+		             "dword3=%08x max=%u\n",
+		             indexed ? 1 : 0, buffer[1] & 0xffffu, buffer[2] & 0xffffu, draw_index_register, buffer[3],
+		             max_count_or_count);
+	}
 	cp.SetIndirectStartInstanceRegister(buffer[2] & 0xffffu);
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
 	                     draw_initiator, indexed, draw_index_register);
@@ -2124,7 +2201,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
+		t_sh_indirect_entry = indirect_buffer + 1;
 		pfunc(cp, cmd_offset, value);
+		t_sh_indirect_entry = nullptr;
 	}
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2491,7 +2570,9 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 		}
 		if (handled) {
 			for (uint32_t i = 0; i < num_values; i++) {
+				t_sh_list_entry = &buffer[1 + i];
 				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
+				t_sh_list_entry = nullptr;
 			}
 			return num_values + 1u;
 		}
@@ -3665,6 +3746,10 @@ void GraphicsInitJmpTablesShIndirect() {
 				    if (logged.fetch_add(1) < 64u) {
 					    std::fprintf(stderr, "[gs-slot] indirect slot=%u value=%08x\n", sgpr, value);
 				    }
+			    }
+			    if (TracedGsSlot() >= 0 && sgpr == static_cast<uint32_t>(TracedGsSlot())) {
+				    NoteGsSlotWrite(t_sh_indirect_entry != nullptr ? 2 : 3,
+				                    t_sh_indirect_entry != nullptr ? t_sh_indirect_entry : t_sh_list_entry, value);
 			    }
 			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);

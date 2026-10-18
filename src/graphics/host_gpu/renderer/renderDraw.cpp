@@ -1008,8 +1008,58 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 	    }();
 	    watch != 0) {
 		const auto& sh = buffer.GetShaders();
-		if (sh.GetVs().es_regs.data_addr != 0 && ShaderDeclaredHash(sh.GetVs().es_regs.data_addr) == watch) {
-			static std::atomic<uint32_t> logged {0};
+		const bool  es_match =
+		    sh.GetVs().es_regs.data_addr != 0 && ShaderDeclaredHash(sh.GetVs().es_regs.data_addr) == watch;
+		// Or the pixel shader's hash; with KYTY_TRACE_GS_SLOT_SEQ the lines come from its budget, with
+		// the last write to the traced slot this thread saw.
+		const bool ps_match =
+		    !es_match && sh.GetPs().ps_regs.data_addr != 0 && ShaderDeclaredHash(sh.GetPs().ps_regs.data_addr) == watch;
+		static std::atomic<uint32_t> logged {0};
+		if ((es_match || ps_match) && std::getenv("KYTY_TRACE_GS_SLOT_SEQ") != nullptr) {
+			// The command-buffer dwords these draws' slot came from, read again a few frames later:
+			// does the game write them after the submission was parsed?
+			struct Pending {
+				const uint32_t* where;
+				uint32_t        value;
+				uint64_t        frame;
+			};
+			static std::mutex           pending_mutex;
+			static std::vector<Pending> pending;
+			const uint64_t frame_now = buffer.GetContext().GetGpu().GetFrameNum();
+			{
+				std::lock_guard lock(pending_mutex);
+				for (auto it = pending.begin(); it != pending.end();) {
+					if (frame_now >= it->frame + 3) {
+						const uint32_t now = *it->where;
+						if (TakeGsSlotSeqLine()) {
+							std::fprintf(stderr, "[gs-seq] later at=%p parsed=%08x now=%08x (%llu frames later)%s\n",
+							             static_cast<const void*>(it->where), it->value, now,
+							             static_cast<unsigned long long>(frame_now - it->frame),
+							             now != it->value ? " CHANGED" : "");
+						}
+						it = pending.erase(it);
+					} else {
+						++it;
+					}
+				}
+				const auto w = GetGsSlotLastWriter();
+				if (w.source == 1 && w.where != nullptr && pending.size() < 256) {
+					pending.push_back({w.where, w.value, frame_now});
+				}
+			}
+			if (TakeGsSlotSeqLine()) {
+				const auto  writer = GetGsSlotLastWriter();
+				const auto& users  = sh.GetVs().gs_user_sgpr.value;
+				std::fprintf(stderr,
+				             "[gs-seq] draw frame=%llu count=%u user_sgpr=%u s36=%08x last=#%llu src=%u value=%08x"
+				             " at=%p now=%08x set=%u+%u\n",
+				             static_cast<unsigned long long>(buffer.GetContext().GetGpu().GetFrameNum()), count,
+				             static_cast<uint32_t>(sh.GetVs().gs_regs.rsrc2.user_sgpr), users[28],
+				             static_cast<unsigned long long>(writer.seq), writer.source, writer.value,
+				             static_cast<const void*>(writer.where),
+				             writer.where != nullptr ? *writer.where : 0u, writer.start, writer.count);
+			}
+		} else if (es_match || ps_match) {
 			if (logged.fetch_add(1) < 200u) {
 				const auto& users = sh.GetVs().gs_user_sgpr.value;
 				std::fprintf(stderr,
@@ -1024,6 +1074,45 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 				             count, instances, static_cast<uint32_t>(sh.GetVs().gs_regs.rsrc2.user_sgpr),
 				             users[24], users[25], users[26], users[27], users[28], users[29], users[30]);
 			}
+		}
+	}
+	// KYTY_TRACE_GS_SLOT_SEQ with KYTY_TRACE_GS_SLOT=<slot> and KYTY_TRACE_GS_SLOT_VALUE=<hex>: every
+	// draw whose GS shader reads that slot and sees that value, with the write that left it.
+	if (static const struct BadSlot {
+		    int32_t  slot  = -1;
+		    uint32_t value = 0;
+	    } bad = [] {
+		    BadSlot     b;
+		    const char* seq   = std::getenv("KYTY_TRACE_GS_SLOT_SEQ");
+		    const char* slot  = std::getenv("KYTY_TRACE_GS_SLOT");
+		    const char* value = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+		    if (seq != nullptr && slot != nullptr && value != nullptr) {
+			    b.slot  = static_cast<int32_t>(std::strtol(slot, nullptr, 10));
+			    b.value = static_cast<uint32_t>(std::strtoul(value, nullptr, 16));
+		    }
+		    return b;
+	    }();
+	    bad.slot >= 0 && bad.slot < 32) {
+		const auto& sh = buffer.GetShaders();
+		if (sh.GetVs().gs_regs.rsrc2.user_sgpr > static_cast<uint32_t>(bad.slot) &&
+		    sh.GetVs().gs_user_sgpr.value[bad.slot] == bad.value && TakeGsSlotSeqLine()) {
+			const auto writer = GetGsSlotLastWriter();
+			const auto h      = [](uint64_t addr) { return addr != 0 ? ShaderDeclaredHash(addr) : 0ull; };
+			// The command-buffer dwords after the write (the packets up to this draw).
+			std::string next;
+			if (writer.source == 1 && writer.where != nullptr) {
+				for (int i = 1; i <= 40; i++) {
+					next += fmt::format(" {:08x}", writer.where[i]);
+				}
+			}
+			std::fprintf(stderr,
+			             "[gs-seq] bad-draw frame=%llu es=%016llx ps=%016llx count=%u instances=%u last=#%llu src=%u"
+			             " value=%08x at=%p next:%s\n",
+			             static_cast<unsigned long long>(buffer.GetContext().GetGpu().GetFrameNum()),
+			             static_cast<unsigned long long>(h(sh.GetVs().es_regs.data_addr)),
+			             static_cast<unsigned long long>(h(sh.GetPs().ps_regs.data_addr)), count, instances,
+			             static_cast<unsigned long long>(writer.seq), writer.source, writer.value,
+			             static_cast<const void*>(writer.where), next.c_str());
 		}
 	}
 	// KYTY_LOG_DRAW_PAIRS=1: each new (es, gs, ps) combination once, with its first draw's shape.

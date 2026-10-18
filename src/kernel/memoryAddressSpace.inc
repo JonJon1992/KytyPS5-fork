@@ -30,9 +30,14 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 thread_local std::vector<std::pair<uint64_t, uint64_t>> g_remapped_views;
 
 static void ResyncRemappedViews() {
+	if (g_remapped_views.empty()) {
+		return;
+	}
+	const auto begin = CostNowNs();
 	for (const auto& [vaddr, size]: std::exchange(g_remapped_views, {})) {
 		ResyncGpuRangeProtection(vaddr, size);
 	}
+	t_resync_ns += CostNowNs() - begin;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -475,6 +480,18 @@ public:
 			return true;
 		}
 
+		// A partial unmap: the whole view goes, and what is left of it on each side is mapped
+		// again (MapCost::split_*).
+		const auto split_begin = CostNowNs();
+		struct SplitCost {
+			uint64_t begin;
+			uint64_t bytes;
+			~SplitCost() {
+				t_split_ns += CostNowNs() - begin;
+				t_split_bytes += bytes;
+				t_splits++;
+			}
+		} split_cost {split_begin, left_size + right_size};
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {

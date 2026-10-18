@@ -22,6 +22,7 @@
 #include <cstring>
 #include <magic_enum.hpp>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -91,6 +92,12 @@ thread_local uint64_t t_lock_wait_ns = 0, t_replace_ns = 0, t_backing_ns = 0;
 // Named steps of a direct map (MapCost::steps): can-map, query, physical map, find, publish,
 // set physical memory type, set range memory type.
 thread_local uint64_t t_step_ns[8] = {};
+// KernelMunmap (MapCost::munmap_ns, unmap_steps).
+thread_local uint64_t t_munmap_ns = 0, t_munmaps = 0;
+thread_local uint64_t t_unmap_step_ns[6] = {};
+// Partial unmaps of a Windows view (the rest of the view mapped again) and the page-tracker
+// protection resync of those remapped parts.
+thread_local uint64_t t_splits = 0, t_split_bytes = 0, t_split_ns = 0, t_resync_ns = 0;
 
 static uint64_t CostNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -104,10 +111,25 @@ struct StepCost {
 	~StepCost() { t_step_ns[step] += CostNowNs() - begin; }
 };
 
+struct UnmapStepCost {
+	int      step;
+	uint64_t begin = CostNowNs();
+	~UnmapStepCost() { t_unmap_step_ns[step] += CostNowNs() - begin; }
+};
+
 MapCost MapCostSnapshot() {
 	MapCost cost {t_gpu_map_ns, t_gpu_unmap_ns, t_gpu_unmaps, t_lock_wait_ns, t_replace_ns, t_backing_ns};
 	for (int i = 0; i < 8; i++) {
 		cost.steps[i] = t_step_ns[i];
+	}
+	cost.splits      = t_splits;
+	cost.split_bytes = t_split_bytes;
+	cost.split_ns    = t_split_ns;
+	cost.resync_ns   = t_resync_ns;
+	cost.munmap_ns = t_munmap_ns;
+	cost.munmaps   = t_munmaps;
+	for (int i = 0; i < 6; i++) {
+		cost.unmap_steps[i] = t_unmap_step_ns[i];
 	}
 	return cost;
 }
@@ -1002,6 +1024,81 @@ static void                               MemoryPoolSubtractCommitted(uint64_t l
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+// KYTY_MEMLOCK_LOG=<ms>: report holds of the memory-operation lock, and waits for it, longer than
+// that ([mem-lock] lines, the first 256), naming the function that held it.
+static uint32_t MemLockLogMs() {
+	static const uint32_t ms = [] {
+		const char* value = std::getenv("KYTY_MEMLOCK_LOG");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return ms;
+}
+static std::atomic<const char*> g_memlock_holder {nullptr};
+static std::atomic<uint64_t>    g_memlock_since_ns {0};
+static thread_local uint32_t    t_memlock_depth = 0;
+static std::atomic<uint32_t>    g_memlock_lines {0};
+
+class MemoryOperationLock {
+public:
+	explicit MemoryOperationLock(const char* where) {
+		const auto limit_ms = MemLockLogMs();
+		if (limit_ms == 0 || t_memlock_depth != 0) {
+			g_memory_operation_mutex.lock();
+			t_memlock_depth++;
+			return;
+		}
+		const auto wait_begin = CostNowNs();
+		if (!g_memory_operation_mutex.try_lock()) {
+			const char* holder       = g_memlock_holder.load(std::memory_order_relaxed);
+			const auto  holder_since = g_memlock_since_ns.load(std::memory_order_relaxed);
+			g_memory_operation_mutex.lock();
+			const auto waited = CostNowNs() - wait_begin;
+			if (waited >= uint64_t {limit_ms} * 1000000u && g_memlock_lines.fetch_add(1) < 256u) {
+				std::fprintf(stderr, "[mem-lock] %s waited %.1f ms for %s (held %.1f ms when it started waiting)\n",
+				             where, static_cast<double>(waited) / 1e6, holder != nullptr ? holder : "?",
+				             holder_since != 0 && wait_begin > holder_since
+				                 ? static_cast<double>(wait_begin - holder_since) / 1e6
+				                 : 0.0);
+			}
+		}
+		t_memlock_depth++;
+		m_where = where;
+		m_begin = CostNowNs();
+		m_splits0 = t_splits;
+		m_split_ns0 = t_split_ns;
+		m_resync_ns0 = t_resync_ns;
+		m_bytes0 = t_split_bytes;
+		g_memlock_holder.store(where, std::memory_order_relaxed);
+		g_memlock_since_ns.store(m_begin, std::memory_order_relaxed);
+	}
+	~MemoryOperationLock() {
+		if (m_where != nullptr) {
+			const auto held = CostNowNs() - m_begin;
+			g_memlock_holder.store(nullptr, std::memory_order_relaxed);
+			g_memlock_since_ns.store(0, std::memory_order_relaxed);
+			if (held >= uint64_t {MemLockLogMs()} * 1000000u && g_memlock_lines.fetch_add(1) < 256u) {
+				std::fprintf(stderr,
+				             "[mem-lock] %s held it %.1f ms (view splits %llu, %.1f MB mapped again, %.1f ms; "
+				             "protection resync %.1f ms)\n",
+				             m_where, static_cast<double>(held) / 1e6,
+				             static_cast<unsigned long long>(t_splits - m_splits0),
+				             static_cast<double>(t_split_bytes - m_bytes0) / 1048576.0,
+				             static_cast<double>(t_split_ns - m_split_ns0) / 1e6,
+				             static_cast<double>(t_resync_ns - m_resync_ns0) / 1e6);
+			}
+		}
+		t_memlock_depth--;
+		g_memory_operation_mutex.unlock();
+	}
+	MemoryOperationLock(const MemoryOperationLock&)            = delete;
+	MemoryOperationLock& operator=(const MemoryOperationLock&) = delete;
+
+private:
+	const char* m_where = nullptr;
+	uint64_t    m_begin = 0;
+	uint64_t    m_splits0 = 0, m_split_ns0 = 0, m_resync_ns0 = 0, m_bytes0 = 0;
+};
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -1434,7 +1531,7 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	EXIT_IF(g_alloc_callback != nullptr || g_free_callback != nullptr);
 	EXIT_IF(alloc_func == nullptr || free_func == nullptr);
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	g_alloc_callback = alloc_func;
 	g_free_callback  = free_func;
@@ -2648,7 +2745,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
                                                    int flags, const char* name) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
 
@@ -2781,7 +2878,7 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	const auto address = reinterpret_cast<uint64_t>(addr);
 
@@ -2859,7 +2956,7 @@ int KYTY_SYSV_ABI KernelGetPrtAperture(int index, void** addr, size_t* len) {
 int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -2886,7 +2983,7 @@ int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, cons
 int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -2912,7 +3009,7 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	}
 
 	VirtualRanges::Range range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &range)) {
+	if (UnmapStepCost cost {1}; !g_virtual_ranges->Query(vaddr, 0, &range)) {
 		return KERNEL_ERROR_EACCES;
 	}
 	const auto chunk_len = std::min<uint64_t>(len, range.size - (vaddr - range.start));
@@ -2921,9 +3018,10 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 		return ret == OK ? UnmapMemoryRange(vaddr + chunk_len, len - chunk_len) : ret;
 	}
 	if (IsReservedRangeType(range.type)) {
-		if (!g_guest_address_space->ReleaseFree(vaddr, len)) {
+		if (UnmapStepCost cost {2}; !g_guest_address_space->ReleaseFree(vaddr, len)) {
 			return KERNEL_ERROR_EACCES;
 		}
+		UnmapStepCost cost {4};
 		g_virtual_ranges->Remove(vaddr, len);
 		return OK;
 	}
@@ -2951,10 +3049,16 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 		VirtualMemory::Mode direct_mode   = VirtualMemory::Mode::NoAccess;
 		GpuAccessMode       direct_gpu    = GpuAccessMode::NoAccess;
 		const auto          direct_offset = range.offset + vaddr - range.start;
-		if (DecodeMemoryProtection(range.protection, &direct_mode, &direct_gpu) &&
-		    g_guest_address_space->BackingContains(vaddr, len) &&
-		    g_guest_address_space->UnmapBacking(vaddr, len)) {
+		bool backing_unmapped = false;
+		{
+			UnmapStepCost cost {2};
+			backing_unmapped = DecodeMemoryProtection(range.protection, &direct_mode, &direct_gpu) &&
+			                   g_guest_address_space->BackingContains(vaddr, len) &&
+			                   g_guest_address_space->UnmapBacking(vaddr, len);
+		}
+		if (backing_unmapped) {
 			uint64_t ignored_host = 0;
+			UnmapStepCost cost {3};
 			if (g_physical_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host)) {
 				owner_unmapped = true;
 			} else {
@@ -2964,16 +3068,21 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	} else if (range.type == VirtualRangeType::Stack) {
 		owner_unmapped = g_guest_address_space->ReleaseCommitted(vaddr, len);
 	} else {
-		uint64_t ignored_host = 0;
-		owner_unmapped        = g_flexible_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host);
+		uint64_t      ignored_host = 0;
+		UnmapStepCost cost {3};
+		owner_unmapped = g_flexible_memory->Unmap(vaddr, len, &gpu_mode, &ignored_host);
 	}
 	if (!owner_unmapped) {
 		return KERNEL_ERROR_EACCES;
 	}
 
-	g_virtual_ranges->Remove(vaddr, len);
+	{
+		UnmapStepCost cost {4};
+		g_virtual_ranges->Remove(vaddr, len);
+	}
 
 	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
+		UnmapStepCost cost {5};
 		g_free_callback(vaddr, len);
 	}
 	if (range.type == VirtualRangeType::Pooled) {
@@ -2986,7 +3095,19 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	const auto munmap_begin = CostNowNs();
+	struct MunmapCost {
+		uint64_t begin;
+		~MunmapCost() {
+			t_munmap_ns += CostNowNs() - begin;
+			t_munmaps++;
+		}
+	} munmap_cost {munmap_begin};
+	std::optional<MemoryOperationLock> memory_operation_lock;
+	{
+		UnmapStepCost cost {0};
+		memory_operation_lock.emplace(__func__);
+	}
 
 	LOGF("\t start = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n",
@@ -2996,7 +3117,7 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 		return KERNEL_ERROR_EINVAL;
 	}
 	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	if (UnmapStepCost cost {1}; !g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
 	UnmapGpuRange(vaddr, len);
@@ -3014,7 +3135,7 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
                                                   size_t* size_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
 	     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -3062,7 +3183,7 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
                                           int* gpu_available) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (cpu_total == nullptr || cpu_available == nullptr || gpu_total == nullptr ||
 	    gpu_available == nullptr) {
@@ -3095,7 +3216,7 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t offset    = 0x%016" PRIx64 "\n"
 	     "\t flags     = 0x%08" PRIx32 "\n"
@@ -3171,7 +3292,7 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic) {
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t search_start = 0x%016" PRIx64 "\n"
 	     "\t search_end   = 0x%016" PRIx64 "\n"
@@ -3215,7 +3336,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
                                                  int64_t* phys_addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t len          = 0x%016" PRIx64 "\n"
 	     "\t alignment    = 0x%016" PRIx64 "\n"
@@ -3227,7 +3348,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 }
 
 static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
 		if (!g_physical_memory->ReleasePoolExpansion(static_cast<uint64_t>(start), len)) {
@@ -3360,7 +3481,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
                                         int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (addr == nullptr) {
 		return KERNEL_ERROR_EFAULT;
@@ -3610,7 +3731,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 	PRINT_NAME();
 
 	const auto lock_begin = CostNowNs();
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 	t_lock_wait_ns += CostNowNs() - lock_begin;
 
 	LOGF("\t type = %d\n", type);
@@ -3630,7 +3751,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 }
 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 	constexpr uint64_t                    page_size = 0x4000;
 	if (size == 0 || (vaddr & (page_size - 1)) != 0 || (size & (page_size - 1)) != 0 ||
 	    vaddr < kExtendedMemoryBase || vaddr >= kExtendedMemoryBase + kExtendedMemorySize ||
@@ -3664,7 +3785,7 @@ int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, 
                                              const char* name) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");
 
@@ -3694,7 +3815,7 @@ int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled() {
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
 
@@ -3919,7 +4040,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	const auto in_addr = (addr != nullptr ? reinterpret_cast<uint64_t>(*addr) : 0);
 
@@ -4031,7 +4152,7 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
                                      uint64_t info_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -4084,7 +4205,7 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -4120,7 +4241,7 @@ int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (size == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -4171,7 +4292,7 @@ static std::vector<VirtualRanges::Range> RequireGuestRuntimeMemory(uint64_t vadd
 static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
                                            VirtualMemory::Mode mode, const char* name,
                                            VirtualRangeType type, bool fixed) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	constexpr uint64_t GuestPageSize = 0x4000;
 	if (size == 0 || size > UINT64_MAX - (GuestPageSize - 1u) || name == nullptr ||
@@ -4202,7 +4323,7 @@ uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	const auto ranges = RequireGuestRuntimeMemory(vaddr, size);
 	if (std::any_of(ranges.begin(), ranges.end(),
@@ -4236,7 +4357,7 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMe
 
 bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
                         VirtualMemory::Mode* old_mode) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 	constexpr uint64_t                    GuestPageSize = 0x4000;
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - (vaddr & (GuestPageSize - 1u))) {
 		return false;
@@ -4262,7 +4383,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	constexpr uint64_t GuestPageSize = 0x4000;
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - (GuestPageSize - 1u)) {
@@ -4277,7 +4398,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
@@ -4344,7 +4465,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"
 	     "\t len  = 0x%016" PRIx64 "\n"
@@ -4360,7 +4481,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
                                   int* num_entries_out, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t entries         = %p\n"
 	     "\t num_entries     = %d\n"
@@ -4383,8 +4504,73 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 
 	int processed = 0;
 
+	// KYTY_MEMLOCK_LOG=<ms>: a batch that took longer reports its operations and where the time went.
+	const auto batch_begin = CostNowNs();
+	const auto cost_begin  = MapCostSnapshot();
+	uint64_t   op_ns[5] {};
+	uint32_t   op_count[5] {};
+	uint64_t   op_bytes[5] {};
+	struct BatchReport {
+		const uint64_t& begin;
+		const MapCost&  cost0;
+		uint64_t*       ns;
+		uint32_t*       count;
+		uint64_t*       bytes;
+		~BatchReport() {
+			const auto limit = MemLockLogMs();
+			const auto total = CostNowNs() - begin;
+			static std::atomic<uint32_t> lines {0};
+			if (limit == 0 || total < uint64_t {limit} * 1000000u || lines.fetch_add(1) >= 128u) {
+				return;
+			}
+			const auto c = MapCostSnapshot();
+			const auto d = [](uint64_t a, uint64_t b) { return static_cast<double>(b - a) / 1e6; };
+			std::fprintf(stderr,
+			             "[batch-map] %.1f ms: map %u (%.1f MB) %.1f ms, unmap %u (%.1f MB) %.1f ms, protect %u %.1f "
+			             "ms, flexible %u %.1f ms, type-protect %u %.1f ms | replace %.1f, host backing %.1f, "
+			             "can-map %.1f, query %.1f, physical map %.1f, find %.1f, publish+ %.1f, gpu map %.1f, gpu "
+			             "unmap %.1f, munmap lock %.1f, munmap backing %.1f, owner %.1f, range table %.1f ms\n",
+			             static_cast<double>(total) / 1e6, count[0], static_cast<double>(bytes[0]) / 1048576.0,
+			             static_cast<double>(ns[0]) / 1e6, count[1], static_cast<double>(bytes[1]) / 1048576.0,
+			             static_cast<double>(ns[1]) / 1e6, count[2], static_cast<double>(ns[2]) / 1e6, count[3],
+			             static_cast<double>(ns[3]) / 1e6, count[4], static_cast<double>(ns[4]) / 1e6,
+			             d(cost0.replace_ns, c.replace_ns), d(cost0.backing_ns, c.backing_ns),
+			             d(cost0.steps[0], c.steps[0]), d(cost0.steps[1], c.steps[1]),
+			             d(cost0.steps[2], c.steps[2]), d(cost0.steps[3], c.steps[3]),
+			             d(cost0.steps[4], c.steps[4]), d(cost0.gpu_map_ns, c.gpu_map_ns),
+			             d(cost0.gpu_unmap_ns, c.gpu_unmap_ns), d(cost0.unmap_steps[0], c.unmap_steps[0]),
+			             d(cost0.unmap_steps[2], c.unmap_steps[2]), d(cost0.unmap_steps[3], c.unmap_steps[3]),
+			             d(cost0.unmap_steps[4], c.unmap_steps[4]));
+		}
+	} batch_report {batch_begin, cost_begin, op_ns, op_count, op_bytes};
+
+	// The GPU side of each run of unmap entries is done in one GPU-thread trip ahead of the run
+	// (PrepareGpuUnmap), instead of one trip per entry: a batch of 512 unmaps spent 46 of its 58 ms
+	// in those trips (cutscene, 2026-10-18). KYTY_BATCHMAP_GPU_UNMAP=0: one trip per entry.
+	static const bool batch_gpu_unmap = [] {
+		const char* value = std::getenv("KYTY_BATCHMAP_GPU_UNMAP");
+		return value == nullptr || value[0] != '0';
+	}();
+	std::vector<std::pair<uint64_t, uint64_t>> run_ranges;
+
 	for (int i = 0; i < num_entries; i++, processed++) {
 		auto* entry = &entries[i];
+
+		if (batch_gpu_unmap && entry->operation == MAP_OP_UNMAP &&
+		    (i == 0 || entries[i - 1].operation != MAP_OP_UNMAP)) {
+			run_ranges.clear();
+			for (int next = i; next < num_entries && entries[next].operation == MAP_OP_UNMAP; next++) {
+				const auto start = reinterpret_cast<uint64_t>(entries[next].start);
+				const auto size  = static_cast<uint64_t>(entries[next].length);
+				if (size == 0) {
+					break;
+				}
+				if (UINT64_MAX - start >= size && IsGpuAddressRange(start, size)) {
+					run_ranges.emplace_back(start, size);
+				}
+			}
+			PrepareGpuUnmap(run_ranges);
+		}
 
 		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
@@ -4397,7 +4583,15 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			break;
 		}
 
-		int result = OK;
+		int        result   = OK;
+		const auto op_begin = CostNowNs();
+		struct OpCost {
+			uint64_t begin;
+			uint64_t* ns;
+			~OpCost() { *ns += CostNowNs() - begin; }
+		} op_cost {op_begin, &op_ns[entry->operation]};
+		op_count[entry->operation]++;
+		op_bytes[entry->operation] += entry->length;
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
 				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
@@ -4461,7 +4655,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
                                          size_t alignment, int64_t* phys_addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	constexpr uint64_t POOL_PAGE_SIZE = 0x10000;
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
@@ -4499,7 +4693,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
                                           void** addr_out) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t addr_in   = 0x%016" PRIx64 "\n"
 	     "\t len       = 0x%016" PRIx64 "\n"
@@ -4545,7 +4739,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t addr  = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n"
@@ -4676,7 +4870,7 @@ static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
 int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	LOGF("\t addr  = 0x%016" PRIx64 "\n"
 	     "\t len   = 0x%016" PRIx64 "\n"
@@ -4718,7 +4912,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
                                         int* num_entries_out, int flags) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (entries == nullptr || num_entries < 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -4774,7 +4968,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
                                                 size_t                      output_size) {
 	PRINT_NAME();
 
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	MemoryOperationLock memory_operation_lock(__func__);
 
 	if (output == nullptr && output_size != 0) {
 		return KERNEL_ERROR_EFAULT;
