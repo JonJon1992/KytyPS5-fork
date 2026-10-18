@@ -16,6 +16,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <utility>
+#include <span>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -59,6 +61,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// UnmapMemory for several ranges with one GPU-thread round trip and one drain (an AMM batch
+	// remaps dozens of ranges; one round trip each made the batch take tens of milliseconds).
+	void               UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// The host protection of the range was replaced behind the page tracker
 	// (PageManager::ResyncHostProtection): the watched pages get the tracker's protection back.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {

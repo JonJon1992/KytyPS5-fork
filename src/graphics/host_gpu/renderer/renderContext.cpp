@@ -11,6 +11,8 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <mutex>
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -202,6 +204,69 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		unmap();
+		return;
+	}
+	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps (each drains the GPU) every 5 s.
+	static const bool stats = std::getenv("KYTY_FPS_LOG") != nullptr;
+	const auto        begin = std::chrono::steady_clock::now();
+	m_gpu->SendCommandSync(unmap);
+	if (stats) {
+		static std::mutex mutex;
+		static double     total_ms = 0.0, max_ms = 0.0;
+		static uint64_t   count    = 0;
+		static auto       last     = std::chrono::steady_clock::now();
+		const auto        now      = std::chrono::steady_clock::now();
+		const double      ms = std::chrono::duration<double, std::milli>(now - begin).count();
+		std::lock_guard   lock(mutex);
+		total_ms += ms;
+		max_ms = std::max(max_ms, ms);
+		count++;
+		if (now - last > std::chrono::seconds(5)) {
+			std::fprintf(stderr, "[unmap-sync] %llu GPU-thread unmaps in %.1f s: %.1f ms total, max %.1f ms\n",
+			             static_cast<unsigned long long>(count),
+			             std::chrono::duration<double>(now - last).count(), total_ms, max_ms);
+			total_ms = max_ms = 0.0;
+			count             = 0;
+			last              = now;
+		}
+	}
+}
+
+void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory unmap from an asynchronous GPU completion\n");
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> mapped;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		for (const auto& [vaddr, size]: ranges) {
+			if (GuestRange {vaddr, size}.Valid() && m_mapped_ranges.Intersects(vaddr, size)) {
+				mapped.emplace_back(vaddr, size);
+			}
+		}
+	}
+	if (mapped.empty()) {
+		return;
+	}
+	const auto unmap = [this, &mapped] {
+		if (m_command_scheduler.Active()) {
+			const auto tick = m_command_scheduler.CurrentTick();
+			m_command_scheduler.Finish();
+			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+		for (const auto& [vaddr, size]: mapped) {
+			m_buffer_cache.UnmapShared(vaddr, size);
+			m_buffer_cache.InvalidateMemory(vaddr, size);
+			m_texture_cache.UnmapMemory(vaddr, size);
+			m_bindless_table.UnwatchRange(vaddr, size);
+		}
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		for (const auto& [vaddr, size]: mapped) {
+			m_mapped_ranges.Subtract(vaddr, size);
+		}
+	};
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
 		return;

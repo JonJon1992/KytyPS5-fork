@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <condition_variable>
+#include <cinttypes>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -1616,12 +1617,146 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
                                      int32_t* execution_result, uint32_t* error_offset);
 
+// Diagnostics: AMM maps queued behind other work in their ring (not yet executed), and the
+// recently executed ones, for the report of a guest fault in extended memory.
+struct QueuedAmmMaps {
+	uint64_t                                   token     = 0;
+	uint32_t                                   priority  = 0;
+	uint64_t                                   queued_us = 0;
+	uint64_t                                   done_us   = 0;
+	const char*                                why       = "";
+	std::vector<std::pair<uint64_t, uint64_t>> ranges; // va, size
+};
+static std::mutex                g_amm_diag_mutex;
+static std::vector<QueuedAmmMaps> g_amm_queued;
+static std::deque<QueuedAmmMaps>  g_amm_done;
+static std::atomic<uint64_t>     g_amm_token {0};
+
+// The wait each ring's running batch is in now (address or counter), for the fault report.
+struct CurrentWait {
+	const char* engine   = nullptr;
+	bool        counter  = false;
+	uint64_t    target   = 0; // address or counter index
+	uint64_t    ref      = 0;
+	uint32_t    compare  = 0;
+	uint64_t    since_us = 0;
+	size_t      maps_behind_in_batch = 0;
+};
+static std::vector<CurrentWait> g_current_waits;
+thread_local const char*         t_ampr_engine = "inline";
+
+static uint64_t AmmDiagMicros() {
+	static const auto start = std::chrono::steady_clock::now();
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now() - start)
+	                                 .count());
+}
+
+static uint64_t AmmDiagQueue(const CommandBufferState& state, uint32_t priority, const char* why) {
+	if (state.amm_map_commands.empty()) {
+		return 0;
+	}
+	QueuedAmmMaps entry;
+	entry.token     = ++g_amm_token;
+	entry.priority  = priority;
+	entry.queued_us = AmmDiagMicros();
+	entry.why       = why;
+	for (const auto& map: state.amm_map_commands) {
+		entry.ranges.emplace_back(map.va, map.size);
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1) < 32) {
+		std::fprintf(stderr, "[amm-queued] p%u %zu maps first=0x%016" PRIx64 "+0x%" PRIx64 " (%s)\n",
+		             priority, entry.ranges.size(), entry.ranges.front().first,
+		             entry.ranges.front().second, why);
+	}
+	const auto token = entry.token;
+	std::scoped_lock lock(g_amm_diag_mutex);
+	g_amm_queued.push_back(std::move(entry));
+	return token;
+}
+
+static void AmmDiagDone(uint64_t token) {
+	if (token == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_amm_diag_mutex);
+	for (auto it = g_amm_queued.begin(); it != g_amm_queued.end(); ++it) {
+		if (it->token == token) {
+			it->done_us = AmmDiagMicros();
+			g_amm_done.push_back(std::move(*it));
+			if (g_amm_done.size() > 4096) {
+				g_amm_done.pop_front();
+			}
+			g_amm_queued.erase(it);
+			return;
+		}
+	}
+}
+
+static void AmmDiagWaitBegin(bool counter, uint64_t target, uint64_t ref, uint32_t compare,
+                             size_t maps_behind) {
+	std::scoped_lock lock(g_amm_diag_mutex);
+	g_current_waits.push_back({t_ampr_engine, counter, target, ref, compare, AmmDiagMicros(), maps_behind});
+}
+
+static void AmmDiagWaitEnd() {
+	std::scoped_lock lock(g_amm_diag_mutex);
+	for (auto it = g_current_waits.begin(); it != g_current_waits.end(); ++it) {
+		if (it->engine == t_ampr_engine) {
+			g_current_waits.erase(it);
+			return;
+		}
+	}
+}
+
+// Called from the unhandled-fault report (Memory::SetUnhandledFaultHook).
+static void AmmDiagDescribe(uint64_t vaddr) {
+	std::unique_lock lock(g_amm_diag_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		std::printf("AMM diagnostics: busy\n");
+		return;
+	}
+	const auto now = AmmDiagMicros();
+	for (const auto& w: g_current_waits) {
+		uint64_t observed = 0;
+		if (!w.counter) {
+			(void)AprShared::ReadGuest(w.target, &observed);
+		}
+		std::printf("ring %s waiting on %s 0x%" PRIx64 " compare=%u ref=0x%016" PRIx64
+		            " observed=0x%016" PRIx64 " for %" PRIu64 " us; %zu maps behind it in its batch\n",
+		            w.engine, w.counter ? "counter" : "address", w.target, w.compare, w.ref, observed,
+		            now - w.since_us, w.maps_behind_in_batch);
+	}
+	std::printf("AMM batches still queued: %zu\n", g_amm_queued.size());
+	for (const auto& q: g_amm_queued) {
+		for (const auto& [va, size]: q.ranges) {
+			if (vaddr >= va && vaddr - va < size) {
+				std::printf("  QUEUED map covering it: 0x%016" PRIx64 "+0x%" PRIx64
+				            " p%u queued %" PRIu64 " us ago (%s)\n",
+				            va, size, q.priority, now - q.queued_us, q.why);
+			}
+		}
+	}
+	for (const auto& q: g_amm_done) {
+		for (const auto& [va, size]: q.ranges) {
+			if (vaddr >= va && vaddr - va < size) {
+				std::printf("  queued map covering it ran: 0x%016" PRIx64 "+0x%" PRIx64
+				            " p%u queued %" PRIu64 " us ago, ran %" PRIu64 " us after queueing (%s)\n",
+				            va, size, q.priority, now - q.queued_us, q.done_us - q.queued_us, q.why);
+			}
+		}
+	}
+	std::fflush(stdout);
+}
+
 namespace {
 
 struct PendingSubmission {
 	CommandBufferState state;
 	uint32_t           id     = 0;
 	uint64_t           result = 0;
+	uint64_t           diag   = 0; // AmmDiagQueue token
 };
 
 // One in-order engine each for the asset reader and the memory mapper, as on the hardware:
@@ -1681,9 +1816,45 @@ private:
 	void Execute(const PendingSubmission& submission, const char* where) {
 		int32_t  execution_result = OK;
 		uint32_t error_offset     = 0;
+		t_ampr_engine = m_name;
 		LOGF("AMPRTRACE begin %s id=%u (%s)\n", m_name, submission.id, where);
+		const auto batch_begin   = std::chrono::steady_clock::now();
+		const auto cost_begin    = LibKernel::Memory::MapCostSnapshot();
 		const auto submit_result = ExecuteCommandBufferState(submission.state, m_amm_engine,
 		                                                     &execution_result, &error_offset);
+		const auto cost_end      = LibKernel::Memory::MapCostSnapshot();
+		if (m_amm_engine && !submission.state.amm_map_commands.empty()) {
+			const double ms = std::chrono::duration<double, std::milli>(
+			                      std::chrono::steady_clock::now() - batch_begin)
+			                      .count();
+			static std::atomic<uint32_t> logged {0};
+			if (ms >= 20.0 && logged.fetch_add(1) < 64) {
+				size_t unmaps = 0;
+				for (const auto& map: submission.state.amm_map_commands) {
+					unmaps += map.kind == AmmCommandKind::Unmap ? 1u : 0u;
+				}
+				const auto d = [](uint64_t a, uint64_t b) { return static_cast<double>(b - a) / 1e6; };
+				std::fprintf(stderr,
+				             "[amm-batch]   lock wait %.1f, replace %.1f, host backing %.1f, can-map %.1f, "
+				             "query %.1f, physical map %.1f, find %.1f, publish+ %.1f, set physical type %.1f, "
+				             "set range type %.1f ms\n",
+				             d(cost_begin.lock_wait_ns, cost_end.lock_wait_ns),
+				             d(cost_begin.replace_ns, cost_end.replace_ns),
+				             d(cost_begin.backing_ns, cost_end.backing_ns), d(cost_begin.steps[0], cost_end.steps[0]),
+				             d(cost_begin.steps[1], cost_end.steps[1]), d(cost_begin.steps[2], cost_end.steps[2]),
+				             d(cost_begin.steps[3], cost_end.steps[3]), d(cost_begin.steps[4], cost_end.steps[4]),
+				             d(cost_begin.steps[5], cost_end.steps[5]), d(cost_begin.steps[6], cost_end.steps[6]));
+				std::fprintf(stderr,
+				             "[amm-batch] %s %zu maps (%zu unmap commands) took %.1f ms (%s): GPU-side "
+				             "unmaps %.1f ms (%llu calls), GPU-side maps %.1f ms, the rest %.1f ms\n",
+				             m_name, submission.state.amm_map_commands.size(), unmaps, ms, where,
+				             static_cast<double>(cost_end.gpu_unmap_ns - cost_begin.gpu_unmap_ns) / 1e6,
+				             static_cast<unsigned long long>(cost_end.gpu_unmaps - cost_begin.gpu_unmaps),
+				             static_cast<double>(cost_end.gpu_map_ns - cost_begin.gpu_map_ns) / 1e6,
+				             ms - static_cast<double>((cost_end.gpu_unmap_ns - cost_begin.gpu_unmap_ns) +
+				                                      (cost_end.gpu_map_ns - cost_begin.gpu_map_ns)) / 1e6);
+			}
+		}
 		LOGF("AMPRTRACE end %s id=%u result=0x%08" PRIx32 "\n", m_name, submission.id,
 		     static_cast<uint32_t>(execution_result));
 		if (submit_result != OK && execution_result == OK) {
@@ -1700,6 +1871,7 @@ private:
 		if (submission.id != 0) {
 			AprShared::SetSubmissionResult(submission.id, execution_result, error_offset);
 		}
+		AmmDiagDone(submission.diag);
 	}
 
 	const char*                   m_name;
@@ -1759,9 +1931,19 @@ static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32
 	// the submitting thread when its ring is idle. Anything else keeps the ring's order.
 	auto&      engine = Engine(amm_engine, priority);
 	const auto& state = submission.state;
-	if (amm_engine && state.wait_address_commands.empty() && state.counter_commands.empty() &&
-	    state.read_file_commands.empty() && engine.TryRunInline(submission)) {
+	const bool can_inline = amm_engine && state.wait_address_commands.empty() &&
+	                        state.counter_commands.empty() && state.read_file_commands.empty();
+	if (can_inline && engine.TryRunInline(submission)) {
 		return OK;
+	}
+	if (amm_engine) {
+		submission.diag = AmmDiagQueue(state, priority,
+		                               can_inline ? "ring busy"
+		                                          : (!state.wait_address_commands.empty()
+		                                                 ? "batch waits on an address"
+		                                                 : (!state.counter_commands.empty()
+		                                                        ? "batch has counter commands"
+		                                                        : "batch reads files")));
 	}
 	engine.Enqueue(std::move(submission));
 	return OK;
@@ -1838,7 +2020,27 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 	static std::mutex g_amm_execution_mutex;
 	std::unique_lock  execution_lock(amm_engine ? g_amm_execution_mutex : g_apr_execution_mutex);
 
-	for (const auto& entry: ordered) {
+	// AMM: the GPU side of the unmaps of each run of map commands (between waits) is done once,
+	// ahead of the run. KYTY_AMM_BATCH_UNMAP=0: one GPU-thread round trip per map, as before.
+	static const bool batch_unmap = [] {
+		const char* value = std::getenv("KYTY_AMM_BATCH_UNMAP");
+		return value == nullptr || value[0] != '0';
+	}();
+	std::vector<std::pair<uint64_t, uint64_t>> run_ranges;
+	for (size_t position = 0; position < ordered.size(); position++) {
+		const auto& entry = ordered[position];
+		if (batch_unmap && amm_engine && entry.kind == CommandKind::AmmMap &&
+		    (position == 0 || ordered[position - 1].kind != CommandKind::AmmMap)) {
+			run_ranges.clear();
+			for (size_t next = position;
+			     next < ordered.size() && ordered[next].kind == CommandKind::AmmMap; next++) {
+				const auto& map = state.amm_map_commands[ordered[next].index];
+				if (ValidateAmmMapArgs(map.va, map.size)) {
+					run_ranges.emplace_back(map.va, map.size);
+				}
+			}
+			LibKernel::Memory::PrepareGpuUnmap(run_ranges);
+		}
 		switch (entry.kind) {
 			case CommandKind::ReadFile: {
 				const auto& command = state.read_file_commands[entry.index];
@@ -1902,6 +2104,11 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				Common::Timer      wait_timer;
 				wait_timer.Start();
 				execution_lock.unlock();
+				size_t maps_behind = 0;
+				for (const auto& map: state.amm_map_commands) {
+					maps_behind += map.record_offset > command.record_offset ? 1u : 0u;
+				}
+				AmmDiagWaitBegin(false, command.address, command.ref_value, command.compare, maps_behind);
 				uint64_t observed = 0;
 				for (;;) {
 					if (!AprShared::ReadGuest(command.address, &observed) || satisfied(observed) ||
@@ -1914,7 +2121,22 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 						Common::Thread::SleepMicro(WaitPollMicros);
 					}
 				}
+				AmmDiagWaitEnd();
 				execution_lock.lock();
+				// stderr: a long wait holds every batch behind it in this ring, maps included, and
+				// the game writes into memory those maps were to provide.
+				if (const double waited_ms = wait_timer.GetTimeS() * 1000.0;
+				    waited_ms >= (amm_engine ? 5.0 : 50.0)) {
+					static std::atomic<uint32_t> logged {0};
+					if (logged.fetch_add(1) < 96) {
+						std::fprintf(stderr,
+						             "[amm-wait] %s address=0x%016" PRIx64 " compare=%u ref=0x%016" PRIx64
+						             " observed=0x%016" PRIx64 " waited=%.1f ms%s\n",
+						             amm_engine ? "amm" : "apr", command.address, command.compare,
+						             command.ref_value, observed, waited_ms,
+						             satisfied(observed) ? "" : " (timed out)");
+					}
+				}
 				LOGF("AMPRTRACE wait-address address=0x%016" PRIx64 " compare=%u ref=0x%016" PRIx64
 				     " observed=0x%016" PRIx64 " waited_ms=%.1f\n",
 				     command.address, command.compare, command.ref_value, observed,
@@ -2020,8 +2242,30 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 						};
 						execution_lock.unlock();
 						{
+							size_t maps_behind = 0;
+							for (const auto& map: state.amm_map_commands) {
+								maps_behind += map.record_offset > command.record_offset ? 1u : 0u;
+							}
+							AmmDiagWaitBegin(true, command.index, command.value, command.op, maps_behind);
+							const auto       wait_begin = std::chrono::steady_clock::now();
 							std::unique_lock lock(g_counter_mutex);
 							const bool met = g_counter_cv.wait_for(lock, WaitTimeout, satisfied);
+							AmmDiagWaitEnd();
+							if (const double waited_ms = std::chrono::duration<double, std::milli>(
+							                                 std::chrono::steady_clock::now() - wait_begin)
+							                                 .count();
+							    waited_ms >= 5.0) {
+								static std::atomic<uint32_t> logged {0};
+								if (logged.fetch_add(1) < 96) {
+									std::fprintf(stderr,
+									             "[amm-wait] %s counter=%u compare=%u ref=0x%016" PRIx64
+									             " observed=0x%016" PRIx64 " waited=%.1f ms%s\n",
+									             amm_engine ? "amm" : "apr",
+									             static_cast<uint32_t>(command.index),
+									             static_cast<uint32_t>(command.op), command.value,
+									             ReadCounterLocked(access), waited_ms, met ? "" : " (timed out)");
+								}
+							}
 							LOGF("AMPRTRACE counter-wait index=%u compare=%u ref=0x%016" PRIx64
 							     " observed=0x%016" PRIx64 " met=%d\n",
 							     static_cast<uint32_t>(command.index), static_cast<uint32_t>(command.op),
@@ -3272,6 +3516,7 @@ static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) 
 } // namespace Ampr
 
 LIB_DEFINE(InitAmpr_1) {
+	LibKernel::Memory::SetUnhandledFaultHook(&Ampr::AmmDiagDescribe);
 	LIB_FUNC("8aI7R7WaOlc", Ampr::CommandBufferConstructor);
 	LIB_FUNC("a8uLzYY--tM", Ampr::AprCommandBufferConstructor);
 	LIB_FUNC("Qs1xtplKo0U", Ampr::AprCommandBufferDestructor);

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -148,6 +149,25 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // Crash diagnostics: prints the guest mapping, the host state and the recent guest mapping changes
 // at an address whose fault nothing handled.
 void DescribeUnhandledFault(uint64_t vaddr);
+// The GPU side of unmapping these ranges, all at once, ahead of the remaps that follow (an AMM
+// batch). The remaps' own unmaps then find the ranges no longer GPU-mapped and skip the GPU.
+void PrepareGpuUnmap(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+
+// Diagnostics: this thread's running totals of time in the GPU side of maps and unmaps.
+struct MapCost {
+	uint64_t gpu_map_ns   = 0;
+	uint64_t gpu_unmap_ns = 0;
+	uint64_t gpu_unmaps   = 0;
+	uint64_t lock_wait_ns = 0; // waiting for the memory-operation lock (KernelMapDirectMemory2)
+	uint64_t replace_ns   = 0; // replacing the old mapping with a reservation
+	uint64_t backing_ns   = 0; // host mapping of the backing view
+	uint64_t steps[8] {};      // can-map, query, physical map, find, publish (to the end of the
+	                           // map), set physical type, set range type
+};
+MapCost MapCostSnapshot();
+
+// Another module's part of that report (the AMM engine's queued maps).
+void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
