@@ -794,7 +794,7 @@ uint64_t BufferCache::StartSrtReadback(uint64_t vaddr, uint64_t size) {
 	}
 	const auto flushed = [this](uint64_t tick) {
 		if (tick >= m_scheduler.CurrentTick()) {
-			m_scheduler.Flush();
+			(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 		}
 		return tick;
 	};
@@ -1257,7 +1257,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			if (ReadbackRetick()) {
 				tick = m_scheduler.CurrentTick();
 			}
-			m_scheduler.Flush();
+			(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 			m_last_async_download_tick = tick;
 			{ t_rm_reason = 5; return tick; }
 		}
@@ -2318,7 +2318,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 		s_refine_waits++;
 		lock.unlock();
 		if (tick >= m_scheduler.CurrentTick()) {
-			m_scheduler.Flush();
+			(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 		}
 		wait_tick = tick;
 		return true;
@@ -2926,7 +2926,7 @@ void BufferCache::WaitSharedWrites(uint64_t vaddr, uint64_t size) {
 				continue;
 			}
 			if (tick >= m_scheduler.CurrentTick()) {
-				m_scheduler.Flush();
+				(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 			}
 			m_scheduler.Wait(tick);
 		}
@@ -2954,7 +2954,7 @@ void BufferCache::WaitSharedWrites(uint64_t vaddr, uint64_t size) {
 	}
 	KYTY_PROFILER_BLOCK("BufferCache::WaitSharedWrites");
 	if (tick >= m_scheduler.CurrentTick()) {
-		m_scheduler.Flush();
+		(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 	}
 	m_scheduler.Wait(tick);
 }
@@ -2994,7 +2994,7 @@ bool BufferCache::PeekGpuCopy(uint64_t vaddr, uint64_t size, std::vector<uint32_
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
 	                       nullptr, 1, &after, 0, nullptr);
 	const auto tick = m_scheduler.CurrentTick();
-	m_scheduler.Flush();
+	(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 	m_scheduler.Wait(tick);
 	temporary->Invalidate(0, size);
 	out.resize(static_cast<size_t>(size / 4u));
@@ -3466,7 +3466,7 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	// the GPU has reached when they have finished). A writer in the tick being recorded is
 	// submitted first; a timeline wait may precede its signal's submission.
 	if (!finished && latest_write >= m_scheduler.CurrentTick()) {
-		m_scheduler.Flush();
+		(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
 	}
 	const uint64_t reached =
 	    finished ? m_scheduler.GetMasterSemaphore().KnownGpuTick() : latest_write;

@@ -463,6 +463,7 @@ void CommandProcessor::BufferFlush() {
 	// Downloads of the windows the game threads keep reading back, behind this submission's
 	// writes, in the recording about to be submitted (BufferCache::EagerDownloads).
 	m_renderer.GetBufferCache().EagerDownloads();
+	SetSubmitReasonIfUnset("BufferFlush (other)");
 	GetScheduler().Flush();
 }
 
@@ -480,7 +481,7 @@ void CommandProcessor::CompleteDraw() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
-	GetScheduler().Finish();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Finish());
 }
 
 void CommandProcessor::ResetDeCe() {
@@ -930,7 +931,7 @@ void GuestGpu::ThreadRun(void* data) {
 					} else {
 						gpu->m_queue_mutex.Unlock();
 						if (scheduler.Active() && pending_tick >= scheduler.CurrentTick()) {
-							scheduler.Flush(); // the download is still in the open command buffer
+							(KYTY_SUBMIT_REASON(), scheduler.Flush()); // the download is still in the open command buffer
 						}
 						(void)scheduler.WaitFor(pending_tick, 2'000'000);
 						gpu->m_queue_mutex.Lock();
@@ -1053,6 +1054,28 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+bool GuestGpu::HasReadySubmission() {
+	Common::LockGuard lock(m_queue_mutex);
+	for (const auto& queue: m_queues) {
+		if (!queue.empty() && !queue.front().blocked) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_COALESCE_SUBMITS=1: a complete guest submission with another one ready behind it is not
+// submitted to the host GPU on its own; the next one records into the same command buffer (the
+// periodic draw flush still submits every 16 draws). ~108 of the ~160 submissions per frame in
+// the jungle were these, 2026-10-18.
+static bool CoalesceSubmits() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COALESCE_SUBMITS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	g_run_expected_next    = nullptr; // a run continues only within one slice of one submission
@@ -1113,7 +1136,10 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				if (!(complete && CoalesceSubmits() && HasReadySubmission())) {
+					SetSubmitReason("end of graphics submission");
+					cp.BufferFlush();
+				}
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -1142,7 +1168,10 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				cp.BufferFlush();
+				if (!(complete && CoalesceSubmits() && HasReadySubmission())) {
+					SetSubmitReason("end of compute submission");
+					cp.BufferFlush();
+				}
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -1156,6 +1185,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
+			SetSubmitReason("suspend point");
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -2505,7 +2535,7 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -2524,7 +2554,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 }
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
@@ -2549,7 +2579,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
-	GetScheduler().Flush();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -2566,11 +2596,11 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
-	GetScheduler().Flush();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Flush());
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	GetScheduler().Finish();
+	(KYTY_SUBMIT_REASON(), GetScheduler().Finish());
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

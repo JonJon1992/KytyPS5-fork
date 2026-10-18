@@ -103,7 +103,7 @@ ShaderFaultReport FaultManager::CollectFaults() {
 	ProcessFaultBufferImpl(&report);
 	// The report is owned by this stack frame; its deferred callback must finish
 	// before returning. Newly populated pages are uploaded in the next recording.
-	m_scheduler.Finish();
+	(KYTY_SUBMIT_REASON(), m_scheduler.Finish());
 	return report;
 }
 

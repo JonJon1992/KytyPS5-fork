@@ -308,6 +308,22 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
+static thread_local const char* t_submit_reason = nullptr;
+
+void SetSubmitReason(const char* reason) {
+	t_submit_reason = reason;
+}
+
+// Sets the reason unless the caller already named one.
+void SetSubmitReasonIfUnset(const char* reason) {
+	if (t_submit_reason == nullptr) {
+		t_submit_reason = reason;
+	}
+}
+static void DefaultSubmitReason(const char* reason) {
+	SetSubmitReasonIfUnset(reason);
+}
+
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
@@ -319,6 +335,7 @@ void CommandScheduler::CompleteReleaseMemWrite() {
 		return;
 	}
 	CheckActive();
+	DefaultSubmitReason("eop writes");
 	Flush();
 }
 
@@ -334,6 +351,7 @@ void CommandScheduler::CompleteReleaseMemInterrupt() {
 		return;
 	}
 	CheckActive();
+	DefaultSubmitReason("eop interrupts");
 	Flush();
 }
 
@@ -343,6 +361,7 @@ void CommandScheduler::CompleteDraw() {
 		return;
 	}
 	CheckActive();
+	DefaultSubmitReason("draw interval");
 	Flush();
 }
 
@@ -353,6 +372,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::FlushAndWait() {
 	KYTY_PROFILER_FUNCTION();
+	DefaultSubmitReason("flush and wait");
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
@@ -362,6 +382,7 @@ void CommandScheduler::Finish() {
 	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
+		DefaultSubmitReason("finish");
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
@@ -440,6 +461,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 					std::fflush(stderr);
 				}
 			}
+			DefaultSubmitReason("wait for the open tick");
 			const auto submitted_tick = Submit();
 			EXIT_IF(submitted_tick != tick);
 			Timeline::Mark("drain-begin", tick);
@@ -630,6 +652,60 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
 	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
+	// KYTY_SUBMIT_STACKS=1: a host stack for every 97th submission (up to 40), to name what splits
+	// the frame into so many submissions. KYTY_FPS_LOG: submissions per second every 5 s.
+	if (static const bool stacks = std::getenv("KYTY_SUBMIT_STACKS") != nullptr; stacks) {
+		static std::atomic<uint32_t> submits {0};
+		const auto                   n = submits.fetch_add(1);
+		if (n % 97 == 0 && n / 97 < 40) {
+			std::fprintf(stderr, "[submit-stack] #%u\n%s\n", n, Common::HostBacktrace().c_str());
+			std::fflush(stderr);
+		}
+	}
+	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
+		static std::atomic<uint64_t> count {0};
+		static std::atomic<int64_t>  window_start {0};
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto start = window_start.load(std::memory_order_relaxed);
+		if (start == 0) {
+			window_start.compare_exchange_strong(start, now);
+			start = now;
+		}
+		const auto n = count.fetch_add(1) + 1;
+		static std::mutex                                  reasons_mutex;
+		static std::vector<std::pair<const char*, uint64_t>> reasons;
+		{
+			std::lock_guard lock(reasons_mutex);
+			const char*     reason = t_submit_reason != nullptr ? t_submit_reason : "untagged";
+			auto it = std::find_if(reasons.begin(), reasons.end(), [reason](const auto& r) { return r.first == reason; });
+			if (it == reasons.end()) {
+				reasons.emplace_back(reason, 1);
+			} else {
+				it->second++;
+			}
+		}
+		if (now - start >= 5000 && window_start.compare_exchange_strong(start, now)) {
+			count.store(0);
+			std::string text;
+			{
+				std::lock_guard lock(reasons_mutex);
+				std::sort(reasons.begin(), reasons.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+				for (const auto& [reason, k]: reasons) {
+					const char* base = std::strrchr(reason, '/');
+					const char* base2 = std::strrchr(reason, '\\');
+					base = base2 != nullptr && (base == nullptr || base2 > base) ? base2 : base;
+					text += fmt::format(" {}={:.0f}", base != nullptr ? base + 1 : reason,
+					                    static_cast<double>(k) * 1000.0 / static_cast<double>(now - start));
+				}
+				reasons.clear();
+			}
+			std::fprintf(stderr, "[submits] %.0f per second:%s\n",
+			             static_cast<double>(n) * 1000.0 / static_cast<double>(now - start), text.c_str());
+		}
+	}
+	t_submit_reason = nullptr;
 
 	SubmitJob job {
 	    .buffer       = m_command.m_buffer,

@@ -94,6 +94,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// A submission waits in a queue and is not blocked (KYTY_COALESCE_SUBMITS).
+	bool              HasReadySubmission();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 

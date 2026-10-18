@@ -257,4 +257,13 @@ private:
 
 } // namespace Libs::Graphics
 
+namespace Libs::Graphics {
+// Diagnostics (KYTY_FPS_LOG): what the next submission on this thread is for, counted by Submit().
+void SetSubmitReason(const char* reason);
+void SetSubmitReasonIfUnset(const char* reason);
+} // namespace Libs::Graphics
+#define KYTY_SUBMIT_REASON_STR2(x) #x
+#define KYTY_SUBMIT_REASON_STR(x)  KYTY_SUBMIT_REASON_STR2(x)
+#define KYTY_SUBMIT_REASON()       ::Libs::Graphics::SetSubmitReason(__FILE__ ":" KYTY_SUBMIT_REASON_STR(__LINE__))
+
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_

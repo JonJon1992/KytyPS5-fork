@@ -85,7 +85,7 @@ void RenderContext::ShutdownGpu() {
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
-			m_command_scheduler.Finish();
+			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 		}
 		m_command_scheduler.DrainPriorityOperations();
 		m_video_out = nullptr;
@@ -192,7 +192,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
+			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		m_buffer_cache.UnmapShared(vaddr, size);
@@ -253,7 +253,7 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 	const auto unmap = [this, &mapped] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
+			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		for (const auto& [vaddr, size]: mapped) {

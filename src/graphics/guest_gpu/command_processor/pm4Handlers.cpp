@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -2453,6 +2454,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
 			// behind a batching window.
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
+			SetSubmitReason("release-mem with interrupt");
 			cp.BufferFlush();
 		}
 
@@ -2473,6 +2475,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
+			SetSubmitReason("release-mem timestamp with interrupt");
 			cp.BufferFlush();
 		}
 

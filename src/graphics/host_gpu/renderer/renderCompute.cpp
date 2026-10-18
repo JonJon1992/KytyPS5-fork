@@ -174,7 +174,7 @@ public:
 		policy.Count(false);
 		// Reports from earlier work cannot be attributed to this transaction.
 		cache.ProcessFaultBuffer();
-		scheduler.Finish();
+		(KYTY_SUBMIT_REASON(), scheduler.Finish());
 		RangeSet ranges;
 		for (size_t i = 0; i < program.info.buffers.size(); ++i) {
 			const auto& source = bindings.buffer_sources[i];
