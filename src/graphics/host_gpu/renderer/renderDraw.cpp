@@ -1000,6 +1000,32 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 			std::fflush(stderr);
 		}
 	}
+	// KYTY_LOG_GS_SLOTS=<es hash>: each draw of that ES/VS shader with its pixel shader and GS
+	// user-data slots 24..30 as the context holds them at the draw (first 200 draws).
+	if (static const uint64_t watch = [] {
+		    const char* value = std::getenv("KYTY_LOG_GS_SLOTS");
+		    return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	    }();
+	    watch != 0) {
+		const auto& sh = buffer.GetShaders();
+		if (sh.GetVs().es_regs.data_addr != 0 && ShaderDeclaredHash(sh.GetVs().es_regs.data_addr) == watch) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 200u) {
+				const auto& users = sh.GetVs().gs_user_sgpr.value;
+				std::fprintf(stderr,
+				             "[gs-slots] frame=%llu ps=%016llx count=%u instances=%u user_sgpr=%u"
+				             " s32..s38: %08x %08x %08x %08x %08x %08x %08x\n",
+				             static_cast<unsigned long long>(
+				                 buffer.GetContext().GetGpu().GetFrameNum()),
+				             static_cast<unsigned long long>(
+				                 sh.GetPs().ps_regs.data_addr != 0
+				                     ? ShaderDeclaredHash(sh.GetPs().ps_regs.data_addr)
+				                     : 0ull),
+				             count, instances, static_cast<uint32_t>(sh.GetVs().gs_regs.rsrc2.user_sgpr),
+				             users[24], users[25], users[26], users[27], users[28], users[29], users[30]);
+			}
+		}
+	}
 	// KYTY_LOG_DRAW_PAIRS=1: each new (es, gs, ps) combination once, with its first draw's shape.
 	if (static const bool log_pairs = std::getenv("KYTY_LOG_DRAW_PAIRS") != nullptr; log_pairs) {
 		static std::mutex                   pairs_mutex;
@@ -1038,6 +1064,16 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 				             bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
 				             bc.separate_alpha_blend ? 1 : 0, bc.alpha_srcblend, bc.alpha_destblend,
 				             bc.alpha_comb_fcn);
+			}
+			{
+				const auto& vs = sh.GetVs();
+				std::string users;
+				for (uint32_t i = 0; i < HW::UserSgprInfo::SGPRS_MAX; i++) {
+					users += fmt::format(" {:08x}", vs.gs_user_sgpr.value[i]);
+				}
+				std::fprintf(stderr, "[draw-pair]   gs user_sgpr=%u written=%u:%s\n",
+				             static_cast<uint32_t>(vs.gs_regs.rsrc2.user_sgpr), vs.gs_user_sgpr.count,
+				             users.c_str());
 			}
 			const auto& dc = regs.GetDepthControl();
 			std::fprintf(stderr, "[draw-pair]   depth z=%d zw=%d zfunc=%u\n", dc.z_enable ? 1 : 0,

@@ -243,6 +243,18 @@ uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
 
+// Diagnostics: KYTY_PROBE_RECT is set and KYTY_PROBE_PC names this non-pixel shader, so it
+// appends its probed values to the bindless feedback buffer (EmitProbeAppend).
+inline bool ProbeAppendWanted(const EmitterState& state) {
+	static const uint64_t hash = [] {
+		const char* probe = std::getenv("KYTY_PROBE_PC");
+		return probe != nullptr && std::getenv("KYTY_PROBE_RECT") != nullptr
+		           ? std::strtoull(probe, nullptr, 16)
+		           : 0ull;
+	}();
+	return hash != 0 && hash == state.program.shader_hash && state.program.stage != ShaderType::Pixel;
+}
+
 // A bindless sampled 3D image: its key may name a 2D or 2D-array texture instead.
 inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
 	return image.bindless && !image.cube && image.resource_class == IR::ImageResourceClass::Sampled &&

@@ -570,6 +570,40 @@ static void EmitProbeRectStore(EmitterState& state, uint32_t value) {
 	});
 }
 
+// Diagnostics: with KYTY_PROBE_RECT set, a probed shader of another stage appends its parameter-0
+// export (the probed registers, Attribute.cpp) per vertex: an atomic counter at
+// BindlessCaptureProbe, then records of 4 words (0x80000000 | sequence, three value bits).
+static void EmitProbeAppend(EmitterState& state, uint32_t data) {
+	const auto pointer = [&](uint32_t index) {
+		const auto element = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          element, state.bindless_feedback_variable, ConstantU32(state, 0),
+		                          index);
+		return element;
+	};
+	const auto sequence = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), sequence,
+	                          pointer(ConstantU32(state, IR::BindlessCaptureProbe)),
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
+	constexpr uint32_t Records = (IR::BindlessCaptureProbeWords - 4u) / 4u;
+	const auto slot = Binary(state, spv::OpUMod, TypeU32(state), sequence, ConstantU32(state, Records));
+	const auto base = Binary(state, spv::OpIAdd, TypeU32(state),
+	                         Binary(state, spv::OpIMul, TypeU32(state), slot, ConstantU32(state, 4u)),
+	                         ConstantU32(state, IR::BindlessCaptureProbe + 4u));
+	const auto Store = [&](uint32_t word, uint32_t value) {
+		state.builder.AddFunction(
+		    spv::OpStore,
+		    pointer(Binary(state, spv::OpIAdd, TypeU32(state), base, ConstantU32(state, word))), value);
+	};
+	Store(0, Binary(state, spv::OpBitwiseOr, TypeU32(state), sequence, ConstantU32(state, 0x80000000u)));
+	for (uint32_t component = 0; component < 3u; component++) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data, component);
+		Store(1u + component, value);
+	}
+}
+
 void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -591,6 +625,10 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	EmitIfCondition(state, exec, [&]() {
 		const auto data = ctx.Arg(inst, 0);
+		if (state.program.stage != ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Parameter &&
+		    exp.index == 0 && ProbeAppendWanted(state) && state.bindless_feedback_variable != 0) {
+			EmitProbeAppend(state, data);
+		}
 		if (exp.kind == IR::ExportTargetKind::Primitive) {
 			if (state.program.stage == ShaderType::Mesh) {
 				state.builder.AddFunction(spv::OpStore, MeshPrimitivePointer(state),

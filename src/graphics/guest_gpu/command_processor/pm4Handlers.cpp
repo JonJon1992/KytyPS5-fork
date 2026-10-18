@@ -1139,6 +1139,30 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
+	// KYTY_TRACE_GS_SLOT=<slot>: SET_SH_REG writes that cover that GS user-data slot.
+	if (static const int32_t traced = [] {
+		    const char* value = std::getenv("KYTY_TRACE_GS_SLOT");
+		    return value != nullptr ? static_cast<int32_t>(std::strtol(value, nullptr, 10)) : -1;
+	    }();
+	    traced >= 0 && static_cast<uint32_t>(traced) >= slot &&
+	    static_cast<uint32_t>(traced) < slot + write_num) {
+		static std::atomic<uint32_t> logged {0};
+		const auto value = buffer[static_cast<uint32_t>(traced) - slot];
+		static const uint32_t only = [] {
+			const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+			return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 16)) : 0u;
+		}();
+		if (value != 0 && (only == 0 || value == only) && logged.fetch_add(1) < 64u) {
+			std::string words;
+			for (uint32_t i = 0; i < write_num; i++) {
+				words += fmt::format(" {:08x}", buffer[i]);
+			}
+			std::fprintf(stderr, "[gs-slot] set_sh_reg slot=%u count=%u value=%08x at=%p:%s\n", slot,
+			             write_num, value,
+			             static_cast<const void*>(&buffer[static_cast<uint32_t>(traced) - slot]),
+			             words.c_str());
+		}
+	}
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
@@ -1612,6 +1636,16 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		uint32_t max_instance_count = buffer[3];
 		uint32_t instance_count     = buffer[6];
 		uint32_t flags              = buffer[7];
+		// KYTY_LOG_DRAW_INDEX_MULTI=1: the packet's dwords, to learn its unparsed fields.
+		if (static const bool log = std::getenv("KYTY_LOG_DRAW_INDEX_MULTI") != nullptr; log) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 64u) {
+				std::fprintf(stderr,
+				             "[draw-index-multi] %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				             buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5],
+				             buffer[6], buffer[7]);
+			}
+		}
 
 		EXIT_NOT_IMPLEMENTED(instance_count > max_instance_count);
 		EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
@@ -3618,6 +3652,20 @@ void GraphicsInitJmpTablesShIndirect() {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
 			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
+			    if (static const int32_t traced = [] {
+				        const char* env = std::getenv("KYTY_TRACE_GS_SLOT");
+				        return env != nullptr ? static_cast<int32_t>(std::strtol(env, nullptr, 10)) : -1;
+			        }();
+			        traced >= 0 && sgpr == static_cast<uint32_t>(traced) && value != 0 &&
+			        [&] {
+				        const char* env = std::getenv("KYTY_TRACE_GS_SLOT_VALUE");
+				        return env == nullptr || std::strtoul(env, nullptr, 16) == value;
+			        }()) {
+				    static std::atomic<uint32_t> logged {0};
+				    if (logged.fetch_add(1) < 64u) {
+					    std::fprintf(stderr, "[gs-slot] indirect slot=%u value=%08x\n", sgpr, value);
+				    }
+			    }
 			    cp.GetShCtx().SetGsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };

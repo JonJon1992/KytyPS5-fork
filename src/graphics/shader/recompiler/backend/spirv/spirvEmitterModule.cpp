@@ -312,7 +312,8 @@ void DefineBindlessImages(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireVersion(0x00010500u);
 	}
-	if (!state.bindless_image_variables.empty() && state.bindless_translation_variable == 0) {
+	if ((!state.bindless_image_variables.empty() || ProbeAppendWanted(state)) &&
+	    state.bindless_translation_variable == 0) {
 		const auto variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
 		    spv::StorageClassStorageBuffer);

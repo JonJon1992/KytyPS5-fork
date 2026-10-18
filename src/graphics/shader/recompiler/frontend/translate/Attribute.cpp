@@ -210,8 +210,11 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 		components[forced.component] = IR::Value(forced.value);
 	}
 	const auto& probe = ProbePcSetting();
+	// Pixel shaders export the probed registers as MRT0; other stages as parameter 0 (the host
+	// reads them back with KYTY_PROBE_RECT, which appends each vertex's values).
 	const bool  probed = probe.hash != 0 && probe.hash == program.shader_hash &&
-	                    program.stage == ShaderType::Pixel && inst.exp.target == 0u;
+	                    (program.stage == ShaderType::Pixel ? inst.exp.target == 0u
+	                                                        : inst.exp.target == 0x20u);
 	if (probed) {
 		for (uint32_t i = 0; i < 3u; i++) {
 			Decoder::Operand source;
@@ -219,7 +222,7 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 			source.reg    = ProbeVgpr + i;
 			components[i] = ReadRawU32(source);
 		}
-		components[3] = IR::Value(0x3f800000u);
+		components[3] = IR::Value(program.stage == ShaderType::Pixel ? 0x3f800000u : 0u);
 	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});

@@ -2804,6 +2804,49 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	// Diagnostics: KYTY_LOG_SHADER_DATA=<hash>: that shader's user-data registers and the values
+	// its shader data carries for them, for the first 8 preparations.
+	if (static const std::string log_hashes = [] {
+		    const char* value = std::getenv("KYTY_LOG_SHADER_DATA");
+		    return value != nullptr ? std::string(value) : std::string();
+	    }();
+	    !log_hashes.empty() &&
+	    log_hashes.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+		static std::mutex                      layouts_mutex;
+		static std::unordered_set<std::string> layouts;
+		std::string layout_key = fmt::format("{:x}/{}/{}:", reinterpret_cast<uintptr_t>(&program),
+		                                     program.bindings.ShaderDataDwords(),
+		                                     program.bindings.push_data_start_dword);
+		for (const auto reg: program.bindings.user_data_registers) {
+			layout_key += fmt::format(" {}", reg);
+		}
+		bool fresh = false;
+		{
+			std::lock_guard lock(layouts_mutex);
+			fresh = layouts.size() < 64 && layouts.insert(layout_key).second;
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (fresh || logged.fetch_add(1) < 4u) {
+			std::string line = " program=" + layout_key;
+			for (size_t i = 0; i < program.bindings.user_data_registers.size(); i++) {
+				line += fmt::format(" s{}={:08x}", program.bindings.user_data_registers[i],
+				                    prepared.shader_data[i]);
+			}
+			std::string raw;
+			for (size_t k = 0; k < snapshot.user_data.size(); k++) {
+				raw += fmt::format(" {:08x}", snapshot.user_data[k]);
+			}
+			std::fprintf(stderr,
+			             "[shader-data] %016llx stage=%u vertex_offset_sgpr=%d instance_offset_sgpr=%d "
+			             "push_start=%u dwords=%u base=%u count=%u:%s | user_data(%zu):%s\n",
+			             static_cast<unsigned long long>(program.shader_hash),
+			             program.info.vertex_offset_sgpr, program.info.instance_offset_sgpr,
+			             static_cast<uint32_t>(program.stage), program.bindings.push_data_start_dword,
+			             program.bindings.ShaderDataDwords(), program.user_data_base,
+			             program.user_data_count, line.c_str(), snapshot.user_data.size(), raw.c_str());
+			std::fflush(stderr);
+		}
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -3005,6 +3048,33 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		// KYTY_LOG_SHADER_DATA: what is uploaded, for each new first dword.
+		if (static const std::string log_hashes = [] {
+			    const char* value = std::getenv("KYTY_LOG_SHADER_DATA");
+			    return value != nullptr ? std::string(value) : std::string();
+		    }();
+		    !log_hashes.empty() &&
+		    log_hashes.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos) {
+			static std::mutex                   first_mutex;
+			static std::unordered_set<uint32_t> firsts;
+			bool fresh = false;
+			{
+				std::lock_guard lock(first_mutex);
+				fresh = firsts.size() < 32 && firsts.insert(prepared.shader_data[0]).second;
+			}
+			if (fresh) {
+				std::string line;
+				for (size_t i = 0; i < prepared.shader_data.size() && i < 8; i++) {
+					line += fmt::format(" {:08x}", prepared.shader_data[i]);
+				}
+				std::fprintf(stderr, "[shader-data-upload] %016llx offset=0x%llx size=%llu:%s\n",
+				             static_cast<unsigned long long>(program.shader_hash),
+				             static_cast<unsigned long long>(prepared.shader_data_buffer.offset),
+				             static_cast<unsigned long long>(prepared.shader_data_buffer.range),
+				             line.c_str());
+				std::fflush(stderr);
+			}
+		}
 	}
 }
 
