@@ -28,6 +28,10 @@ inline constexpr uint32_t BindlessSlotFlagMask   = 0xc0000000u;
 // word BindlessCaptureImages + (key & 0xffff) and every sampler key in BindlessCaptureSamplers +
 // (key & 0xffff); the host prints them ([key-capture]). Above any heap region.
 inline constexpr uint32_t BindlessCaptureImages   = 0xe0000u;
+// Diagnostics (KYTY_PROBE_RECT with KYTY_PROBE_PC): the probed pixel shader's MRT0 export per
+// pixel of a screen rectangle, 4 words each (x | y << 16, then three value bits); 16384 pixels.
+inline constexpr uint32_t BindlessCaptureProbe    = 0xd0000u;
+inline constexpr uint32_t BindlessCaptureProbeWords = 0x10000u;
 inline constexpr uint32_t BindlessCaptureSamplers = 0xf0000u;
 // The S# a sampler without a usable heap entry gets: wrap on every axis, trilinear, full LOD range.
 inline constexpr std::array<uint32_t, 4> BindlessDefaultSampler {

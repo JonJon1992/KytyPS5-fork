@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
@@ -473,6 +474,102 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+// Diagnostics: KYTY_PROBE_RECT=<x>,<y>,<w>,<h> (w * h <= 16384) with KYTY_PROBE_PC=<hash>@...: that
+// pixel shader stores its float MRT0 export (the probed registers) for each pixel of the screen
+// rectangle in the bindless feedback buffer (BindlessCaptureProbe); the host writes it to
+// KYTY_PROBE_RECT_FILE. Numbers, where the on-screen probe only shows post-processed colours.
+static void EmitProbeRectStore(EmitterState& state, uint32_t value) {
+	struct Rect {
+		uint64_t hash = 0;
+		uint32_t x = 0, y = 0, w = 0, h = 0;
+	};
+	static const Rect rect = [] {
+		Rect        result;
+		const char* probe = std::getenv("KYTY_PROBE_PC");
+		const char* value = std::getenv("KYTY_PROBE_RECT");
+		if (probe == nullptr || value == nullptr) {
+			return result;
+		}
+		result.hash = std::strtoull(probe, nullptr, 16);
+		uint32_t numbers[4] {};
+		char*    cursor = const_cast<char*>(value);
+		for (auto& number: numbers) {
+			number = static_cast<uint32_t>(std::strtoul(cursor, &cursor, 10));
+			if (*cursor == ',') {
+				cursor++;
+			}
+		}
+		result.x = numbers[0];
+		result.y = numbers[1];
+		result.w = numbers[2];
+		result.h = numbers[3];
+		if (result.w == 0u || result.h == 0u ||
+		    result.w * result.h * 4u > IR::BindlessCaptureProbeWords) {
+			result.hash = 0;
+		}
+		return result;
+	}();
+	if (rect.hash == 0 || rect.hash != state.program.shader_hash ||
+	    state.program.stage != ShaderType::Pixel || state.bindless_feedback_variable == 0) {
+		return;
+	}
+	const auto frag = InputVariableForKind(state, IR::StageInputKind::FragCoord);
+	if (frag == 0) {
+		std::fprintf(stderr, "[probe-rect] %016llx has no FragCoord input; nothing stored\n",
+		             static_cast<unsigned long long>(state.program.shader_hash));
+		return;
+	}
+	const auto Coordinate = [&](uint32_t component, uint32_t origin) {
+		const auto pointer = state.builder.AllocateId();
+		const auto f32     = state.builder.AllocateId();
+		const auto u32     = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, frag, ConstantU32(state, component));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), f32, pointer);
+		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), u32, f32);
+		return std::pair {u32, Binary(state, spv::OpISub, TypeU32(state), u32,
+		                              ConstantU32(state, origin))};
+	};
+	const auto [x, dx] = Coordinate(0, rect.x);
+	const auto [y, dy] = Coordinate(1, rect.y);
+	const auto inside  = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	                            Binary(state, spv::OpULessThan, TypeBool(state), dx,
+	                                   ConstantU32(state, rect.w)),
+	                            Binary(state, spv::OpULessThan, TypeBool(state), dy,
+	                                   ConstantU32(state, rect.h)));
+	EmitIfCondition(state, inside, [&]() {
+		const auto index = Binary(state, spv::OpIAdd, TypeU32(state),
+		                          Binary(state, spv::OpIMul, TypeU32(state), dy,
+		                                 ConstantU32(state, rect.w)),
+		                          dx);
+		const auto base  = Binary(state, spv::OpIAdd, TypeU32(state),
+		                          Binary(state, spv::OpIMul, TypeU32(state), index,
+		                                 ConstantU32(state, 4u)),
+		                          ConstantU32(state, IR::BindlessCaptureProbe));
+		const auto Store = [&](uint32_t word, uint32_t bits) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.bindless_feedback_variable,
+			                          ConstantU32(state, 0),
+			                          Binary(state, spv::OpIAdd, TypeU32(state), base,
+			                                 ConstantU32(state, word)));
+			state.builder.AddFunction(spv::OpStore, pointer, bits);
+		};
+		Store(0, Binary(state, spv::OpBitwiseOr, TypeU32(state), x,
+		                Binary(state, spv::OpShiftLeftLogical, TypeU32(state), y,
+		                       ConstantU32(state, 16u))));
+		for (uint32_t component = 0; component < 3u; component++) {
+			const auto f32  = state.builder.AllocateId();
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), f32, value,
+			                          component);
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
+			Store(1u + component, bits);
+		}
+	});
+}
+
 void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -539,6 +636,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         : sint_output ? TypeI32Vector(state, 4)
 		                                       : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output || sint_output);
+		if (mrt && exp.index == 0 && !uint_output && !sint_output) {
+			EmitProbeRectStore(state, value);
+		}
 		// KYTY_DEBUG_MAGENTA_PS=<hash>: that pixel shader's float MRT0 export becomes magenta,
 		// to see where its draws land (diagnostic).
 		if (static const std::string magenta = [] {

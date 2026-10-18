@@ -783,7 +783,8 @@ void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot
 
 void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	// Regions are allocated contiguously after word 0, so one copy covers every heap.
-	static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr;
+	static const bool capture =
+	    std::getenv("KYTY_KEY_CAPTURE") != nullptr || std::getenv("KYTY_PROBE_RECT") != nullptr;
 	const vk::DeviceSize size = vk::DeviceSize {capture ? TranslationEntries : m_next_region} *
 	                            sizeof(uint32_t);
 	scheduler.EndRendering();
@@ -852,6 +853,12 @@ void BindlessTable::TakeCapture(uint32_t first, uint32_t count,
 	if (cleared) {
 		m_feedback->Flush(first * sizeof(uint32_t), count * sizeof(uint32_t));
 	}
+}
+
+void BindlessTable::ReadSnapshot(uint32_t first, uint32_t count, std::vector<uint32_t>& words) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	m_feedback_snapshot->Invalidate(first * sizeof(uint32_t), count * sizeof(uint32_t));
+	words.assign(snapshot + first, snapshot + first + count);
 }
 
 uint32_t BindlessTable::TakeWordZero() {

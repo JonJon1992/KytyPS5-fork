@@ -1996,6 +1996,21 @@ void RenderExecutor::ResolveBindlessRequests() {
 			     word0 & 0x7fffffffu, word0);
 		}
 	}
+	// Diagnostics: KYTY_PROBE_RECT_FILE=<path> (with KYTY_PROBE_RECT): the probed pixels' values
+	// (BindlessCaptureProbe), rewritten every 30th snapshot.
+	if (static const char* probe_file = std::getenv("KYTY_PROBE_RECT_FILE"); probe_file != nullptr) {
+		static uint32_t probe_rounds = 0;
+		if (++probe_rounds % 30u == 0u) {
+			std::vector<uint32_t> words;
+			m_context.GetBindlessTable().ReadSnapshot(ShaderRecompiler::IR::BindlessCaptureProbe,
+			                                          ShaderRecompiler::IR::BindlessCaptureProbeWords,
+			                                          words);
+			if (FILE* file = std::fopen(probe_file, "wb"); file != nullptr) {
+				std::fwrite(words.data(), sizeof(uint32_t), words.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the image and sampler keys that shader sampled since the
 	// last print, every 60th snapshot, up to 12 prints.
 	if (static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr; capture) {

@@ -110,7 +110,8 @@ const ProbePc& ProbePcSetting() {
 		if (end != nullptr && end[0] == ':') {
 			end++;
 			while (end != nullptr &&
-			       (end[0] == 'v' || end[0] == 'u' || end[0] == 's' || end[0] == 'U' || end[0] == 'S') &&
+			       (end[0] == 'v' || end[0] == 'u' || end[0] == 's' || end[0] == 'U' || end[0] == 'S' ||
+			        end[0] == 'r') &&
 			       result.count < 3u) {
 				result.kinds[result.count]   = end[0];
 				result.vgprs[result.count++] = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
@@ -129,7 +130,8 @@ void Translator::ProbeCopy(const ProbePc& probe) {
 	for (uint32_t i = 0; i < 3u; i++) {
 		const uint32_t   at = std::min(i, probe.count - 1u);
 		Decoder::Operand source;
-		const bool scalar = probe.kinds[at] == 's' || probe.kinds[at] == 'S';
+		// r<n>: scalar register n's raw bits (a float constant, read back with KYTY_PROBE_RECT).
+		const bool scalar = probe.kinds[at] == 's' || probe.kinds[at] == 'S' || probe.kinds[at] == 'r';
 		source.kind = scalar ? Decoder::OperandKind::Sgpr : Decoder::OperandKind::Vgpr;
 		source.reg  = probe.vgprs[at];
 		if (scalar && (source.reg == 106u || source.reg == 107u)) {
@@ -137,7 +139,7 @@ void Translator::ProbeCopy(const ProbePc& probe) {
 			source.reg  = 0;
 		}
 		values[i]   = ReadRawU32(source);
-		if (probe.kinds[at] != 'v') {
+		if (probe.kinds[at] != 'v' && probe.kinds[at] != 'r') {
 			const auto as_float = ir.Emit(IR::ValueOpcode::ConvertF32U32, {values[i]});
 			// Lower case: 1/8 per unit; upper case (U/S): one unit is full brightness.
 			const float scale =
