@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include <fmt/format.h>
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -35,6 +36,8 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <deque>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -490,6 +493,306 @@ private:
 	CommandBuffer& m_buffer;
 	bool           m_enabled;
 };
+
+// Diagnostics: KYTY_BVH_CHECK=<hash>:<counter buffer>:<leaf buffer> (bad108e74fb72e9f:5:0). The
+// bottom-up BVH refit counts arrivals in a counter per node (bits 0-2; parent index in bits 3-29,
+// slot in the parent above) and re-arms each counter when its node completes, so between refits
+// every counter of a blob holds the value it started with. At the shader's first dispatch of each
+// presented frame the GPU copies of the counters of the blobs refit in the last frames are compared
+// with their reference ([bvh-check] on stderr):
+// - only count bits differ: a refit left nodes incomplete (printed at once, with the last refits of
+//   the blob and the workgroup and thread counts they ran with);
+// - a valid armed tree with other links: the blob was instanced again (new reference, silently);
+// - anything else: the memory holds other data now; printed only if the shader refits it again.
+namespace {
+struct BvhRefitNote {
+	uint64_t frame     = 0;
+	uint64_t seq       = 0;
+	bool     continues = false;
+	bool     batched   = false;
+	uint32_t slot      = UINT32_MAX;
+	uint32_t leaves    = 0;
+	std::array<uint32_t, 6> counts {}; // groups, threads (filled by the first check after it)
+	bool     counts_known = false;
+};
+struct BvhRecord {
+	uint64_t                                    frame = 0, seq = 0, run = 0;
+	const uint32_t*                             packet = nullptr;
+	bool                                        continues = false, batched = false;
+	uint32_t                                    slot = UINT32_MAX;
+	std::array<std::pair<uint64_t, uint64_t>, 8> ranges {};
+};
+struct BvhBlob {
+	uint64_t                 size = 0;
+	std::vector<uint32_t>    ref;
+	std::vector<uint32_t>    garbage; // the last snapshot, when it was neither the tree nor a tree
+	std::deque<BvhRefitNote> notes;
+	uint64_t                 last_refit = 0;
+	bool                     reported   = false;
+};
+class BvhCheck {
+public:
+	static BvhCheck& Get() {
+		static BvhCheck check;
+		return check;
+	}
+	bool     enabled     = false;
+	uint64_t hash        = 0;
+	uint32_t counter_idx = 5;
+	uint32_t leaf_idx    = 0;
+
+	void OnDispatch(RenderContext& context, const PreparedBindings& bindings, bool batched,
+	                vk::Buffer ring, uint64_t ring_bytes, vk::Buffer indirect_buffer,
+	                uint64_t indirect_offset) {
+		if (counter_idx >= bindings.buffer_sources.size()) return;
+		const auto frame = context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+		std::lock_guard lock(m_mutex);
+		if (frame != m_last_frame) {
+			m_last_frame = frame;
+			Check(context, frame, ring, ring_bytes);
+		}
+		const auto& source = bindings.buffer_sources[counter_idx];
+		if (source.address == 0 || source.size == 0) return;
+		auto& blob = m_blobs[source.address];
+		const auto size = std::min<uint64_t>(source.size & ~uint64_t {3}, 0x2000u);
+		if (blob.size != size) {
+			blob = {};
+			blob.size = size;
+		}
+		if (!blob.garbage.empty()) {
+			if (m_reports < 60) {
+				m_reports++;
+				Print("refit reads foreign counters", frame, source.address, blob, blob.garbage);
+			}
+			blob.garbage.clear();
+			blob.ref.clear(); // re-captured by the next check
+		}
+		BvhRefitNote note;
+		note.frame     = frame;
+		note.seq       = ++m_seq;
+		note.continues = DispatchRunsEnabled() && DispatchRun().continues;
+		note.batched   = batched;
+		note.slot      = indirect_buffer == ring ? static_cast<uint32_t>(indirect_offset / 32u) : UINT32_MAX;
+		note.leaves    = leaf_idx < bindings.buffer_sources.size()
+		                     ? static_cast<uint32_t>(bindings.buffer_sources[leaf_idx].size / 4u)
+		                     : 0u;
+		blob.notes.push_back(note);
+		if (blob.notes.size() > 6) blob.notes.pop_front();
+		blob.last_refit = frame;
+		if (!note.continues) m_run++;
+		BvhRecord record;
+		record.frame     = frame;
+		record.seq       = note.seq;
+		record.run       = m_run;
+		record.packet    = DispatchRunsEnabled() ? DispatchRun().packet : nullptr;
+		record.continues = note.continues;
+		record.batched   = batched;
+		record.slot      = note.slot;
+		for (size_t i = 0; i < record.ranges.size() && i < bindings.buffer_sources.size(); i++) {
+			record.ranges[i] = {bindings.buffer_sources[i].address, bindings.buffer_sources[i].size};
+		}
+		m_records.push_back(record);
+		if (m_records.size() > 8192) m_records.pop_front();
+	}
+
+private:
+	void Print(const char* what, uint64_t frame, uint64_t address, const BvhBlob& blob,
+	           const std::vector<uint32_t>& now) {
+		std::string changed;
+		uint32_t    count = 0;
+		for (size_t k = 0; k < now.size() && k < blob.ref.size(); k++) {
+			if (now[k] != blob.ref[k] && count++ < 10) {
+				changed += fmt::format(" [{}] {:08x}->{:08x}", k, blob.ref[k], now[k]);
+			}
+		}
+		std::fprintf(stderr, "[bvh-check] %s: frame=%llu blob=0x%llx bytes=0x%llx words changed=%u:%s\n", what,
+		             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(address),
+		             static_cast<unsigned long long>(blob.size), count, changed.c_str());
+		PrintRecords(frame, address, blob.size, 0);
+		for (const auto& note: blob.notes) {
+			const std::string counts =
+			    note.counts_known ? fmt::format(" groups={}x{}x{} threads={}x{}x{}", note.counts[0], note.counts[1],
+			                                    note.counts[2], note.counts[3], note.counts[4], note.counts[5])
+			                      : std::string(note.slot == UINT32_MAX ? " (direct groups)" : " (counts not captured)");
+			std::fprintf(stderr, "[bvh-check]   refit frame=%llu seq=%llu continues=%d batched=%d leaves=%u%s\n",
+			             static_cast<unsigned long long>(note.frame), static_cast<unsigned long long>(note.seq),
+			             note.continues ? 1 : 0, note.batched ? 1 : 0, note.leaves, counts.c_str());
+		}
+	}
+
+	// Every recent dispatch whose bindings overlap [address, address + size) (any binding).
+	void PrintRecords(uint64_t frame, uint64_t address, uint64_t size, uint64_t focus) {
+		uint32_t listed = 0;
+		for (auto it = m_records.rbegin(); it != m_records.rend() && listed < 12; ++it) {
+			if (it->frame + 4 < frame) break;
+			int hit = -1;
+			for (size_t b = 0; b < it->ranges.size(); b++) {
+				const auto [a, n] = it->ranges[b];
+				if (n != 0 && a < address + size && address < a + n) {
+					hit = static_cast<int>(b);
+					break;
+				}
+			}
+			if (hit < 0) continue;
+			listed++;
+			std::string bufs;
+			for (size_t b = 0; b < it->ranges.size(); b++) {
+				if (it->ranges[b].second != 0) {
+					bufs += fmt::format(" b{}=0x{:x}+0x{:x}", b, it->ranges[b].first, it->ranges[b].second);
+				}
+			}
+			std::fprintf(stderr,
+			             "[bvh-check]   %sdispatch frame=%llu seq=%llu run=%llu packet=%p continues=%d batched=%d slot=%u "
+			             "hit=b%d%s\n",
+			             it->seq == focus ? "* " : "", static_cast<unsigned long long>(it->frame), static_cast<unsigned long long>(it->seq),
+			             static_cast<unsigned long long>(it->run), static_cast<const void*>(it->packet),
+			             it->continues ? 1 : 0, it->batched ? 1 : 0, it->slot, hit, bufs.c_str());
+		}
+	}
+
+	static bool ValidArmed(const std::vector<uint32_t>& words) {
+		for (const auto w: words) {
+			if (w == 0) continue;
+			const auto count  = w & 7u;
+			const auto parent = (w >> 3u) & 0x7ffffffu;
+			if (count == 0 || count > 4 || parent >= words.size()) return false;
+		}
+		return true;
+	}
+
+	void Check(RenderContext& context, uint64_t frame, vk::Buffer ring, uint64_t ring_bytes) {
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		std::vector<uint64_t>                      keys;
+		for (const auto& [address, blob]: m_blobs) {
+			if (blob.last_refit + 3 >= frame) {
+				ranges.emplace_back(address, blob.size);
+				keys.push_back(address);
+			}
+		}
+		if (ranges.empty()) return;
+		context.GetBufferCache().SnapshotGpu(
+		    ranges, ring, 0, ring_bytes,
+		    [this, frame, keys = std::move(keys)](std::vector<std::vector<uint32_t>>& words,
+		                                          std::vector<uint32_t>&              ring_words) {
+			    std::lock_guard lock(m_mutex);
+			    m_checks++;
+			    for (size_t i = 0; i < keys.size() && i < words.size(); i++) {
+				    auto found = m_blobs.find(keys[i]);
+				    if (found == m_blobs.end() || words[i].empty()) continue;
+				    auto& blob = found->second;
+				    if (words[i].size() * 4u != blob.size) continue;
+				    // Counts of the refits since the last check: their ring slots are current.
+				    for (auto& note: blob.notes) {
+					    if (!note.counts_known && note.slot != UINT32_MAX && note.frame + 2 >= frame &&
+					        (note.slot + 1u) * 8u <= ring_words.size()) {
+						    const auto* e = &ring_words[note.slot * 8u];
+						    note.counts       = {e[0], e[1], e[2], e[4], e[5], e[6]};
+						    note.counts_known = true;
+						    // Four threads a leaf: thread counts that disagree with the leaf list the
+						    // dispatch bound ran this refit on another instance's arguments.
+						    if (note.leaves != 0 && note.counts[3] != note.leaves * 4u) {
+							    m_args_mismatch++;
+							    if (m_mismatch_reports < 40) {
+								    m_mismatch_reports++;
+								    std::fprintf(stderr,
+								                 "[bvh-check] refit arguments disagree with its leaf list: frame=%llu "
+								                 "seq=%llu blob=0x%llx leaves=%u threads=%u groups=%u\n",
+								                 static_cast<unsigned long long>(note.frame),
+								                 static_cast<unsigned long long>(note.seq),
+								                 static_cast<unsigned long long>(keys[i]), note.leaves, note.counts[3],
+								                 note.counts[0]);
+								    PrintRecords(frame, keys[i], blob.size, note.seq);
+							    }
+						    }
+					    }
+				    }
+				    const auto& now = words[i];
+				    if (blob.ref.empty()) {
+					    if (ValidArmed(now)) blob.ref = now;
+					    continue;
+				    }
+				    uint32_t count_only = 0, structural = 0, decremented = 0;
+				    for (size_t k = 0; k < now.size(); k++) {
+					    if (now[k] == blob.ref[k]) continue;
+					    ((now[k] & ~7u) == (blob.ref[k] & ~7u) ? count_only : structural)++;
+					    // Lowered by a few arrivals, borrowing into the parent index or not.
+					    if (blob.ref[k] - now[k] <= 8u) decremented++;
+				    }
+				    if (structural != 0 && decremented == count_only + structural) {
+					    // Refit arrivals beyond a node's count: the parent links are now wrong.
+					    m_underflow++;
+					    if (m_reports < 60) {
+						    m_reports++;
+						    Print("counters decremented past zero", frame, keys[i], blob, now);
+					    }
+					    blob.garbage = now;
+					    continue;
+				    }
+				    if (count_only == 0 && structural == 0) {
+					    m_matches++;
+					    continue;
+				    }
+				    if (structural != 0) {
+					    const bool valid = ValidArmed(now);
+					    if (m_reports < 60) {
+						    m_reports++;
+						    Print(valid ? "counters now a different valid tree" : "counters now foreign", frame,
+						          keys[i], blob, now);
+					    }
+					    if (valid) {
+						    m_reinstanced++;
+						    blob.ref = now;
+					    } else {
+						    m_foreign++;
+						    blob.garbage = now;
+					    }
+					    continue;
+				    }
+				    m_partial++;
+				    if (!blob.reported && m_reports < 60) {
+					    blob.reported = true;
+					    m_reports++;
+					    Print("counters left incomplete", frame, keys[i], blob, now);
+				    }
+			    }
+			    const auto t = std::chrono::steady_clock::now();
+			    if (t - m_last_report > std::chrono::seconds(10)) {
+				    m_last_report = t;
+				    std::fprintf(stderr,
+				                 "[bvh-check] blobs=%zu checks=%llu match=%llu incomplete=%llu reinstanced=%llu "
+				                 "foreign=%llu underflow=%llu args-mismatch=%llu\n",
+				                 m_blobs.size(), static_cast<unsigned long long>(m_checks),
+				                 static_cast<unsigned long long>(m_matches), static_cast<unsigned long long>(m_partial),
+				                 static_cast<unsigned long long>(m_reinstanced),
+				                 static_cast<unsigned long long>(m_foreign),
+				                 static_cast<unsigned long long>(m_underflow),
+				                 static_cast<unsigned long long>(m_args_mismatch));
+			    }
+		    });
+	}
+
+	BvhCheck() {
+		if (const char* value = std::getenv("KYTY_BVH_CHECK"); value != nullptr) {
+			char* end = nullptr;
+			hash      = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') counter_idx = std::strtoul(end + 1, &end, 10);
+			if (end != nullptr && *end == ':') leaf_idx = std::strtoul(end + 1, &end, 10);
+			enabled = hash != 0;
+		}
+	}
+	std::recursive_mutex                  m_mutex;
+	std::unordered_map<uint64_t, BvhBlob> m_blobs;
+	uint64_t                              m_last_frame = UINT64_MAX;
+	uint64_t                              m_seq        = 0;
+	uint64_t m_checks = 0, m_matches = 0, m_partial = 0, m_reinstanced = 0, m_foreign = 0, m_underflow = 0;
+	uint64_t                              m_run = 0;
+	uint64_t                              m_args_mismatch = 0;
+	uint32_t                              m_mismatch_reports = 0;
+	std::deque<BvhRecord>                 m_records;
+	uint32_t                              m_reports = 0;
+	std::chrono::steady_clock::time_point m_last_report = std::chrono::steady_clock::now();
+};
+} // namespace
 
 // Whether the barrier before this dispatch can be left out (an earlier dispatch of its run was
 // recorded last), and the one after it (another dispatch of the run follows).
@@ -1009,6 +1312,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
 			        vk::PipelineStageFlagBits::eTransfer,
 			    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+		if (auto& check = BvhCheck::Get(); check.enabled && program.shader_hash == check.hash) {
+			check.OnDispatch(m_context, bindings, run_converted.has_value(),
+			                 m_indirect_groups ? m_indirect_groups->RingHandle() : vk::Buffer {},
+			                 IndirectDispatchGroups::RingBytes(), indirect_buffer, indirect_offset);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);

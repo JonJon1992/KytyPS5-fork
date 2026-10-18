@@ -2415,8 +2415,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				const char* value = std::getenv("KYTY_TRACE_COPY_MAX");
 				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 400u;
 			}();
+			static const uint64_t copy_from = [] {
+				const char* value = std::getenv("KYTY_TRACE_COPY_FROM");
+				return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+			}();
 			static std::atomic<uint32_t> copy_logs {0};
-			if (copy_hash != 0 && program.shader_hash == copy_hash && copy_logs.fetch_add(1) < copy_max) {
+			if (copy_hash != 0 && program.shader_hash == copy_hash && frame_now >= copy_from &&
+			    copy_logs.fetch_add(1) < copy_max) {
 				std::string line;
 				for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
 					const auto     r     = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
@@ -2429,8 +2434,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 					                    r.Base48() != 0 && bytes != 0 && m_context.GetBufferCache().HasGpuDirtyBytes(r.Base48(), bytes) ? 1 : 0,
 					                    w[0], w[1], w[2], w[16], w[17], w[18], read ? "" : " (unread)");
 				}
-				std::fprintf(stderr, "[copy] frame=%llu %016" PRIx64 "%s\n",
-				             static_cast<unsigned long long>(frame_now), program.shader_hash, line.c_str());
+				std::string user;
+				for (size_t k = 0; k < snapshot.user_data.size() && k < 16; k++) {
+					user += fmt::format(" {:08x}", snapshot.user_data[k]);
+				}
+				std::fprintf(stderr, "[copy] frame=%llu %016" PRIx64 " user:%s%s\n",
+				             static_cast<unsigned long long>(frame_now), program.shader_hash, user.c_str(),
+				             line.c_str());
 			}
 		}
 		// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the buffers that shader binds (from frame 2100), which

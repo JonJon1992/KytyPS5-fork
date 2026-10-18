@@ -43,6 +43,7 @@ struct DispatchRunState {
 	std::unordered_map<const uint32_t*, DispatchRunConverted>         converted;
 	bool pending_post = false; // a dispatch of the run left out its barrier after it
 	uint64_t runs = 0, members = 0, batched = 0, skipped_barriers = 0; // stats
+	uint64_t stale_hits = 0; // run starts that found entries of an earlier instance (cumulative)
 };
 
 inline bool DispatchRunsEnabled() {

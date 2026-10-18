@@ -851,8 +851,9 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int  selected_queue = -1;
-				bool tick_pending   = false;
+				int      selected_queue = -1;
+				bool     tick_pending   = false;
+				uint64_t pending_tick   = UINT64_MAX;
 				auto& scheduler     = gpu->m_renderer.GetCommandScheduler();
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
@@ -864,6 +865,7 @@ void GuestGpu::ThreadRun(void* data) {
 						// A dispatch suspended for SRT bytes to land (KYTY_SRT_DEFER).
 						if (!scheduler.IsFree(front.srt_wait_tick)) {
 							tick_pending = true;
+							pending_tick = std::min(pending_tick, front.srt_wait_tick);
 							continue;
 						}
 						front.blocked = false;
@@ -879,7 +881,24 @@ void GuestGpu::ThreadRun(void* data) {
 					// Nothing else to run: poll for the downloads (and new submissions).
 					gpu->m_processing = false;
 					const auto wait_begin = std::chrono::steady_clock::now();
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 50);
+					// Wait for the GPU itself (2 ms slices, the queue unlocked so the guest can
+					// submit), not for a new submission: nothing signals m_work_available when a
+					// download lands, so a 50 ms wait sat out most of it when no other work came
+					// (KYTY_SRT_DEFER_IDLE_LEGACY=1: the old wait).
+					static const bool legacy_idle = [] {
+						const char* value = std::getenv("KYTY_SRT_DEFER_IDLE_LEGACY");
+						return value != nullptr && value[0] == '1';
+					}();
+					if (legacy_idle || pending_tick == UINT64_MAX) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 50);
+					} else {
+						gpu->m_queue_mutex.Unlock();
+						if (scheduler.Active() && pending_tick >= scheduler.CurrentTick()) {
+							scheduler.Flush(); // the download is still in the open command buffer
+						}
+						(void)scheduler.WaitFor(pending_tick, 2'000'000);
+						gpu->m_queue_mutex.Lock();
+					}
 					g_srt_defer_stats.idle_waits++;
 					g_srt_defer_stats.idle_us += static_cast<uint64_t>(
 					    std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1822,6 +1841,23 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	}
 	run.packet             = packet;
 	run.continues          = packet == g_run_expected_next;
+	if (!run.continues && !run.converted.empty()) {
+		// Converted counts belong to the run instance that converted them. A command buffer the
+		// game submits again (or a run resumed after KYTY_SRT_DEFER) reaches the same packets
+		// later: their entries then name ring slots later conversions rewrote, and counts of
+		// arguments since rewritten (a refit then ran with the wrong number of groups).
+		// KYTY_RUN_CONVERTED_KEEP=1: keep them, as before (the count of such starts is still logged).
+		static const bool keep = [] {
+			const char* value = std::getenv("KYTY_RUN_CONVERTED_KEEP");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (run.converted.contains(packet)) {
+			run.stale_hits++;
+		}
+		if (!keep) {
+			run.converted.clear();
+		}
+	}
 	// KYTY_FPS_LOG: run lengths by the shader of each dispatch (addr -> {dispatches, runs started}).
 	// (getenv once: on Windows each call locks and scans the environment, ~1 us a dispatch.)
 	static const bool run_log = std::getenv("KYTY_FPS_LOG") != nullptr;
@@ -1896,9 +1932,10 @@ static void ReportDispatchRuns() {
 	auto& run        = DispatchRun();
 	std::fprintf(stderr,
 	             "[dispatch-runs] runs %.0f/s dispatches %.0f/s barriers left out %.0f/s indirect "
-	             "counts converted in batches %.0f/s\n",
+	             "counts converted in batches %.0f/s, stale conversions dropped %llu\n",
 	             static_cast<double>(run.runs) / s, static_cast<double>(run.members) / s,
-	             static_cast<double>(run.skipped_barriers) / s, static_cast<double>(run.batched) / s);
+	             static_cast<double>(run.skipped_barriers) / s, static_cast<double>(run.batched) / s,
+	             static_cast<unsigned long long>(run.stale_hits));
 	run.runs = run.members = run.skipped_barriers = run.batched = 0;
 }
 

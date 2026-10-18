@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -119,6 +120,11 @@ public:
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
 	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	// Whether an asynchronous download of bytes in the range is still in flight: those bytes are
+	// no longer GPU-dirty, but guest memory holds them only once the download is published.
+	[[nodiscard]] bool              HasPendingDownload(uint64_t vaddr, uint64_t size);
+	// GPU thread: waits until no download of bytes in the range is in flight (published).
+	void                            WaitDownloadsLanded(uint64_t vaddr, uint64_t size);
 	// GPU thread, before it reads guest bytes on the host (indirect arguments, COND_EXEC): shared
 	// buffers are not page-protected, so a read there does not fault into a sync. Waits for the
 	// GPU writes to them recorded so far.
@@ -158,6 +164,13 @@ public:
 	// Diagnostics (GPU thread): the GPU copy of [vaddr, vaddr + size) as the cached buffer holding
 	// it has it now, waiting for the GPU; false when no single buffer holds the range.
 	bool                            PeekGpuCopy(uint64_t vaddr, uint64_t size, std::vector<uint32_t>& out);
+	// Diagnostics (GPU thread): records copies of the GPU's bytes of each guest range, and of
+	// [raw_offset, raw_offset + raw_size) of the host buffer raw, behind all work recorded so far,
+	// and calls done with them once that work has run (no wait). A range no single cached buffer
+	// holds comes back empty.
+	using SnapshotDone = std::function<void(std::vector<std::vector<uint32_t>>&, std::vector<uint32_t>&)>;
+	void SnapshotGpu(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, vk::Buffer raw,
+	                 uint64_t raw_offset, uint64_t raw_size, SnapshotDone done);
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -385,6 +398,7 @@ private:
 	uint64_t                                           m_bitmap_written_pages = 0;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
+	std::atomic<uint64_t>                              m_download_publish_tick {0}; // latest download's publication tick
 	// PeekDword: a small host-visible buffer of dword copies, one slot per guest address.
 	struct PeekSlot {
 		uint32_t index = 0;

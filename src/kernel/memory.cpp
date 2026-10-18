@@ -1017,6 +1017,9 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
+		} else if (buffers.HasPendingDownload(vaddr, size)) {
+			// Downloading: current in guest memory only once published.
+			buffers.WaitDownloadsLanded(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
@@ -1063,11 +1066,13 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return false;
 	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	// Bytes still downloading are not current in the backing yet either.
 	if (t_gpu_read_delegate) {
-		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
+		return buffers.HasGpuDirtyBytesShared(vaddr, size) || buffers.HasPendingDownload(vaddr, size);
 	}
-	return !Graphics::GuestGpu::IsGpuThread() ||
-	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+	return !Graphics::GuestGpu::IsGpuThread() || buffers.HasGpuDirtyBytes(vaddr, size) ||
+	       buffers.HasPendingDownload(vaddr, size);
 }
 
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {

@@ -581,6 +581,10 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+bool CommandScheduler::WaitFor(uint64_t tick, uint64_t timeout_ns) {
+	return IsFree(tick) || (tick < CurrentTick() && m_master.WaitFor(tick, timeout_ns));
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }

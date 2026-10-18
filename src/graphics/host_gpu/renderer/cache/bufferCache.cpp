@@ -200,6 +200,8 @@ bool BufferCache::VoteShared(BufferId id) {
 	if (HasGpuDirtyBytes(begin, size)) {
 		return false;
 	}
+	// A download still in flight would publish older bytes into what is then the GPU's memory.
+	WaitDownloadsLanded(begin, size);
 	if (m_memory_tracker.IsRegionGpuModified(begin, size)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(begin, size);
 	}
@@ -398,6 +400,12 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		}
 	};
 	if constexpr (async) {
+		// The tick whose completion publishes these bytes (the priority operation runs then).
+		const auto publish_tick = m_scheduler.CurrentTick();
+		for (auto seen = m_download_publish_tick.load(std::memory_order_relaxed);
+		     publish_tick > seen &&
+		     !m_download_publish_tick.compare_exchange_weak(seen, publish_tick, std::memory_order_relaxed);) {
+		}
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
@@ -2771,6 +2779,42 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::HasPendingDownload(uint64_t vaddr, uint64_t size) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_downloading_ranges.Intersects(vaddr, size);
+}
+
+// A read of guest memory that bypasses page protection (the SRT walker, the clean-page caches)
+// finds bytes downloading as not GPU-dirty, but guest memory holds their older value until the
+// download is published. An asynchronous readback (a game thread's fault, a readback window, the
+// collector, an SRT defer) publishes when its tick completes, while the GPU thread goes on: an
+// SRT refresh in that window read the previous layout of a BVH blob the game had just instanced
+// again, and the refit it bound ran with another instance's buffers (counters double-decremented,
+// parent links broken, the refit looping until the device was lost).
+void BufferCache::WaitDownloadsLanded(uint64_t vaddr, uint64_t size) {
+	for (int round = 0; round < 8 && HasPendingDownload(vaddr, size); round++) {
+		if (const auto marker = FindCopyReadback(vaddr, size); marker != 0) {
+			CompleteCopyReadback(marker);
+			continue;
+		}
+		const auto tick = std::max(m_download_publish_tick.load(std::memory_order_relaxed),
+		                           m_last_async_download_tick);
+		if (tick == 0) {
+			break;
+		}
+		if (!m_scheduler.IsFree(tick)) {
+			m_scheduler.Wait(tick);
+		}
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	if (HasPendingDownload(vaddr, size)) {
+		// Not published by the latest download's tick: drain everything recorded so far.
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+}
+
 std::string BufferCache::DescribeWriteState(uint64_t vaddr) {
 	const auto       page = Common::AlignDown(vaddr, WriteBitmapPage);
 	std::unique_lock lock(m_dirty_ranges_mutex);
@@ -2917,6 +2961,84 @@ bool BufferCache::PeekGpuCopy(uint64_t vaddr, uint64_t size, std::vector<uint32_
 	out.resize(static_cast<size_t>(size / 4u));
 	std::memcpy(out.data(), temporary->Mapped().data(), out.size() * 4u);
 	return true;
+}
+
+void BufferCache::SnapshotGpu(const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                              vk::Buffer raw, uint64_t raw_offset, uint64_t raw_size,
+                              SnapshotDone done) {
+	struct Piece {
+		vk::Buffer source;
+		uint64_t   source_offset;
+		uint64_t   size;
+		uint64_t   at;
+	};
+	std::vector<Piece>    pieces;
+	std::vector<uint64_t> placed(ranges.size(), UINT64_MAX);
+	uint64_t              total = 0;
+	for (size_t i = 0; i < ranges.size(); i++) {
+		const auto [vaddr, size] = ranges[i];
+		auto it = m_buffers.upper_bound(vaddr);
+		if (size == 0 || (size & 3u) != 0 || it == m_buffers.begin()) {
+			continue;
+		}
+		--it;
+		const auto& buffer = m_slot_buffers[it->second];
+		if (vaddr < buffer.CpuAddress() || vaddr + size > buffer.CpuAddress() + buffer.Size()) {
+			continue;
+		}
+		pieces.push_back({buffer.Handle(), vaddr - buffer.CpuAddress(), size, total});
+		placed[i] = total;
+		total += Common::AlignUp(size, 16);
+	}
+	const uint64_t raw_at = total;
+	if (raw && raw_size != 0) {
+		pieces.push_back({raw, raw_offset, raw_size, raw_at});
+		total += Common::AlignUp(raw_size, 16);
+	}
+	if (total == 0) {
+		return;
+	}
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                          vk::BufferUsageFlagBits::eTransferDst, total);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Recorder();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	for (const auto& piece: pieces) {
+		const vk::BufferCopy copy {piece.source_offset, piece.at, piece.size};
+		native.copyBuffer(piece.source, temporary->Handle(), 1, &copy);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                       &after, 0, nullptr, 0, nullptr);
+	std::vector<uint64_t> sizes;
+	sizes.reserve(ranges.size());
+	for (const auto& range: ranges) {
+		sizes.push_back(range.second);
+	}
+	m_scheduler.DeferOperation([owner = std::move(temporary), placed = std::move(placed),
+	                            sizes = std::move(sizes), raw_at, raw_size, total,
+	                            done = std::move(done)]() mutable {
+		owner->Invalidate(0, total);
+		const auto*                        bytes = owner->Mapped().data();
+		std::vector<std::vector<uint32_t>> out(placed.size());
+		for (size_t i = 0; i < placed.size(); i++) {
+			if (placed[i] == UINT64_MAX) continue;
+			out[i].resize(static_cast<size_t>(sizes[i] / 4u));
+			std::memcpy(out[i].data(), bytes + placed[i], out[i].size() * 4u);
+		}
+		std::vector<uint32_t> raw_words(static_cast<size_t>(raw_size / 4u));
+		if (!raw_words.empty()) {
+			std::memcpy(raw_words.data(), bytes + raw_at, raw_words.size() * 4u);
+		}
+		done(out, raw_words);
+	});
 }
 
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {

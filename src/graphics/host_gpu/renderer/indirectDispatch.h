@@ -41,6 +41,10 @@ public:
 	                             const std::array<uint32_t, 3>& local_size, bool pre_barrier = true,
 	                             bool post_barrier = true);
 
+	// Diagnostics: the ring of converted counts (entry n at n * 32 bytes: groups, then threads).
+	[[nodiscard]] vk::Buffer           RingHandle() const { return m_groups.Handle(); }
+	[[nodiscard]] static constexpr uint64_t RingBytes() { return uint64_t {Entries} * EntryDwords * 4u; }
+
 private:
 	// Ring of converted counts. An entry is rewritten only after 4096 later conversions, each
 	// ordered behind the indirect reads before it.

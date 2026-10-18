@@ -12,6 +12,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
@@ -107,6 +108,25 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		// Diagnostics: KYTY_TRACE_WRITERS=<hex address>:<hex size>: guest CPU write faults in that
+		// range ([cpu-write], first 200), with whether the page holds GPU-written bytes.
+		static const std::pair<uint64_t, uint64_t> trace = [] {
+			std::pair<uint64_t, uint64_t> range {0, 0};
+			if (const char* value = std::getenv("KYTY_TRACE_WRITERS"); value != nullptr) {
+				char* end    = nullptr;
+				range.first  = std::strtoull(value, &end, 16);
+				range.second = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 16) : 4u;
+			}
+			return range;
+		}();
+		static std::atomic<uint32_t> traced {0};
+		if (trace.first != 0 && fault_vaddr >= trace.first && fault_vaddr < trace.first + trace.second &&
+		    traced.fetch_add(1) < 200u) {
+			std::fprintf(stderr, "[cpu-write] 0x%012llx frame=%llu gpu_dirty_page=%d\n",
+			             static_cast<unsigned long long>(fault_vaddr),
+			             static_cast<unsigned long long>(GetGraphics().presented_frames.load()),
+			             m_buffer_cache.HasGpuDirtyBytes(fault_vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0);
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
