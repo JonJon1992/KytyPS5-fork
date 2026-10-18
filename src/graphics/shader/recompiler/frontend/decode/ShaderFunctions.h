@@ -45,6 +45,14 @@ public:
 	            uint32_t wave_size, uint64_t code_hash = 0);
 	// Whether the code Expand last analyzed at this address contains calls (true when unknown).
 	[[nodiscard]] bool HasCalls(std::span<const uint32_t> code) const;
+	// The user-data registers the last complete call resolution of this code (same content hash
+	// and wave size) consulted, or nullptr when unknown. The resolution is a function of the
+	// code, the base, the wave size, the memory it reads and the values of the registers it
+	// consults: with those equal, another resolution consults the same registers and gives the
+	// same result whatever the other registers hold.
+	[[nodiscard]] const std::vector<uint32_t>* ConsultedUserData(std::span<const uint32_t> code,
+	                                                             uint64_t code_hash,
+	                                                             uint32_t wave_size) const;
 
 private:
 	struct Impl;

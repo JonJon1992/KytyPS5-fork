@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/timeline.h"
 
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -56,8 +58,21 @@ uint32_t ThreadId() {
 namespace Detail {
 
 void MarkSlow(const char* event, uint64_t a, uint64_t b) {
-	LOGF("TL %" PRIu64 " %u %s 0x%" PRIx64 " 0x%" PRIx64 "\n", NowMicros(), ThreadId(), event, a,
-	     b);
+	// Each thread names itself once (guest thread name, or host).
+	thread_local bool named = false;
+	if (!named) {
+		named              = true;
+		char name[64]      = "(host)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, name) != 0) {
+				std::snprintf(name, sizeof(name), "(guest)");
+			}
+		}
+		std::fprintf(stderr, "TLN %u %s\n", ThreadId(), name);
+	}
+	// stderr: the emulator log is usually silent.
+	std::fprintf(stderr, "TL %" PRIu64 " %u %s 0x%" PRIx64 " 0x%" PRIx64 "\n", NowMicros(),
+	             ThreadId(), event, a, b);
 }
 
 } // namespace Detail

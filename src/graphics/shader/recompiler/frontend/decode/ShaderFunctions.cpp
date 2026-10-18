@@ -660,6 +660,11 @@ struct ShaderFunctionExpander::Impl {
 		uint64_t               code_hash = 0;
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
+		// The user-data registers the last complete call resolution consulted (code-dependent
+		// only); valid while consulted_known.
+		std::vector<uint32_t> consulted;
+		uint32_t              consulted_wave  = 0;
+		bool                  consulted_known = false;
 	};
 	static constexpr size_t MaxExpansions = 8;
 
@@ -688,6 +693,18 @@ bool ShaderFunctionExpander::HasCalls(std::span<const uint32_t> code) const {
 		return true;
 	}
 	return found->second.analysis.has_calls || found->second.analysis.has_setpc;
+}
+
+const std::vector<uint32_t>* ShaderFunctionExpander::ConsultedUserData(
+    std::span<const uint32_t> code, uint64_t code_hash, uint32_t wave_size) const {
+	const auto found = m_impl->shaders.find(reinterpret_cast<uint64_t>(code.data()));
+	if (code_hash == 0 || found == m_impl->shaders.end() || !found->second.consulted_known ||
+	    found->second.consulted_wave != wave_size ||
+	    found->second.code_hash != code_hash ||
+	    found->second.analysis.code.size() != code.size()) {
+		return nullptr;
+	}
+	return &found->second.consulted;
 }
 
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
@@ -720,8 +737,12 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+		shader.consulted_known = false;
 		return false;
 	}
+	shader.consulted.assign(dependencies.begin(), dependencies.end());
+	shader.consulted_wave  = wave_size;
+	shader.consulted_known = true;
 	// Re-reading every callee to confirm the kept expansion was ~2 us a dispatch for a shader
 	// whose call targets depend on per-dispatch data (title CS c4df2a00067e0666, ~16,000
 	// dispatches a second, all with different user data): once confirmed, the same targets reuse

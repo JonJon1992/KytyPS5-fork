@@ -564,6 +564,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	// Timeline: the whole read, whatever path it takes.
+	struct TimelineEnd {
+		uint64_t vaddr;
+		~TimelineEnd() { Timeline::Mark("readmem-end", vaddr); }
+	} timeline_end {vaddr};
 	// KYTY_READBACK_STATS=1: time spent in readbacks, game threads and GPU thread, every 10 s.
 	struct ReadbackTimer {
 		bool                                  enabled;

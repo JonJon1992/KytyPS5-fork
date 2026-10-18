@@ -824,6 +824,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::fflush(stdout);
 	}
+	if (info->access_violation_vaddr != 0) {
+		Libs::LibKernel::Memory::DescribeUnhandledFault(info->access_violation_vaddr);
+	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,

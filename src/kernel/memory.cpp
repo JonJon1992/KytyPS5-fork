@@ -14,13 +14,17 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -231,6 +235,41 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 static bool g_test_fail_next_range_replace = false;
 #endif
 
+// Crash diagnostics: the last guest mapping changes (DescribeUnhandledFault prints those that
+// touch the faulting address).
+struct RangeHistoryEntry {
+	uint64_t start = 0;
+	uint64_t size  = 0;
+	uint64_t micros = 0;
+	uint32_t thread = 0;
+	char     op     = 0; // 'A' add, 'R' remove, 'S' replace span, 'P' protect
+	int      type   = 0;
+	int      protection = 0;
+};
+static std::array<RangeHistoryEntry, 4096> g_range_history {};
+static std::atomic<uint64_t>                g_range_history_next {0};
+
+static uint32_t RangeHistoryThread() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return static_cast<uint32_t>(GetCurrentThreadId());
+#else
+	return 0;
+#endif
+}
+
+static uint64_t RangeHistoryMicros() {
+	static const auto start = std::chrono::steady_clock::now();
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now() - start)
+	                                 .count());
+}
+
+static void RecordRangeChange(char op, uint64_t start, uint64_t size, int type, int protection) {
+	const auto index = g_range_history_next.fetch_add(1, std::memory_order_relaxed);
+	auto&      entry = g_range_history[index % g_range_history.size()];
+	entry            = {start, size, RangeHistoryMicros(), RangeHistoryThread(), op, type, protection};
+}
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -247,6 +286,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		RecordRangeChange('A', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
@@ -279,6 +319,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		RecordRangeChange('R', start, size, 0, 0);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
@@ -329,6 +370,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		RecordRangeChange('S', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
@@ -391,6 +433,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		RecordRangeChange('P', start, size, 0, protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
@@ -1198,6 +1241,47 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+}
+
+void DescribeUnhandledFault(uint64_t vaddr) {
+	std::printf("--- Guest memory at 0x%016" PRIx64 " ---\n", vaddr);
+	if (g_virtual_ranges != nullptr) {
+		VirtualRanges::Range range {};
+		if (g_virtual_ranges->Query(vaddr, 0, &range)) {
+			std::printf("guest range: 0x%016" PRIx64 "..0x%016" PRIx64 " type=%s prot=0x%x "
+			            "memory_type=%d offset=0x%" PRIx64 " name=%s\n",
+			            range.start, range.start + range.size,
+			            std::string(magic_enum::enum_name(range.type)).c_str(), range.protection,
+			            range.memory_type, range.offset, range.name);
+		} else {
+			std::printf("guest range: none (not mapped in the guest's map)\n");
+		}
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0) {
+		std::printf("host: base=%p alloc_base=%p size=0x%zx state=0x%lx protect=0x%lx "
+		            "type=0x%lx\n",
+		            info.BaseAddress, info.AllocationBase, static_cast<size_t>(info.RegionSize),
+		            info.State, info.Protect, info.Type);
+	}
+#endif
+	const auto now   = RangeHistoryMicros();
+	const auto next  = g_range_history_next.load(std::memory_order_relaxed);
+	const auto count = std::min<uint64_t>(next, g_range_history.size());
+	std::printf("guest mapping changes touching it (newest last, of the last %" PRIu64 "; now=%" PRIu64
+	            " us, faulting thread %u):\n",
+	            count, now, RangeHistoryThread());
+	for (uint64_t i = next - count; i < next; i++) {
+		const auto& entry = g_range_history[i % g_range_history.size()];
+		if (vaddr >= entry.start && vaddr - entry.start < entry.size) {
+			std::printf("  %c 0x%016" PRIx64 " size=0x%" PRIx64 " type=%d prot=0x%x thread=%u "
+			            "%" PRIu64 " us ago\n",
+			            entry.op, entry.start, entry.size, entry.type, entry.protection,
+			            entry.thread, now - entry.micros);
+		}
+	}
+	std::fflush(stdout);
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {

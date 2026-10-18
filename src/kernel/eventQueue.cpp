@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/timeline.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -428,6 +429,11 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		     Common::Thread::GetThreadIdUnique());
 	}
 
+	const bool blocking = timo == nullptr || *timo != 0;
+	if (blocking) {
+		Libs::Graphics::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq),
+		                               timo == nullptr ? ~uint64_t {0} : *timo);
+	}
 	if (timo == nullptr) {
 		*out = owner->WaitForEvents(ev, num, 0);
 	}
@@ -438,6 +444,13 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		} else {
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
+	}
+	if (blocking) {
+		Libs::Graphics::Timeline::Mark(
+		    "eq-woke", static_cast<uint64_t>(eq),
+		    *out > 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(ev[0].filter)) << 48u) |
+		                   (static_cast<uint64_t>(ev[0].ident) & 0xffffffffffffull)
+		             : 0);
 	}
 
 	if (*out == KERNEL_ERROR_EBADF) {

@@ -351,6 +351,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
+	Timeline::Mark("submit-flip", request_id);
 	Submission submission;
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;

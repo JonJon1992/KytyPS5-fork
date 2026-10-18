@@ -1607,14 +1607,21 @@ struct PipelineCache::ProgramCache {
 				const char* value = std::getenv("KYTY_FAST_PROGRAM");
 				return value == nullptr || value[0] != '0';
 			}();
+			// The program depends on the user data only through the expanded functions
+			// (ExpansionInputsHash), and on the static state.
+			const auto make_fast_key = [&] {
+				const uint64_t inputs = ExpansionInputsHash(
+				    params, user_data, input_info.wave_size,
+				    params.hash ^ params.Base() ^
+				        (static_cast<uint64_t>(input_info.wave_size) << 56u) ^
+				        (static_cast<uint64_t>(params.code.size()) << 32u));
+				return XXH3_64bits_withSeed(lookup_key.static_state.data(),
+				                            lookup_key.static_state.size() * sizeof(uint32_t),
+				                            inputs) |
+				       1u;
+			};
 			if (fast_program) {
-				fast_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
-				                                params.hash ^ params.Base() ^
-				                                    (static_cast<uint64_t>(input_info.wave_size) << 56u) ^
-				                                    (static_cast<uint64_t>(params.code.size()) << 32u));
-				fast_key = XXH3_64bits_withSeed(lookup_key.static_state.data(),
-				                                lookup_key.static_state.size() * sizeof(uint32_t),
-				                                fast_key) | 1u;
+				fast_key = make_fast_key();
 				// A dispatch comes back once a frame (~100 ms at our frame rates), so the window is
 				// longer than the expansion reuse's 50 ms. KYTY_FAST_PROGRAM_MS sets it.
 				static const auto window = std::chrono::milliseconds([] {
@@ -1631,6 +1638,10 @@ struct PipelineCache::ProgramCache {
 				KYTY_PROFILER_BLOCK("ProgramCache::ExpandFunctions");
 				ExpandShaderFunctions(params, user_data, input_info.wave_size,
 				                      lookup_key.function_code);
+				if (fast_key != 0) {
+					// Kept under the registers this expansion consulted.
+					fast_key = make_fast_key();
+				}
 			}
 		}
 		if (fast_hit == nullptr && unsupported.contains(lookup_key)) {
@@ -2151,6 +2162,47 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// KYTY_EXPAND_BY_CONSULTED=0: the reuse and fast-program keys hash all of the user data.
+	static bool KeyByConsulted() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_EXPAND_BY_CONSULTED");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	// A hash of the user data as far as the expanded code (and so the program) depends on it:
+	// only its size for code without calls, the registers the last complete call resolution
+	// consulted (and their values) for code with calls, all of it otherwise. The title's call
+	// shader c4df2a00067e0666 is dispatched ~16,000 times a second with different user data but
+	// the same call-table registers: hashing all of it missed every reuse and expanded each time
+	// (~3 us, 8 % of the GPU thread in the jungle, 2026-10-18).
+	uint64_t ExpansionInputsHash(const ShaderParams& params, std::span<const uint32_t> user_data,
+	                             uint32_t wave_size, uint64_t seed) {
+		if (KeyByConsulted() && params.hash != 0) {
+			const uint64_t no_call_key =
+			    params.hash ^ (static_cast<uint64_t>(params.code.size()) << 32u) ^
+			    (static_cast<uint64_t>(wave_size) << 56u);
+			const uint64_t count = user_data.size();
+			if (no_call_shaders.contains(no_call_key)) {
+				return XXH3_64bits_withSeed(&count, sizeof(count), seed ^ 0x6e6f2d63616c6c73ull);
+			}
+			if (const auto* regs = function_expander.ConsultedUserData(params.code, params.hash,
+			                                                           wave_size)) {
+				consulted_scratch.clear();
+				consulted_scratch.push_back(static_cast<uint32_t>(count));
+				for (const auto reg: *regs) {
+					consulted_scratch.push_back(reg);
+					consulted_scratch.push_back(reg < user_data.size() ? user_data[reg] : 0u);
+				}
+				return XXH3_64bits_withSeed(consulted_scratch.data(),
+				                            consulted_scratch.size() * sizeof(uint32_t),
+				                            seed ^ 0x636f6e73756c7465ull);
+			}
+		}
+		return XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(), seed);
+	}
+
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
 	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
@@ -2175,11 +2227,11 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto now = std::chrono::steady_clock::now();
 		uint64_t   reuse_key = 0;
+		const uint64_t reuse_seed = params.hash ^ params.Base() ^
+		                            (static_cast<uint64_t>(wave_size) << 56u) ^
+		                            (static_cast<uint64_t>(params.code.size()) << 32u);
 		if (reuse.count() != 0) {
-			reuse_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
-			                                 params.hash ^ params.Base() ^
-			                                     (static_cast<uint64_t>(wave_size) << 56u) ^
-			                                     (static_cast<uint64_t>(params.code.size()) << 32u));
+			reuse_key = ExpansionInputsHash(params, user_data, wave_size, reuse_seed);
 			if (const auto it = expand_reuse.find(reuse_key);
 			    it != expand_reuse.end() && now - it->second.validated < reuse) {
 				expanded = it->second.code;
@@ -2210,6 +2262,10 @@ struct PipelineCache::ProgramCache {
 			     return ReadShaderGuestMemoryRaw(nullptr, address, words);
 		     },
 		     expanded, reason, wave_size, params.hash);
+		if (reuse_key != 0) {
+			// Kept under the registers this resolution consulted.
+			remember.key = ExpansionInputsHash(params, user_data, wave_size, reuse_seed);
+		}
 		if (expanded_ok && expanded.empty() && reason.empty() && params.hash != 0 &&
 		    !function_expander.HasCalls(params.code)) {
 			no_call_shaders.insert(no_call_key);
@@ -2259,6 +2315,7 @@ struct PipelineCache::ProgramCache {
 	};
 	std::unordered_map<uint64_t, ExpandReused>                     expand_reuse;
 	std::unordered_set<uint64_t>                                   no_call_shaders;
+	std::vector<uint32_t>                                          consulted_scratch;
 	// The last function expansion by shader and code address, for the draw-prep scanner.
 	std::mutex                                                     scan_expand_mutex;
 	std::unordered_map<uint64_t, std::vector<uint32_t>>            scan_expansions;
