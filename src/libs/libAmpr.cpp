@@ -1842,6 +1842,13 @@ private:
 				}
 				const auto d = [](uint64_t a, uint64_t b) { return static_cast<double>(b - a) / 1e6; };
 				std::fprintf(stderr,
+				             "[amm-batch]   host: commit %.1f ms (%.1f MB), map view %.1f ms (%llu), protect view %.1f ms\n",
+				             d(cost_begin.commit_ns, cost_end.commit_ns),
+				             static_cast<double>(cost_end.commit_bytes - cost_begin.commit_bytes) / 1048576.0,
+				             d(cost_begin.mapview_ns, cost_end.mapview_ns),
+				             static_cast<unsigned long long>(cost_end.mapviews - cost_begin.mapviews),
+				             d(cost_begin.view_protect_ns, cost_end.view_protect_ns));
+				std::fprintf(stderr,
 				             "[amm-batch]   view splits %llu (%.1f MB mapped again) %.1f ms, protection resync %.1f ms\n",
 				             static_cast<unsigned long long>(cost_end.splits - cost_begin.splits),
 				             static_cast<double>(cost_end.split_bytes - cost_begin.split_bytes) / 1048576.0,

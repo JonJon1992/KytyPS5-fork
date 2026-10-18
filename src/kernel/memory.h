@@ -171,6 +171,11 @@ struct MapCost {
 	uint64_t split_bytes = 0;
 	uint64_t split_ns    = 0;
 	uint64_t resync_ns   = 0; // page-tracker protection of the parts mapped again
+	uint64_t commit_ns       = 0; // host backing: committing the section, mapping views, protecting them
+	uint64_t commit_bytes    = 0;
+	uint64_t mapview_ns      = 0;
+	uint64_t mapviews        = 0;
+	uint64_t view_protect_ns = 0;
 };
 MapCost MapCostSnapshot();
 

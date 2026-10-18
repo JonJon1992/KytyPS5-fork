@@ -7,6 +7,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -98,6 +99,8 @@ thread_local uint64_t t_unmap_step_ns[6] = {};
 // Partial unmaps of a Windows view (the rest of the view mapped again) and the page-tracker
 // protection resync of those remapped parts.
 thread_local uint64_t t_splits = 0, t_split_bytes = 0, t_split_ns = 0, t_resync_ns = 0;
+// Host backing of a map: committing the backing section, mapping the view, protecting it.
+thread_local uint64_t t_commit_ns = 0, t_commit_bytes = 0, t_mapview_ns = 0, t_mapviews = 0, t_view_protect_ns = 0;
 
 static uint64_t CostNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -122,6 +125,11 @@ MapCost MapCostSnapshot() {
 	for (int i = 0; i < 8; i++) {
 		cost.steps[i] = t_step_ns[i];
 	}
+	cost.commit_ns       = t_commit_ns;
+	cost.commit_bytes    = t_commit_bytes;
+	cost.mapview_ns      = t_mapview_ns;
+	cost.mapviews        = t_mapviews;
+	cost.view_protect_ns = t_view_protect_ns;
 	cost.splits      = t_splits;
 	cost.split_bytes = t_split_bytes;
 	cost.split_ns    = t_split_ns;
@@ -259,6 +267,117 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 	return left_start < right_end && right_start < left_end;
 }
 
+// KYTY_MEMLOCK_LOG=<ms> also reports long holds of, and waits for, the address-space and backing
+// store mutexes ([mem-mutex] lines), naming the threads.
+static uint32_t MemLockLogMs();
+static const char* CurrentThreadLabel() {
+	thread_local std::string label = [] {
+		char name[64] = "host";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, name) != 0) {
+				std::snprintf(name, sizeof(name), "guest");
+			}
+			return std::string(name);
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		PWSTR description = nullptr;
+		if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description != nullptr) {
+			char utf8[64] = {};
+			WideCharToMultiByte(CP_UTF8, 0, description, -1, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+			LocalFree(description);
+			if (utf8[0] != 0) {
+				return std::string("host ") + utf8;
+			}
+		}
+		std::snprintf(name, sizeof(name), "host %lu", static_cast<unsigned long>(GetCurrentThreadId()));
+#endif
+		return std::string(name);
+	}();
+	return label.c_str();
+}
+static std::atomic<uint32_t> g_mem_mutex_lines {0};
+
+class DiagMutex {
+public:
+	explicit DiagMutex(const char* name): m_name(name) {}
+	void lock() {
+		const auto limit = MemLockLogMs();
+		if (limit == 0) {
+			m_mutex.lock();
+			return;
+		}
+		if (!m_mutex.try_lock()) {
+			const char* holder       = m_holder.load(std::memory_order_relaxed);
+			const char* holder_where = m_where_shared.load(std::memory_order_relaxed);
+			const auto  begin        = CostNowNs();
+			m_mutex.lock();
+			const auto waited = CostNowNs() - begin;
+			if (waited >= uint64_t {limit} * 1000000u && g_mem_mutex_lines.fetch_add(1) < 256u) {
+				std::fprintf(stderr, "[mem-mutex] %s: %s waited %.1f ms (held by %s in %s)\n", m_name,
+				             CurrentThreadLabel(), static_cast<double>(waited) / 1e6, holder != nullptr ? holder : "?",
+				             holder_where != nullptr ? holder_where : "?");
+			}
+		}
+		Acquired();
+	}
+	bool try_lock() {
+		if (!m_mutex.try_lock()) {
+			return false;
+		}
+		if (MemLockLogMs() != 0) {
+			Acquired();
+		}
+		return true;
+	}
+	void unlock() {
+		if (const auto limit = MemLockLogMs(); limit != 0 && m_since != 0) {
+			const auto held = CostNowNs() - m_since;
+			m_since         = 0;
+			m_holder.store(nullptr, std::memory_order_relaxed);
+			const char* where = m_where != nullptr ? m_where : "?";
+			m_where           = nullptr;
+			m_where_shared.store(nullptr, std::memory_order_relaxed);
+			if (held >= uint64_t {limit} * 1000000u && g_mem_mutex_lines.fetch_add(1) < 256u) {
+				std::fprintf(stderr, "[mem-mutex] %s: %s held it %.1f ms in %s\n", m_name, CurrentThreadLabel(),
+				             static_cast<double>(held) / 1e6, where);
+			}
+		}
+		m_mutex.unlock();
+	}
+	void SetWhere(const char* where) {
+		if (m_since != 0) {
+			m_where = where;
+			m_where_shared.store(where, std::memory_order_relaxed);
+		}
+	}
+
+private:
+	void Acquired() {
+		m_since = CostNowNs();
+		m_holder.store(CurrentThreadLabel(), std::memory_order_relaxed);
+	}
+	std::mutex               m_mutex;
+	const char*              m_name;
+	uint64_t                 m_since = 0;
+	const char*              m_where = nullptr;
+	std::atomic<const char*> m_holder {nullptr};
+	std::atomic<const char*> m_where_shared {nullptr};
+};
+
+class DiagLockGuard {
+public:
+	DiagLockGuard(DiagMutex& mutex, const char* where): m_mutex(mutex) {
+		m_mutex.lock();
+		m_mutex.SetWhere(where);
+	}
+	~DiagLockGuard() { m_mutex.unlock(); }
+	DiagLockGuard(const DiagLockGuard&)            = delete;
+	DiagLockGuard& operator=(const DiagLockGuard&) = delete;
+
+private:
+	DiagMutex& m_mutex;
+};
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
@@ -363,7 +482,7 @@ public:
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('A', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -389,7 +508,7 @@ public:
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('R', start, size, 0, 0);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -402,14 +521,14 @@ public:
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 
 		return FindOverlap(start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 
 		const auto* overlap = FindOverlap(start, size);
 		if (overlap == nullptr) {
@@ -420,7 +539,7 @@ public:
 	}
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
@@ -435,7 +554,7 @@ public:
 	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('S', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -475,7 +594,7 @@ public:
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (const auto it = m_ranges.find(start); it != m_ranges.end() && it->second.size == size) {
@@ -487,7 +606,7 @@ public:
 	}
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('P', start, size, 0, protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
@@ -495,7 +614,7 @@ public:
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
@@ -504,7 +623,7 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 
 		auto next = m_ranges.upper_bound(addr);
 		if (next != m_ranges.begin()) {
@@ -525,7 +644,7 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -575,7 +694,7 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -642,7 +761,7 @@ public:
 		thread_local std::vector<Span> local;
 		thread_local uint64_t          local_generation = 0;
 		if (local_generation != m_coverage_generation.load(std::memory_order_acquire)) {
-			Common::LockGuard lock(m_mutex);
+			DiagLockGuard lock(m_mutex, __func__);
 			const auto        generation = m_coverage_generation.load(std::memory_order_relaxed);
 			if (m_spans_generation != generation) {
 				RebuildSpansUnlocked();
@@ -662,7 +781,7 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Common::LockGuard lock(m_mutex);
+		DiagLockGuard lock(m_mutex, __func__);
 
 		uint64_t used = 0;
 		for (const auto& [key, r]: m_ranges) {
@@ -835,7 +954,7 @@ private:
 	}
 
 	RangeMap      m_ranges;
-	Common::Mutex m_mutex;
+	DiagMutex m_mutex {"range table"};
 	// Bumped by every change of the ranges.
 	std::atomic<uint64_t> m_generation {1};
 	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
@@ -4529,7 +4648,8 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			             "[batch-map] %.1f ms: map %u (%.1f MB) %.1f ms, unmap %u (%.1f MB) %.1f ms, protect %u %.1f "
 			             "ms, flexible %u %.1f ms, type-protect %u %.1f ms | replace %.1f, host backing %.1f, "
 			             "can-map %.1f, query %.1f, physical map %.1f, find %.1f, publish+ %.1f, gpu map %.1f, gpu "
-			             "unmap %.1f, munmap lock %.1f, munmap backing %.1f, owner %.1f, range table %.1f ms\n",
+			             "unmap %.1f, munmap lock %.1f, munmap backing %.1f, owner %.1f, range table %.1f ms | host: "
+			             "commit %.1f ms (%.1f MB), map view %.1f ms (%llu), protect view %.1f ms\n",
 			             static_cast<double>(total) / 1e6, count[0], static_cast<double>(bytes[0]) / 1048576.0,
 			             static_cast<double>(ns[0]) / 1e6, count[1], static_cast<double>(bytes[1]) / 1048576.0,
 			             static_cast<double>(ns[1]) / 1e6, count[2], static_cast<double>(ns[2]) / 1e6, count[3],
@@ -4540,7 +4660,10 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			             d(cost0.steps[4], c.steps[4]), d(cost0.gpu_map_ns, c.gpu_map_ns),
 			             d(cost0.gpu_unmap_ns, c.gpu_unmap_ns), d(cost0.unmap_steps[0], c.unmap_steps[0]),
 			             d(cost0.unmap_steps[2], c.unmap_steps[2]), d(cost0.unmap_steps[3], c.unmap_steps[3]),
-			             d(cost0.unmap_steps[4], c.unmap_steps[4]));
+			             d(cost0.unmap_steps[4], c.unmap_steps[4]), d(cost0.commit_ns, c.commit_ns),
+			             static_cast<double>(c.commit_bytes - cost0.commit_bytes) / 1048576.0,
+			             d(cost0.mapview_ns, c.mapview_ns), static_cast<unsigned long long>(c.mapviews - cost0.mapviews),
+			             d(cost0.view_protect_ns, c.view_protect_ns));
 		}
 	} batch_report {batch_begin, cost_begin, op_ns, op_count, op_bytes};
 

@@ -1093,16 +1093,58 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 		    return b;
 	    }();
 	    bad.slot >= 0 && bad.slot < 32) {
+		// The dword the bad value came from, read again 1, 4, 16 and 40 ms later (checked at every
+		// draw): does the game write it after the submission was parsed?
+		struct Timed {
+			const uint32_t*                       where;
+			uint32_t                              parsed;
+			std::chrono::steady_clock::time_point at;
+			uint32_t                              seen[4];
+			int                                   next;
+		};
+		static std::vector<Timed> timed;
+		if (!timed.empty()) {
+			const auto now = std::chrono::steady_clock::now();
+			static constexpr int ages_ms[4] = {1, 4, 16, 40};
+			for (auto it = timed.begin(); it != timed.end();) {
+				while (it->next < 4 && now - it->at >= std::chrono::milliseconds(ages_ms[it->next])) {
+					it->seen[it->next++] = *it->where;
+				}
+				if (it->next == 4) {
+					std::fprintf(stderr, "[gs-seq] timed at=%p parsed=%08x +1ms=%08x +4ms=%08x +16ms=%08x +40ms=%08x\n",
+					             static_cast<const void*>(it->where), it->parsed, it->seen[0], it->seen[1],
+					             it->seen[2], it->seen[3]);
+					it = timed.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
 		const auto& sh = buffer.GetShaders();
 		if (sh.GetVs().gs_regs.rsrc2.user_sgpr > static_cast<uint32_t>(bad.slot) &&
 		    sh.GetVs().gs_user_sgpr.value[bad.slot] == bad.value && TakeGsSlotSeqLine()) {
 			const auto writer = GetGsSlotLastWriter();
+			if (writer.where != nullptr && timed.size() < 64) {
+				timed.push_back({writer.where, writer.value, std::chrono::steady_clock::now(), {}, 0});
+			}
 			const auto h      = [](uint64_t addr) { return addr != 0 ? ShaderDeclaredHash(addr) : 0ull; };
 			// The command-buffer dwords after the write (the packets up to this draw).
 			std::string next;
+			if (writer.where != nullptr) {
+				const auto addr = reinterpret_cast<uint64_t>(writer.where);
+				next += fmt::format(" gpu-written={} gpu-value={:08x} |",
+				                    Libs::LibKernel::Memory::IsGpuBufferWritten(addr, 4) ? 1 : 0,
+				                    Libs::LibKernel::Memory::PeekGpuDword(addr));
+			}
 			if (writer.source == 1 && writer.where != nullptr) {
 				for (int i = 1; i <= 40; i++) {
 					next += fmt::format(" {:08x}", writer.where[i]);
+				}
+				// And the 48 dwords before the SET_SH_REG packet's header.
+				const auto* header = writer.where - (bad.slot - static_cast<int32_t>(writer.start)) - 2;
+				next += " | before:";
+				for (int i = -48; i <= 0; i++) {
+					next += fmt::format(" {:08x}", header[i]);
 				}
 			}
 			std::fprintf(stderr,
