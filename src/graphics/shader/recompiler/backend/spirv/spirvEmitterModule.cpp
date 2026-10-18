@@ -252,10 +252,21 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 // Set 1 (BindlessBindings.h): one runtime array per image type, aliasing the binding of its
 // dimension, and the translation buffer. Declared before the entry point collects globals.
 void DefineBindlessImages(EmitterState& state) {
+	std::vector<IR::ImageResource> images;
 	for (const auto& image: state.program.info.images) {
 		if (!image.bindless) {
 			continue;
 		}
+		images.push_back(image);
+		// A 3D image instruction may get a 2D or 2D-array T# (BindlessSlotArrayFlag): it reads
+		// the 2D-array array too.
+		if (BindlessVolumeMayBeArray(image)) {
+			auto as_array      = image;
+			as_array.dimension = ImageDimension::Dim2DArray;
+			images.push_back(as_array);
+		}
+	}
+	for (const auto& image: images) {
 		const auto type = ImageType(state, image);
 		if (state.bindless_image_variables.contains(type)) {
 			continue;

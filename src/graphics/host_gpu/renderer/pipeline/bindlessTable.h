@@ -101,7 +101,9 @@ public:
 		std::vector<uint8_t>                stale;
 		std::vector<uint32_t>               stale_keys;
 		ShaderRecompiler::IR::ImageResource resource;
-		std::vector<uint32_t>               slots;    // per key; 0 = not resolved
+		// Per key, 0 = not resolved; else the translation entry: the slot in this heap's binding,
+		// or (BindlessSlotArrayFlag) in the 2D-array binding. SlotBinding/SlotIndex decode it.
+		std::vector<uint32_t>               slots;
 		std::vector<uint8_t>                settled;  // per key; resolved, or known placeholder
 		std::vector<ImageId>                resolved; // images to keep readable for draws
 		std::vector<ImageId>                unchecked; // settled since the last bindless draw (E5)
@@ -126,6 +128,23 @@ public:
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. A released slot is reused once the GPU has finished the work
 	// recorded before its release.
+	// The binding and array slot a Heap::slots entry names.
+	[[nodiscard]] static uint32_t SlotBinding(const Heap& heap, uint32_t entry) {
+		return (entry & ShaderRecompiler::IR::BindlessSlotFlagMask) ==
+		               ShaderRecompiler::IR::BindlessSlotArrayFlag
+		           ? static_cast<uint32_t>(Images2DArray)
+		           : heap.binding;
+	}
+	[[nodiscard]] static uint32_t SlotIndex(uint32_t entry) {
+		return (entry & ShaderRecompiler::IR::BindlessSlotFlagMask) ==
+		               ShaderRecompiler::IR::BindlessSlotArrayFlag
+		           ? entry & ~ShaderRecompiler::IR::BindlessSlotFlagMask
+		           : entry;
+	}
+	// Placeholder 0 (transparent, or grey with KYTY_BINDLESS_DEBUG_COLORS) of a binding's view type.
+	[[nodiscard]] vk::ImageView PlaceholderView(uint32_t binding) const {
+		return m_placeholder_views[binding];
+	}
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.

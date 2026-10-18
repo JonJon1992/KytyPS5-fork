@@ -168,6 +168,13 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	// The raw translation entry behind bindless_slot (BindlessSlotArrayFlag marks a 2D or 2D-array
+	// texture a 3D image instruction samples).
+	uint32_t                                         bindless_translation_raw      = 0;
+	// While image_override_index names a resource, ImageResourceAt() returns image_override for
+	// it: the same instruction emitted against another view type of its texture.
+	uint32_t                                         image_override_index          = UINT32_MAX;
+	IR::ImageResource                                image_override {};
 	uint32_t                                         bindless_sampler_variable     = 0;
 	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
@@ -235,6 +242,17 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
+
+// A bindless sampled 3D image: its key may name a 2D or 2D-array texture instead.
+inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
+	return image.bindless && !image.cube && image.resource_class == IR::ImageResourceClass::Sampled &&
+	       image.dimension == Decoder::ImageDimension::Dim3D;
+}
+
+inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint32_t index) {
+	return index == state.image_override_index ? state.image_override
+	                                           : state.program.info.images.at(index);
+}
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;

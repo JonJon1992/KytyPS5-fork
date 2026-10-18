@@ -738,11 +738,9 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 		for (const auto& [binding, slot]: slots) {
 			held = true;
 			for (auto& heap: m_heaps) {
-				if (heap.binding != binding) {
-					continue;
-				}
 				for (uint32_t key = 0; key < heap.slots.size(); key++) {
-					if (heap.slots[key] != slot) {
+					if (heap.slots[key] == 0 || SlotBinding(heap, heap.slots[key]) != binding ||
+					    SlotIndex(heap.slots[key]) != slot) {
 						continue;
 					}
 					if (const auto id = heap.images[key]; id) {
@@ -762,7 +760,7 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 					SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 				}
 			}
-			WriteSlot(binding, slot, m_placeholder_views[binding * PlaceholderColors],
+			WriteSlot(binding, slot, PlaceholderView(binding),
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1) < 16) {
@@ -957,7 +955,7 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 		}
 	}
 	if (heap.slots[key] != 0) {
-		ReleaseSlot(heap.binding, heap.slots[key]);
+		ReleaseSlot(SlotBinding(heap, heap.slots[key]), SlotIndex(heap.slots[key]));
 	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
@@ -973,12 +971,14 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 	}
 	for (const auto& [heap, key]: found->second) {
 		if (heap->slots[key] != 0) {
-			// Placeholder 0 of the heap's own view type: m_placeholder_views[binding] was a
-			// placeholder of binding 0's type for every binding below 3.
-			WriteSlot(heap->binding, heap->slots[key],
-			          m_placeholder_views[heap->binding * PlaceholderColors],
+			// Placeholder 0 of the slot's own view type. Placeholder i is of binding
+			// i % ImageArrays and colour i / ImageArrays, so colour 0 of binding b is entry b
+			// (b * PlaceholderColors named another binding's view type for b = 1..3).
+			const auto binding = SlotBinding(*heap, heap->slots[key]);
+			const auto slot    = SlotIndex(heap->slots[key]);
+			WriteSlot(binding, slot, PlaceholderView(binding),
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
-			ReleaseSlot(heap->binding, heap->slots[key]);
+			ReleaseSlot(binding, slot);
 		}
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;

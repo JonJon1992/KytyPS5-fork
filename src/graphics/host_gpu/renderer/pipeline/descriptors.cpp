@@ -1208,12 +1208,12 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 		return false;
 	}
 	switch (descriptor.Type()) {
+		// A 3D image instruction reads a 2D or 2D-array T# as a 2D array (BindlessSlotArrayFlag).
 		case Prospero::ImageType::kColor2D:
-			return binding == ShaderRecompiler::IR::BindlessImages2D ||
-			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
 		case Prospero::ImageType::kColor2DArray:
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
-			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray ||
+			       binding == ShaderRecompiler::IR::BindlessImages3D;
 		// A cube's faces are a 2D array to the hardware: shaders that address faces themselves
 		// (a 2D-array sample of a cube T#) were left the transparent placeholder, ~10 % of the
 		// jungle's heap keys. KYTY_BINDLESS_CUBE_AS_ARRAY=0 restores that.
@@ -1311,6 +1311,57 @@ static void BindlessStatsReport(uint64_t frame) {
 	std::fflush(stderr);
 }
 
+// KYTY_BINDLESS_LOG_KEYS=<binding>[:<key>]: each key resolution of that binding (0 2D, 1 2D array,
+// 2 cube, 3 3D), or only that key, with its outcome and descriptor; up to 256 lines.
+struct BindlessKeyLogSetting {
+	uint32_t binding = UINT32_MAX;
+	uint32_t key     = UINT32_MAX;
+};
+static const BindlessKeyLogSetting& BindlessKeyLog() {
+	static const BindlessKeyLogSetting setting = [] {
+		BindlessKeyLogSetting result;
+		if (const char* value = std::getenv("KYTY_BINDLESS_LOG_KEYS"); value != nullptr) {
+			char* end      = nullptr;
+			result.binding = static_cast<uint32_t>(std::strtoul(value, &end, 10));
+			if (end != nullptr && *end == ':') {
+				result.key = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
+			}
+		}
+		return result;
+	}();
+	return setting;
+}
+
+static void LogBindlessKey(const BindlessTable::Heap& heap, uint32_t key, const char* outcome,
+                           const ShaderTextureResource* descriptor) {
+	const auto& setting = BindlessKeyLog();
+	if (setting.binding != heap.binding || (setting.key != UINT32_MAX && setting.key != key)) {
+		return;
+	}
+	static std::atomic<uint32_t> lines {0};
+	if (lines.fetch_add(1, std::memory_order_relaxed) >= 256u) {
+		return;
+	}
+	if (descriptor == nullptr) {
+		std::fprintf(stderr, "[bindless-key] binding=%u key=%u %s\n", heap.binding, key, outcome);
+	} else {
+		std::fprintf(stderr,
+		             "[bindless-key] binding=%u key=%u %s type=%u format=%u tile=%u %ux%ux%u levels=%u-%u"
+		             " base=0x%llx dst=0x%03x\n",
+		             heap.binding, key, outcome, static_cast<uint32_t>(descriptor->Type()),
+		             static_cast<uint32_t>(descriptor->Format()),
+		             static_cast<uint32_t>(descriptor->TileMode()),
+		             static_cast<uint32_t>(descriptor->Width5()) + 1u,
+		             static_cast<uint32_t>(descriptor->Height5()) + 1u,
+		             static_cast<uint32_t>(descriptor->Depth()) + 1u,
+		             static_cast<uint32_t>(descriptor->BaseLevel()),
+		             static_cast<uint32_t>(descriptor->LastLevel()),
+		             static_cast<unsigned long long>(descriptor->Base40()),
+		             static_cast<uint32_t>(descriptor->DstSelXYZW()));
+	}
+	std::fflush(stderr);
+}
+
 bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key) {
 	auto&                                 table = m_context.GetBindlessTable();
 	ShaderRecompiler::IR::DescriptorValue value {};
@@ -1321,12 +1372,14 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.descriptors[key] = {};
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
 		BindlessStat(StatNoBacking);
+		LogBindlessKey(heap, key, "no-backing", nullptr);
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	if (!BindlessCompatible(descriptor, heap.binding)) {
+		LogBindlessKey(heap, key, "incompatible", &descriptor);
 		if (BindlessStatsEnabled()) {
 			if (descriptor.IsNull()) {
 				BindlessStat(StatNullDesc);
@@ -1352,11 +1405,23 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
-	auto binding = ResolveTexture(heap.resource, value);
+	// The GPU addresses by the T# type: a 3D instruction's 2D or 2D-array texture is a 2D array
+	// at layer round(z). It lives in the 2D-array binding; the flag tells the shader.
+	const bool as_array = heap.binding == ShaderRecompiler::IR::BindlessImages3D &&
+	                      (descriptor.Type() == Prospero::ImageType::kColor2D ||
+	                       descriptor.Type() == Prospero::ImageType::kColor2DArray);
+	const uint32_t slot_binding =
+	    as_array ? ShaderRecompiler::IR::BindlessImages2DArray : heap.binding;
+	auto resource = heap.resource;
+	if (as_array) {
+		resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+	}
+	auto binding = ResolveTexture(resource, value);
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
 		BindlessStat(StatEmptyImage);
+		LogBindlessKey(heap, key, image == nullptr ? "no-image" : "empty-image", &descriptor);
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
@@ -1368,16 +1433,19 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		// outlive it, since its unregistration is over. The key is asked for again next frame.
 		heap.settled[key] = 0;
 		BindlessStat(StatUnregistered);
+		LogBindlessKey(heap, key, "unregistered", &descriptor);
 		table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
 		return false;
 	}
-	const auto slot = table.AllocateSlot(heap.binding);
+	const auto slot = table.AllocateSlot(slot_binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
 		BindlessStat(StatNoSlot);
+		LogBindlessKey(heap, key, "no-slot", &descriptor);
 		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	BindlessStat(StatOk);
+	LogBindlessKey(heap, key, "ok", &descriptor);
 	if (BindlessStatsEnabled()) {
 		// Width class, base level and min-LOD clamp of resolved textures: is streaming stuck low?
 		const uint32_t width = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -1396,15 +1464,16 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
-	table.WriteSlot(heap.binding, slot, view, layout);
-	heap.slots[key]         = slot;
+	table.WriteSlot(slot_binding, slot, view, layout);
+	const uint32_t entry    = as_array ? (slot | ShaderRecompiler::IR::BindlessSlotArrayFlag) : slot;
+	heap.slots[key]         = entry;
 	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;
 	image->usage.texture    = true;
 	heap.resolved.push_back(binding.image_id);
 	heap.unchecked.push_back(binding.image_id);
 	table.AddImageReference(binding.image_id, heap, key);
-	table.SetTranslation(heap, key, slot);
+	table.SetTranslation(heap, key, entry);
 	return true;
 }
 
@@ -1913,6 +1982,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 	}
 	table.ConsumeSnapshot();
 	const auto snapshot_frame = m_bindless_snapshot_frame;
+	BindlessStatsReport(frame);
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget   = 128;
 	uint32_t           resolved = RevalidateBindlessKeys(Budget);

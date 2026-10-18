@@ -18,6 +18,12 @@ inline constexpr uint32_t BindlessFeedback       = 5;
 inline constexpr uint32_t BindlessSamplers       = 6;
 // A translation entry for a key whose texture is not resident yet; the shader samples slot 0.
 inline constexpr uint32_t BindlessPending        = 0xffffffffu;
+// In a 3D binding's region: the key's T# is a 2D or 2D-array texture, held in the 2D-array
+// binding at the slot in the low bits. The hardware addresses by the T# type, not the
+// instruction's dimension, so a 3D sample of it reads layer round(z) (Marvel's Wolverine
+// particles). Pending (all bits set) is told apart by the bit above.
+inline constexpr uint32_t BindlessSlotArrayFlag  = 0x40000000u;
+inline constexpr uint32_t BindlessSlotFlagMask   = 0xc0000000u;
 // Diagnostics (KYTY_KEY_CAPTURE=<hash>): that shader marks every image key it samples in feedback
 // word BindlessCaptureImages + (key & 0xffff) and every sampler key in BindlessCaptureSamplers +
 // (key & 0xffff); the host prints them ([key-capture]). Above any heap region.

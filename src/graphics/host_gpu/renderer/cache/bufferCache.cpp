@@ -1408,6 +1408,7 @@ struct SyncStats {
 	uint64_t written_buckets[6] = {};
 	uint64_t written    = 0;
 	double   walk_s     = 0.0;
+	double   walk_written_s = 0.0;
 };
 SyncStats g_sync_stats;
 
@@ -1418,6 +1419,7 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 	st.bytes += size;
 	st.written += is_written ? 1 : 0;
 	st.walk_s += walk_s;
+	if (is_written) st.walk_written_s += walk_s;
 	const int bucket = size <= 0x1000 ? 0 : size <= 0x10000 ? 1 : size <= 0x100000 ? 2
 	                 : size <= 0x1000000 ? 3 : size <= 0x10000000 ? 4 : 5;
 	st.buckets[bucket]++;
@@ -1425,11 +1427,12 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 		st.written_buckets[bucket]++;
 	}
 	if (st.calls % 200000 == 0) {
-		LOGF("SyncStats: calls=%" PRIu64 " uploads=%" PRIu64 " written=%" PRIu64
-		     " avg_bytes=%" PRIu64 " walk_total=%.1fms sizes(<=4K,64K,1M,16M,256M,>)=%" PRIu64
+		std::fprintf(stderr, "[sync-stats] calls=%" PRIu64 " uploads=%" PRIu64 " written=%" PRIu64
+		     " avg_bytes=%" PRIu64 " walk_total=%.1fms (written %.1fms) sizes(<=4K,64K,1M,16M,256M,>)=%" PRIu64
 		     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 " written_sizes=%" PRIu64
 		     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
 		     st.calls, st.uploads, st.written, st.bytes / st.calls, st.walk_s * 1000.0,
+		     st.walk_written_s * 1000.0,
 		     st.buckets[0], st.buckets[1], st.buckets[2], st.buckets[3], st.buckets[4],
 		     st.buckets[5], st.written_buckets[0], st.written_buckets[1], st.written_buckets[2],
 		     st.written_buckets[3], st.written_buckets[4], st.written_buckets[5]);
