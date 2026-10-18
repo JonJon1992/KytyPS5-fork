@@ -25,18 +25,28 @@ namespace Libs::Graphics::Timeline {
 
 namespace {
 
+// KYTY_TIMELINE=<first frame>:<frames>, or t<seconds>:<frames> to open at the first present
+// that many seconds after the emulator started.
 struct Window {
-	uint64_t first = 0;
-	uint64_t count = 0;
+	uint64_t first   = 0;
+	uint64_t count   = 0;
+	uint64_t seconds = 0;
 };
+
+const auto g_process_start = std::chrono::steady_clock::now();
 
 const Window& GetWindow() {
 	static const Window window = [] {
 		Window result;
 		const char* value = std::getenv("KYTY_TIMELINE");
 		if (value != nullptr) {
-			char* end    = nullptr;
-			result.first = std::strtoull(value, &end, 10);
+			char* end = nullptr;
+			if (value[0] == 't') {
+				result.seconds = std::strtoull(value + 1, &end, 10);
+				result.first   = UINT64_MAX;
+			} else {
+				result.first = std::strtoull(value, &end, 10);
+			}
 			result.count = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 1;
 		}
 		return result;
@@ -142,7 +152,12 @@ void Present(uint64_t frame) {
 	if (window.count == 0) {
 		return;
 	}
-	const bool active      = frame >= window.first && frame - window.first < window.count;
+	static uint64_t first = window.first;
+	if (first == UINT64_MAX &&
+	    std::chrono::steady_clock::now() - g_process_start >= std::chrono::seconds(window.seconds)) {
+		first = frame;
+	}
+	const bool active      = first != UINT64_MAX && frame >= first && frame - first < window.count;
 	const bool was_active  = Detail::g_active.load(std::memory_order_relaxed);
 	if (active || was_active) {
 		Detail::MarkSlow("present", frame, 0);
