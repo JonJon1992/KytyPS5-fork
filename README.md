@@ -13,12 +13,25 @@ This is where it stands right now:
 
 | Scene | FPS |
 |---|---|
-| Title screen | ~24 |
+| Title screen | 24–28 |
 | Opening cutscene | 24–28 |
-| Jungle gameplay | 17–21 |
+| Jungle gameplay | 16–21 |
 | Heavy action scenes | 9–15 |
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
+
+### Screenshots
+
+The FPS is in each window title (Performance mode, RTX 5090 Laptop). Click a picture for full size.
+
+| | |
+|---|---|
+| ![Title screen, 28 FPS](docs/screenshots/frank/01_title.jpg) | ![Cutscene, 17 FPS](docs/screenshots/frank/02_cutscene.jpg) |
+| Title screen, 28 FPS (the red dots are the particle bug below) | Cutscene, 17 FPS |
+| ![Cutscene, 20 FPS](docs/screenshots/frank/03_cutscene.jpg) | ![Jungle gameplay, 16 FPS](docs/screenshots/frank/04_jungle.jpg) |
+| Cutscene, 20 FPS | Jungle gameplay, 16 FPS |
+| ![Jungle gameplay, 16 FPS](docs/screenshots/frank/05_jungle_cliff.jpg) | ![Climbing, 25 FPS](docs/screenshots/frank/06_climbing.jpg) |
+| Jungle gameplay, 16 FPS | Climbing, 25 FPS |
 
 **Working:** boots, menus, cutscenes and gameplay, with correct terrain, foliage, lighting and ray-traced passes.
 
@@ -47,6 +60,9 @@ Stability:
 
 - **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** AMD and Intel GPUs and other games are untested.
 - **Occasional GPU "device lost" crash.** A shader reads a GPU address outside any buffer. The crash report now names the address; the cause is under investigation.
+- **Occasional freeze.** The game can stop responding in some scene changes, for example the drop-off scene below (frame counter stuck, two threads spinning at 100%). Restarting gets past it. Under investigation.
+
+  ![Freeze at the drop-off scene](docs/screenshots/frank/07_freeze.jpg)
 - **Red squares and red streaks instead of some particles** (title screen, rain and embers in some scenes). The particle shader (ES `4efbcf79c36d8adf`) adds GS user-data slot 28 (s36) to the instance ID to pick its one 16-byte record. The game sets slot 28 with a 29-register `SET_SH_REG` whose last dword is leftover command-buffer data on some frames (`0x00100011`, even a PM4 header), so the index lands past the record and the shader reads zeros. Forcing it to 0 gives the correct soft particles. What we've ruled out: the dword doesn't change in the 40 ms after we parse it, the GPU doesn't write it, and the draw (`DRAW_INDEX_INDIRECT_MULTI`, no base-vertex/start-instance/draw-index register) writes no user data. So either the real GPU doesn't load that register for this shader, or it treats that out-of-range index differently. It's a good place to help if you know RDNA2 merged ES/GS user SGPRs or PS5 command buffers.
 - **You need your own legally dumped copy of the game.** No games or system files are provided or linked.
 
