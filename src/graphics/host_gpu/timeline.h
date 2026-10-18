@@ -24,6 +24,28 @@ inline void Mark(const char* event, uint64_t a = 0, uint64_t b = 0) {
 	}
 }
 
+// Marks `begin` now and `end` when the scope ends (both with `a`).
+class Scope {
+public:
+	Scope(const char* begin, const char* end, uint64_t a): m_end(end), m_a(a), m_active(Active()) {
+		if (m_active) {
+			Detail::MarkSlow(begin, a, 0);
+		}
+	}
+	~Scope() {
+		if (m_active) {
+			Detail::MarkSlow(m_end, m_a, 0);
+		}
+	}
+	Scope(const Scope&)            = delete;
+	Scope& operator=(const Scope&) = delete;
+
+private:
+	const char* m_end;
+	uint64_t    m_a;
+	bool        m_active;
+};
+
 // Called once per presented frame.
 void Present(uint64_t frame);
 

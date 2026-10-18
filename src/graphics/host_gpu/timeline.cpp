@@ -3,10 +3,16 @@
 #include "common/logging/log.h"
 #include "kernel/pthread.h"
 
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -53,26 +59,80 @@ uint32_t ThreadId() {
 #endif
 }
 
+// Events are kept in memory while the window is open and written out when it closes: written as
+// they happened (unbuffered stderr), the marks slowed the frames they measured ~10x.
+struct Event {
+	uint64_t    micros;
+	uint32_t    thread;
+	const char* name;
+	uint64_t    a;
+	uint64_t    b;
+};
+
+constexpr size_t MaxEvents = size_t {1} << 21u;
+
+struct Store {
+	std::unique_ptr<Event[]>                       events {new Event[MaxEvents]};
+	std::atomic<uint64_t>                          next {0};
+	std::mutex                                     names_mutex;
+	std::vector<std::pair<uint32_t, std::string>> names;
+};
+
+Store& GetStore() {
+	static Store store;
+	return store;
+}
+
+void Flush() {
+	auto&      store = GetStore();
+	const auto count = std::min<uint64_t>(store.next.exchange(0), MaxEvents);
+	std::string text;
+	text.reserve(1u << 20u);
+	{
+		std::lock_guard lock(store.names_mutex);
+		for (const auto& [thread, name]: store.names) {
+			text += "TLN " + std::to_string(thread) + " " + name + "\n";
+		}
+	}
+	char line[192];
+	for (uint64_t i = 0; i < count; i++) {
+		const auto& e = store.events[i];
+		std::snprintf(line, sizeof(line), "TL %" PRIu64 " %u %s 0x%" PRIx64 " 0x%" PRIx64 "\n",
+		              e.micros, e.thread, e.name, e.a, e.b);
+		text += line;
+		if (text.size() > (1u << 20u)) {
+			std::fwrite(text.data(), 1, text.size(), stderr);
+			text.clear();
+		}
+	}
+	std::fwrite(text.data(), 1, text.size(), stderr);
+	std::fprintf(stderr, "TLEND %" PRIu64 " events\n", count);
+	std::fflush(stderr);
+}
+
 } // namespace
 
 namespace Detail {
 
 void MarkSlow(const char* event, uint64_t a, uint64_t b) {
+	auto& store = GetStore();
 	// Each thread names itself once (guest thread name, or host).
 	thread_local bool named = false;
 	if (!named) {
-		named              = true;
-		char name[64]      = "(host)";
+		named         = true;
+		char name[64] = "(host)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, name) != 0) {
 				std::snprintf(name, sizeof(name), "(guest)");
 			}
 		}
-		std::fprintf(stderr, "TLN %u %s\n", ThreadId(), name);
+		std::lock_guard lock(store.names_mutex);
+		store.names.emplace_back(ThreadId(), name);
 	}
-	// stderr: the emulator log is usually silent.
-	std::fprintf(stderr, "TL %" PRIu64 " %u %s 0x%" PRIx64 " 0x%" PRIx64 "\n", NowMicros(),
-	             ThreadId(), event, a, b);
+	const auto index = store.next.fetch_add(1, std::memory_order_relaxed);
+	if (index < MaxEvents) {
+		store.events[index] = {NowMicros(), ThreadId(), event, a, b};
+	}
 }
 
 } // namespace Detail
@@ -82,11 +142,15 @@ void Present(uint64_t frame) {
 	if (window.count == 0) {
 		return;
 	}
-	const bool active = frame >= window.first && frame - window.first < window.count;
-	if (active || Detail::g_active.load(std::memory_order_relaxed)) {
+	const bool active      = frame >= window.first && frame - window.first < window.count;
+	const bool was_active  = Detail::g_active.load(std::memory_order_relaxed);
+	if (active || was_active) {
 		Detail::MarkSlow("present", frame, 0);
 	}
 	Detail::g_active.store(active, std::memory_order_relaxed);
+	if (was_active && !active) {
+		Flush();
+	}
 }
 
 } // namespace Libs::Graphics::Timeline
