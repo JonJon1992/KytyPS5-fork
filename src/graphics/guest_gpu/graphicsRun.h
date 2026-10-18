@@ -7,6 +7,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 
+#include <vector>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -85,6 +86,9 @@ private:
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
 		uint64_t                  srt_wait_tick     = 0; // KYTY_SRT_DEFER: run again once free
+		// KYTY_COPY_SUBMISSIONS=1: the command words as they were at submission (the spans point
+		// here), in case the game rewrites the buffer before the GPU thread reaches it.
+		std::shared_ptr<std::vector<uint32_t>> owned_words;
 	};
 
 	void              Enqueue(Submission submission);

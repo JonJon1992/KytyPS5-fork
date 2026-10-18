@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -516,7 +517,58 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// KytyPS5-Frank: the settings tuned on Marvel's Wolverine are the defaults. Each environment
+// variable already set (to anything) wins; KYTY_FRANK_DEFAULTS=0 leaves all of them unset and the
+// command line options at KytyPS5's defaults.
+static bool FrankDefaultsEnabled() {
+	const char* value = std::getenv("KYTY_FRANK_DEFAULTS");
+	return value == nullptr || value[0] != '0';
+}
+
+static void ApplyFrankEnvironmentDefaults() {
+	if (!FrankDefaultsEnabled()) {
+		return;
+	}
+	static constexpr std::pair<const char*, const char*> Defaults[] = {
+	    {"KYTY_BINDLESS_EVICT", "0"},
+	    {"KYTY_BINDLESS_SLOT_REUSE", "0"},
+	    {"KYTY_SHARED_BUFFERS", "1"},
+	    {"KYTY_WRITE_BITMAP", "1"},
+	    // Ray traversal (dc76e1223a9bf673) loops without end on our side: a 2048-step cap.
+	    {"KYTY_LOOP_GUARD_HASHES", "dc76e1223a9bf673"},
+	    {"KYTY_LOOP_GUARD_LIMIT", "2048"},
+	    // No barriers between dispatches the game's command stream does not order.
+	    {"KYTY_DISPATCH_RUNS", "1"},
+	    // No NVIDIA crash-diagnostic markers per draw and dispatch (they serialize the GPU).
+	    {"KYTY_NV_CHECKPOINTS", "0"},
+	    {"KYTY_SRT_DEFER", "1"},
+	};
+	for (const auto& [name, value]: Defaults) {
+		if (std::getenv(name) == nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			_putenv_s(name, value);
+#else
+			setenv(name, value, 0);
+#endif
+		}
+	}
+}
+
+static void ApplyFrankOptionDefaults(RunOptions& options) {
+	if (!FrankDefaultsEnabled()) {
+		return;
+	}
+	options.config.bindless_images_enabled = true;
+	options.config.tessellation_enabled    = true;
+	options.config.readback_linear_images  = true;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	options.config.red_zone_protection_enabled = true;
+#endif
+	(void)ParseEnum(std::string("Performance"), options.config.shader_optimization_type);
+}
+
 static int Main(int argc, char* argv[]) {
+	ApplyFrankEnvironmentDefaults();
 	VirtualMemory::Init();
 	InitializeThreads();
 #if defined(KYTY_PGO_GENERATE)
@@ -526,6 +578,7 @@ static int Main(int argc, char* argv[]) {
 
 	RunOptions options;
 	bool       show_help = false;
+	ApplyFrankOptionDefaults(options);
 
 	if (argc < 2) {
 		PrintUsage();

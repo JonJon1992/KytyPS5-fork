@@ -322,6 +322,14 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+static bool CopySubmissions() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_SUBMISSIONS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {
@@ -333,6 +341,19 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
+	if (CopySubmissions()) {
+		auto words = std::make_shared<std::vector<uint32_t>>();
+		words->reserve(draw_commands.size() + constant_commands.size());
+		words->insert(words->end(), draw_commands.begin(), draw_commands.end());
+		words->insert(words->end(), constant_commands.begin(), constant_commands.end());
+		submission.commands = std::span<const uint32_t>(words->data(), draw_commands.size());
+		submission.constant_commands =
+		    constant_commands.empty()
+		        ? std::span<const uint32_t> {}
+		        : std::span<const uint32_t>(words->data() + draw_commands.size(),
+		                                    constant_commands.size());
+		submission.owned_words = std::move(words);
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -347,6 +368,11 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
+	if (CopySubmissions()) {
+		auto words = std::make_shared<std::vector<uint32_t>>(commands.begin(), commands.end());
+		submission.commands    = std::span<const uint32_t>(words->data(), words->size());
+		submission.owned_words = std::move(words);
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -693,6 +719,15 @@ void GuestGpu::Enqueue(Submission submission) {
 			                               submission.commands);
 		} else if (submission.type == SubmissionType::SuspendPoint) {
 			m_draw_prep->EnqueueReset(submission.queue_id);
+		}
+	}
+	if (submission.owned_words != nullptr) {
+		// The draw-prep scanner can still be reading a submission the GPU thread has finished:
+		// keep the copies of the last ones alive.
+		static std::deque<std::shared_ptr<std::vector<uint32_t>>> recent;
+		recent.push_back(submission.owned_words);
+		if (recent.size() > 1024) {
+			recent.pop_front();
 		}
 	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
