@@ -577,6 +577,10 @@ uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// The software flush even under DenormFlushToZero (compare operands, which the mode leaves).
+uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value);
+// Whether this shader declares DenormFlushToZero for 32-bit floats (SetDenormFlushToZero32).
+bool     HostFlushesF32Denorms(const EmitterState& state);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 

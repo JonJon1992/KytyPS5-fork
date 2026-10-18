@@ -771,6 +771,17 @@ uint32_t BufferCache::PeekDword(uint64_t vaddr) {
 	return slot.value;
 }
 
+// KYTY_SRT_NARROW_READBACK=1: an SRT defer readback downloads only the pages the refresh reads,
+// not the 4 MiB window game-thread reads take (so the window's other bytes do not count as
+// downloading behind the whole GPU backlog). Off: no measurable change in the jungle (2026-10-18).
+static bool SrtNarrowReadback() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_NARROW_READBACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint64_t BufferCache::StartSrtReadback(uint64_t vaddr, uint64_t size) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid()) {
@@ -805,7 +816,9 @@ uint64_t BufferCache::StartSrtReadback(uint64_t vaddr, uint64_t size) {
 		}
 		return 0;
 	}
+	m_srt_readback  = true;
 	const auto tick = ReadMemoryStep(vaddr, size, false, true, true);
+	m_srt_readback  = false;
 	if (tick == 0) {
 		return 0;
 	}
@@ -843,6 +856,19 @@ static bool ReadbackRetick() {
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return 0;
+	}
+	// MEASUREMENT ONLY (wrong results): KYTY_TEST_NO_READBACK_WAIT=1 lets game-thread reads of
+	// GPU-written pages see guest memory as it is, without any readback, to bound what the
+	// readback waits cost. The bytes stay GPU-written for the GPU thread.
+	if (static const bool no_wait = [] {
+		    const char* value = std::getenv("KYTY_TEST_NO_READBACK_WAIT");
+		    return value != nullptr && value[0] == '1';
+	    }();
+	    no_wait && !is_write && !from_gpu_thread) {
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		return 0;
 	}
 	if (!from_gpu_thread && SharedBuffersEnabled()) {
@@ -1041,7 +1067,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// labels.
 	// GPU write bitmap: pages of tracked bindings the GPU did not write lose their GPU-written
 	// bytes here, so the window below downloads only what was written, or nothing.
-	m_narrow_window = false;
+	m_narrow_window = m_srt_readback && SrtNarrowReadback();
 	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
 		{ t_rm_reason = 1; return wait_tick; }
 	}
@@ -1166,11 +1192,16 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// far has finished; then the pages fault again, and a read downloads the final bytes (cheap:
 	// the writers are done). Writes still fault and wait, and the bytes stay GPU-written for the
 	// GPU thread's own reads, so nothing the GPU writes is lost or overwritten.
-	if (static const bool snapshots = [] {
-		    const char* value = std::getenv("KYTY_READ_SNAPSHOT");
-		    return value != nullptr && value[0] == '1';
-	    }();
-	    snapshots && async && !is_write && !from_gpu_thread) {
+	// KYTY_READ_SNAPSHOT=2: every game-thread read snapshots (copy behind finished work), also
+	// when no writer is known to run: the writer ticks are kept per 1 MiB block and per heap-wide
+	// binding, so a writer always seemed to run, and a read that did not snapshot downloaded on the
+	// main queue behind all the work recorded so far (~7 ms a read for the BVH headers the game
+	// reads each frame).
+	static const int snapshot_mode = [] {
+		const char* value = std::getenv("KYTY_READ_SNAPSHOT");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (const bool snapshots = snapshot_mode != 0; snapshots && async && !is_write && !from_gpu_thread) {
 		constexpr uint64_t SnapshotWindow = 64u * 1024u;
 		const auto snap_begin = std::max(Common::AlignDown(vaddr, SnapshotWindow), buffer.CpuAddress());
 		const auto snap_end   = std::min(std::max(snap_begin + SnapshotWindow,
@@ -1194,7 +1225,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			{ t_rm_reason = 6; return 0; }
 		}
 		const auto latest = LatestGpuWriteTick(snap_begin, snap_end);
-		if (latest != 0 && !m_scheduler.IsFree(latest)) {
+		if (snapshot_mode == 2 || (latest != 0 && !m_scheduler.IsFree(latest))) {
 			if (const auto marker = TrySnapshotReadback(buffer, snap_begin, snap_end); marker != 0) {
 				{ t_rm_reason = 7; return marker; }
 			}
@@ -3605,9 +3636,25 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 	                     "wait for readback");
 	slot.staging->Invalidate(0, slot.total_size);
 	const auto* mapped = slot.staging->Mapped().data();
-	for (const auto& copy: slot.copies) {
-		Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
-		                                      mapped + copy.dstOffset, copy.size);
+	if (slot.snapshot) {
+		// Only bytes still GPU-written: a download recorded since may have published newer
+		// bytes of the rest, which the older snapshot must not overwrite.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: slot.copies) {
+			const auto begin = slot.buffer_address + copy.srcOffset;
+			m_gpu_modified_ranges.ForEachInRange(begin, copy.size, [&](uint64_t from, uint64_t to) {
+				if (m_downloading_ranges.Intersects(from, to - from)) {
+					return;
+				}
+				Libs::LibKernel::Memory::WriteBacking(from, mapped + copy.dstOffset + (from - begin),
+				                                      to - from);
+			});
+		}
+	} else {
+		for (const auto& copy: slot.copies) {
+			Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
+			                                      mapped + copy.dstOffset, copy.size);
+		}
 	}
 	if (slot.snapshot) {
 		// The bytes stay GPU-written; the GPU thread lets reads of the window through.

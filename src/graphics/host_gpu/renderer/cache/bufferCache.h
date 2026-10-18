@@ -394,6 +394,7 @@ private:
 	};
 	std::deque<PendingBitmapWrite>                     m_pending_bitmap_writes;
 	bool m_narrow_window = false; // RefineWithWriteBitmap: download only the faulting pages
+	bool m_srt_readback  = false; // StartSrtReadback is asking (KYTY_SRT_NARROW_READBACK)
 	uint64_t                                           m_bitmap_dropped_pages = 0;
 	uint64_t                                           m_bitmap_written_pages = 0;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.

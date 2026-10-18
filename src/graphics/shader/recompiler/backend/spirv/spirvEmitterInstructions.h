@@ -131,7 +131,7 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+		return flush ? EmitFlushF32DenormAlways(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }

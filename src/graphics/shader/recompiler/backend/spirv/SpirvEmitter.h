@@ -35,6 +35,15 @@ uint32_t GetDeviceClockShift();
 void SetCoherentLoadAcquire(bool enabled);
 bool GetCoherentLoadAcquire();
 
+// The device runs 32-bit float shaders in the SPIR-V DenormFlushToZero mode
+// (shaderDenormFlushToZeroFloat32, with independent denormal behaviour per width). Shaders whose
+// MODE flushes FP32 denormals (every one this title runs) then declare the mode and drop the
+// software flushes around MAD/MAC, conversions and transcendentals: the host flushes the inputs
+// and outputs of every FP32 operation itself, as the guest ALU does. KYTY_DENORM_FTZ_MODE=0 keeps
+// the software flushes.
+void SetDenormFlushToZero32(bool supported);
+bool GetDenormFlushToZero32();
+
 // Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
 [[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);
 

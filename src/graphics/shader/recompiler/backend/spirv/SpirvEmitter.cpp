@@ -491,10 +491,23 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
+std::atomic_bool     g_denorm_ftz32 {false};
 } // namespace
 
 void SetCoherentLoadAcquire(bool enabled) {
 	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+void SetDenormFlushToZero32(bool supported) {
+	g_denorm_ftz32.store(supported, std::memory_order_relaxed);
+}
+
+bool GetDenormFlushToZero32() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_DENORM_FTZ_MODE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed && g_denorm_ftz32.load(std::memory_order_relaxed);
 }
 
 bool GetCoherentLoadAcquire() {

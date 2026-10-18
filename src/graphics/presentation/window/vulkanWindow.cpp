@@ -577,6 +577,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 
+	// SPIR-V DenormFlushToZero for 32-bit floats, set alone (the 64-bit behaviour is left).
+	{
+		const bool ftz32 = float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE &&
+		                   float_controls.denormBehaviorIndependence !=
+		                       vk::ShaderFloatControlsIndependence::eNone;
+		ShaderRecompiler::Spirv::SetDenormFlushToZero32(ftz32);
+		LOGF("Vulkan FP32 denormal flush-to-zero mode: %s\n", ftz32 ? "supported" : "unsupported");
+	}
+
 	graphics.bindless_max_sampled_images =
 	    graphics.bindless_enabled ? properties12.maxDescriptorSetUpdateAfterBindSampledImages : 0u;
 	graphics.bindless_max_samplers =

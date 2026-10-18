@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <cstdlib>
 
@@ -232,7 +233,26 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 
+bool HostFlushesF32Denorms(const EmitterState& state) {
+	if (!state.float_controls || !GetDenormFlushToZero32()) {
+		return false;
+	}
+	if (state.program.stage == ShaderType::Compute) {
+		// MODE.FP_DENORM bits 4-5: 0 flushes FP32 denormals.
+		return state.input_info.compute != nullptr && (state.input_info.compute->float_mode & 0x30u) == 0;
+	}
+	return true;
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (HostFlushesF32Denorms(state)) {
+		// DenormFlushToZero: the operation consuming or producing the value flushes it.
+		return value;
+	}
+	return EmitFlushF32DenormAlways(state, value);
+}
+
+uint32_t EmitFlushF32DenormAlways(EmitterState& state, uint32_t value) {
 	// Experiment (2026-10-17): KYTY_DENORM_FLUSH=0 leaves FP32 denormals to the host instead of
 	// flushing them in software around every MAD, conversion and flushing compare (about half
 	// the instructions of the heaviest shaders).
