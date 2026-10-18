@@ -15,6 +15,8 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
+#include <cstdio>
+#include <atomic>
 #include <memory>
 #include <windows.h>
 #endif
@@ -1950,6 +1952,18 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				     command.dmem_offset, static_cast<uint32_t>(result));
 
 				if (result != OK) {
+					// stderr too: the game goes on to use the mapping (the Render Thread's
+					// memcpy fault in extended memory, 2026-10-18).
+					static std::atomic<uint32_t> reported {0};
+					if (reported.fetch_add(1) < 64) {
+						std::fprintf(stderr,
+						             "[amm] command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
+						             " size=0x%016" PRIx64 " type=%" PRId32 " prot=0x%08" PRIx32
+						             " result=0x%08" PRIx32 "\n",
+						             static_cast<uint32_t>(command.kind), command.va, command.dmem_offset,
+						             command.size, command.type, static_cast<uint32_t>(command.prot),
+						             static_cast<uint32_t>(result));
+					}
 					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64
 					     " dmem=0x%016" PRIx64 " size=0x%016" PRIx64 " type=%" PRId32
 					     " prot=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",

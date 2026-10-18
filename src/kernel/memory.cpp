@@ -264,10 +264,19 @@ static uint64_t RangeHistoryMicros() {
 	                                 .count());
 }
 
+// Extended memory (AMM's range) has a ring of its own: other mappings cycle the shared one fast.
+static std::array<RangeHistoryEntry, 16384> g_extended_history {};
+static std::atomic<uint64_t>                 g_extended_history_next {0};
+
 static void RecordRangeChange(char op, uint64_t start, uint64_t size, int type, int protection) {
+	const RangeHistoryEntry value {start, size, RangeHistoryMicros(), RangeHistoryThread(), op, type,
+	                               protection};
 	const auto index = g_range_history_next.fetch_add(1, std::memory_order_relaxed);
-	auto&      entry = g_range_history[index % g_range_history.size()];
-	entry            = {start, size, RangeHistoryMicros(), RangeHistoryThread(), op, type, protection};
+	g_range_history[index % g_range_history.size()] = value;
+	if (start + size > kExtendedMemoryBase && start < kExtendedMemoryBase + kExtendedMemorySize) {
+		const auto ext = g_extended_history_next.fetch_add(1, std::memory_order_relaxed);
+		g_extended_history[ext % g_extended_history.size()] = value;
+	}
 }
 
 class VirtualRanges {
@@ -1275,6 +1284,21 @@ void DescribeUnhandledFault(uint64_t vaddr) {
 	for (uint64_t i = next - count; i < next; i++) {
 		const auto& entry = g_range_history[i % g_range_history.size()];
 		if (vaddr >= entry.start && vaddr - entry.start < entry.size) {
+			std::printf("  %c 0x%016" PRIx64 " size=0x%" PRIx64 " type=%d prot=0x%x thread=%u "
+			            "%" PRIu64 " us ago\n",
+			            entry.op, entry.start, entry.size, entry.type, entry.protection,
+			            entry.thread, now - entry.micros);
+		}
+	}
+	const auto ext_next  = g_extended_history_next.load(std::memory_order_relaxed);
+	const auto ext_count = std::min<uint64_t>(ext_next, g_extended_history.size());
+	std::printf("extended-memory changes within 1 MiB of it (newest last, of the last %" PRIu64 "):\n",
+	            ext_count);
+	uint32_t shown = 0;
+	for (uint64_t i = ext_next - ext_count; i < ext_next; i++) {
+		const auto& entry = g_extended_history[i % g_extended_history.size()];
+		const auto  lo    = entry.start > 0x100000 ? entry.start - 0x100000 : 0;
+		if (vaddr >= lo && vaddr < entry.start + entry.size + 0x100000 && shown++ < 48) {
 			std::printf("  %c 0x%016" PRIx64 " size=0x%" PRIx64 " type=%d prot=0x%x thread=%u "
 			            "%" PRIu64 " us ago\n",
 			            entry.op, entry.start, entry.size, entry.type, entry.protection,
