@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <source_location>
 #include <unordered_set>
 #include <array>
 #include <memory>
@@ -126,7 +127,7 @@ public:
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
-	void EndRendering() const;
+	void EndRendering(std::source_location site = std::source_location::current()) const;
 
 	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
 	// this first waits until the thread has run everything queued; hot paths use Recorder().
@@ -230,6 +231,8 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,

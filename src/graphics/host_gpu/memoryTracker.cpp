@@ -139,6 +139,8 @@ bool MemoryTracker::TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	bool all = true;
 	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
+		// A hot page is CPU-dirty without a write: the GPU's bytes are the newer ones.
+		manager->DemoteHot(manager->GetCpuAddr() + offset, bytes);
 		if (manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
 			all = false; // the CPU wrote here since: its bytes are newer than the GPU's
 			return;

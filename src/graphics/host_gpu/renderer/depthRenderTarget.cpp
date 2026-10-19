@@ -164,7 +164,12 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (z.z_info.max_mip_level != 0 ||
 	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state (target): max_mip=%u current_mip=%u "
+		           "shading_rate=%u htile=%d address=0x%016" PRIx64 " write_buffer=%d",
+		           static_cast<unsigned>(z.z_info.max_mip_level),
+		           static_cast<unsigned>(z.depth_view.current_mip_level),
+		           static_cast<unsigned>(z.shading_rate_encoding), has_htile ? 1 : 0,
+		           static_cast<uint64_t>(depth_address), write_buffer ? 1 : 0);
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -299,12 +304,29 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
-	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	if (rc.copy_stencil_to_color ||
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+		DepthFatal("unsupported depth register state (control): copy_stencil_to_color=%d "
+		           "zfunc=%u depth_write_disable=%d z_read=0x%016" PRIx64 " z_write=0x%016" PRIx64
+		           " stencil=%d stencil_write_disable=%d stencil_read=0x%016" PRIx64
+		           " stencil_write=0x%016" PRIx64,
+		           rc.copy_stencil_to_color ? 1 : 0, static_cast<unsigned>(dc.zfunc),
+		           z.depth_view.depth_write_disable ? 1 : 0,
+		           static_cast<uint64_t>(z.z_read_base_addr),
+		           static_cast<uint64_t>(z.z_write_base_addr), has_stencil ? 1 : 0,
+		           z.depth_view.stencil_write_disable ? 1 : 0,
+		           static_cast<uint64_t>(z.stencil_read_base_addr),
+		           static_cast<uint64_t>(z.stencil_write_base_addr));
+	}
+	if (rc.copy_depth_to_color &&
+	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
+	     z.z_info.format != Prospero::DepthFormat::kZ32F ||
+	     dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || dc.stencil_enable ||
+	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
+		DepthFatal("unsupported depth-to-color copy state");
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;

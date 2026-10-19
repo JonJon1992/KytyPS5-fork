@@ -7,7 +7,7 @@ I'm testing it only on Marvel's Wolverine for now, the tests are all done on my 
 I'm sharing this for anyone who wants to try it and add to it, if you can help us with the issues we're facing that would be awesome.
 This is where it stands right now:
 
-## Where it stands (October 18, 2026)
+## Where it stands (October 19, 2026, v0.2)
 
 **Game:** Marvel's Wolverine (PPSA03671, version 01.001.005), Performance mode.
 
@@ -35,6 +35,13 @@ The FPS is in each window title (Performance mode, RTX 5090 Laptop). Click a pic
 
 **Working:** boots, menus, cutscenes and gameplay, with correct terrain, foliage, lighting and ray-traced passes.
 
+### New in v0.2
+
+- **One cause of the GPU hang ~20 s into gameplay fixed.** Two compute shaders (`06544f382c6b0850`, `3378b4a64461d6ca`) overlapped when their barriers were left out; they keep them now (0 hangs in 20 boots with the fix, same FPS). The other rare GPU crash (a shader reading outside any buffer) is still open: in a v0.1/v0.2 comparison on the test laptop, each build crashed once in three runs.
+- **Red squares and streaks instead of particles fixed** (title screen, rain, embers). GS user-data slot 28 is zeroed for the particle shader `4efbcf79c36d8adf` (see the old known issue below for the details). `KYTY_PARTICLE_SLOT28=0` turns it off.
+- **AMD: black window fixed.** AMD's Windows driver offers Mailbox presentation but shows nothing with it; on AMD GPUs the build now presents with Fifo (found on an RX 7900 XT). `KYTY_AMD_MAILBOX=1` keeps Mailbox.
+- **Depth-to-color copies** (from upstream KytyPS5). An AMD tester's build stopped with "unsupported depth register state" at the Sony logo; this may fix it, and if not, the log now names the exact setting. Please send your `kyty_log.txt` if you still hit it.
+
 ### What this build changes compared with KytyPS5
 
 Visual fixes:
@@ -58,12 +65,12 @@ Stability:
 
 ## Known issues and caveats
 
-- **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** AMD and Intel GPUs and other games are untested.
+- **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** Two testers run it on AMD (RX 7600, RX 7900 XT); v0.2 has their first fixes. Intel GPUs and other games are untested.
 - **Occasional GPU "device lost" crash.** A shader reads a GPU address outside any buffer. The crash report now names the address; the cause is under investigation.
 - **Occasional freeze.** The game can stop responding in some scene changes, for example the drop-off scene below (frame counter stuck, two threads spinning at 100%). Restarting gets past it. Under investigation.
 
   ![Freeze at the drop-off scene](docs/screenshots/frank/07_freeze.jpg)
-- **Red squares and red streaks instead of some particles** (title screen, rain and embers in some scenes). The particle shader (ES `4efbcf79c36d8adf`) adds GS user-data slot 28 (s36) to the instance ID to pick its one 16-byte record. The game sets slot 28 with a 29-register `SET_SH_REG` whose last dword is leftover command-buffer data on some frames (`0x00100011`, even a PM4 header), so the index lands past the record and the shader reads zeros. Forcing it to 0 gives the correct soft particles. What we've ruled out: the dword doesn't change in the 40 ms after we parse it, the GPU doesn't write it, and the draw (`DRAW_INDEX_INDIRECT_MULTI`, no base-vertex/start-instance/draw-index register) writes no user data. So either the real GPU doesn't load that register for this shader, or it treats that out-of-range index differently. It's a good place to help if you know RDNA2 merged ES/GS user SGPRs or PS5 command buffers.
+- **Red squares and red streaks instead of some particles** (title screen, rain and embers in some scenes; worked around in v0.2, the root cause is still open). The particle shader (ES `4efbcf79c36d8adf`) adds GS user-data slot 28 (s36) to the instance ID to pick its one 16-byte record. The game sets slot 28 with a 29-register `SET_SH_REG` whose last dword is leftover command-buffer data on some frames (`0x00100011`, even a PM4 header), so the index lands past the record and the shader reads zeros. Forcing it to 0 gives the correct soft particles. What we've ruled out: the dword doesn't change in the 40 ms after we parse it, the GPU doesn't write it, and the draw (`DRAW_INDEX_INDIRECT_MULTI`, no base-vertex/start-instance/draw-index register) writes no user data. So either the real GPU doesn't load that register for this shader, or it treats that out-of-range index differently. It's a good place to help if you know RDNA2 merged ES/GS user SGPRs or PS5 command buffers.
 - **You need your own legally dumped copy of the game.** No games or system files are provided or linked.
 
 ## Where we're struggling, and what we tried

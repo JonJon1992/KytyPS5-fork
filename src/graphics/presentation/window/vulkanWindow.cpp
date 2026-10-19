@@ -12,6 +12,8 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/barrierSink.h"
+#include "graphics/host_gpu/renderer/barrierStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -512,6 +514,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool maintenance8_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
+	if (maintenance8_extension) {
+		maintenance8.pNext = supported_features2.pNext;
+		supported_features2.pNext = &maintenance8;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -619,6 +628,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
+	LOGF("Vulkan depth/color copy support: %s\n",
+	     graphics.depth_color_copy_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -799,6 +811,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			create_info.pNext             = &device_fault;
 			graphics.device_fault_enabled = true;
 		}
+	}
+	if (graphics.depth_color_copy_enabled) {
+		maintenance8.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &maintenance8;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1280,6 +1296,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1301,6 +1318,8 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	InstallBarrierSink();
+	InstallBarrierStats();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.queue_count >= 2) {

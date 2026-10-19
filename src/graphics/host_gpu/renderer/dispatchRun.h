@@ -60,6 +60,61 @@ inline DispatchRunState& DispatchRun() {
 	return state;
 }
 
+// Mesh-args runs (KYTY_MESH_ARGS_RUNS=1). Each DRAW_INDIRECT of a fast-launch mesh draw had its
+// counts converted into a mesh-tasks command by a one-thread dispatch of its own: the rendering
+// instance ended, a barrier, the dispatch, a barrier, and rendering began again (~290 a frame in
+// the jungle, about 38 % of the GPU's drains). The arguments of the DRAW_INDIRECTs that follow,
+// up to the command stream's next sync or memory-writing packet, cannot change before those draws
+// read them (on the console their writers are ordered by such packets too), so the command
+// processor collects them at the first draw and the renderer converts them all there, between one
+// barrier before and one after. The later draws use their converted commands and keep their
+// rendering instance.
+struct MeshArgsRunEntry {
+	const uint32_t* packet = nullptr;
+	uint64_t        args   = 0;
+	vk::Buffer      buffer;
+	vk::DeviceSize  offset = 0;
+};
+
+struct MeshArgsRunState {
+	const uint32_t*               packet = nullptr; // the DRAW_INDIRECT being recorded
+	std::vector<MeshArgsRunEntry> upcoming;         // collected when packet has no conversion
+	std::vector<MeshArgsRunEntry> converted;        // the current batch, in command order
+	size_t                        next = 0;         // first batch entry not used yet
+	uint64_t batches = 0, batched = 0, hits = 0, single = 0; // stats
+
+	[[nodiscard]] bool Contains(const uint32_t* p) const {
+		for (size_t i = next; i < converted.size(); i++) {
+			if (converted[i].packet == p) return true;
+		}
+		return false;
+	}
+	// The batch entry of `p`; entries before it are skipped (their draws were not mesh draws).
+	const MeshArgsRunEntry* Take(const uint32_t* p) {
+		for (size_t i = next; i < converted.size(); i++) {
+			if (converted[i].packet == p) {
+				next = i + 1;
+				return &converted[i];
+			}
+		}
+		return nullptr;
+	}
+};
+
+inline bool MeshArgsRunsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MESH_ARGS_RUNS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// GPU thread only.
+inline MeshArgsRunState& MeshArgsRun() {
+	static MeshArgsRunState state;
+	return state;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DISPATCHRUN_H_

@@ -1,3 +1,4 @@
+#include "common/sampler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -302,9 +303,9 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 	Current().BeginRendering(state);
 }
 
-void CommandScheduler::EndRendering() {
+void CommandScheduler::EndRendering(std::source_location site) {
 	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
+		Current().EndRendering(site);
 	}
 }
 
@@ -904,6 +905,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
+	Common::Sampler::RegisterCurrentThread("record");
 	Common::PreferPerformanceCores("Vulkan recording thread");
 	Common::RaiseGpuThreadPriority();
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are

@@ -134,11 +134,11 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering    = true;
 }
 
-void CommandBuffer::EndRendering() const {
+void CommandBuffer::EndRendering(std::source_location site) const {
 	if (!m_rendering) {
 		return;
 	}
-	Recorder().endRendering();
+	Recorder().endRendering(site);
 	m_rendering    = false;
 	m_render_state = {};
 }

@@ -12,6 +12,7 @@
 #include <limits>
 #include <atomic>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -57,6 +58,18 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// KYTY_GUEST_STORAGE_REPEAT=1: a shader write that guest draws and dispatches repeat in the same
+	// layout and access gets no barrier between them, as nothing but the guest's own barriers
+	// (EmitGlobalBarrier) orders them on the console. A repeated write after any other access (an
+	// upload, a copy, a helper pass) keeps its barrier. The scope marks the transitions of a guest
+	// draw's or dispatch's bindings.
+	struct GuestTransitScope {
+		GuestTransitScope();
+		~GuestTransitScope();
+		GuestTransitScope(const GuestTransitScope&)            = delete;
+		GuestTransitScope& operator=(const GuestTransitScope&) = delete;
+		bool m_previous;
+	};
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
@@ -64,7 +77,8 @@ public:
 	// Records through the recording thread when given a threaded CommandBuffer::Recorder(); a raw
 	// command buffer converts.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer);
+	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer,
+	             std::source_location site = std::source_location::current());
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

@@ -18,6 +18,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -744,10 +746,24 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto& sh     = context.GetShaderRegisters();
 	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
-	auto        params = GetShaderParams(
-	    regs.es_regs.data_addr, hash,
-	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged ? 8u : 0u);
+	// The particle ES (4efbcf79c36d8adf) reads the last GS user-data register (slot 28, s36) as an
+	// index into its per-instance records. The game's 29-register SET_SH_REG sometimes leaves stale
+	// command-buffer data in that last dword, which sends the index out of range and draws the
+	// particles as opaque squares. Zero that register for this shader.
+	const std::span<const uint32_t> gs_users(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
+	std::span<const uint32_t>       user_data = gs_users;
+	std::array<uint32_t, HW::UserSgprInfo::SGPRS_MAX> gs_users_fixed {};
+	// KYTY_PARTICLE_SLOT28=0 leaves the register as the game set it (diagnostics).
+	static const bool zero_slot28 = [] {
+		const char* value = std::getenv("KYTY_PARTICLE_SLOT28");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (zero_slot28 && hash == 0x4efbcf79c36d8adfULL && gs_users.size() > 28u) {
+		std::copy(gs_users.begin(), gs_users.end(), gs_users_fixed.begin());
+		gs_users_fixed[28] = 0;
+		user_data          = std::span<const uint32_t>(gs_users_fixed.data(), gs_users.size());
+	}
+	auto params = GetShaderParams(regs.es_regs.data_addr, hash, user_data, data, merged ? 8u : 0u);
 	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {

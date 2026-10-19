@@ -6,6 +6,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
+#include <string>
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -190,8 +193,102 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
+	// KYTY_FPS_LOG: host protection changes per second, arming (to read-only or no access) and
+	// disarming (back to read-write), and how many pages are armed again and again ([page-protect]).
+	struct ProtectStats {
+		std::mutex                             mutex;
+		std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now();
+		uint64_t                               arm_calls = 0, arm_pages = 0, disarm_calls = 0,
+		                                       disarm_pages = 0, noaccess_pages = 0;
+		std::unordered_map<uint64_t, std::array<uint64_t, 3>> regions; // 2 MB -> read, none, rw
+		double                                 arm_us = 0, disarm_us = 0;
+		std::unordered_map<uint64_t, uint32_t> armed; // page -> arm count in the window
+	};
+	static ProtectStats* Stats() {
+		static ProtectStats* stats =
+		    std::getenv("KYTY_FPS_LOG") != nullptr ? new ProtectStats : nullptr;
+		return stats;
+	}
+	static void Note(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode, double us) {
+		auto* stats = Stats();
+		if (stats == nullptr) {
+			return;
+		}
+		const bool       arm   = mode != Common::VirtualMemory::Mode::ReadWrite;
+		const uint64_t   pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+		std::scoped_lock lock(stats->mutex);
+		auto& region = stats->regions[vaddr >> 21u];
+		region[mode == Common::VirtualMemory::Mode::Read ? 0 : arm ? 1 : 2] += pages;
+		if (mode == Common::VirtualMemory::Mode::NoAccess) {
+			stats->noaccess_pages += pages;
+		}
+		if (arm) {
+			stats->arm_calls++;
+			stats->arm_pages += pages;
+			stats->arm_us += us;
+			for (uint64_t p = 0; p < pages && p < 4096; p++) {
+				stats->armed[vaddr / PAGE_SIZE + p]++;
+			}
+		} else {
+			stats->disarm_calls++;
+			stats->disarm_pages += pages;
+			stats->disarm_us += us;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const auto s   = std::chrono::duration<double>(now - stats->start).count();
+		if (s < 5.0) {
+			return;
+		}
+		uint64_t hot = 0, hot_arms = 0, total_arms = 0;
+		for (const auto& [page, count]: stats->armed) {
+			total_arms += count;
+			if (count >= 5) {
+				hot++;
+				hot_arms += count;
+			}
+		}
+		std::fprintf(stderr,
+		             "[page-protect] arm %.0f calls/s %.0f pages/s %.1f ms/s | disarm %.0f calls/s "
+		             "%.0f pages/s %.1f ms/s | pages armed %zu, armed >=5x: %llu pages = %.0f%% of "
+		             "arms\n",
+		             stats->arm_calls / s, stats->arm_pages / s, stats->arm_us / 1000.0 / s,
+		             stats->disarm_calls / s, stats->disarm_pages / s,
+		             stats->disarm_us / 1000.0 / s, stats->armed.size(),
+		             static_cast<unsigned long long>(hot),
+		             total_arms != 0 ? 100.0 * static_cast<double>(hot_arms) / total_arms : 0.0);
+		std::vector<std::pair<uint64_t, std::array<uint64_t, 3>>> top(stats->regions.begin(),
+		                                                               stats->regions.end());
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+			return a.second[0] + a.second[1] + a.second[2] > b.second[0] + b.second[1] + b.second[2];
+		});
+		std::string text;
+		for (size_t i = 0; i < top.size() && i < 10; i++) {
+			char line[160];
+			std::snprintf(line, sizeof(line), " 0x%llx:r%.0f/n%.0f/w%.0f",
+			              static_cast<unsigned long long>(top[i].first << 21u),
+			              top[i].second[0] / s, top[i].second[1] / s, top[i].second[2] / s);
+			text += line;
+		}
+		std::fprintf(stderr, "[page-protect] no-access %.0f pages/s; 2MB regions (pages/s read-only/no-access/rw):%s\n",
+		             stats->noaccess_pages / s, text.c_str());
+		stats->regions.clear();
+		stats->noaccess_pages = 0;
+		stats->arm_calls = stats->arm_pages = stats->disarm_calls = stats->disarm_pages = 0;
+		stats->arm_us = stats->disarm_us = 0;
+		stats->armed.clear();
+		stats->start = now;
+	}
+
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
+		const auto t0 = Stats() != nullptr ? std::chrono::steady_clock::now()
+		                                   : std::chrono::steady_clock::time_point {};
+		const bool ok = Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode);
+		if (Stats() != nullptr) {
+			Note(vaddr, size, mode,
+			     std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+			         .count());
+		}
+		if (!ok) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}

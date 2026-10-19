@@ -14,6 +14,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "common/sampler.h"
+#include "graphics/host_gpu/renderer/barrierSink.h"
 #include "graphics/host_gpu/renderer/dispatchRun.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -34,6 +36,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <fmt/format.h>
+#include <map>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -542,6 +547,12 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 template <typename T>
 T CommandProcessor::ReadLabel(const volatile T* addr) const {
+	// A label the CPU wrote (its page is CPU-dirty) may follow data it wrote (KYTY_HOT_PAGES);
+	// the GPU's own labels (end-of-pipe writes) do not start a generation.
+	if (HotPagesEnabled() && m_renderer.GetBufferCache().IsRegionCpuModified(
+	                             reinterpret_cast<uint64_t>(addr) & ~uint64_t {3}, sizeof(T))) {
+		BumpHotGeneration();
+	}
 	return GuestGpu::LabelsDeferred() ? m_renderer.GetGpu().ReadLabel(addr) : *addr;
 }
 
@@ -845,6 +856,7 @@ void GuestGpu::ThreadRun(void* data) {
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::Sampler::RegisterCurrentThread("gpu");
 
 	auto loop_mark = std::chrono::steady_clock::now();
 	for (;;) {
@@ -1076,7 +1088,46 @@ static bool CoalesceSubmits() {
 	return enabled;
 }
 
+// KYTY_HOT_PAGES: a new generation when a submission starts (the game submits after writing);
+// every 60 s every hot page goes back to faulting once (KYTY_FPS_LOG prints [hot-pages]).
+static void HotPagesSlice(bool first_slice) {
+	if (!HotPagesEnabled()) {
+		return;
+	}
+	if (first_slice) {
+		BumpHotGeneration();
+	}
+	static auto last       = std::chrono::steady_clock::now();
+	static auto last_epoch = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	const auto  s    = std::chrono::duration<double>(now - last).count();
+	if (s < 5.0) {
+		return;
+	}
+	last = now;
+	if (now - last_epoch > std::chrono::seconds(60)) {
+		last_epoch = now;
+		g_hot_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+		std::fprintf(stderr,
+		             "[hot-pages] faults %.0f/s, promoted %.0f/s, uploads %.0f/s, repeats skipped "
+		             "%.0f/s, demoted by GPU writes %.0f/s, generations %.0f/s\n",
+		             g_hot_stats.faults.exchange(0) / s, g_hot_stats.promoted.exchange(0) / s,
+		             g_hot_stats.uploads.exchange(0) / s, g_hot_stats.repeats.exchange(0) / s,
+		             g_hot_stats.demoted_by_gpu.exchange(0) / s,
+		             [&] {
+			             static uint32_t previous = 0;
+			             const auto      current  = g_hot_generation.load();
+			             const auto      delta    = current - previous;
+			             previous                 = current;
+			             return delta / s;
+		             }());
+	}
+}
+
 bool GuestGpu::Process(Submission& submission) {
+	HotPagesSlice(!submission.started);
 	const bool first_slice = !submission.started;
 	g_run_expected_next    = nullptr; // a run continues only within one slice of one submission
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -1476,6 +1527,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
 	(void)count_in_dwords;
+	BumpHotGeneration();
 	uint64_t value = 0;
 
 	switch (op) {
@@ -1576,6 +1628,144 @@ void CommandProcessor::WriteIndirectStartInstance(uint32_t start_instance) {
 	g_hw_sh_indirect_func[reg](*this, reg, start_instance);
 }
 
+// KYTY_MESH_ARGS_RUNS: packet, end: the DRAW_INDIRECT packet and the end of its command buffer.
+// Collects the arguments of the non-indexed DRAW_INDIRECTs from this one up to the first packet
+// that may write memory, synchronize, change the arguments' base or leave this command buffer.
+static void PrepareMeshArgsRun(const CommandProcessor& cp, const uint32_t* packet,
+                               const uint32_t* end) {
+	auto& run  = MeshArgsRun();
+	run.packet = nullptr;
+	run.upcoming.clear();
+	// KYTY_FPS_LOG: why runs do (not) form, every 5 s.
+	static uint64_t calls = 0, no_packet = 0, bad_header = 0, contained = 0, scanned = 0,
+	                collected = 0, multi = 0;
+	static uint32_t last_header = 0, last_prev = 0, last_stop = 0;
+	static auto     last_log    = std::chrono::steady_clock::now();
+	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && MeshArgsRunsEnabled()) {
+		calls++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_log >= std::chrono::seconds(5)) {
+			last_log = now;
+			std::fprintf(stderr,
+			             "[mesh-args-scan] calls %llu no-packet %llu bad-header %llu (0x%08x, next "
+			             "0x%08x) contained %llu scanned %llu collected %llu runs>1 %llu last-stop "
+			             "0x%08x\n",
+			             static_cast<unsigned long long>(calls),
+			             static_cast<unsigned long long>(no_packet),
+			             static_cast<unsigned long long>(bad_header), last_header, last_prev,
+			             static_cast<unsigned long long>(contained),
+			             static_cast<unsigned long long>(scanned),
+			             static_cast<unsigned long long>(collected),
+			             static_cast<unsigned long long>(multi), last_stop);
+			calls = no_packet = bad_header = contained = scanned = collected = multi = 0;
+		}
+	}
+	if (!MeshArgsRunsEnabled()) {
+		return;
+	}
+	if (packet == nullptr || end == nullptr || packet >= end) {
+		no_packet++;
+		return;
+	}
+	if ((packet[0] & ~1u) != 0xc0032400u) {
+		bad_header++;
+		last_header = packet[0];
+		last_prev   = packet + 1 < end ? packet[1] : 0;
+		return;
+	}
+	run.packet = packet;
+	if (run.Contains(packet)) {
+		contained++;
+		return;
+	}
+	uint64_t base = cp.GetDrawIndirectArgsBaseAddress();
+	if (base == 0) {
+		return;
+	}
+	scanned++;
+	for (const uint32_t* p = packet; p < end && run.upcoming.size() < 1024;) {
+		const uint32_t header = p[0];
+		if ((header >> 30u) != 3u || (header & 1u) != 0) {
+			break; // not a type-3 packet, or predicated
+		}
+		const uint32_t op  = (header >> 8u) & 0xffu;
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len < 2 || len > static_cast<uint64_t>(end - p)) {
+			break;
+		}
+		bool go_on = true;
+		switch (op) {
+			case Pm4::IT_SET_BASE:
+				// The arguments' base for the DRAW_INDIRECTs after it (as CpOpSetBase).
+				if (len != 4u || (p[1] & 0xfu) != 1u || ((header >> 1u) & 0x3u) > 1u) {
+					go_on = false;
+				} else if (((header >> 1u) & 0x3u) == 0u) {
+					base = (p[2] & ~0x7ull) | (static_cast<uint64_t>(p[3] & 0xffffu) << 32u);
+					go_on = base != 0;
+				}
+				break;
+			case Pm4::IT_DRAW_INDIRECT:
+				if (header != 0xc0032400u || (p[1] & 3u) != 0) {
+					go_on = false;
+				} else {
+					run.upcoming.push_back({p, base + p[1], {}, 0});
+				}
+				break;
+			// Register state and draws: none writes memory the arguments live in without a guest
+			// sync packet before the arguments are read.
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_NUM_INSTANCES:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_BUFFER_SIZE:
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			// Register loads from memory (they write registers only).
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+			// An end-of-pipe label or interrupt: it orders nothing after it on the console (a
+			// later read of what it waited for needs WAIT_REG_MEM or a cache sync, which stop the
+			// scan), and its label is not a draw's arguments.
+			case Pm4::IT_RELEASE_MEM: break;
+			case Pm4::IT_NOP: {
+				const auto r = KYTY_PM4_R(header);
+				go_on = r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+				        r == Pm4::R_RELEASE_MEM || r == Pm4::R_CONTEXT_STATE;
+				break;
+			}
+			default: go_on = false; break;
+		}
+		if (!go_on) {
+			last_stop = header;
+			if (op == Pm4::IT_EVENT_WRITE && len >= 2) {
+				static std::map<uint32_t, uint64_t> events;
+				static auto                         events_log = std::chrono::steady_clock::now();
+				events[p[1]]++;
+				if (const auto now = std::chrono::steady_clock::now();
+				    now - events_log >= std::chrono::seconds(5)) {
+					events_log = now;
+					std::string line = "[mesh-args-scan] EVENT_WRITE stops (payload:count)";
+					for (const auto& [payload, count]: events) {
+						line += fmt::format(" 0x{:x}:{}", payload, count);
+					}
+					std::fprintf(stderr, "%s\n", line.c_str());
+					events.clear();
+				}
+			}
+			break;
+		}
+		p += len;
+	}
+	collected += run.upcoming.size();
+	multi += run.upcoming.size() > 1 ? 1 : 0;
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
@@ -1611,9 +1801,20 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 				             static_cast<const uint32_t*>(args_addr)[3]);
 			}
 		}
+		{
+			const uint32_t* run_packet = nullptr;
+			const uint32_t* run_end    = nullptr;
+			if (g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty()) {
+				const auto& cursor = g_current_execution->m_buffer_stack.back();
+				run_packet         = cursor.commands.data() + cursor.offset_dw;
+				run_end            = cursor.commands.data() + cursor.commands.size();
+			}
+			PrepareMeshArgsRun(*this, run_packet, run_end);
+		}
 		DrawIndexAuto({.offset_source       = DrawOffsetSource::IndirectArgs,
 		               .gpu_args_address    = reinterpret_cast<uint64_t>(args_addr),
 		               .start_instance_sgpr = start_instance_sgpr});
+		MeshArgsRun().packet = nullptr;
 		return;
 	}
 	if (!indexed) {
@@ -2406,7 +2607,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
-void CommandProcessor::EmitGlobalBarrier() {
+void CommandProcessor::EmitGlobalBarrier(std::source_location site) {
 	Common::LockGuard lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
@@ -2418,8 +2619,13 @@ void CommandProcessor::EmitGlobalBarrier() {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
+	if (BarrierSinkEnabled()) {
+		// Rendering ends there only if the barrier cannot stay pending (barrierSink.h).
+		CurrentBuffer().Recorder().guestPipelineBarrier2(dependency, site);
+		return;
+	}
 	GetScheduler().EndRendering();
-	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
+	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

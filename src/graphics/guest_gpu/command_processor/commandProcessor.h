@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <source_location>
 #include <span>
 #include <vector>
 
@@ -94,6 +95,9 @@ public:
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
+	[[nodiscard]] uint64_t GetDrawIndirectArgsBaseAddress() const {
+		return m_draw_indirect_args_base_addr;
+	}
 	[[nodiscard]] uint64_t GetDispatchIndirectArgsBaseAddress() const {
 		return m_dispatch_indirect_args_base_addr;
 	}
@@ -122,7 +126,7 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
-	void EmitGlobalBarrier();
+	void EmitGlobalBarrier(std::source_location site = std::source_location::current());
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);

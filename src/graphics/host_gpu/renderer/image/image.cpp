@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+
+#include <cstdlib>
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -155,6 +157,25 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+// KYTY_GUEST_STORAGE_REPEAT=1 (Image::GuestTransitScope; ported from chenxiao07/KytyPS5 397112a04 by
+// way of Jetsku/KytyPS5 c7cb1495).
+static bool GuestStorageRepeatEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+static thread_local bool t_guest_transit = false;
+
+Image::GuestTransitScope::GuestTransitScope(): m_previous(t_guest_transit) {
+	t_guest_transit = GuestStorageRepeatEnabled();
+}
+
+Image::GuestTransitScope::~GuestTransitScope() {
+	t_guest_transit = m_previous;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -170,6 +191,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
+	const bool guest                  = t_guest_transit;
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
@@ -191,7 +213,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eShaderWrite |
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
+				    static_cast<bool>(subresource_state.access_mask & write_access) &&
+				    !(guest && subresource_state.guest);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -210,7 +233,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = {destination_stage, destination_access, destination_layout,
+					                     guest};
 				}
 			}
 		}
@@ -224,7 +248,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		                                vk::AccessFlagBits2::eMemoryWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		    (!repeated_write || (guest && state.guest))) {
 			return {};
 		}
 
@@ -249,13 +273,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	if (state.layout != destination_layout) {
 		NoteBindlessStateChange(*this);
 	}
-	state = {destination_stage, destination_access, destination_layout};
+	state = {destination_stage, destination_access, destination_layout, guest};
 	return barriers;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range,
-                    const CommandRecorder&               command_buffer) {
+                    const CommandRecorder& command_buffer, std::source_location site) {
 	// Every use of the image goes through here (layouts), also when no barrier is needed: the
 	// cache keeps a released image until the GPU has finished the last tick that used it.
 	tick_accessed_last = std::max(tick_accessed_last, m_scheduler.CurrentTick());
@@ -279,7 +303,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
-	command_buffer.pipelineBarrier2(dependency);
+	command_buffer.pipelineBarrier2(dependency, site);
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

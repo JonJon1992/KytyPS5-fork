@@ -3402,6 +3402,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			heap->checked_generation = g_bindless_state_generation.load(std::memory_order_relaxed);
 			heap->checked_count      = resolved.size();
 		}
+		const Image::GuestTransitScope guest_transits;
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];

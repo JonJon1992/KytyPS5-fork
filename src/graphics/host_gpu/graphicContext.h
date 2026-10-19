@@ -67,6 +67,7 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
@@ -201,6 +202,8 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// Set by a guest draw's or dispatch's bindings (KYTY_GUEST_STORAGE_REPEAT, Image::GetBarriers).
+	bool guest = false;
 };
 
 struct VulkanImage {

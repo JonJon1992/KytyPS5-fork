@@ -183,20 +183,24 @@ MeshIndirectArgs::~MeshIndirectArgs() {
 }
 
 MeshIndirectArgs::Result MeshIndirectArgs::Convert(const CommandRecorder& command,
-                                                   vk::DeviceAddress     args) {
+                                                   vk::DeviceAddress args, bool pre_barrier,
+                                                   bool post_barrier) {
 	const auto entry  = m_next;
 	m_next            = (m_next + 1u) % Entries;
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
 
 	// The counts' writer (a dispatch or a copy) and the entry's last indirect read come first.
-	vk::MemoryBarrier counts_ready {};
-	counts_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
-	                             vk::AccessFlagBits::eTransferWrite |
-	                             vk::AccessFlagBits::eIndirectCommandRead;
-	counts_ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &counts_ready, 0,
-	                        nullptr, 0, nullptr);
+	if (pre_barrier) {
+		vk::MemoryBarrier counts_ready {};
+		counts_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+		                             vk::AccessFlagBits::eTransferWrite |
+		                             vk::AccessFlagBits::eIndirectCommandRead;
+		counts_ready.dstAccessMask =
+		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &counts_ready, 0,
+		                        nullptr, 0, nullptr);
+	}
 
 	const vk::DescriptorBufferInfo info {m_commands.Handle(), 0, VK_WHOLE_SIZE};
 	vk::WriteDescriptorSet         write {};
@@ -215,12 +219,14 @@ MeshIndirectArgs::Result MeshIndirectArgs::Convert(const CommandRecorder& comman
 	                      &push);
 	command.dispatch(1, 1, 1);
 
-	vk::MemoryBarrier command_ready {};
-	command_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	command_ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &command_ready, 0,
-	                        nullptr, 0, nullptr);
+	if (post_barrier) {
+		vk::MemoryBarrier command_ready {};
+		command_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		command_ready.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		                        vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &command_ready, 0,
+		                        nullptr, 0, nullptr);
+	}
 	return {m_commands.Handle(), offset};
 }
 

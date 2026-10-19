@@ -75,7 +75,10 @@ public:
 	// Records the conversion of the counts at `args` (vertex count, instance count) and returns
 	// the command's location, ready for drawMeshTasksIndirectEXT. Binds a compute pipeline and
 	// push state, so call it outside rendering and before committing the draw's bindings.
-	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress args);
+	// pre_barrier / post_barrier = false: the caller orders the counts' writers before and the
+	// indirect reads after a batch of conversions itself (KYTY_MESH_ARGS_RUNS).
+	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress args,
+	                             bool pre_barrier = true, bool post_barrier = true);
 
 private:
 	static constexpr uint32_t Entries     = 4096;

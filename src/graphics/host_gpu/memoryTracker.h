@@ -85,6 +85,7 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				manager->NoteCpuWrite(manager->GetCpuAddr() + offset, bytes);
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();

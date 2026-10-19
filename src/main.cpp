@@ -542,6 +542,9 @@ static void ApplyFrankEnvironmentDefaults() {
 	    // No NVIDIA crash-diagnostic markers per draw and dispatch (they serialize the GPU).
 	    {"KYTY_NV_CHECKPOINTS", "0"},
 	    {"KYTY_SRT_DEFER", "1"},
+	    // GPU-driven mesh draws convert their counts in batches, not one dispatch, two drains and
+	    // a rendering restart each (jungle median 18.5 -> 20.5-22.3 fps).
+	    {"KYTY_MESH_ARGS_RUNS", "1"},
 	};
 	for (const auto& [name, value]: Defaults) {
 		if (std::getenv(name) == nullptr) {

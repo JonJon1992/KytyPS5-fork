@@ -622,6 +622,17 @@ void Swapchain::Create() {
 		case Config::PresentMode::Fifo:
 		default: create_info.presentMode = vk::PresentModeKHR::eFifo; break;
 	}
+	// AMD's Windows driver offers Mailbox but shows a black window with it (the frames render;
+	// reported on an RX 7900 XT, Immediate and Fifo present fine). KYTY_AMD_MAILBOX=1 keeps it.
+	if (create_info.presentMode == vk::PresentModeKHR::eMailbox &&
+	    graphics.GetPhysicalDeviceProperties().vendorID == 0x1002u) {
+		const char* keep = std::getenv("KYTY_AMD_MAILBOX");
+		if (keep == nullptr || keep[0] != '1') {
+			LOGF("AMD GPU: presenting with Fifo instead of Mailbox (KYTY_AMD_MAILBOX=1 keeps "
+			     "Mailbox)\n");
+			create_info.presentMode = vk::PresentModeKHR::eFifo;
+		}
+	}
 	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
 	              create_info.presentMode) == surface.present_modes.end()) {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");

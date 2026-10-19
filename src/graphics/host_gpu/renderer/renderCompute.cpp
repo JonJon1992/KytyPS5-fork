@@ -794,13 +794,52 @@ private:
 };
 } // namespace
 
+// Dispatches whose ordering the guest stream leaves out but which still need it (they keep their
+// barriers inside runs). Marvel's Wolverine: 06544f382c6b0850 and 3378b4a64461d6ca (cs 0x11d04f8000
+// and 0x11d04f3600, 14-26 groups each); overlapped inside a run they hung the GPU about 20 s into
+// gameplay in about 1 boot in 3-4 (0 in 10 with their barriers kept, at the same frame rate).
+// KYTY_DISPATCH_RUN_EXCLUDE=<hex shader hashes or cs addresses> replaces the list (empty: none);
+// KYTY_DISPATCH_RUN_ONLY=<...> keeps runs for the listed shaders only (diagnostic).
+static thread_local bool t_run_excluded = false;
+
+static void NoteRunShader(uint64_t cs_addr, uint64_t shader_hash) {
+	struct Lists {
+		std::vector<uint64_t> exclude, only;
+	};
+	static const Lists lists = [] {
+		Lists l;
+		const auto parse = [](const char* value, std::vector<uint64_t>& out) {
+			if (value == nullptr) return;
+			for (const char* p = value; *p != '\0';) {
+				char* end = nullptr;
+				const auto v = std::strtoull(p, &end, 16);
+				if (end == p) {
+					p++;
+					continue;
+				}
+				out.push_back(v);
+				p = end;
+			}
+		};
+		const char* exclude = std::getenv("KYTY_DISPATCH_RUN_EXCLUDE");
+		parse(exclude != nullptr ? exclude : "06544f382c6b0850,3378b4a64461d6ca", l.exclude);
+		parse(std::getenv("KYTY_DISPATCH_RUN_ONLY"), l.only);
+		return l;
+	}();
+	const auto listed = [cs_addr, shader_hash](const std::vector<uint64_t>& list) {
+		return std::find(list.begin(), list.end(), cs_addr) != list.end() ||
+		       std::find(list.begin(), list.end(), shader_hash) != list.end();
+	};
+	t_run_excluded = listed(lists.exclude) || (!lists.only.empty() && !listed(lists.only));
+}
+
 // Whether the barrier before this dispatch can be left out (an earlier dispatch of its run was
 // recorded last), and the one after it (another dispatch of the run follows).
 static bool RunSkipsBarrierBefore() {
-	return DispatchRunsEnabled() && DispatchRun().continues;
+	return DispatchRunsEnabled() && DispatchRun().continues && !t_run_excluded;
 }
 static bool RunSkipsBarrierAfter() {
-	if (!DispatchRunsEnabled() || !DispatchRun().more) return false;
+	if (!DispatchRunsEnabled() || !DispatchRun().more || t_run_excluded) return false;
 	DispatchRun().pending_post = true;
 	DispatchRun().skipped_barriers++;
 	return true;
@@ -912,6 +951,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& program   = *input_info.stage.program;
+	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
 	const auto& resources = *input_info.stage.resources;
 	// KYTY_LOG_CS_IMAGES=1: each compute shader's written images (extent, format), once per shape.
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
@@ -1063,6 +1103,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// while allowing the queue to execute asynchronously.
 			if (DispatchSyncEnabled() && !RunSkipsBarrierBefore()) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
+		if (t_run_excluded && DispatchRunsEnabled() && DispatchRun().continues &&
+		    DispatchSyncEnabled()) {
+			// The dispatch before it left out its barrier after (KYTY_DISPATCH_RUN_EXCLUDE).
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
@@ -1206,6 +1251,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
 		static std::unordered_set<uint64_t> seen;
 		const auto& resources = *input_info.stage.resources;
@@ -1317,6 +1363,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			check.OnDispatch(m_context, bindings, run_converted.has_value(),
 			                 m_indirect_groups ? m_indirect_groups->RingHandle() : vk::Buffer {},
 			                 IndirectDispatchGroups::RingBytes(), indirect_buffer, indirect_offset);
+		}
+		if (t_run_excluded && DispatchRunsEnabled() && DispatchRun().continues &&
+		    DispatchSyncEnabled()) {
+			// The dispatch before it left out its barrier after (KYTY_DISPATCH_RUN_EXCLUDE).
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);

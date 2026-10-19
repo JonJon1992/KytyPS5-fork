@@ -2,6 +2,8 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDRECORDER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/barrierSink.h"
+#include "graphics/host_gpu/renderer/barrierStats.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -33,34 +35,48 @@ public:
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
 			command.draw(vertices, instances, first_vertex, first_instance);
 		});
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
+		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
 		});
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
 			command.drawIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
-		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
+		const bool safe = NextDrawSafe();
+		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
+			command.drawMeshTasksEXT(x, y, z);
+		});
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
+		const bool safe = NextDrawSafe();
 		Run([=](vk::CommandBuffer command) {
+			SetCommandDrawSafe(safe);
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
 	}
@@ -145,10 +161,13 @@ public:
 	                     vk::DependencyFlags flags, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
-	                     const vk::ImageMemoryBarrier* images) const {
+	                     const vk::ImageMemoryBarrier* images,
+	                     std::source_location site = std::source_location::current()) const {
 		if (!Threaded()) {
+			SetBarrierSite(&site);
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
 			                         buffers, image_count, images);
+			SetBarrierSite(nullptr);
 			return;
 		}
 		RequireNoNext(memory, memory_count);
@@ -158,13 +177,18 @@ public:
 		const auto* b = m_scheduler->Stash(buffers, buffer_count);
 		const auto* i = m_scheduler->Stash(images, image_count);
 		m_scheduler->Record([=](vk::CommandBuffer command) {
+			SetBarrierSite(&site);
 			command.pipelineBarrier(source, destination, flags, memory_count, m, buffer_count, b,
 			                        image_count, i);
+			SetBarrierSite(nullptr);
 		});
 	}
-	void pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+	void pipelineBarrier2(const vk::DependencyInfo& dependency,
+	                      std::source_location site = std::source_location::current()) const {
 		if (!Threaded()) {
+			SetBarrierSite(&site);
 			m_direct.pipelineBarrier2(dependency);
+			SetBarrierSite(nullptr);
 			return;
 		}
 		EXIT_IF(dependency.pNext != nullptr);
@@ -178,7 +202,29 @@ public:
 		                                                dependency.bufferMemoryBarrierCount);
 		copy.pImageMemoryBarriers =
 		    m_scheduler->Stash(dependency.pImageMemoryBarriers, dependency.imageMemoryBarrierCount);
-		m_scheduler->Record([copy](vk::CommandBuffer command) { command.pipelineBarrier2(copy); });
+		m_scheduler->Record([copy, site](vk::CommandBuffer command) {
+			SetBarrierSite(&site);
+			command.pipelineBarrier2(copy);
+			SetBarrierSite(nullptr);
+		});
+	}
+	// The guest's own barrier (CommandProcessor::EmitGlobalBarrier): with KYTY_BARRIER_SINK it may be
+	// requested inside rendering and stay pending (barrierSink.h).
+	void guestPipelineBarrier2(const vk::DependencyInfo& dependency,
+	                           std::source_location site = std::source_location::current()) const {
+		EXIT_IF(dependency.pNext != nullptr || dependency.memoryBarrierCount != 1 ||
+		        dependency.bufferMemoryBarrierCount != 0 || dependency.imageMemoryBarrierCount != 0);
+		const vk::MemoryBarrier2 barrier = dependency.pMemoryBarriers[0];
+		Run([=](vk::CommandBuffer command) {
+			vk::DependencyInfo copy {};
+			copy.memoryBarrierCount = 1;
+			copy.pMemoryBarriers    = &barrier;
+			SetBarrierSite(&site);
+			SetCommandGuestBarrier(true);
+			command.pipelineBarrier2(copy);
+			SetCommandGuestBarrier(false);
+			SetBarrierSite(nullptr);
+		});
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
@@ -315,8 +361,12 @@ public:
 		                                             info.pStencilAttachment != nullptr ? 1u : 0u);
 		m_scheduler->Record([copy](vk::CommandBuffer command) { command.beginRendering(copy); });
 	}
-	void endRendering() const {
-		Run([](vk::CommandBuffer command) { command.endRendering(); });
+	void endRendering(std::source_location site = std::source_location::current()) const {
+		Run([site](vk::CommandBuffer command) {
+			SetBarrierSite(&site);
+			command.endRendering();
+			SetBarrierSite(nullptr);
+		});
 	}
 	void setCheckpointNV(const void* marker) const {
 		Run([=](vk::CommandBuffer command) { command.setCheckpointNV(marker); });
