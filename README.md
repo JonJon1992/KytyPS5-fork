@@ -25,6 +25,12 @@ Turning the camera used to drop to single digits (rooftop ~13, sewer ~9–12); i
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
 
+### Gameplay video (v0.3)
+
+[![Marvel's Wolverine on PC – PS5 Emulator (KytyPS5-Frank) – RTX 5090 Laptop Gameplay](https://img.youtube.com/vi/kV5F9csrAUk/hqdefault.jpg)](https://youtu.be/kV5F9csrAUk)
+
+About 11 minutes of gameplay with v0.3 on the RTX 5090 Laptop (FPS in the window title). It ends with one of the "device lost" crashes listed under known issues.
+
 ### Screenshots
 
 From v0.2 (FPS is in each window title, Performance mode, RTX 5090 Laptop). Click a picture for full size.
