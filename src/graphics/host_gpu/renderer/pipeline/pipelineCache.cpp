@@ -866,6 +866,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+bool SlowGraphicsPipelineListed(uint64_t vs_hash, uint64_t ps_hash); // shaders.cpp
+
 // A/B switch for background pipeline compiles (KYTY_ASYNC_PIPELINES=0 compiles every graphics
 // pipeline on the GPU thread, as before) and how long a draw waits for a new one
 // (KYTY_PIPELINE_WAIT_MS, default 20) before it is skipped.
@@ -1579,6 +1581,8 @@ struct PipelineCache::ProgramCache {
 		// frame in the jungle). Remember the refusal by shader, code address, static state and
 		// user data, and skip before expanding. KYTY_GAVE_UP_FAST=0 turns this off.
 		uint64_t gave_up_key = 0;
+		[[maybe_unused]] uint64_t gave_up_shader_key = 0; // the shader as a whole (KYTY_GAVE_UP_SHADER_AFTER)
+		[[maybe_unused]] uint32_t gave_up_limit      = 0;
 		uint64_t                 fast_key = 0;
 		ProgramsMap::value_type* fast_hit = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
@@ -1586,12 +1590,33 @@ struct PipelineCache::ProgramCache {
 				const char* value = std::getenv("KYTY_GAVE_UP_FAST");
 				return value == nullptr || value[0] != '0';
 			}();
+			// The shader (code address, static state) as a whole: past KYTY_GAVE_UP_SHADER_AFTER
+			// refusals with different inputs (default 16; 0: off) every dispatch of it is taken as
+			// refused. The title's call shader fc0537b7278db60c gives up with every call target
+			// set, and turning the camera brought new user data each dispatch: each expanded its
+			// functions (and built hundreds of expansions) just to give up again.
+			static const uint32_t gave_up_after = [] {
+				const char* value = std::getenv("KYTY_GAVE_UP_SHADER_AFTER");
+				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 16u;
+			}();
+			const uint64_t shader_key = XXH3_64bits_withSeed(
+			    lookup_key.static_state.data(), lookup_key.static_state.size() * sizeof(uint32_t),
+			    params.hash ^ params.Base() ^ (static_cast<uint64_t>(params.code.size()) << 32u));
+			gave_up_shader_key = shader_key;
+			gave_up_limit      = gave_up_after;
+			if (fast && gave_up_after != 0) {
+				if (const auto it = gave_up_shaders.find(shader_key);
+				    it != gave_up_shaders.end() && it->second >= gave_up_after) {
+					Profiler::Add(Profiler::Counter::SkippedGaveUp);
+					return ShaderProgram {};
+				}
+			}
+			// By the user data the expansion depends on (ExpansionInputsHash), not all of it.
+			const auto make_gave_up_key = [&] {
+				return ExpansionInputsHash(params, user_data, input_info.wave_size, shader_key) | 1u;
+			};
 			if (fast) {
-				gave_up_key = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(),
-				                                   params.hash ^ params.Base());
-				gave_up_key = XXH3_64bits_withSeed(
-				    lookup_key.static_state.data(),
-				    lookup_key.static_state.size() * sizeof(uint32_t), gave_up_key);
+				gave_up_key = make_gave_up_key();
 				if (gave_up_fast.contains(gave_up_key)) {
 					Profiler::Add(Profiler::Counter::SkippedGaveUp);
 					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
@@ -1645,8 +1670,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (fast_hit == nullptr && unsupported.contains(lookup_key)) {
-			if (gave_up_key != 0) {
-				gave_up_fast.insert(gave_up_key);
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (gave_up_key != 0) {
+					// Keyed by the registers this expansion consulted.
+					gave_up_key = ExpansionInputsHash(params, user_data, input_info.wave_size,
+					                                  gave_up_shader_key) |
+					              1u;
+					if (gave_up_fast.insert(gave_up_key).second && gave_up_limit != 0) {
+						auto& refusals = gave_up_shaders[gave_up_shader_key];
+						if (++refusals == gave_up_limit) {
+							std::fprintf(stderr, "[gave-up] cs %016" PRIx64 " at 0x%016" PRIx64
+							             ": refused with %u inputs, skipped from now on\n",
+							             params.hash, static_cast<uint64_t>(params.Base()), refusals);
+						}
+					}
+				}
 			}
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
@@ -2213,7 +2251,7 @@ struct PipelineCache::ProgramCache {
 		// 50 ms before it is validated again. KYTY_EXPAND_REUSE_MS=0 validates every time.
 		static const auto reuse = std::chrono::milliseconds([] {
 			const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
-			return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
+			return value != nullptr ? std::strtoul(value, nullptr, 10) : 250ul;
 		}());
 		// Code without calls expands to nothing whatever the user data: once the expander has
 		// found none in this code (named by its content hash and size), skip the user-data hash,
@@ -2247,7 +2285,8 @@ struct PipelineCache::ProgramCache {
 				if (key == 0) {
 					return;
 				}
-				if (map.size() > 4096) {
+				// ~2,800 programs a frame on the title: 4,096 cleared the map every frame or two.
+				if (map.size() > 32768) {
 					map.clear();
 				}
 				auto& entry     = map[key];
@@ -2309,6 +2348,7 @@ struct PipelineCache::ProgramCache {
 	std::shared_mutex                                              programs_mutex;
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	std::unordered_set<uint64_t>                                   gave_up_fast;
+	std::unordered_map<uint64_t, uint32_t>                         gave_up_shaders;
 	struct ExpandReused {
 		std::vector<uint32_t>                 code;
 		std::chrono::steady_clock::time_point validated;
@@ -3558,6 +3598,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	// A pipeline the driver never finished compiling in an earlier run (shaders.cpp): its draws
+	// are skipped. KYTY_SLOW_GRAPHICS_TRY=1: build it anyway, without driver optimization
+	// (PrepareGraphicsPipeline), on the worker; its draws wait for it like any other pipeline's.
+	static const bool slow_try = [] {
+		const char* value = std::getenv("KYTY_SLOW_GRAPHICS_TRY");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!slow_try &&
+	    SlowGraphicsPipelineListed(vs_input_info.stage.program->shader_hash,
+	                               ps_active ? ps_input_info->stage.program->shader_hash : 0)) {
+		return defer();
+	}
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
@@ -3597,8 +3649,24 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	for (const auto& info: vertex_info) {
 		writes_memory = writes_memory || stage_writes(info.stage.program);
 	}
-	if (may_defer && (defer_writing || !writes_memory) && spirv_words > g_pipeline_sync_words &&
-	    !layer_draw && m_compiler != nullptr && !m_compiler->Stopped()) {
+	// The pipelines above that compile "at once", and those of draws that may not be skipped
+	// (they write memory), compile on a worker too, waited for up to KYTY_PIPELINE_SYNC_WAIT_MS
+	// (default 3000) and KYTY_PIPELINE_WRITE_WAIT_MS (default 10000; 0 for either: on the GPU
+	// thread, as before): NVIDIA's compiler never finished one pipeline of the Wolverine save of
+	// 2026-10-20 (VS 0xd1ea70c7117d4d3a, PS 0x85892b3b3d0a61ba), which froze the game for good on
+	// the GPU thread. Past the wait the draw is skipped like a background compile's.
+	static const std::chrono::milliseconds sync_wait = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SYNC_WAIT_MS");
+		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 3000u);
+	}();
+	static const std::chrono::milliseconds write_wait = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_WRITE_WAIT_MS");
+		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 10000u);
+	}();
+	const bool background = may_defer && (defer_writing || !writes_memory) &&
+	                        spirv_words > g_pipeline_sync_words && !layer_draw;
+	const auto budget = background ? g_pipeline_wait : may_defer ? sync_wait : write_wait;
+	if ((background || budget.count() > 0) && m_compiler != nullptr && !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
 		// the background, and its draws are skipped until it is ready.
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
@@ -3609,7 +3677,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		cached->pending   = job;
 		Profiler::Add(Profiler::Counter::PipelinesPending);
 		m_compiler->Submit(job);
-		(void)m_compiler->Wait(*job, g_pipeline_wait);
+		(void)m_compiler->Wait(*job, budget);
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;

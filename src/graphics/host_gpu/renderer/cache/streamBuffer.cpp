@@ -9,8 +9,14 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -466,7 +472,33 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		// up yet.
 		{
 			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
+			// KYTY_FPS_LOG: [ring-wait] per 5 s, the waits and their time by ring size.
+			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			const auto        wait_start = std::chrono::steady_clock::now();
 			Scheduler().Wait(watch.tick);
+			if (log) {
+				static std::mutex                                         mutex;
+				static std::map<uint64_t, std::pair<uint64_t, double>>    waits;
+				static auto last = std::chrono::steady_clock::now();
+				const auto  now  = std::chrono::steady_clock::now();
+				std::lock_guard lock(mutex);
+				auto&           entry = waits[Size() >> 20u];
+				entry.first++;
+				entry.second += std::chrono::duration<double, std::milli>(now - wait_start).count();
+				if (now - last > std::chrono::seconds(5)) {
+					std::string text;
+					for (const auto& [mib, stat]: waits) {
+						char part[64];
+						std::snprintf(part, sizeof(part), " %lluMB:%llux/%.0fms",
+						              static_cast<unsigned long long>(mib),
+						              static_cast<unsigned long long>(stat.first), stat.second);
+						text += part;
+					}
+					std::fprintf(stderr, "[ring-wait] 5 s:%s\n", text.c_str());
+					waits.clear();
+					last = now;
+				}
+			}
 			if (Usage() == MemoryUsage::Download) {
 				Scheduler().WaitPriorityOperations(watch.tick);
 			}

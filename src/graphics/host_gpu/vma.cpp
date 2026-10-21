@@ -122,13 +122,16 @@ static void LogCommit(const char* when) {
 	}
 }
 
-// The video memory the emulator plans for, whatever the card has (KYTY_VRAM_TARGET_MB, default
-// 14336 = what a 16 GB card leaves an application; 0 = the card's own budget). Senaxx, 2026-10-09:
-// it must always fit on a 16 GB GPU. On cards with less the card's budget is the smaller one.
+// The video memory the emulator plans for, whatever the card has (KYTY_VRAM_TARGET_MB; 0, the
+// default, = the card's own budget; Senaxx's 14336 = what a 16 GB card leaves an application). On
+// a 24 GB card the 14 GB target had the caches collecting from 90 % of it on: in the Trask
+// compound (~19 GB in use) the buffer collector ran ~1,900 times per 5 s, waited for the GPU
+// 1.3-1.6 s of every 5 and the readback ring ~1.9 s: 2-4 fps; with the card's budget 12-22 fps
+// (2026-10-20). On cards with 16 GB or less the card's budget is the smaller one anyway.
 static uint64_t VramTargetBytes() {
 	static const uint64_t target = [] {
 		const char* value = std::getenv("KYTY_VRAM_TARGET_MB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {14336}) << 20u;
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
 	}();
 	return target;
 }

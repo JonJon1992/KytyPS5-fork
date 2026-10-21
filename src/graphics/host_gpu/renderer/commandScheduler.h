@@ -175,6 +175,7 @@ private:
 		uint32_t          debug_arg2   = 0;
 		uint32_t          debug_arg3   = 0;
 		uint64_t          debug_arg4   = 0;
+		uint64_t          upload_reads = 0; // KYTY_UPLOAD_WORKER: reads queued before this submit
 	};
 
 	struct RecordedCommand {

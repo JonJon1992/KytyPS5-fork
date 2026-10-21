@@ -218,9 +218,14 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 // whatever the card's size (default 6 GiB each; 0 = no bound). The thresholds otherwise follow the
 // device budget, and on a 32 GB card the caches kept everything up to ~25 GB: textures and buffers
 // of scenes the game had left stayed until the card was full (a new game's prologue, 2026-10-07).
-static uint64_t CacheCapBytes(const char* name) {
+// Unset, the bound is the larger of 6 GiB and 60 % of the video memory budget (a 24 GB card held
+// ~19 GB in the Trask compound; a 6 GiB bound there collected and re-uploaded all the time).
+static uint64_t CacheCapBytes(const char* name, uint64_t budget) {
 	const char* value = std::getenv(name);
-	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 6144ull;
+	if (value == nullptr) {
+		return std::max<uint64_t>(6144ull << 20u, budget / 10 * 6);
+	}
+	const auto mib = std::strtoull(value, nullptr, 10);
 	return mib == 0 ? UINT64_MAX : mib << 20u;
 }
 
@@ -242,7 +247,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
-	if (const auto cap = CacheCapBytes("KYTY_TEXTURE_CACHE_MB"); cap != UINT64_MAX) {
+	if (const auto cap = CacheCapBytes("KYTY_TEXTURE_CACHE_MB",
+	                                   m_graphics.CanReportMemoryUsage() ? m_graphics.GetTotalMemoryBudget() : 0);
+	    cap != UINT64_MAX) {
 		m_pressure_gc_memory = std::min(m_pressure_gc_memory, cap);
 		m_critical_gc_memory = std::min(m_critical_gc_memory, cap + cap / 4);
 		m_trigger_gc_memory  = std::min(m_trigger_gc_memory, cap / 4 * 3);

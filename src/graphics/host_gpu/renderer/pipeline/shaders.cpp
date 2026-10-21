@@ -24,6 +24,9 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <limits>
+#include <cstdio>
+#include <thread>
+#include <mutex>
 #include <memory>
 #include <span>
 #include <string>
@@ -34,6 +37,117 @@ namespace Libs::Graphics {
 // KYTY_DISABLE_OPTIMIZATION_HASHES="hash,hash,...": build the pipelines of these guest shaders
 // with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, to tell driver code-generation problems apart
 // from emulation problems.
+// Slow pipelines (KYTY_SLOW_PIPELINES=0 turns this off): a pipeline the driver has been compiling
+// for 30 s is written to _ShaderDump/slow_pipelines.txt ([slow-pipeline] on stderr) while the
+// compile still runs, since NVIDIA's compiler can loop on a shader for good (VS 0xd1ea70c7117d4d3a
+// with PS 0x85892b3b3d0a61ba, with or without optimization). From the next start, the draws of a
+// listed graphics pipeline are skipped (PipelineCache) and a listed compute pipeline is built
+// without driver optimization.
+namespace {
+bool SlowPipelinesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SLOW_PIPELINES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+constexpr const char* SlowPipelineFile = "_ShaderDump/slow_pipelines.txt";
+struct SlowKey {
+	char     kind; // 'G' graphics (a: VS, b: PS), 'C' compute (a: CS)
+	uint64_t a, b;
+	bool     operator==(const SlowKey&) const = default;
+};
+const std::vector<SlowKey>& ListedSlowPipelines() {
+	static const std::vector<SlowKey> listed = [] {
+		std::vector<SlowKey> result;
+		if (!SlowPipelinesEnabled()) {
+			return result;
+		}
+		if (auto* file = std::fopen(SlowPipelineFile, "r"); file != nullptr) {
+			char               kind = 0;
+			unsigned long long a = 0, b = 0;
+			while (std::fscanf(file, " %c %llx %llx", &kind, &a, &b) == 3) {
+				result.push_back({kind, a, b});
+				std::fprintf(stderr, "[slow-pipeline] %c %016llx %016llx: listed (graphics: draws skipped; compute: no optimization)\n", kind, a, b);
+			}
+			std::fclose(file);
+		}
+		return result;
+	}();
+	return listed;
+}
+bool SlowPipelineListed(char kind, uint64_t a, uint64_t b) {
+	const auto& listed = ListedSlowPipelines();
+	return std::ranges::find(listed, SlowKey {kind, a, b}) != listed.end();
+}
+struct InFlight {
+	SlowKey                               key;
+	std::chrono::steady_clock::time_point start;
+	bool                                  written = false;
+};
+std::mutex                     g_inflight_mutex;
+std::vector<InFlight*>         g_inflight;
+std::atomic<bool>              g_slow_watch_started {false};
+void SlowWatch() {
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		std::lock_guard lock(g_inflight_mutex);
+		const auto      now = std::chrono::steady_clock::now();
+		for (auto* entry: g_inflight) {
+			if (entry->written || now - entry->start < std::chrono::seconds(30)) {
+				continue;
+			}
+			entry->written = true;
+			std::fprintf(stderr, "[slow-pipeline] %c %016llx %016llx: compiling for 30 s; listed in %s\n",
+			             entry->key.kind, static_cast<unsigned long long>(entry->key.a),
+			             static_cast<unsigned long long>(entry->key.b), SlowPipelineFile);
+			std::fflush(stderr);
+			if (auto* file = std::fopen(SlowPipelineFile, "a"); file != nullptr) {
+				std::fprintf(file, "%c %016llx %016llx\n", entry->key.kind,
+				             static_cast<unsigned long long>(entry->key.a),
+				             static_cast<unsigned long long>(entry->key.b));
+				std::fclose(file);
+			}
+		}
+	}
+}
+} // namespace
+
+// PipelineCache: the draws of this graphics pipeline are skipped (it never finished compiling).
+bool SlowGraphicsPipelineListed(uint64_t vs_hash, uint64_t ps_hash) {
+	return SlowPipelineListed('G', vs_hash, ps_hash);
+}
+
+namespace {
+// Around one driver pipeline compile.
+class CompileWatch {
+public:
+	CompileWatch(char kind, uint64_t a, uint64_t b): m_entry {{kind, a, b}, std::chrono::steady_clock::now()} {
+		if (!SlowPipelinesEnabled()) {
+			return;
+		}
+		if (!g_slow_watch_started.exchange(true)) {
+			std::thread(SlowWatch).detach();
+		}
+		std::lock_guard lock(g_inflight_mutex);
+		g_inflight.push_back(&m_entry);
+		m_registered = true;
+	}
+	~CompileWatch() {
+		if (!m_registered) {
+			return;
+		}
+		std::lock_guard lock(g_inflight_mutex);
+		std::erase(g_inflight, &m_entry);
+	}
+	KYTY_CLASS_NO_COPY(CompileWatch);
+
+private:
+	InFlight m_entry;
+	bool     m_registered = false;
+};
+} // namespace
+
 static bool DisableOptimizationFor(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> result;
@@ -640,7 +754,8 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                             : 0;
 	build.vs_hash = vs_input_info.stage.program->shader_hash;
 	build.ps_hash = ps_hash;
-	bool disable_optimization = ps_hash != 0 && DisableOptimizationFor(ps_hash);
+	bool disable_optimization = (ps_hash != 0 && DisableOptimizationFor(ps_hash)) ||
+	                            SlowPipelineListed('G', build.vs_hash, ps_hash);
 	for (const auto& info: vertex_info) {
 		disable_optimization = disable_optimization ||
 		                       (info.stage && DisableOptimizationFor(info.stage.program->shader_hash));
@@ -667,6 +782,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
                                   vk::Pipeline* pipeline) {
 	const auto create_begin = std::chrono::steady_clock::now();
+	const CompileWatch watch('G', build.vs_hash, build.ps_hash);
 	const auto result =
 	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
 	// On the GPU thread, a slow pipeline stops every queue.
@@ -753,7 +869,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
-	if (DisableOptimizationFor(input_info.stage.program->shader_hash)) {
+	if (DisableOptimizationFor(input_info.stage.program->shader_hash) ||
+	    SlowPipelineListed('C', input_info.stage.program->shader_hash, 0)) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " built without optimization\n",
 		     input_info.stage.program->shader_hash);
@@ -764,6 +881,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
 	const auto create_begin = std::chrono::steady_clock::now();
+	const CompileWatch watch('C', input_info.stage.program->shader_hash, 0);
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

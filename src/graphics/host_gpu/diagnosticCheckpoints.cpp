@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <algorithm>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -30,6 +31,7 @@ const char* OpName(uint32_t op) {
 		case 6: return "EopFlip";
 		case 7: return "EopWriteBackFlip";
 		case 8: return "EopOnlyFlip";
+		case 9: return "DispatchIndirect";
 		default: return "Unknown";
 	}
 }
@@ -112,6 +114,88 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		}
 	}
 	std::fflush(stdout);
+}
+
+// The draws and dispatches recorded per tick (CP side, always on): when a wait never finishes, the
+// work of the first tick the GPU has not completed is named ([gpu-hang] work lines), without
+// KYTY_NV_CHECKPOINTS (which serializes the GPU and hides the hang).
+namespace {
+struct TickWork {
+	std::atomic<uint64_t> tick {0};
+	uint64_t              a = 0, b = 0;
+	char                  kind = 0;
+};
+constexpr size_t      TickWorkSize = 1u << 16u;
+TickWork              g_tick_work[TickWorkSize];
+std::atomic<uint64_t> g_tick_work_next {0};
+} // namespace
+
+void NoteTickWork(uint64_t tick, char kind, uint64_t a, uint64_t b) {
+	auto& slot = g_tick_work[g_tick_work_next.fetch_add(1, std::memory_order_relaxed) % TickWorkSize];
+	slot.tick.store(0, std::memory_order_relaxed);
+	slot.a    = a;
+	slot.b    = b;
+	slot.kind = kind;
+	slot.tick.store(tick, std::memory_order_release);
+}
+
+void DumpHangWork(uint64_t first_incomplete, uint64_t waited) {
+	struct Entry {
+		char     kind;
+		uint64_t a, b;
+		uint32_t count;
+	};
+	std::vector<Entry> entries;
+	for (const auto& slot: g_tick_work) {
+		const auto tick = slot.tick.load(std::memory_order_acquire);
+		if (tick != first_incomplete) continue;
+		auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry& e) {
+			return e.kind == slot.kind && e.a == slot.a && e.b == slot.b;
+		});
+		if (it == entries.end()) {
+			entries.push_back({slot.kind, slot.a, slot.b, 1});
+		} else {
+			it->count++;
+		}
+	}
+	std::fprintf(stderr, "[gpu-hang] first unfinished tick %" PRIu64 " (waited %" PRIu64 "): %zu distinct draws/dispatches\n",
+	             first_incomplete, waited, entries.size());
+	for (size_t i = 0; i < entries.size() && i < 60; i++) {
+		std::fprintf(stderr, "[gpu-hang]   work %c %016" PRIx64 " %016" PRIx64 " x%u\n", entries[i].kind,
+		             entries[i].a, entries[i].b, entries[i].count);
+	}
+	std::fflush(stderr);
+}
+
+// A wait that has not finished after seconds: the GPU's last checkpoints (the draw or dispatch it is
+// stuck in), without losing the device. Requires KYTY_NV_CHECKPOINTS=1.
+void DumpGpuHangCheckpoints(GraphicContext& graphics, uint64_t tick, double seconds) {
+	if (!graphics.diagnostic_checkpoints_enabled || graphics.queue == nullptr) {
+		std::fprintf(stderr, "[gpu-hang] tick %" PRIu64 " not done after %.0f s (KYTY_NV_CHECKPOINTS=1 names the work)\n",
+		             tick, seconds);
+		return;
+	}
+	std::vector<vk::CheckpointDataNV> data;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		data = graphics.queue.getCheckpointDataNV();
+	}
+	std::fprintf(stderr, "[gpu-hang] tick %" PRIu64 " not done after %.0f s; checkpoints %zu, last recorded seq=%" PRIu64 "\n",
+	             tick, seconds, data.size(), g_checkpoint_sequence.load(std::memory_order_relaxed));
+	for (const auto& entry: data) {
+		const auto* checkpoint = static_cast<const DiagnosticCheckpoint*>(entry.pCheckpointMarker);
+		const bool  in_ring    = checkpoint >= g_checkpoints.data() &&
+		                      checkpoint < g_checkpoints.data() + g_checkpoints.size();
+		if (checkpoint == nullptr || !in_ring) {
+			continue;
+		}
+		std::fprintf(stderr,
+		             "[gpu-hang]   [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		             vk::to_string(entry.stage).c_str(), checkpoint->sequence, OpName(checkpoint->op),
+		             checkpoint->submit_id, checkpoint->arg0, checkpoint->arg1, checkpoint->arg2,
+		             checkpoint->arg3, checkpoint->arg4);
+	}
+	std::fflush(stderr);
 }
 
 void DumpDeviceLossDiagnostics(GraphicContext& graphics) {

@@ -64,11 +64,79 @@ public:
 	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).
 	template <typename Func>
 	void ForEachMaybeCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		if (g_tracker_bitmap && size != 0) {
+			// Only the regions the bitmap marks CPU-dirty, 64 at a time: the caller (the BDA sync
+			// walk, PrepareBda) passes every mapped range, thousands of mostly clean regions, and
+			// loading each one cost ~6 % of the GPU thread (env3, 2026-10-20). A bit is set before
+			// its region is published (GetOrCreateRegion), so a null region is skipped.
+			ValidateRange(vaddr, size);
+			const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+			const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+			const uint64_t end   = vaddr + size;
+			for (uint64_t word = first / 64; word <= last / 64; word++) {
+				auto dirty = m_cpu_dirty_regions[word].load(std::memory_order_acquire) &
+				             WordMask(word == first / 64 ? first % 64 : 0,
+				                      word == last / 64 ? last % 64 : 63);
+				while (dirty != 0) {
+					const uint64_t index = word * 64 + static_cast<uint64_t>(std::countr_zero(dirty));
+					dirty &= dirty - 1;
+					auto* manager = m_regions[index].load(std::memory_order_acquire);
+					if (manager == nullptr || !manager->MaybeModified<DirtySource::Cpu>()) {
+						continue;
+					}
+					const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+					const uint64_t begin        = std::max(vaddr, region_begin);
+					const uint64_t finish       = std::min(end, region_begin + TRACKER_REGION_SIZE);
+					func(begin, finish - begin);
+				}
+			}
+			return;
+		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			if (manager->MaybeModified<DirtySource::Cpu>()) {
 				func(manager->GetCpuAddr() + offset, bytes);
 			}
 		});
+	}
+	// func(address, bytes) for the part of the range in each region where pages became CPU-dirty
+	// since the last call that covered it, clearing those touched bits first (a page dirtied
+	// meanwhile sets its bit again). Regions no longer CPU-dirty are skipped.
+	template <typename Func>
+	void ForEachCpuTouchedRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		if (size == 0) {
+			return;
+		}
+		ValidateRange(vaddr, size);
+		const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		const uint64_t end   = vaddr + size;
+		for (uint64_t word = first / 64; word <= last / 64; word++) {
+			const auto mask = WordMask(word == first / 64 ? first % 64 : 0,
+			                           word == last / 64 ? last % 64 : 63);
+			if ((m_cpu_touched_regions[word].load(std::memory_order_relaxed) & mask) == 0) {
+				continue;
+			}
+			auto touched =
+			    m_cpu_touched_regions[word].fetch_and(~mask, std::memory_order_acq_rel) & mask;
+			while (touched != 0) {
+				const uint64_t index = word * 64 + static_cast<uint64_t>(std::countr_zero(touched));
+				touched &= touched - 1;
+				auto* manager = m_regions[index].load(std::memory_order_acquire);
+				if (manager == nullptr) {
+					// Not published yet (GetOrCreateRegion sets the bit first): keep it for later.
+					m_cpu_touched_regions[word].fetch_or(uint64_t {1} << (index % 64),
+					                                     std::memory_order_acq_rel);
+					continue;
+				}
+				if (!manager->MaybeModified<DirtySource::Cpu>()) {
+					continue;
+				}
+				const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+				const uint64_t begin        = std::max(vaddr, region_begin);
+				const uint64_t finish       = std::min(end, region_begin + TRACKER_REGION_SIZE);
+				func(begin, finish - begin);
+			}
+		}
 	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
@@ -275,6 +343,8 @@ private:
 	// One bit per region: the region exists / its CPU summary is set (RegionManager::StoreSummary).
 	std::unique_ptr<std::atomic<uint64_t>[]> m_present_regions;
 	std::unique_ptr<std::atomic<uint64_t>[]> m_cpu_dirty_regions;
+	// One bit per region: pages became CPU-dirty since the BDA walk last covered it.
+	std::unique_ptr<std::atomic<uint64_t>[]> m_cpu_touched_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

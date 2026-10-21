@@ -37,9 +37,13 @@ public:
 	// pre_barrier false: the caller has already ordered the counts' writers (and the entry's
 	// previous indirect read) before this conversion. post_barrier false: the caller orders the
 	// groups before their indirect read (a batch of conversions, KYTY_DISPATCH_RUNS).
+	// Counts beyond the device's limits or KYTY_INDIRECT_MAX_GROUPS in all (default 4M groups; 0
+	// turns the check off) dispatch nothing; the first such dispatch per report is printed
+	// ([indirect-clamp], with shader_hash when the caller knows it). Group-count arguments
+	// (no thread-dimension initiator) pass local_size {1, 1, 1}.
 	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress threads,
 	                             const std::array<uint32_t, 3>& local_size, bool pre_barrier = true,
-	                             bool post_barrier = true);
+	                             bool post_barrier = true, uint64_t shader_hash = 0);
 
 	// Diagnostics: the ring of converted counts (entry n at n * 32 bytes: groups, then threads).
 	[[nodiscard]] vk::Buffer           RingHandle() const { return m_groups.Handle(); }
@@ -51,12 +55,19 @@ private:
 	static constexpr uint32_t Entries      = 4096;
 	static constexpr uint32_t EntryDwords  = 8; // groups at 0, thread counts at 4
 
+	void Report();
+
 	GraphicContext&         m_graphics;
 	Buffer                  m_groups;
+	Buffer                  m_report; // host-visible: see dispatch_indirect_groups.comp
 	vk::DescriptorSetLayout m_set_layout      = nullptr;
 	vk::PipelineLayout      m_pipeline_layout = nullptr;
 	vk::Pipeline            m_pipeline        = nullptr;
 	uint32_t                m_next            = 0;
+	uint32_t                m_max_total       = 0;
+	uint64_t                m_converted       = 0;
+	uint64_t                m_emptied         = 0;
+	int64_t                 m_last_report_ms  = 0;
 };
 
 // DRAW_INDIRECT of a fast-launch mesh draw: the guest's vertex and instance counts become the

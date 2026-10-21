@@ -13,6 +13,8 @@
 
 namespace Libs::Graphics {
 
+void DumpHangWork(uint64_t first_incomplete, uint64_t waited); // diagnosticCheckpoints.cpp
+
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -94,7 +96,19 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::Timer timer;
 	timer.Start();
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// A GPU hang (work that never finishes, the GPU busy) blocks here: after 5 s, and every 20 s
+	// after that, the GPU's last checkpoints name the draw or dispatch it is stuck in ([gpu-hang]).
+	auto result = m_graphics.device.waitSemaphores(&wait_info, 5'000'000'000ull);
+	for (uint32_t reports = 0; result == vk::Result::eTimeout; reports++) {
+		if (reports < 8) {
+			DumpGpuHangCheckpoints(m_graphics, tick, timer.GetTimeS());
+			uint64_t done = 0;
+			if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &done) == vk::Result::eSuccess) {
+				DumpHangWork(done + 1, tick);
+			}
+		}
+		result = m_graphics.device.waitSemaphores(&wait_info, 20'000'000'000ull);
+	}
 	const double waited = timer.GetTimeS();
 	RecordSemaphoreWait(waited, tick, m_gpu_tick.load(std::memory_order_acquire));
 	if (Profiler::t_gpu_thread) {

@@ -741,6 +741,115 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
+
+namespace {
+// Instance-base SGPR guard. An NGG (merged ES/GS) shader that adds a user SGPR to the instance-id
+// VGPR (v8) and indexes a buffer with the sum (BUFFER_LOAD idxen) reads a per-instance record
+// table. The game's SET_SH_REG sometimes leaves stale command-buffer data in that SGPR (the
+// title-screen particles, Arczibald's 4efbcf79c36d8adf), and an index past the table's
+// NUM_RECORDS reads zeros on hardware but another buffer's bytes here: red squares, exploding
+// effect meshes. When the base is at or past NUM_RECORDS it is zeroed (record 0 of the table).
+struct InstanceBase {
+	int8_t base_slot   = -1; // user-data slot of the base SGPR
+	int8_t vsharp_slot = -1; // user-data slot of the record table's V# (dword 0)
+};
+
+// Instruction length in dwords of the RDNA2 instruction at code[pc], 0 when unknown.
+uint32_t Rdna2InstLength(std::span<const uint32_t> code, size_t pc) {
+	const uint32_t w   = code[pc];
+	const auto     lit = [](uint32_t src) { return src == 255u ? 1u : 0u; };
+	if ((w >> 31u) == 0u) { // VOP1 / VOPC / VOP2
+		const uint32_t src0 = w & 0x1ffu;
+		uint32_t       len  = 1u + lit(src0);
+		if (src0 == 0xf9u || src0 == 0xfau || src0 == 0xe9u || src0 == 0xeau) {
+			len += 1u; // SDWA / DPP
+		}
+		if (((w >> 25u) & 0x7fu) < 0x3eu) { // VOP2
+			const uint32_t op = (w >> 25u) & 0x3fu;
+			if (op == 0x2cu || op == 0x2du || op == 0x37u || op == 0x38u) {
+				len += 1u; // FMAMK / FMAAK (f32, f16): an inline literal
+			}
+		}
+		return len;
+	}
+	if ((w >> 30u) == 2u) { // SOP*
+		if ((w >> 28u) == 0xbu) { // SOPK
+			return ((w >> 23u) & 0x1fu) == 0x15u ? 2u : 1u; // S_SETREG_IMM32_B32
+		}
+		const uint32_t top9 = w >> 23u;
+		if (top9 == 0x17fu) return 1u;                    // SOPP
+		if (top9 == 0x17du) return 1u + lit(w & 0xffu);   // SOP1
+		return 1u + ((lit(w & 0xffu) | lit((w >> 8u) & 0xffu)) != 0u ? 1u : 0u); // SOP2 / SOPC
+	}
+	switch (w >> 26u) {
+		case 0x3du: return 2u; // SMEM
+		case 0x35u:            // VOP3
+		case 0x33u:            // VOP3P
+			if (pc + 1u < code.size()) {
+				const uint32_t w1 = code[pc + 1u];
+				const bool l = (w1 & 0x1ffu) == 255u || ((w1 >> 9u) & 0x1ffu) == 255u ||
+				               ((w1 >> 18u) & 0x1ffu) == 255u;
+				return l ? 3u : 2u;
+			}
+			return 2u;
+		case 0x38u: // MUBUF
+		case 0x3au: // MTBUF
+		case 0x36u: // DS
+		case 0x37u: // FLAT / GLOBAL / SCRATCH
+		case 0x3eu: // EXP
+			return 2u;
+		case 0x3cu: // MIMG (NSA adds dwords)
+			return 2u + ((w >> 1u) & 3u);
+		case 0x32u: return 1u; // VINTRP
+		default: return 0u;
+	}
+}
+
+InstanceBase FindInstanceBase(std::span<const uint32_t> code, uint32_t user_count,
+                              uint32_t user_base) {
+	InstanceBase result;
+	int          base_vgpr = -1;
+	int          base_sgpr = -1;
+	size_t       pc        = 0;
+	for (uint32_t n = 0; n < 160u && pc < code.size(); n++) {
+		const uint32_t w = code[pc];
+		if (w == 0xbf810000u) break; // S_ENDPGM
+		const auto len = Rdna2InstLength(code, pc);
+		if (len == 0u) break;
+		if ((w >> 31u) == 0u && ((w >> 25u) & 0x3fu) == 0x25u && ((w >> 9u) & 0xffu) == 8u) {
+			// V_ADD_NC_U32 vD, sN, v8
+			const uint32_t src0 = w & 0x1ffu;
+			if (src0 >= user_base && src0 < user_base + user_count) {
+				base_vgpr = static_cast<int>((w >> 17u) & 0xffu);
+				base_sgpr = static_cast<int>(src0);
+			}
+		} else if (base_vgpr >= 0 && (w >> 26u) == 0x38u && ((w >> 13u) & 1u) != 0u &&
+		           pc + 1u < code.size()) {
+			// MUBUF with idxen whose index is that sum
+			const uint32_t w1 = code[pc + 1u];
+			if (static_cast<int>(w1 & 0xffu) == base_vgpr) {
+				const uint32_t srsrc = ((w1 >> 16u) & 0x1fu) * 4u;
+				if (srsrc >= user_base && srsrc + 4u <= user_base + user_count) {
+					result.base_slot   = static_cast<int8_t>(base_sgpr - static_cast<int>(user_base));
+					result.vsharp_slot = static_cast<int8_t>(srsrc - user_base);
+				}
+				break;
+			}
+		}
+		pc += len;
+	}
+	return result;
+}
+
+bool InstanceBaseGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INSTANCE_BASE_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+} // namespace
+
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
 	const auto& sh     = context.GetShaderRegisters();
@@ -762,6 +871,57 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		std::copy(gs_users.begin(), gs_users.end(), gs_users_fixed.begin());
 		gs_users_fixed[28] = 0;
 		user_data          = std::span<const uint32_t>(gs_users_fixed.data(), gs_users.size());
+	}
+	// NGG shaders (merged or not) receive their user data from s8 on.
+	if (InstanceBaseGuardEnabled() && regs.es_regs.data_addr != 0) {
+		static std::mutex                                 mutex;
+		static std::unordered_map<uint64_t, InstanceBase> found;
+		InstanceBase                                      ib;
+		{
+			std::lock_guard lock(mutex);
+			auto            it = found.find(regs.es_regs.data_addr);
+			if (it == found.end()) {
+				const auto words = data.code_size_bytes / sizeof(uint32_t);
+				it = found
+				         .emplace(regs.es_regs.data_addr,
+				                  FindInstanceBase(
+				                      std::span {reinterpret_cast<const uint32_t*>(
+				                                     regs.es_regs.data_addr),
+				                                 static_cast<size_t>(words)},
+				                      static_cast<uint32_t>(gs_users.size()), 8u))
+				         .first;
+				if (std::getenv("KYTY_LOG_INSTANCE_BASE") != nullptr) {
+					std::fprintf(stderr, "[instance-base] scan es %016llx merged=%d words=%zu users=%zu -> %d/%d\n",
+					             static_cast<unsigned long long>(hash), merged ? 1 : 0,
+					             static_cast<size_t>(words), gs_users.size(), it->second.base_slot,
+					             it->second.vsharp_slot);
+				}
+				if (it->second.base_slot >= 0 && std::getenv("KYTY_FPS_LOG") != nullptr) {
+					std::fprintf(stderr, "[instance-base] es %016llx: base slot %d, table V# slot %d\n",
+					             static_cast<unsigned long long>(hash), it->second.base_slot,
+					             it->second.vsharp_slot);
+				}
+			}
+			ib = it->second;
+		}
+		if (ib.base_slot >= 0 && static_cast<size_t>(ib.vsharp_slot) + 3u < gs_users.size() &&
+		    static_cast<size_t>(ib.base_slot) < gs_users.size()) {
+			const uint32_t num_records = user_data[static_cast<size_t>(ib.vsharp_slot) + 2u];
+			const uint32_t base        = user_data[static_cast<size_t>(ib.base_slot)];
+			if (base != 0u && base >= num_records) {
+				if (user_data.data() != gs_users_fixed.data()) {
+					std::copy(gs_users.begin(), gs_users.end(), gs_users_fixed.begin());
+					user_data = std::span<const uint32_t>(gs_users_fixed.data(), gs_users.size());
+				}
+				gs_users_fixed[static_cast<size_t>(ib.base_slot)] = 0;
+				static std::atomic<uint32_t> logged {0};
+				if (std::getenv("KYTY_FPS_LOG") != nullptr && logged.fetch_add(1) < 64) {
+					std::fprintf(stderr,
+					             "[instance-base] es %016llx: base %08x >= records %u, zeroed\n",
+					             static_cast<unsigned long long>(hash), base, num_records);
+				}
+			}
+		}
 	}
 	auto params = GetShaderParams(regs.es_regs.data_addr, hash, user_data, data, merged ? 8u : 0u);
 	if (!merged) {

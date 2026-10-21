@@ -61,6 +61,8 @@
 
 namespace Libs::Graphics {
 
+void NoteTickWork(uint64_t tick, char kind, uint64_t a, uint64_t b); // diagnosticCheckpoints.cpp
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1377,6 +1379,7 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1585,6 +1588,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
@@ -1626,6 +1630,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::Buffer     mesh_command_buffer = nullptr;
 	vk::DeviceSize mesh_command_offset = 0;
 	if (emit.gpu_args_address != 0) {
+		KYTY_PROFILER_BLOCK("Draw::GpuArgs");
 		// The mesh shader reads the start vertex there, and the counts are copied from there:
 		// synchronize and register the arguments like the guest indices below.
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
@@ -1673,10 +1678,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	{
+		KYTY_PROFILER_BLOCK("Draw::PrepareGraphicsBindings");
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		KYTY_PROFILER_BLOCK("Draw::VertexIndexBuffers");
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1700,23 +1709,29 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
 	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
-	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, may_defer);
+	auto* deferred_pipeline = [&] {
+		KYTY_PROFILER_BLOCK("Draw::GetPipeline");
+		return m_context.GetPipelineCache().TryGetGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs, may_defer);
+	}();
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const auto rendering = [&] {
+		KYTY_PROFILER_BLOCK("Draw::AcquireRenderTargets");
+		return AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
+		                            feedback_aspects, stages);
+	}();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory. Recorded through the recording thread when it runs.
 	const auto vk_buffer = buffer.Recorder();
+	KYTY_PROFILER_BLOCK("Draw::Commit");
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1850,10 +1865,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
+	KYTY_PROFILER_BLOCK("Draw::Record");
+	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'D',
+	             vertex_stages.back().stage.program->shader_hash,
+	             state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+	}
+	// KYTY_RT_SIZES=1: draws per first color target size, every 10 s ([rt-sizes]): the game's
+	// internal render resolution.
+	if (static const bool log = std::getenv("KYTY_RT_SIZES") != nullptr; log) {
+		static std::mutex                             mutex;
+		static std::unordered_map<uint64_t, uint32_t> sizes;
+		static auto                                   last = std::chrono::steady_clock::now();
+		const uint64_t key = state.color_count != 0
+		                         ? (uint64_t {state.color_info[0].Extent().width} << 32u) |
+		                               state.color_info[0].Extent().height
+		                         : 0u;
+		std::lock_guard lock(mutex);
+		sizes[key]++;
+		if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(10)) {
+			last = now;
+			std::vector<std::pair<uint64_t, uint32_t>> list(sizes.begin(), sizes.end());
+			std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::string text;
+			for (size_t i = 0; i < list.size() && i < 10; i++) {
+				text += fmt::format(" {}x{}:{}", list[i].first >> 32u, list[i].first & 0xffffffffu, list[i].second);
+			}
+			std::fprintf(stderr, "[rt-sizes] draws by first color target:%s\n", text.c_str());
+			sizes.clear();
+		}
 	}
 	GpuTiming::Before(m_context, buffer);
 	int64_t gpu_zone = -1;
@@ -1991,7 +2034,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// The zone is the wait for the renderer mutex (another thread holding it).
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (args.index_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
 		                  -1);
@@ -2131,7 +2178,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		}
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// The zone is the wait for the renderer mutex (another thread holding it).
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (args.gpu_args_address == 0 &&
 	    (args.vertex_count == 0 ||
 	     (args.instance_count == 0 && args.gpu_instance_count_address == 0))) {

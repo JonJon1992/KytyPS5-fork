@@ -8,12 +8,16 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+// Sets that do not fit the push-descriptor limit (32 on NVIDIA) come from these pools, ~40
+// storage buffers each: a pool of 8,192 held ~200 sets, so the GPU thread switched pools (failed
+// allocations, then a reset or a new pool) every few hundred such draws. Eight times larger pools
+// switch eight times less often (~4 MB of descriptors each).
+constexpr uint32_t   DescriptorHeapCount = 4096;
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 8192},
 };
 
 } // namespace

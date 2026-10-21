@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <array>
 #include <cstddef>
@@ -655,18 +656,45 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 		// When StillReads last confirmed the callee code.
 		std::chrono::steady_clock::time_point validated;
+		uint64_t                              sites_hash = 0; // SitesHash(sites)
 	};
 	struct Shader {
 		uint64_t               code_hash = 0;
 		ShaderAnalysis         analysis;
-		std::vector<Expansion> expansions; // most recent last
+		std::vector<Expansion> expansions; // kept; replaced in turn once full
+		std::unordered_map<uint64_t, uint32_t> by_sites; // sites_hash -> index
+		uint32_t               next_victim = 0;
 		// The user-data registers the last complete call resolution consulted (code-dependent
 		// only); valid while consulted_known.
 		std::vector<uint32_t> consulted;
 		uint32_t              consulted_wave  = 0;
 		bool                  consulted_known = false;
 	};
-	static constexpr size_t MaxExpansions = 8;
+	// The expansions kept per shader (KYTY_EXPAND_KEEP, default 2048). A call shader's targets
+	// come from per-object tables: with 8 kept, turning the camera brought more objects than that
+	// into view, each expansion was built again (~3 ms each, 190 a second, 55 % of the GPU thread
+	// while turning on the env3 roof, 2026-10-21); 256 still filled up (shader fc0537b7278db60c).
+	static size_t MaxExpansions() {
+		static const size_t keep = [] {
+			const char* value = std::getenv("KYTY_EXPAND_KEEP");
+			const auto  n     = value != nullptr ? std::strtoull(value, nullptr, 10) : 2048ull;
+			return static_cast<size_t>(n < 1 ? 1 : n);
+		}();
+		return keep;
+	}
+	static uint64_t SitesHash(const std::vector<CallSite>& sites) {
+		uint64_t h = 0xcbf29ce484222325ull;
+		const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
+		for (const auto& site: sites) {
+			mix(site.pc);
+			mix((uint64_t {site.source_reg} << 32u) | site.return_reg);
+			mix(site.dynamic ? 1u : 0u);
+			for (const auto address: site.addresses) mix(address);
+			mix(site.addresses.size());
+		}
+		return h;
+	}
+	uint64_t builds = 0;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
@@ -751,9 +779,12 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		const char* value = std::getenv("KYTY_EXPAND_REUSE_MS");
 		return value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
 	}());
-	const auto now = std::chrono::steady_clock::now();
-	for (auto& expansion: shader.expansions) {
-		if (expansion.base == base && expansion.wave_size == wave_size &&
+	const auto now        = std::chrono::steady_clock::now();
+	const auto sites_hash = Impl::SitesHash(sites);
+	if (const auto found = shader.by_sites.find(sites_hash); found != shader.by_sites.end()) {
+		auto& expansion = shader.expansions[found->second];
+		if (expansion.sites_hash == sites_hash && expansion.base == base &&
+		    expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
 		    ((reuse.count() != 0 && now - expansion.validated < reuse) ||
 		     m_impl->StillReads(expansion, read))) {
@@ -770,6 +801,7 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.wave_size       = wave_size;
 	expansion.user_data_count = user_data.size();
 	expansion.sites           = std::move(sites);
+	expansion.sites_hash      = sites_hash;
 	const ShaderCodeReader recording = [&](uint64_t address, std::span<uint32_t> words) {
 		const bool ok = read(address, words);
 		(ok ? expansion.reads : expansion.failed)
@@ -782,11 +814,26 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.validated = now;
 	expanded = expansion.code;
 	reason   = expansion.reason;
-	if (shader.expansions.size() >= Impl::MaxExpansions) {
-		shader.expansions.erase(shader.expansions.begin());
+	uint32_t slot = 0;
+	if (shader.expansions.size() < Impl::MaxExpansions()) {
+		slot = static_cast<uint32_t>(shader.expansions.size());
+		shader.expansions.emplace_back();
+	} else {
+		slot = shader.next_victim++ % static_cast<uint32_t>(shader.expansions.size());
+		const auto old_hash = shader.expansions[slot].sites_hash;
+		if (const auto it = shader.by_sites.find(old_hash); it != shader.by_sites.end() && it->second == slot) {
+			shader.by_sites.erase(it);
+		}
 	}
-	shader.expansions.push_back(std::move(expansion));
-	return shader.expansions.back().ok;
+	// KYTY_FPS_LOG: how often expansions are built ([expand], every 256 builds).
+	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && (++m_impl->builds % 256) == 0) {
+		std::fprintf(stderr, "[expand] %llu built; shader %016llx keeps %zu\n",
+		             static_cast<unsigned long long>(m_impl->builds),
+		             static_cast<unsigned long long>(code_hash), shader.expansions.size());
+	}
+	shader.expansions[slot] = std::move(expansion);
+	shader.by_sites[sites_hash] = slot;
+	return shader.expansions[slot].ok;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

@@ -841,6 +841,146 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 	return true;
 }
 
+// A walk visits a block's dominators before it and its post-dominators after it whatever the
+// outcomes, so a condition whose skippable blocks (reachable from it, not post-dominating it) only
+// hold sources and SRT reads those always-visited blocks already hold cannot change the active
+// sources or the refreshed reads. Evaluating it only reads memory: in Wolverine's
+// 06544f382c6b0850 a per-record flag the GPU has just written, a readback drain per frame.
+// Port of Revivedx/KytyPS5 5f533fcb (MarkIrrelevantConditions).
+static uint32_t MarkIrrelevantConditions(std::vector<ResourceBlock>& blocks, std::vector<uint8_t>& irrelevant) {
+	irrelevant.assign(blocks.size(), 0u);
+	const size_t n = blocks.size();
+	if (n == 0u || n > 4096u) return 0;
+	const size_t words = (n + 63u) / 64u;
+	using Bits         = std::vector<uint64_t>;
+	const auto test    = [](const Bits& bits, size_t i) { return ((bits[i / 64u] >> (i % 64u)) & 1u) != 0u; };
+	const auto set     = [](Bits& bits, size_t i) { bits[i / 64u] |= uint64_t {1} << (i % 64u); };
+	std::vector<std::vector<uint32_t>> preds(n);
+	for (uint32_t i = 0; i < n; i++) {
+		for (const auto s: blocks[i].successors) {
+			if (s >= n) return 0;
+			preds[s].push_back(i);
+		}
+	}
+	std::vector<uint8_t>  live(n, 0u);
+	std::vector<uint32_t> stack {0u};
+	while (!stack.empty()) {
+		const auto i = stack.back();
+		stack.pop_back();
+		if (live[i] != 0u) continue;
+		live[i] = 1u;
+		for (const auto s: blocks[i].successors) stack.push_back(s);
+	}
+	// Post-dominance needs every live block to reach an exit.
+	std::vector<uint8_t> exits(n, 0u);
+	for (uint32_t i = 0; i < n; i++) {
+		if (live[i] != 0u && blocks[i].successors.empty()) {
+			exits[i] = 1u;
+			stack.push_back(i);
+		}
+	}
+	while (!stack.empty()) {
+		const auto i = stack.back();
+		stack.pop_back();
+		for (const auto p: preds[i]) {
+			if (live[p] != 0u && exits[p] == 0u) {
+				exits[p] = 2u;
+				stack.push_back(p);
+			}
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (live[i] != 0u && exits[i] == 0u) return 0;
+	}
+	const Bits         ones(words, ~uint64_t {0});
+	std::vector<Bits>  dom(n, ones);
+	std::vector<Bits>  pdom(n, ones);
+	dom[0].assign(words, 0u);
+	set(dom[0], 0);
+	for (uint32_t i = 0; i < n; i++) {
+		if (exits[i] == 1u) {
+			pdom[i].assign(words, 0u);
+			set(pdom[i], i);
+		}
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (uint32_t i = 1; i < n; i++) {
+			if (live[i] == 0u) continue;
+			Bits next = ones;
+			for (const auto p: preds[i]) {
+				if (live[p] == 0u) continue;
+				for (size_t w = 0; w < words; w++) next[w] &= dom[p][w];
+			}
+			set(next, i);
+			if (next != dom[i]) {
+				dom[i]  = std::move(next);
+				changed = true;
+			}
+		}
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (uint32_t i = static_cast<uint32_t>(n); i-- > 0;) {
+			if (live[i] == 0u || exits[i] == 1u) continue;
+			Bits next = ones;
+			for (const auto s: blocks[i].successors) {
+				for (size_t w = 0; w < words; w++) next[w] &= pdom[s][w];
+			}
+			set(next, i);
+			if (next != pdom[i]) {
+				pdom[i] = std::move(next);
+				changed = true;
+			}
+		}
+	}
+	std::vector<std::vector<uint32_t>> reads(n);
+	for (uint32_t i = 0; i < n; i++) {
+		reads[i] = blocks[i].srt_reads;
+		std::ranges::sort(reads[i]);
+		reads[i].erase(std::unique(reads[i].begin(), reads[i].end()), reads[i].end());
+	}
+	uint32_t marked = 0;
+	for (uint32_t b = 0; b < n; b++) {
+		auto& block = blocks[b];
+		if (block.condition.IsEmpty()) continue;
+		if (live[b] == 0u) {
+			irrelevant[b] = 1u;
+			marked++;
+			continue;
+		}
+		std::vector<uint32_t> always_sources;
+		std::vector<uint32_t> always_reads;
+		for (uint32_t x = 0; x < n; x++) {
+			if (live[x] != 0u && (test(dom[b], x) || test(pdom[b], x))) {
+				always_sources.insert(always_sources.end(), blocks[x].sources.begin(), blocks[x].sources.end());
+				always_reads.insert(always_reads.end(), reads[x].begin(), reads[x].end());
+			}
+		}
+		std::ranges::sort(always_sources);
+		std::ranges::sort(always_reads);
+		std::vector<uint8_t> seen(n, 0u);
+		stack.assign(block.successors.begin(), block.successors.end());
+		bool covered = true;
+		while (!stack.empty() && covered) {
+			const auto x = stack.back();
+			stack.pop_back();
+			if (seen[x] != 0u) continue;
+			seen[x] = 1u;
+			if (!test(pdom[b], x)) {
+				covered = std::ranges::includes(always_sources, blocks[x].sources) &&
+				          std::ranges::includes(always_reads, reads[x]);
+			}
+			for (const auto s: blocks[x].successors) stack.push_back(s);
+		}
+		if (covered) {
+			irrelevant[b] = 1u;
+			marked++;
+		}
+	}
+	return marked;
+}
+
 template <typename Predicate>
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, const Predicate& predicate) {
 	// The renderer checks captured scalar reads against final buffer and image write ranges.
@@ -931,6 +1071,21 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		block.condition = std::ranges::any_of(block.successors, [&](uint32_t successor) {
 			return resource_reachable[successor] != 0;
 		}) ? predicate(block.condition) : Value {};
+	}
+	// KYTY_PRUNE_CONDITIONS (default 1; 0 keeps them): conditions that cannot change the walk are
+	// dropped at plan time. Revivedx measured ~1 CP readback drain fewer per frame, +3.8 %.
+	static const bool prune = [] {
+		const char* value = std::getenv("KYTY_PRUNE_CONDITIONS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (prune && std::ranges::any_of(
+	                 blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
+		std::vector<uint8_t> irrelevant;
+		if (MarkIrrelevantConditions(blocks, irrelevant) != 0u) {
+			for (size_t i = 0; i < blocks.size(); i++) {
+				if (irrelevant[i] != 0u) blocks[i].condition = Value {};
+			}
+		}
 	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {

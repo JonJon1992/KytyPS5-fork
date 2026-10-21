@@ -2,13 +2,26 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 
-// DISPATCH_INDIRECT with the thread-dimension initiator: the guest's arguments are thread
-// counts, which the host turns into workgroup counts on the GPU instead of reading them back.
+// DISPATCH_INDIRECT: the guest's arguments become the workgroup counts here, on the GPU, instead
+// of the command processor reading them back. With the thread-dimension initiator they are thread
+// counts (local_size is the shader's group size); otherwise they already are group counts
+// (local_size 1). Counts the device cannot run, or that no real dispatch needs (memory not
+// written yet, stale, or garbage), dispatch nothing: a dispatch of billions of groups never ends,
+// and NVIDIA preempts compute, so the device is never lost either: the queue just stops.
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ThreadCounts {
     uint threads[3];
+};
+
+// The first dispatch emptied, for the host to report (count, then the first one's details).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Report {
+    uint count;
+    uint hash_low;
+    uint hash_high;
+    uint threads[3];
+    uint local_size[3];
 };
 
 layout(std430, binding = 0) writeonly buffer Groups {
@@ -21,6 +34,13 @@ layout(push_constant) uniform Push {
     uint  local_size_y;
     uint  local_size_z;
     uint  output_dword;
+    uint  max_x;
+    uint  max_y;
+    uint  max_z;
+    uint  max_total;
+    uvec2 report_address;
+    uint  hash_low;
+    uint  hash_high;
 } pc;
 
 uint GroupCount(uint threads, uint local_size) {
@@ -30,9 +50,32 @@ uint GroupCount(uint threads, uint local_size) {
 void main() {
     ThreadCounts counts = ThreadCounts(pc.threads_address);
     const uvec3 threads = uvec3(counts.threads[0], counts.threads[1], counts.threads[2]);
-    groups[pc.output_dword + 0u] = GroupCount(threads.x, pc.local_size_x);
-    groups[pc.output_dword + 1u] = GroupCount(threads.y, pc.local_size_y);
-    groups[pc.output_dword + 2u] = GroupCount(threads.z, pc.local_size_z);
+    uvec3 g = uvec3(GroupCount(threads.x, pc.local_size_x), GroupCount(threads.y, pc.local_size_y),
+                    GroupCount(threads.z, pc.local_size_z));
+    if (pc.max_total != 0u) {
+        const bool too_big = g.x > pc.max_x || g.y > pc.max_y || g.z > pc.max_z ||
+                             (g.x != 0u && g.y > pc.max_total / g.x) ||
+                             (g.x * g.y != 0u && g.z > pc.max_total / (g.x * g.y));
+        if (too_big) {
+            g = uvec3(0u);
+            if (pc.report_address != uvec2(0u)) {
+                Report report = Report(pc.report_address);
+                if (atomicAdd(report.count, 1u) == 0u) {
+                    report.hash_low      = pc.hash_low;
+                    report.hash_high     = pc.hash_high;
+                    report.threads[0]    = threads.x;
+                    report.threads[1]    = threads.y;
+                    report.threads[2]    = threads.z;
+                    report.local_size[0] = pc.local_size_x;
+                    report.local_size[1] = pc.local_size_y;
+                    report.local_size[2] = pc.local_size_z;
+                }
+            }
+        }
+    }
+    groups[pc.output_dword + 0u] = g.x;
+    groups[pc.output_dword + 1u] = g.y;
+    groups[pc.output_dword + 2u] = g.z;
     // The dispatch bounds its threads by this copy (see IndirectDispatchGroups::Result).
     groups[pc.output_dword + 4u] = threads.x;
     groups[pc.output_dword + 5u] = threads.y;

@@ -25,10 +25,16 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <chrono>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// KYTY_UPLOAD_WORKER: the number of upload reads queued so far (0 when off), and a wait until the
+// reads before that number are done (bufferCache.cpp).
+[[nodiscard]] uint64_t UploadWorkerPushed();
+void                   WaitUploadWorker(uint64_t upto);
 
 struct GraphicContext;
 class CommandScheduler;
@@ -154,9 +160,12 @@ public:
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
 	}
-	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	uint64_t                        SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	// The BDA walk over every mapped range, limited to regions with new CPU writes.
+	void                            SynchronizeTouchedMappedBuffers(const RangeSet& mapped);
+	static bool                     BdaTouchedEnabled();
 	void                            RunGarbageCollector();
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
@@ -203,6 +212,23 @@ private:
 	std::unordered_map<uint64_t, uint32_t>     m_shared_attempts;
 	// The tick of the latest GPU write recorded into each shared buffer, until it completes.
 	std::unordered_map<uint64_t, uint64_t>     m_shared_write_ticks;
+	// Host zones (KYTY_HOST_ZONES=1, after Revivedx 31cf25b7): guest ranges the game's threads
+	// keep writing (per-object constants) get one shared buffer over the guest's own memory, so
+	// their pages stay writable (no write faults, no uploads, no re-protection) and the GPU reads
+	// the bytes when it runs, as on the console. A zone falls back to normal buffers for good when
+	// a buffer would cross it or it holds GPU-written bytes.
+	struct HostZone {
+		uint64_t begin  = 0;
+		uint64_t size   = 0;
+		BufferId id     = NULL_BUFFER_ID;
+		bool     has_id = false;
+		bool     failed = false;
+		uint32_t waits  = 0; // not mapped (or not in one mapping) yet
+	};
+	std::vector<HostZone> m_host_zones;
+	HostZone*             FindHostZone(uint64_t vaddr, uint64_t size);
+	bool                  CreateHostZoneBuffer(HostZone& zone);
+	void                  DropHostZone(HostZone& zone, const char* reason);
 	friend struct BufferCacheTestAccess;
 
 	void ReleaseBuffer(BufferId id);
@@ -366,6 +392,11 @@ private:
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;
+	struct GcStats {
+		uint64_t runs = 0, aggressive = 0, deleted = 0, waits = 0, created = 0;
+		double   wait_ms = 0.0;
+		std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+	} m_gc_stats;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
@@ -375,6 +406,13 @@ private:
 	// window cleared the range while the second was in flight; a game thread then took the
 	// page as current, wrote it, and the second publication put older GPU bytes over that).
 	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// Whether m_downloading_ranges holds anything, set under m_dirty_ranges_mutex after each change:
+	// HasPendingDownload (every clean guest read of the SRT walks and draw-prep checks) answers
+	// without the lock while nothing downloads.
+	std::atomic<bool>                                  m_downloading_any {false};
+	void NoteDownloading() {
+		m_downloading_any.store(!m_downloading_ranges.Empty(), std::memory_order_release);
+	}
 	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
 	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
 	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.

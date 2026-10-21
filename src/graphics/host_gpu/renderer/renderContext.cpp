@@ -102,6 +102,19 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+namespace {
+// KYTY_FAULT_GRANULE_KB (default 0 = one page): a power of two of at least 4 KB. Read once at
+// start-up: HandleFault runs in the fault handler. Port of Senaxx/KytyPS5 PR #17 (aea48484).
+// 64 KB: env3 18.2/18.9 -> 19.2/19.1 fps, fight 23.5 -> 24.3, grass 25.7 -> 26.1, but loads froze
+// with it (the game stopped presenting, GPU at 100%) in most of the player's sessions, 2026-10-20.
+uint64_t FaultGranuleFromEnv() {
+	const char*    value = std::getenv("KYTY_FAULT_GRANULE_KB");
+	const uint64_t bytes = (value != nullptr ? std::strtoull(value, nullptr, 10) : 0) << 10u;
+	return bytes >= 4096 && (bytes & (bytes - 1)) == 0 ? bytes : 0;
+}
+const uint64_t g_fault_granule = FaultGranuleFromEnv();
+} // namespace
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -129,7 +142,22 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			             static_cast<unsigned long long>(GetGraphics().presented_frames.load()),
 			             m_buffer_cache.HasGpuDirtyBytes(fault_vaddr & ~uint64_t {0xfff}, 0x1000) ? 1 : 0);
 		}
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// KYTY_FAULT_GRANULE_KB: the buffer cache takes the whole aligned granule around the written
+		// byte as CPU-written, not just its page, so a guest filling a buffer page by page faults
+		// (and changes protection) once per granule instead of once per page. A granule holding
+		// GPU-written bytes keeps the single page, so nothing is downloaded for it. Images and the
+		// bindless table still take only the page.
+		uint64_t vaddr = fault_vaddr;
+		uint64_t size  = fault_size;
+		if (g_fault_granule != 0) {
+			const uint64_t base = fault_vaddr & ~(g_fault_granule - 1);
+			if (IsMapped(base, g_fault_granule) &&
+			    !m_buffer_cache.IsRegionGpuModified(base, g_fault_granule)) {
+				vaddr = base;
+				size  = g_fault_granule;
+			}
+		}
+		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 	} else {
@@ -298,10 +326,15 @@ void RenderContext::PrepareBda() {
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
+		KYTY_PROFILER_BLOCK("PrepareBda::Walk");
 		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
-		});
+		if (BufferCache::BdaTouchedEnabled()) {
+			m_buffer_cache.SynchronizeTouchedMappedBuffers(m_mapped_ranges);
+		} else {
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
+			});
+		}
 		m_bda_synced_epoch = epoch;
 	}
 	m_fault_process_pending = true;

@@ -8,6 +8,12 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -17,7 +23,28 @@ struct PushConstants {
 	uint32_t threads_high;
 	uint32_t local_size[3];
 	uint32_t output_dword;
+	uint32_t max_x;
+	uint32_t max_y;
+	uint32_t max_z;
+	uint32_t max_total;
+	uint32_t report_low;
+	uint32_t report_high;
+	uint32_t hash_low;
+	uint32_t hash_high;
 };
+
+struct ClampReport {
+	uint32_t count;
+	uint32_t hash_low;
+	uint32_t hash_high;
+	uint32_t threads[3];
+	uint32_t local_size[3];
+};
+
+uint32_t MaxIndirectGroups() {
+	const char* value = std::getenv("KYTY_INDIRECT_MAX_GROUPS");
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : (1u << 22u);
+}
 
 } // namespace
 
@@ -26,8 +53,15 @@ IndirectDispatchGroups::IndirectDispatchGroups(GraphicContext& graphics, Command
       m_groups(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
                    vk::BufferUsageFlagBits::eShaderDeviceAddress,
-               Entries * EntryDwords * sizeof(uint32_t)) {
+               Entries * EntryDwords * sizeof(uint32_t)),
+      m_report(graphics, scheduler, MemoryUsage::Download, 0,
+               vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+               256),
+      m_max_total(MaxIndirectGroups()) {
 	SetVulkanObjectNameF(graphics.device, m_groups.Handle(), "Indirect Dispatch Groups");
+	SetVulkanObjectNameF(graphics.device, m_report.Handle(), "Indirect Dispatch Clamp Report");
+	std::memset(m_report.Mapped().data(), 0, sizeof(ClampReport));
+	m_report.Flush(0, m_report.Size());
 
 	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1,
 	                                              vk::ShaderStageFlagBits::eCompute, nullptr};
@@ -72,7 +106,11 @@ IndirectDispatchGroups::~IndirectDispatchGroups() {
 
 IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
     const CommandRecorder& command, vk::DeviceAddress threads,
-    const std::array<uint32_t, 3>& local_size, bool pre_barrier, bool post_barrier) {
+    const std::array<uint32_t, 3>& local_size, bool pre_barrier, bool post_barrier,
+    uint64_t shader_hash) {
+	if ((++m_converted & 511u) == 0u) {
+		Report();
+	}
 	const auto entry  = m_next;
 	m_next            = (m_next + 1u) % Entries;
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
@@ -96,9 +134,15 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
 	write.pBufferInfo     = &info;
+	const auto& limits = m_graphics.physical_device_properties.limits;
+	const auto  report = m_report.HasDeviceAddress() ? m_report.BufferDeviceAddress() : 0;
 	const PushConstants push {
 	    static_cast<uint32_t>(threads), static_cast<uint32_t>(threads >> 32u),
-	    {local_size[0], local_size[1], local_size[2]}, entry * EntryDwords};
+	    {local_size[0], local_size[1], local_size[2]}, entry * EntryDwords,
+	    limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
+	    limits.maxComputeWorkGroupCount[2], m_max_total,
+	    static_cast<uint32_t>(report), static_cast<uint32_t>(report >> 32u),
+	    static_cast<uint32_t>(shader_hash), static_cast<uint32_t>(shader_hash >> 32u)};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
@@ -119,6 +163,35 @@ IndirectDispatchGroups::Result IndirectDispatchGroups::Convert(
 	                        {}, 1, &groups_ready, 0, nullptr, 0, nullptr);
 	return {m_groups.Handle(), offset,
 	        m_groups.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
+}
+
+// Every 512 conversions, at most every 5 s: the dispatches emptied since the last report (the
+// GPU's count is read without waiting, so a report can trail by a frame).
+void IndirectDispatchGroups::Report() {
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	if (now - m_last_report_ms < 5000) {
+		return;
+	}
+	m_last_report_ms = now;
+	m_report.Invalidate(0, sizeof(ClampReport));
+	ClampReport report {};
+	std::memcpy(&report, m_report.Mapped().data(), sizeof(report));
+	if (report.count == 0) {
+		return;
+	}
+	m_emptied += report.count;
+	std::fprintf(stderr,
+	             "[indirect-clamp] %u dispatches emptied (total %" PRIu64 ", conversions %" PRIu64
+	             "); first: hash=%08x%08x args=%u,%u,%u local=%u,%u,%u\n",
+	             report.count, m_emptied, m_converted, report.hash_high, report.hash_low,
+	             report.threads[0], report.threads[1], report.threads[2], report.local_size[0],
+	             report.local_size[1], report.local_size[2]);
+	std::fflush(stderr);
+	// Racy with a dispatch emptied right now (its count can be lost); diagnostics only.
+	std::memset(m_report.Mapped().data(), 0, sizeof(ClampReport));
+	m_report.Flush(0, sizeof(ClampReport));
 }
 
 namespace {

@@ -38,6 +38,7 @@ RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 // After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
 // _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.
 void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+void DumpGpuHangCheckpoints(GraphicContext& graphics, uint64_t tick, double seconds);
 
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;

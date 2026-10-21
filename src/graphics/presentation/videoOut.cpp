@@ -23,7 +23,11 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <string>
 #include <atomic>
 #include <fmt/format.h>
 #include <list>
@@ -213,7 +217,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	bool Flip(uint32_t micros, bool off_vblank = false);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -489,6 +493,43 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	}
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
+
+
+namespace {
+// KYTY_FPS_LOG: which video-out timing calls the game makes (calls per 5 s, to stderr).
+enum VoApi { VoGetVblankStatus, VoWaitVblank, VoAddVblankEvent, VoAddPreVblankEvent, VoAddFlipEvent,
+	         VoGetFlipStatus, VoIsFlipPending, VoSubmitFlip, VoLatencyWait, VoApiCount };
+constexpr const char* kVoApiNames[VoApiCount] = {"GetVblankStatus", "WaitVblank", "AddVblankEvent",
+                                                 "AddPreVblankStartEvent", "AddFlipEvent",
+                                                 "GetFlipStatus", "IsFlipPending", "SubmitFlip",
+                                                 "LatencyControlWaitBeforeInput"};
+std::array<std::atomic<uint32_t>, VoApiCount> g_vo_api_calls {};
+bool VoApiLogEnabled() {
+	static const bool enabled = std::getenv("KYTY_FPS_LOG") != nullptr;
+	return enabled;
+}
+void NoteVoApi(VoApi api) {
+	if (VoApiLogEnabled() && g_vo_api_calls[api].fetch_add(1, std::memory_order_relaxed) == 0) {
+		static std::array<std::atomic_bool, VoApiCount> first {};
+		if (!first[api].exchange(true)) {
+			std::fprintf(stderr, "[vo-api] first call: %s\n", kVoApiNames[api]);
+		}
+	}
+}
+void PrintVoApiStats() {
+	if (!VoApiLogEnabled()) return;
+	static auto window_start = std::chrono::steady_clock::now();
+	const auto  now          = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) return;
+	window_start = now;
+	std::string line = "[vo-api] per 5 s:";
+	for (int i = 0; i < VoApiCount; i++) {
+		const auto n = g_vo_api_calls[i].exchange(0, std::memory_order_relaxed);
+		if (n != 0) line += fmt::format(" {}={}", kVoApiNames[i], n);
+	}
+	std::fprintf(stderr, "%s\n", line.c_str());
+}
+} // namespace
 
 static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
@@ -850,16 +891,38 @@ void VideoOutDriver::Impl::VblankEnd() {
 			ctx.mutex.Unlock();
 		}
 	}
+	PrintVoApiStats();
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
+	// KYTY_FLIP_IMMEDIATE=1: a flip whose frame is ready is presented (and completed for the
+	// game) right away instead of at the next vblank. The vblank count and events keep their
+	// 60 Hz rhythm; only the wait of a late frame for the next vblank goes (a frame that took
+	// 40 ms showed at 50 ms). Flips with a flip rate (30 or 20 FPS caps) keep vblank alignment.
+	static const bool flip_immediate = [] {
+		const char* value = std::getenv("KYTY_FLIP_IMMEDIATE");
+		return value != nullptr && value[0] == '1';
+	}();
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		if (total_wait > 0 && flip_immediate && !m_presenter.IsGuestPaused()) {
+			// Wait for the vblank in steps of up to 1 ms, presenting ready flips as they come.
+			const auto deadline = sleep_begin + static_cast<uint64_t>(total_wait);
+			for (;;) {
+				(void)m_flip_queue.Flip(0, true);
+				const auto now = Common::Timer::QueryPerformanceCounter();
+				if (now >= deadline || token.stop_requested()) {
+					break;
+				}
+				const auto left_us = (deadline - now) * 1000000u / frequency;
+				Common::Thread::SleepMicro(
+				    static_cast<uint32_t>(std::clamp<uint64_t>(left_us, 1, 1000)));
+			}
+		} else if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
@@ -1198,7 +1261,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip(uint32_t micros, bool off_vblank) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1244,6 +1307,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
+			// Between vblanks (KYTY_FLIP_IMMEDIATE) only flips without a flip rate go out.
+			due &= !off_vblank || r.cfg->flip_rate == 0;
 		}
 		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
 	}
@@ -1383,6 +1448,7 @@ KYTY_SYSV_ABI int VideoOutDeleteFlipEvent(EventQueue::KernelEqueue eq, int handl
 
 KYTY_SYSV_ABI int VideoOutAddFlipEvent(EventQueue::KernelEqueue eq, int handle, void* udata) {
 	PRINT_NAME();
+	NoteVoApi(VoAddFlipEvent);
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Flip, udata);
 }
 
@@ -1399,12 +1465,14 @@ KYTY_SYSV_ABI int VideoOutDeletePreVblankStartEvent(EventQueue::KernelEqueue eq,
 KYTY_SYSV_ABI int VideoOutAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                          void* udata) {
 	PRINT_NAME();
+	NoteVoApi(VoAddVblankEvent);
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Vblank, udata);
 }
 
 KYTY_SYSV_ABI int VideoOutAddPreVblankStartEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                                  void* udata) {
 	PRINT_NAME();
+	NoteVoApi(VoAddPreVblankEvent);
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::PreVblankStart, udata);
 }
 
@@ -1584,6 +1652,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+	NoteVoApi(VoSubmitFlip);
 
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
@@ -1641,6 +1710,7 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
+	NoteVoApi(VoGetFlipStatus);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1670,6 +1740,7 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 
 KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 	PRINT_NAME();
+	NoteVoApi(VoIsFlipPending);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1688,6 +1759,7 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
 	PRINT_NAME();
+	NoteVoApi(VoGetVblankStatus);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1768,6 +1840,7 @@ KYTY_SYSV_ABI int VideoOutGetEventCount(const EventQueue::KernelEvent* ev) {
 
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	PRINT_NAME();
+	NoteVoApi(VoWaitVblank);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1949,6 +2022,7 @@ KYTY_SYSV_ABI int VideoOutSetWindowModeMargins(int handle, int top, int bottom) 
 
 KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle) {
 	PRINT_NAME();
+	NoteVoApi(VoLatencyWait);
 
 	[[maybe_unused]] auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

@@ -21,6 +21,10 @@
 
 namespace Libs::Graphics {
 
+// bufferCache.cpp (KYTY_UPLOAD_WORKER).
+uint64_t UploadWorkerPushed();
+void     WaitUploadWorker(uint64_t upto);
+
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
@@ -718,6 +722,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg2   = m_command.m_debug_arg2,
 	    .debug_arg3   = m_command.m_debug_arg3,
 	    .debug_arg4   = m_command.m_debug_arg4,
+	    .upload_reads = UploadWorkerPushed(),
 	};
 	m_command.m_buffer                = nullptr;
 	m_command.m_open                  = false;
@@ -764,6 +769,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
+	// KYTY_UPLOAD_WORKER: the staging bytes this submission's copies read are written.
+	WaitUploadWorker(job.upload_reads);
 	auto&      graphics = m_graphics;
 	vk::Result result;
 	{

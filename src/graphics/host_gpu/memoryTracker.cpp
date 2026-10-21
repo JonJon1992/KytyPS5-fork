@@ -11,6 +11,7 @@ MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_man
 	m_regions           = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_present_regions   = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
+	m_cpu_touched_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 }
 
 bool MemoryTracker::IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
@@ -87,7 +88,9 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	// A new region is all CPU-dirty (its summary starts true): mirror that before it exists.
 	const uint64_t bit = uint64_t {1} << (index % 64);
 	m_cpu_dirty_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
+	m_cpu_touched_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
 	ptr->SetCpuSummaryBit(&m_cpu_dirty_regions[index / 64], bit);
+	ptr->SetCpuTouchedWord(&m_cpu_touched_regions[index / 64]);
 	m_present_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;

@@ -1,5 +1,7 @@
 #include "graphics/presentation/renderDoc.h"
 
+#include "common/sampler.h"
+
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -159,7 +161,10 @@ static void StartCapture() {
 	LOGF("RenderDoc: capture started\n");
 }
 
+uint64_t AllocCountTotal(); // allocStats.cpp
+
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	Common::Sampler::NoteGuestFrame(); // freeze recorder
 	// KYTY_FPS_LOG=1: guest flips per second, every 5 s, to stderr (for scripted runs).
 	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
 		static auto     window_start = std::chrono::steady_clock::now();
@@ -169,6 +174,12 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		const auto elapsed = std::chrono::duration<double>(now - window_start).count();
 		if (elapsed >= 5.0) {
 			std::fprintf(stderr, "[fps] %.2f\n", flips / elapsed);
+			// Heap allocations per second (allocStats.cpp).
+			static uint64_t allocs_before = 0;
+			const uint64_t  allocs        = AllocCountTotal();
+			std::fprintf(stderr, "[alloc] %.0f/s\n",
+			             static_cast<double>(allocs - allocs_before) / elapsed);
+			allocs_before = allocs;
 			flips        = 0;
 			window_start = now;
 		}

@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <mutex>
+#include <cstdlib>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
 	[[maybe_unused]] CommandProcessor &cp, uint32_t cmd_id, [[maybe_unused]] uint32_t cmd_offset,  \
@@ -3210,10 +3212,29 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::VGT_GS_ONCHIP_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetGsOnchipCntl(value);
 	};
+	// KYTY_FPS_LOG: the distinct tessellation clamps the game programs (the hardware clamps tess
+	// factors to [min, max]; the host pipeline does not apply them yet).
+	static const auto log_tess_level = [](const char* which, uint32_t value) {
+		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; !log) {
+			return;
+		}
+		static std::mutex                    mutex;
+		static std::vector<uint64_t>         seen;
+		const uint64_t                       key = (uint64_t {which[1] == 'a'} << 32u) | value;
+		std::lock_guard                      lock(mutex);
+		if (seen.size() < 32 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+			seen.push_back(key);
+			float level = 0.0f;
+			std::memcpy(&level, &value, sizeof(level));
+			std::fprintf(stderr, "[tess-level] %s = 0x%08x (%g)\n", which, value, level);
+		}
+	};
 	g_hw_ctx_indirect_func[Pm4::VGT_HOS_MAX_TESS_LEVEL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		log_tess_level("max", value);
 		cp.GetCtx().SetHosMaxTessLevel(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::VGT_HOS_MIN_TESS_LEVEL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		log_tess_level("min", value);
 		cp.GetCtx().SetHosMinTessLevel(value);
 	};
 

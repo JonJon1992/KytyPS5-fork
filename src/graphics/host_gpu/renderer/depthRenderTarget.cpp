@@ -304,9 +304,16 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
+	// Write-only depth: no read buffer, a write buffer, and a depth test that never reads
+	// (ALWAYS or disabled). Seen on AMD at the Sony logo. Render into the write buffer.
+	const bool depth_write_only =
+	    z.z_read_base_addr == 0 && z.z_write_base_addr != 0 && !z.depth_view.depth_write_disable &&
+	    (!dc.z_enable || dc.zfunc == static_cast<uint8_t>(vk::CompareOp::eAlways)) &&
+	    !has_stencil;
 	if (rc.copy_stencil_to_color ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
-	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
+	    (!depth_write_only && !z.depth_view.depth_write_disable &&
+	     z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state (control): copy_stencil_to_color=%d "
@@ -328,7 +335,14 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	if (depth_write_only) {
+		static std::atomic_bool logged_write_only = false;
+		if (!logged_write_only.exchange(true, std::memory_order_relaxed)) {
+			LOGF("[depth] write-only depth target: write=0x%016" PRIx64 " (no read buffer)\n",
+			     static_cast<uint64_t>(z.z_write_base_addr));
+		}
+	}
+	r.desc = MakeDepthTargetDesc(buffer, z, depth_write_only);
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

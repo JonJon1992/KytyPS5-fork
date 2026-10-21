@@ -107,6 +107,9 @@ public:
 	}
 
 	[[nodiscard]] bool   Empty() const { return m_ranges.empty(); }
+	// The lowest start and the highest end (the set must not be empty).
+	[[nodiscard]] uint64_t Lowest() const { return m_ranges.begin()->first; }
+	[[nodiscard]] uint64_t Highest() const { return m_ranges.rbegin()->second; }
 	[[nodiscard]] size_t Count() const { return m_ranges.size(); }
 
 private:

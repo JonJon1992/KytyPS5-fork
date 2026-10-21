@@ -3135,11 +3135,13 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {
+		KYTY_PROFILER_BLOCK("Draw::PrepareBda");
 		m_context.PrepareBda();
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	KYTY_PROFILER_BLOCK("Draw::ColorTargets");
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);

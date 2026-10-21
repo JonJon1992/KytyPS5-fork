@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <timeapi.h>
 #endif
 
@@ -211,7 +213,175 @@ void Run() {
 	std::fflush(stderr);
 }
 
+// --- Freeze recorder ---
+
+std::atomic<int64_t> g_last_frame_ms {0};
+std::atomic<bool>    g_freeze_watch_started {false};
+
+int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now() - g_process_start)
+	    .count();
+}
+
+uint64_t ThreadCpuMs(HANDLE handle) {
+	FILETIME create {}, exit {}, kernel {}, user {};
+	if (GetThreadTimes(handle, &create, &exit, &kernel, &user) == FALSE) return 0;
+	const auto k = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32u) | kernel.dwLowDateTime;
+	const auto u = (static_cast<uint64_t>(user.dwHighDateTime) << 32u) | user.dwLowDateTime;
+	return (k + u) / 10000u;
+}
+
+constexpr int FreezeCallers = 14;
+
+struct FreezeSample {
+	bool    ok = false;
+	DWORD64 rip = 0;
+	DWORD64 callers[FreezeCallers] {};
+};
+
+// Suspends the thread, reads its instruction pointer and the return addresses on its stack, and
+// resumes it; nothing is allocated meanwhile (it may hold the heap lock).
+FreezeSample SampleThread(HANDLE handle) {
+	FreezeSample sample;
+	if (SuspendThread(handle) == static_cast<DWORD>(-1)) return sample;
+	CONTEXT context {};
+	context.ContextFlags = CONTEXT_CONTROL;
+	if (GetThreadContext(handle, &context) != FALSE) {
+		sample.ok  = true;
+		sample.rip = context.Rip;
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &info, sizeof(info)) != 0) {
+			const auto top   = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+			const auto* slot = reinterpret_cast<const uintptr_t*>(context.Rsp);
+			int         found = 0;
+			for (int k = 0; k < 2048 && found < FreezeCallers; k++) {
+				if (context.Rsp + (k + 1) * sizeof(uintptr_t) > top) break;
+				if (IsReturnAddress(slot[k])) sample.callers[found++] = slot[k];
+			}
+		}
+	}
+	ResumeThread(handle);
+	return sample;
+}
+
+bool InImage(DWORD64 address) {
+	return address >= g_image_begin && address < g_image_end;
+}
+
+std::string NameOf(DWORD64 address) {
+	if (address == 0) return "?";
+	auto name = FunctionOf(Common::HostAddressName(reinterpret_cast<const void*>(address)));
+	if (name == "?" || name.empty()) {
+		char text[48];
+		if (InImage(address)) {
+			std::snprintf(text, sizeof(text), "exe+0x%llx", static_cast<unsigned long long>(address - g_image_begin));
+		} else {
+			std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+		}
+		name = text;
+	}
+	return name;
+}
+
+void FreezeReport(int report) {
+	struct Thread {
+		DWORD    id;
+		HANDLE   handle;
+		uint64_t cpu0;
+	};
+	std::vector<Thread> threads;
+	const DWORD         pid      = GetCurrentProcessId();
+	const DWORD         self     = GetCurrentThreadId();
+	HANDLE              snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL more = Thread32First(snapshot, &entry); more != FALSE; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+		                           FALSE, entry.th32ThreadID);
+		if (handle != nullptr) threads.push_back({entry.th32ThreadID, handle, ThreadCpuMs(handle)});
+	}
+	CloseHandle(snapshot);
+	Sleep(1000);
+	std::string out;
+	char        line[256];
+	std::snprintf(line, sizeof(line), "[freeze] report %d: no guest flip for %lld s, %zu threads\n", report,
+	              static_cast<long long>((NowMs() - g_last_frame_ms.load()) / 1000), threads.size());
+	out += line;
+	int listed = 0;
+	for (auto& thread: threads) {
+		const auto cpu  = ThreadCpuMs(thread.handle) - thread.cpu0;
+		const bool busy = cpu >= 100;
+		FreezeSample samples[3];
+		samples[0] = SampleThread(thread.handle);
+		bool ours  = samples[0].ok && InImage(samples[0].rip);
+		for (const auto c: samples[0].callers) ours = ours || (c != 0 && InImage(c));
+		if (!busy && (!ours || listed >= 48)) continue;
+		listed++;
+		if (busy) {
+			Sleep(100);
+			samples[1] = SampleThread(thread.handle);
+			Sleep(100);
+			samples[2] = SampleThread(thread.handle);
+		}
+		std::snprintf(line, sizeof(line), "[freeze] thread %lu cpu %llu ms/s%s\n", static_cast<unsigned long>(thread.id),
+		              static_cast<unsigned long long>(cpu), busy ? " BUSY" : "");
+		out += line;
+		for (const auto& sample: samples) {
+			if (!sample.ok) continue;
+			std::string chain = "[freeze]   at " + NameOf(sample.rip);
+			for (const auto c: sample.callers) {
+				if (c == 0) break;
+				chain += " < " + NameOf(c);
+			}
+			out += chain.substr(0, 1500) + "\n";
+		}
+	}
+	for (auto& thread: threads) CloseHandle(thread.handle);
+	std::fputs(out.c_str(), stderr);
+	std::fflush(stderr);
+}
+
+void FreezeWatch() {
+	{
+		MODULEINFO info {};
+		if (GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &info, sizeof(info)) != FALSE) {
+			g_image_begin = reinterpret_cast<uintptr_t>(info.lpBaseOfDll);
+			g_image_end   = g_image_begin + info.SizeOfImage;
+		}
+	}
+	int     reports     = 0;
+	int64_t next_report = 0;
+	for (;;) {
+		Sleep(1000);
+		const auto last = g_last_frame_ms.load(std::memory_order_relaxed);
+		const auto now  = NowMs();
+		if (now - last < 15000) {
+			next_report = 0;
+			continue;
+		}
+		if (reports >= 3 || now < next_report) continue;
+		for (int i = 0; i < 3 && reports < 3; i++) {
+			FreezeReport(++reports);
+		}
+		next_report = now + 60000;
+	}
+}
+
 } // namespace
+
+void NoteGuestFrame() {
+	g_last_frame_ms.store(NowMs(), std::memory_order_relaxed);
+	if (!g_freeze_watch_started.load(std::memory_order_relaxed) &&
+	    !g_freeze_watch_started.exchange(true)) {
+		const char* value = std::getenv("KYTY_FREEZE_DUMP");
+		if (value == nullptr || value[0] != '0') {
+			std::thread(FreezeWatch).detach();
+		}
+	}
+}
 
 void RegisterCurrentThread(const char* name) {
 	if (!GetConfig().enabled) {
@@ -235,6 +405,7 @@ void RegisterCurrentThread(const char* name) {
 #else
 
 void RegisterCurrentThread(const char* /*name*/) {}
+void NoteGuestFrame() {}
 
 #endif
 

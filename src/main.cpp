@@ -545,6 +545,11 @@ static void ApplyFrankEnvironmentDefaults() {
 	    // GPU-driven mesh draws convert their counts in batches, not one dispatch, two drains and
 	    // a rendering restart each (jungle median 18.5 -> 20.5-22.3 fps).
 	    {"KYTY_MESH_ARGS_RUNS", "1"},
+	    // Guest-visible host buffers over the CPU-written hot ranges, instead of page faults per
+	    // write (sewer standing 20.1 -> 22.6 fps, roof 19.7 -> 22.0; KYTY_HOST_ZONES=0 turns off).
+	    {"KYTY_HOST_ZONES", "1"},
+	    // Repeated syncs of a range with no page changed skip the tracker walk (37-52 % skipped).
+	    {"KYTY_SYNC_SKIP", "1"},
 	};
 	for (const auto& [name, value]: Defaults) {
 		if (std::getenv(name) == nullptr) {

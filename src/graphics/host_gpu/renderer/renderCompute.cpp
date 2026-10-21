@@ -54,6 +54,8 @@
 
 namespace Libs::Graphics {
 
+void NoteTickWork(uint64_t tick, char kind, uint64_t a, uint64_t b); // diagnosticCheckpoints.cpp
+
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
 static bool EarlyDispatchSkip() {
@@ -869,7 +871,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// The zone is the wait for the renderer mutex (another thread holding it).
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -952,6 +958,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
 	const auto& resources = *input_info.stage.resources;
 	// KYTY_LOG_CS_IMAGES=1: each compute shader's written images (extent, format), once per shape.
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
@@ -1153,7 +1160,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	// The zone is the wait for the renderer mutex (another thread holding it).
+	Common::LockGuard lock = [&]() -> Common::LockGuard {
+		KYTY_PROFILER_BLOCK("Renderer mutex wait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -1186,7 +1197,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			             input_info.stage.program->shader_hash);
 		}
 	}
-	if (use_thread_dimensions && m_indirect_groups == nullptr) {
+	// KYTY_INDIRECT_CLAMP_GROUPS (default 1): group-count arguments go through the same GPU
+	// conversion, which empties dispatches no real workload needs (garbage counts launched
+	// billions of groups and stopped the queue for good: the "GPU hang" on loads).
+	static const bool clamp_groups = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_CLAMP_GROUPS");
+		return value == nullptr || value[0] != '0';
+	}();
+	const bool convert_groups = !use_thread_dimensions && clamp_groups;
+	if ((use_thread_dimensions || convert_groups) && m_indirect_groups == nullptr) {
 		m_indirect_groups = std::make_unique<IndirectDispatchGroups>(
 		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
@@ -1227,7 +1246,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 				}
 				const auto converted = m_indirect_groups->Convert(
 				    buffer.Recorder(), entry_buffer->BufferDeviceAddress() + entry_offset, local,
-				    false, false);
+				    false, false,
+				    entry.packet == run.packet ? input_info.stage.program->shader_hash : 0u);
 				run.converted[entry.packet] = {converted.groups_buffer, converted.groups_offset,
 				                               converted.threads};
 			}
@@ -1252,6 +1272,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
+	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
 	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
 		static std::unordered_set<uint64_t> seen;
 		const auto& resources = *input_info.stage.resources;
@@ -1292,7 +1313,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		} else {
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false, false, {},
-		    use_thread_dimensions);
+		    use_thread_dimensions || convert_groups);
 		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 		indirect_buffer = args_buffer->Handle();
 		indirect_offset = args_offset;
@@ -1321,7 +1342,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 			const auto converted = m_indirect_groups->Convert(
 			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size,
-			    !merged_barriers);
+			    !merged_barriers, true, program.shader_hash);
 			indirect_buffer = converted.groups_buffer;
 			indirect_offset = converted.groups_offset;
 			// The shader reads the thread counts through this device address (upstream's
@@ -1331,6 +1352,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 				bindings.shader_data[dword]      = static_cast<uint32_t>(converted.threads);
 				bindings.shader_data[dword + 1u] = static_cast<uint32_t>(converted.threads >> 32u);
 			}
+		} else if (convert_groups && args_buffer->HasDeviceAddress()) {
+			const auto converted = m_indirect_groups->Convert(
+			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, {1u, 1u, 1u},
+			    true, true, program.shader_hash);
+			indirect_buffer = converted.groups_buffer;
+			indirect_offset = converted.groups_offset;
 		}
 		}
 		RebindBuffers(bindings);

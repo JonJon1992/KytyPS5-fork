@@ -7,6 +7,9 @@
 
 #include <array>
 #include <atomic>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -30,13 +33,26 @@
 
 namespace Libs::Graphics {
 
+inline void TrackingSpinPause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+	_mm_pause();
+#endif
+}
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// Wait with plain loads and a pause until the lock looks free, then retry the
+			// exchange: write faults take this lock while another thread holds it across a
+			// protection change, and spinning on test_and_set kept the cache line bouncing
+			// between cores (ReverendOzmund, Senaxx/KytyPS5 PR #17, 33e02045).
+			do {
+				TrackingSpinPause();
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -233,6 +249,9 @@ public:
 			bits.SetRange(start, end);
 			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
+				if (m_cpu_touched_word != nullptr) {
+					m_cpu_touched_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
+				}
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 			}
 		} else {
@@ -325,6 +344,9 @@ public:
 		m_cpu_summary_word = word;
 		m_cpu_summary_bit  = bit;
 	}
+	// The tracker's touched bitmap (same bit): set whenever pages become CPU-dirty, cleared by the
+	// BDA walk (MemoryTracker::ForEachCpuTouchedRegion).
+	void SetCpuTouchedWord(std::atomic<uint64_t>* word) noexcept { m_cpu_touched_word = word; }
 
 	TrackingSpinLock lock;
 
@@ -431,6 +453,7 @@ private:
 	std::atomic<bool> m_cpu_maybe_dirty {true};
 	std::atomic<bool> m_gpu_maybe_dirty {false};
 	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
+	std::atomic<uint64_t>* m_cpu_touched_word = nullptr;
 	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;

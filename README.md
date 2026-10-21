@@ -7,22 +7,27 @@ I'm testing it only on Marvel's Wolverine for now, the tests are all done on my 
 I'm sharing this for anyone who wants to try it and add to it, if you can help us with the issues we're facing that would be awesome.
 This is where it stands right now:
 
-## Where it stands (October 19, 2026, v0.2)
+## Where it stands (October 21, 2026, v0.3)
 
-**Game:** Marvel's Wolverine (PPSA03671, version 01.001.005), Performance mode.
+**Game:** Marvel's Wolverine (PPSA03671, version 01.001.005).
 
-| Scene | FPS |
+| Scene (RTX 5090 Laptop) | v0.3 FPS |
 |---|---|
-| Title screen | 24–28 |
-| Opening cutscene | 24–28 |
-| Jungle gameplay | 16–21 |
-| Heavy action scenes | 9–15 |
+| First rooftop, standing | 21–22 |
+| First rooftop, turning the camera | ~25 |
+| Sewer, standing | 23 |
+| Sewer, turning the camera | ~14 |
+| Grass / jungle, standing | 19 |
+| A Fidelity-mode save, standing | 19 |
+| Title screen and opening cutscene (v0.2, not re-measured) | 24–28 |
+
+Turning the camera used to drop to single digits (rooftop ~13, sewer ~9–12); in v0.3 it no longer does.
 
 Target: 60 FPS in Performance mode, 30 in Fidelity.
 
 ### Screenshots
 
-The FPS is in each window title (Performance mode, RTX 5090 Laptop). Click a picture for full size.
+From v0.2 (FPS is in each window title, Performance mode, RTX 5090 Laptop). Click a picture for full size.
 
 | | |
 |---|---|
@@ -34,6 +39,16 @@ The FPS is in each window title (Performance mode, RTX 5090 Laptop). Click a pic
 | Jungle gameplay, 16 FPS | Climbing, 25 FPS |
 
 **Working:** boots, menus, cutscenes and gameplay, with correct terrain, foliage, lighting and ray-traced passes.
+
+### New in v0.3
+
+- **Faster, most of all when turning the camera.** The game's call shaders (shaders that call functions through per-object tables) were re-resolved on every dispatch: the reuse window (50 ms) was shorter than one frame at 18 FPS, and a shader that can't be compiled was re-processed for every new object only to be refused again. Turning the camera on the first rooftop went from ~13 to ~25 FPS.
+- **Host zones and sync skip on by default.** The memory ranges the game writes every frame get a buffer shared with the GPU instead of a page fault per write, and repeated buffer syncs with nothing changed are skipped. Standing FPS up 7–18% depending on the scene. `KYTY_HOST_ZONES=0` / `KYTY_SYNC_SKIP=0` turn them off.
+- **Freeze when loading some saves fixed** (the sewer area). The NVIDIA driver never finishes compiling one pipeline there (VS `d1ea70c7117d4d3a`, PS `85892b3b3d0a61ba`). Compiles now run on worker threads with a time limit, and a pipeline that compiles for 30 s is listed in `_ShaderDump/slow_pipelines.txt` and its draws are skipped from then on. Side effect: the blue scent trail in that area doesn't draw yet.
+- **Safety net for one kind of GPU hang.** Indirect dispatch sizes are checked on the GPU; a size past the device limits or 4M workgroups becomes an empty dispatch (`[indirect-clamp]` in the log) instead of a job that never ends.
+- **Video memory plan follows your card's own VRAM** instead of assuming 16 GB (`KYTY_VRAM_TARGET_MB=14336` restores the old plan).
+- **Write-only depth targets** no longer stop the emulator.
+- **Diagnostics** (all off unless asked for): the GPU-hang report names the draws and dispatches the GPU was stuck on, a freeze recorder samples busy threads when no frame came for 15 s, and a sampling profiler (`KYTY_SAMPLE`).
 
 ### New in v0.2
 
@@ -66,10 +81,12 @@ Stability:
 ## Known issues and caveats
 
 - **Tested only on Marvel's Wolverine, and only on an NVIDIA RTX 5090 Laptop.** Two testers run it on AMD (RX 7600, RX 7900 XT); v0.2 has their first fixes. Intel GPUs and other games are untested.
-- **Occasional GPU "device lost" crash.** A shader reads a GPU address outside any buffer. The crash report now names the address; the cause is under investigation.
-- **Occasional freeze.** The game can stop responding in some scene changes, for example the drop-off scene below (frame counter stuck, two threads spinning at 100%). Restarting gets past it. Under investigation.
+- **Occasional GPU "device lost" crash** (about once every 20–40 minutes of play on the test laptop). The GPU reads an address just past a mapped buffer. The two crashes seen with v0.3 both had the particle draws of `8fb896cb9412ab56` / `4efbcf79c36d8adf` in flight. Under investigation.
+- **Occasional freeze.** The game can stop responding in some scene changes, for example the drop-off scene below (frame counter stuck). Restarting gets past it. v0.3 empties one kind of runaway GPU job that caused hangs like this; whether that was the cause of these freezes isn't confirmed yet.
 
   ![Freeze at the drop-off scene](docs/screenshots/frank/07_freeze.jpg)
+- **The blue scent trail in the sewer area doesn't draw** (its pipeline is skipped, see v0.3 above).
+- **Flickering textures** in some places, for example cracks in the ground.
 - **Red squares and red streaks instead of some particles** (title screen, rain and embers in some scenes; worked around in v0.2, the root cause is still open). The particle shader (ES `4efbcf79c36d8adf`) adds GS user-data slot 28 (s36) to the instance ID to pick its one 16-byte record. The game sets slot 28 with a 29-register `SET_SH_REG` whose last dword is leftover command-buffer data on some frames (`0x00100011`, even a PM4 header), so the index lands past the record and the shader reads zeros. Forcing it to 0 gives the correct soft particles. What we've ruled out: the dword doesn't change in the 40 ms after we parse it, the GPU doesn't write it, and the draw (`DRAW_INDEX_INDIRECT_MULTI`, no base-vertex/start-instance/draw-index register) writes no user data. So either the real GPU doesn't load that register for this shader, or it treats that out-of-range index differently. It's a good place to help if you know RDNA2 merged ES/GS user SGPRs or PS5 command buffers.
 - **You need your own legally dumped copy of the game.** No games or system files are provided or linked.
 

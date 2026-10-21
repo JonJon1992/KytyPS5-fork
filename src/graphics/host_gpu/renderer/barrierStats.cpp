@@ -110,8 +110,11 @@ struct SiteKey {
 	uint64_t    src    = 0;
 	uint64_t    dst    = 0;
 	uint32_t    shapes = 0;       // bit 0 memory, 1 buffer, 2 image barriers present
+	uint32_t    layouts = 0;      // first image barrier: compact old layout << 16 | new layout
+	uint64_t    access  = 0;      // first image barrier: src access << 32 | dst access (low bits)
 	auto        Tie() const {
-		       return std::tie(file, line, pc[0], pc[1], pc[2], kind, src, dst, shapes);
+		       return std::tie(file, line, pc[0], pc[1], pc[2], kind, src, dst, shapes, layouts,
+		                       access);
 	}
 	bool operator<(const SiteKey& other) const { return Tie() < other.Tie(); }
 };
@@ -183,6 +186,10 @@ void Report(int64_t now) {
 		                       static_cast<double>((std::max)(count.total, uint64_t {1})),
 		                   key.kind, key.src, key.dst, (key.shapes & 1) != 0 ? " mem" : "",
 		                   (key.shapes & 2) != 0 ? " buf" : "", (key.shapes & 4) != 0 ? " img" : "");
+		if ((key.shapes & 4) != 0) {
+			out += fmt::format(" L{}->{} a0x{:x}->0x{:x}", key.layouts >> 16u, key.layouts & 0xffffu,
+			                   key.access >> 32u, key.access & 0xffffffffu);
+		}
 		if (key.file != nullptr) {
 			out += fmt::format(" at {}:{}\n", BaseName(key.file), key.line);
 		} else {
@@ -236,6 +243,17 @@ void Count(VkCommandBuffer command, SiteKey key) {
 	}
 }
 
+// VkImageLayout in 16 bits: core values as is, extension values as 100 + extension number.
+uint32_t CompactLayout(uint32_t layout) {
+	return layout < 1000 ? layout : 100 + (layout - 1000000000u) / 1000u % 1000u;
+}
+
+void NoteImageBarrier(SiteKey& key, uint32_t old_layout, uint32_t new_layout, uint64_t src_access,
+                      uint64_t dst_access) {
+	key.layouts = CompactLayout(old_layout) << 16u | CompactLayout(new_layout);
+	key.access  = (src_access & 0xffffffffu) << 32u | (dst_access & 0xffffffffu);
+}
+
 VKAPI_ATTR void VKAPI_CALL HookBarrier(VkCommandBuffer command, VkPipelineStageFlags src,
                                        VkPipelineStageFlags dst, VkDependencyFlags flags,
                                        uint32_t memory_count, const VkMemoryBarrier* memory,
@@ -247,6 +265,10 @@ VKAPI_ATTR void VKAPI_CALL HookBarrier(VkCommandBuffer command, VkPipelineStageF
 	key.dst    = dst;
 	key.shapes = (memory_count != 0 ? 1u : 0u) | (buffer_count != 0 ? 2u : 0u) |
 	             (image_count != 0 ? 4u : 0u);
+	if (image_count != 0) {
+		NoteImageBarrier(key, images[0].oldLayout, images[0].newLayout, images[0].srcAccessMask,
+		                 images[0].dstAccessMask);
+	}
 	Count(command, key);
 	g_barrier(command, src, dst, flags, memory_count, memory, buffer_count, buffers, image_count,
 	          images);
@@ -270,6 +292,11 @@ SiteKey Key2(const VkDependencyInfo* info) {
 	key.shapes = (info->memoryBarrierCount != 0 ? 1u : 0u) |
 	             (info->bufferMemoryBarrierCount != 0 ? 2u : 0u) |
 	             (info->imageMemoryBarrierCount != 0 ? 4u : 0u);
+	if (info->imageMemoryBarrierCount != 0) {
+		const auto& image = info->pImageMemoryBarriers[0];
+		NoteImageBarrier(key, image.oldLayout, image.newLayout, image.srcAccessMask,
+		                 image.dstAccessMask);
+	}
 	return key;
 }
 

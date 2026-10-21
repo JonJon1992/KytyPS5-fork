@@ -18,6 +18,13 @@ namespace Common::Sampler {
 // registering does nothing.
 void RegisterCurrentThread(const char* name);
 
+// Freeze recorder (Windows; KYTY_FREEZE_DUMP=0 turns it off): every guest flip calls
+// NoteGuestFrame. When no flip came for 15 s after the game had been flipping, the threads of
+// the process that are busy (and those stopped inside the emulator's own code) are suspended one
+// at a time and their instruction pointer and return addresses are printed by name ([freeze]
+// lines on stderr), three times a second apart; again after 60 s, at most three reports.
+void NoteGuestFrame();
+
 } // namespace Common::Sampler
 
 #endif /* KYTY_COMMON_SAMPLER_H_ */

@@ -49,6 +49,17 @@
 
 namespace Libs::Graphics {
 
+// bufferCache.cpp (KYTY_UPLOAD_WORKER).
+uint64_t UploadWorkerPushed();
+void     WaitUploadWorker(uint64_t upto);
+// Before the command processor writes guest memory itself: upload reads queued before must not
+// see the bytes it writes (they belong to work recorded earlier).
+static void SettleUploadReads() {
+	if (const auto pushed = UploadWorkerPushed(); pushed != 0) {
+		WaitUploadWorker(pushed);
+	}
+}
+
 static std::atomic<uint64_t> g_cmd_from_send {0};
 static std::atomic<uint64_t> g_cmd_from_try {0};
 static std::atomic<uint64_t> g_cmd_from_sync {0};
@@ -611,6 +622,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	SettleUploadReads();
 	if (CpWriteTraced(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4u)) {
 		std::fprintf(stderr, "[cp-writers] WRITE_DATA dst=0x%012" PRIx64 " dwords=%u first=%08x one_addr=%d\n",
 		             reinterpret_cast<uint64_t>(dst), dw_num, src[0], write_one_address ? 1 : 0);
@@ -642,6 +654,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	SettleUploadReads();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
@@ -2433,6 +2446,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
+			SettleUploadReads();
 			std::memcpy(dst, &data, sizeof(data));
 		}
 
@@ -2492,6 +2506,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
 					} else {
+						SettleUploadReads();
 						std::memcpy(dst, &value, sizeof(value));
 					}
 
@@ -2754,6 +2769,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	SettleUploadReads();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -2779,6 +2795,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	SettleUploadReads();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
