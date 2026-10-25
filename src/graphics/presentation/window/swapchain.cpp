@@ -29,6 +29,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -624,13 +625,20 @@ void Swapchain::Create() {
 	}
 	// AMD's Windows driver offers Mailbox but shows a black window with it (the frames render;
 	// reported on an RX 7900 XT, Immediate and Fifo present fine). KYTY_AMD_MAILBOX=1 keeps it.
+	// Mailbox is asked for so that presenting never waits for a vertical blank; on AMD that is
+	// Immediate (tear-free within a FreeSync monitor's range), not Fifo: Fifo rounded every frame
+	// time up to whole refresh intervals, so a 60 Hz display showed 20, 15, 12 or 10 fps where the
+	// emulator made 13-14 (RX 9070 XT, 2026-10-22). KYTY_AMD_PRESENT=fifo restores Fifo.
 	if (create_info.presentMode == vk::PresentModeKHR::eMailbox &&
 	    graphics.GetPhysicalDeviceProperties().vendorID == 0x1002u) {
 		const char* keep = std::getenv("KYTY_AMD_MAILBOX");
 		if (keep == nullptr || keep[0] != '1') {
-			LOGF("AMD GPU: presenting with Fifo instead of Mailbox (KYTY_AMD_MAILBOX=1 keeps "
-			     "Mailbox)\n");
-			create_info.presentMode = vk::PresentModeKHR::eFifo;
+			const char* amd_present = std::getenv("KYTY_AMD_PRESENT");
+			const bool  fifo        = amd_present != nullptr && std::strcmp(amd_present, "fifo") == 0;
+			Log::WriteToConsoleAndLog(fifo ? "AMD GPU: presenting with Fifo instead of Mailbox\n"
+			                               : "AMD GPU: presenting with Immediate instead of Mailbox "
+			                                 "(KYTY_AMD_PRESENT=fifo for Fifo)\n");
+			create_info.presentMode = fifo ? vk::PresentModeKHR::eFifo : vk::PresentModeKHR::eImmediate;
 		}
 	}
 	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
@@ -1143,8 +1151,36 @@ void Presenter::Present(Frame& frame) {
 	Present(std::span(&layer, 1));
 }
 
+// KYTY_FRAME_TIMES=<file>: one line per presented guest frame, "at,frame_ms": steady-clock seconds
+// (the time base of [pipeline-wait] and [shader-compile]) and the time since the previous frame.
+// The window title's fps is sampled once a second, which hides stalls shorter than that.
+static void LogFrameTime() {
+	static std::FILE* file = [] {
+		const char* path = std::getenv("KYTY_FRAME_TIMES");
+		std::FILE*  out  = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
+		if (out != nullptr) {
+			std::fputs("at,frame_ms\n", out);
+		}
+		return out;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	static double   previous = 0.0;
+	static uint32_t lines    = 0;
+	const double    now =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	std::fprintf(file, "%.6f,%.3f\n", now, previous > 0.0 ? (now - previous) * 1000.0 : 0.0);
+	previous = now;
+	// About once a second: a crash loses little.
+	if (++lines % 64 == 0) {
+		std::fflush(file);
+	}
+}
+
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
+	LogFrameTime();
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
 		m_impl->frames.ValidateForPresent(layer.frame);

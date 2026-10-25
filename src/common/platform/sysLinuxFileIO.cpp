@@ -646,12 +646,7 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	auto real_src = get_internal_name(src);
 	auto real_dst = get_internal_name(dst);
 
-	// Match MoveFileW: fail when the destination exists.
-	std::error_code error;
-	if (std::filesystem::exists(real_dst, error)) {
-		return false;
-	}
-
+	// rename() replaces an existing destination in one step, like the Windows MOVEFILE_REPLACE_EXISTING.
 	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
 }
 

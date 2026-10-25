@@ -2,6 +2,7 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include "common/assert.h"
+#include "common/environment.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -430,6 +431,26 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// KYTY_READBACK_QUEUE=transfer|compute (opt-in; unset: a second queue of the graphics family).
+// Copy-queue readbacks then run on a queue of another family, beside the graphics queue (AMD: the
+// SDMA engine, or an async compute queue). On the RX 9070 XT a game thread waited ~23 % of its time
+// for these copies, a few KB each, behind the frame's graphics work (2026-10-22).
+enum class ReadbackQueueRequest { Graphics, Transfer, Compute };
+
+static ReadbackQueueRequest RequestedReadbackQueue() {
+	static const ReadbackQueueRequest request = [] {
+		const char* value = std::getenv("KYTY_READBACK_QUEUE");
+		if (value != nullptr && std::strcmp(value, "transfer") == 0) {
+			return ReadbackQueueRequest::Transfer;
+		}
+		if (value != nullptr && std::strcmp(value, "compute") == 0) {
+			return ReadbackQueueRequest::Compute;
+		}
+		return ReadbackQueueRequest::Graphics;
+	}();
+	return request;
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	// Aftermath must be enabled before the device exists (KYTY_AFTERMATH_DLL, opt-in).
@@ -445,7 +466,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	const auto  families            = physical_device.getQueueFamilyProperties();
 	const char* copy_queue_switch   = std::getenv("KYTY_COPY_QUEUE_READBACK");
 	const bool  want_copy_queue     = copy_queue_switch == nullptr || copy_queue_switch[0] != '0';
-	const float queue_priorities[2] = {1.0f, 1.0f};
+	// KYTY_READBACK_QUEUE_PRIORITY (default on; =0 equal priorities): the graphics queue gets a
+	// lower priority than the readback queue. Its copies of a few KB ran behind the frame's graphics
+	// work on the same engine: a game thread waited ~27 % of its time for them (RX 9070 XT,
+	// 2026-10-22). The spec lets a driver give a higher-priority queue more time; it promises nothing.
+	static const bool readback_first = [] {
+		const char* value = std::getenv("KYTY_READBACK_QUEUE_PRIORITY");
+		return value == nullptr || value[0] != '0';
+	}();
+	const float queue_priorities[2] = {readback_first ? 0.5f : 1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount =
@@ -454,6 +483,38 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	        : 1u;
 	queue_create_info.pQueuePriorities = queue_priorities;
 	graphics.queue_count               = queue_create_info.queueCount;
+
+	// KYTY_READBACK_QUEUE: the readback queue of another family. Cache buffers become
+	// VK_SHARING_MODE_CONCURRENT over both families (Buffer, streamBuffer.cpp), so the readback
+	// queue copies from them with no ownership transfer. The first version enabled maintenance9
+	// instead (contents preserved on an implicit acquire): the AMD driver then missed its whole
+	// pipeline cache (0 hits against 513, a compute pipeline compiling 30 s, 2026-10-22).
+	vk::DeviceQueueCreateInfo queue_create_infos[2] = {queue_create_info, {}};
+	uint32_t                  queue_create_count    = 1;
+	if (RequestedReadbackQueue() != ReadbackQueueRequest::Graphics) {
+		const bool transfer = RequestedReadbackQueue() == ReadbackQueueRequest::Transfer;
+		for (uint32_t family = 0; family < families.size(); family++) {
+			const auto flags = families[family].queueFlags;
+			const bool fits  = transfer ? (flags & vk::QueueFlagBits::eTransfer) &&
+			                                 !(flags & (vk::QueueFlagBits::eGraphics |
+			                                            vk::QueueFlagBits::eCompute))
+			                            : (flags & vk::QueueFlagBits::eCompute) &&
+			                                 !(flags & vk::QueueFlagBits::eGraphics);
+			if (fits && family != queue_family && families[family].queueCount >= 1) {
+				queue_create_infos[1].queueFamilyIndex = family;
+				queue_create_infos[1].queueCount       = 1;
+				queue_create_infos[1].pQueuePriorities = &queue_priorities[1];
+				queue_create_count                     = 2;
+				graphics.readback_queue_family         = family;
+				graphics.buffer_queue_families         = {queue_family, family};
+				break;
+			}
+		}
+		std::fprintf(stderr, "[copy-readback] queue family for readbacks: %s\n",
+		             graphics.readback_queue_family == static_cast<uint32_t>(-1)
+		                 ? "graphics (no other family)"
+		                 : (transfer ? "transfer, concurrent buffers" : "compute, concurrent buffers"));
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -624,6 +685,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
+	graphics.pipeline_cache_control_enabled =
+	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -709,6 +772,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = graphics.subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.pipelineCreationCacheControl =
+	    graphics.pipeline_cache_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -736,7 +801,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Shader debug info, resource tracking and shader error reporting cost driver compile and
 	// CPU time. Aftermath needs them; KYTY_NV_DIAGNOSTICS=1 enables them without it.
 	const char* nv_diagnostics_value = std::getenv("KYTY_NV_DIAGNOSTICS");
-	const bool  nv_diagnostics       = std::getenv("KYTY_AFTERMATH_DLL") != nullptr ||
+	const bool  nv_diagnostics       = Common::Environment::IsSet("KYTY_AFTERMATH_DLL") ||
 	                            (nv_diagnostics_value != nullptr && nv_diagnostics_value[0] == '1');
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
@@ -816,8 +881,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos;
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1020,6 +1085,14 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanAddressBindingCallback(
 	                           : std::string("?");
 	const auto  handle   = callback_data->objectCount != 0 ? callback_data->pObjects[0].objectHandle
 	                                                       : 0ull;
+	NoteAddressBinding(binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind,
+	                   static_cast<uint64_t>(binding->baseAddress), static_cast<uint64_t>(binding->size),
+	                   callback_data->objectCount != 0
+	                       ? static_cast<uint32_t>(callback_data->pObjects[0].objectType)
+	                       : 0u,
+	                   handle,
+	                   static_cast<bool>(binding->flags &
+	                                     vk::DeviceAddressBindingFlagBitsEXT::eInternalObject));
 	LOGF("ADDRBIND %s type=%s handle=0x%016" PRIx64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
 	     " end=0x%016" PRIx64 "%s\n",
 	     binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind ? "bind" : "unbind",
@@ -1322,7 +1395,10 @@ void WindowContext::CreateVulkan() {
 	InstallBarrierStats();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
-	if (graphic_ctx.queue_count >= 2) {
+	if (graphic_ctx.readback_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_queue_family, 0,
+		                            &graphic_ctx.readback_queue);
+	} else if (graphic_ctx.queue_count >= 2) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 	}
 

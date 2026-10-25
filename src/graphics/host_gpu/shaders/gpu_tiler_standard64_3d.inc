@@ -7,11 +7,17 @@ uvec3 standard64_3d_extent() {
 	return uvec3(16, 16, 16);
 }
 uint standard64_3d_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(4, 4, 4, 5) :
-	          ELEMENT_BYTES == 2 ? uvec4(3, 4, 4, 4) :
-	          ELEMENT_BYTES == 4 ? uvec4(3, 3, 4, 4) :
-	          ELEMENT_BYTES == 8 ? uvec4(3, 3, 3, 4) : uvec4(2, 3, 3, 3);
-	return standard3d_offset(p) ^ (((p.x >> s.x) & 1u) << 12) ^
-	       (((p.z >> s.y) & 1u) << 13) ^ (((p.y >> s.z) & 1u) << 14) ^
-	       (((p.x >> s.w) & 1u) << 15);
+	// One scalar selector per component: AMD's Windows compiler gets a vector Select on a
+	// specialization constant wrong (Jetsku 7d881089). Same table as before, by ELEMENT_BYTES.
+	uint sx = ELEMENT_BYTES == 1 ? 4u : ELEMENT_BYTES == 2 ? 3u : ELEMENT_BYTES == 4 ? 3u :
+	          ELEMENT_BYTES == 8 ? 3u : 2u;
+	uint sy = ELEMENT_BYTES == 1 ? 4u : ELEMENT_BYTES == 2 ? 4u : ELEMENT_BYTES == 4 ? 3u :
+	          ELEMENT_BYTES == 8 ? 3u : 3u;
+	uint sz = ELEMENT_BYTES == 1 ? 4u : ELEMENT_BYTES == 2 ? 4u : ELEMENT_BYTES == 4 ? 4u :
+	          ELEMENT_BYTES == 8 ? 3u : 3u;
+	uint sw = ELEMENT_BYTES == 1 ? 5u : ELEMENT_BYTES == 2 ? 4u : ELEMENT_BYTES == 4 ? 4u :
+	          ELEMENT_BYTES == 8 ? 4u : 3u;
+	return standard3d_offset(p) ^ (((p.x >> sx) & 1u) << 12) ^
+	       (((p.z >> sy) & 1u) << 13) ^ (((p.y >> sz) & 1u) << 14) ^
+	       (((p.x >> sw) & 1u) << 15);
 }

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -136,7 +137,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.maxLod                  = max_lod;
 	// KYTY_FORCE_MIP0=1: diagnostic, every sampler reads only the top mip (is a surface flat
 	// because of the LOD it samples at?).
-	static const bool force_mip0 = std::getenv("KYTY_FORCE_MIP0") != nullptr;
+	static const bool force_mip0 = Common::Environment::IsSet("KYTY_FORCE_MIP0");
 	if (force_mip0) {
 		sampler_info.minLod     = 0.0f;
 		sampler_info.maxLod     = 0.0f;

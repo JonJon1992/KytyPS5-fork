@@ -37,12 +37,21 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 		return;
 	}
 
-	thread_local HANDLE timer = CreateWaitableTimerExW(
-	    nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-	if (timer == nullptr) {
-		thread_local HANDLE fallback_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
-		timer                              = fallback_timer;
-	}
+	// One timer per thread, closed when the thread exits (guest threads come and go).
+	thread_local const struct TimerOwner {
+		HANDLE h = [] {
+			HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+			                                      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+			                                      TIMER_ALL_ACCESS);
+			return timer != nullptr ? timer : CreateWaitableTimerW(nullptr, TRUE, nullptr);
+		}();
+		~TimerOwner() {
+			if (h != nullptr) {
+				CloseHandle(h);
+			}
+		}
+	} timer_owner;
+	const HANDLE timer = timer_owner.h;
 
 	if (timer != nullptr) {
 		LARGE_INTEGER due_time {};

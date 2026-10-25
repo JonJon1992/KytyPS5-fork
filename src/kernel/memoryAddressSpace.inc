@@ -789,8 +789,16 @@ private:
 			return nullptr;
 		}
 
+		// MapViewOfFile3 already gave the view the mode's protection; only NoAccess, mapped read-write
+		// above, needs a VirtualProtect (KytyPS5 c30ac7c9: one call less per map of the streaming
+		// title's hundreds a second). KYTY_SKIP_VIEW_PROTECT=0 protects every view again.
+		static const bool skip_redundant = [] {
+			const char* value = std::getenv("KYTY_SKIP_VIEW_PROTECT");
+			return value == nullptr || value[0] != '0';
+		}();
 		const auto protect_begin = CostNowNs();
-		const bool protected_ok  = ApplyProtection(ptr, size, mode);
+		const bool protected_ok  = (skip_redundant && mode != VirtualMemory::Mode::NoAccess) ||
+		                          ApplyProtection(ptr, size, mode);
 		t_view_protect_ns += CostNowNs() - protect_begin;
 		if (!protected_ok) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);

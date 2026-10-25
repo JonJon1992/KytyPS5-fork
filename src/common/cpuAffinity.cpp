@@ -38,6 +38,20 @@ void RaiseGpuThreadPriority() {
 #endif
 }
 
+void LowerWorkerThreadPriority() {
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_WORKER_THREAD_PRIORITY");
+		return value != nullptr ? std::atoi(value) : -1;
+	}();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (level < 0) {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	}
+#else
+	(void)level;
+#endif
+}
+
 static bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PCORE_AFFINITY");

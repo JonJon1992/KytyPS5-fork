@@ -131,6 +131,9 @@ struct EmitterState {
 	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
 	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
 	uint32_t                                         wave_lds_scope          = 0;
+	// No scope fits (wave_lds_scope 0, a multi-wave LDS-writing compute shader): the same places
+	// get a subgroup-scope memory barrier instead (KYTY_WAVE_LDS_FENCE).
+	bool                                             wave_lds_fence          = false;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;

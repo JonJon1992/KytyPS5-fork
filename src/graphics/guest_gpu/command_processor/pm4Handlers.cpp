@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/environment.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1578,11 +1579,32 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
+	// KYTY_COND_IB: how a selected target returns. Unset: it replaces the parent's cursor (chain).
+	// "call": the parent resumes after it, so packets after the branch (fence writes) still run
+	// (a UE5 title hung without that). "bit": bit 20 of the target's size dword, the CHAIN bit of
+	// an ordinary INDIRECT_BUFFER, decides; unverified that this packet uses it.
+	enum class CondIbMode { Chain, Call, Bit };
+	static const CondIbMode cond_ib_mode = [] {
+		const char* value = std::getenv("KYTY_COND_IB");
+		if (value != nullptr && std::strcmp(value, "call") == 0) {
+			return CondIbMode::Call;
+		}
+		return value != nullptr && std::strcmp(value, "bit") == 0 ? CondIbMode::Bit : CondIbMode::Chain;
+	}();
+	const auto chain = [](uint32_t size_dw) {
+		return cond_ib_mode == CondIbMode::Chain || (cond_ib_mode == CondIbMode::Bit && (size_dw & (1u << 20u)) != 0);
+	};
+	// The first branches' raw size dwords, to learn whether the high bits carry CHAIN.
+	if (static std::atomic<uint32_t> logged {0}; logged.fetch_add(1) < 8u) {
+		std::fprintf(stderr, "cond-ib: mode=%u func=%u take=%u then_dw=0x%08x else_dw=0x%08x\n", mode, function,
+		             take_then ? 1u : 0u, buffer[9], buffer[12]);
+	}
+
 	if (take_then) {
-		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, chain(buffer[9]));
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, chain(buffer[12]));
 	}
 
 	return payload_dw;
@@ -1703,7 +1725,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		uint32_t instance_count     = buffer[6];
 		uint32_t flags              = buffer[7];
 		// KYTY_LOG_DRAW_INDEX_MULTI=1: the packet's dwords, to learn its unparsed fields.
-		if (static const bool log = std::getenv("KYTY_LOG_DRAW_INDEX_MULTI") != nullptr; log) {
+		if (static const bool log = Common::Environment::IsSet("KYTY_LOG_DRAW_INDEX_MULTI"); log) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1) < 64u) {
 				std::fprintf(stderr,
@@ -1750,7 +1772,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
 
-	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	if (static const bool packets = Common::Environment::IsSet("KYTY_TRACE_GS_SLOT_PACKETS");
 	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
 		std::fprintf(stderr, "[gs-seq] draw-indirect indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x args=%p\n",
 		             indexed ? 1 : 0, buffer[1] & 0xffffu, buffer[2] & 0xffffu,
@@ -1783,7 +1805,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 		count_addr = nullptr;
 	}
 
-	if (static const bool packets = std::getenv("KYTY_TRACE_GS_SLOT_PACKETS") != nullptr;
+	if (static const bool packets = Common::Environment::IsSet("KYTY_TRACE_GS_SLOT_PACKETS");
 	    packets && TracedGsSlot() >= 0 && TakeGsSlotSeqLine()) {
 		std::fprintf(stderr,
 		             "[gs-seq] draw-indirect-multi indexed=%d base_vtx_loc=0x%x start_inst_loc=0x%x draw_index_loc=0x%x "
@@ -3215,7 +3237,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	// KYTY_FPS_LOG: the distinct tessellation clamps the game programs (the hardware clamps tess
 	// factors to [min, max]; the host pipeline does not apply them yet).
 	static const auto log_tess_level = [](const char* which, uint32_t value) {
-		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; !log) {
+		if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); !log) {
 			return;
 		}
 		static std::mutex                    mutex;

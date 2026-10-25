@@ -62,14 +62,21 @@ uint32_t Builder::Import(const char* name) {
 	return id;
 }
 
-uint32_t Builder::DeclareType(spv::Op opcode, std::vector<uint32_t> key) {
+uint32_t Builder::DeclareType(spv::Op opcode, std::span<const uint32_t> key) {
 	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
 		return it->second;
 	}
-	const auto id = AllocateId();
-	AppendInstruction(m_declarations, opcode, id, std::span<const uint32_t>(key).subspan(2));
-	m_declaration_ids.emplace(std::move(key), id);
-	return id;
+	return DeclareType(opcode, std::vector<uint32_t>(key.begin(), key.end()));
+}
+
+uint32_t Builder::DeclareType(spv::Op opcode, std::vector<uint32_t> key) {
+	const auto [it, inserted] = m_declaration_ids.try_emplace(std::move(key), m_next_id);
+	if (inserted) {
+		const auto id = AllocateId();
+		AppendInstruction(m_declarations, opcode, id,
+		                  std::span<const uint32_t>(it->first).subspan(2));
+	}
+	return it->second;
 }
 
 uint32_t Builder::DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
@@ -97,15 +104,21 @@ uint32_t Builder::DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key
 	return id;
 }
 
-uint32_t Builder::DeclareConstant(spv::Op opcode, std::vector<uint32_t> key) {
+uint32_t Builder::DeclareConstant(spv::Op opcode, std::span<const uint32_t> key) {
 	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
 		return it->second;
 	}
-	const auto id = AllocateId();
-	AppendInstruction(m_declarations, opcode, key[1], id,
-	                  std::span<const uint32_t>(key).subspan(2));
-	m_declaration_ids.emplace(std::move(key), id);
-	return id;
+	return DeclareConstant(opcode, std::vector<uint32_t>(key.begin(), key.end()));
+}
+
+uint32_t Builder::DeclareConstant(spv::Op opcode, std::vector<uint32_t> key) {
+	const auto [it, inserted] = m_declaration_ids.try_emplace(std::move(key), m_next_id);
+	if (inserted) {
+		const auto id = AllocateId();
+		AppendInstruction(m_declarations, opcode, it->first[1], id,
+		                  std::span<const uint32_t>(it->first).subspan(2));
+	}
+	return it->second;
 }
 
 uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class) {

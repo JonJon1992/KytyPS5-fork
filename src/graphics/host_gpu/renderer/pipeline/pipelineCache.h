@@ -9,10 +9,14 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +115,7 @@ struct ShaderProgram {
 	vk::ShaderModule module = nullptr;
 	uint32_t         spirv_words = 0;
 	uint64_t         hash        = 0;
+	uint64_t         spirv_hash  = 0; // XXH3 of the SPIR-V words, for KYTY_PIPELINE_MISS_LOG
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -218,6 +223,14 @@ public:
 	static void                   BeginSrtDefer(bool allowed);
 	[[nodiscard]] static uint64_t EndSrtDefer();
 	[[nodiscard]] static bool     SrtDeferPending();
+	// KYTY_PIPELINE_WAIT_SUSPEND / KYTY_COMPUTE_ASYNC (GPU thread, around one draw or dispatch whose
+	// packet may run again): waiting for its pipeline waits a slice at a time; EndPipelineSuspend is
+	// true when the draw or dispatch was not made and its packet should be suspended and run again.
+	static void               BeginPipelineSuspend(bool allowed);
+	[[nodiscard]] static bool EndPipelineSuspend();
+	// Within BeginPipelineSuspend: the draw or dispatch at hand suspended its packet (its shader is
+	// on the workers, KYTY_SHADER_WORKERS); not skipped.
+	[[nodiscard]] static bool PipelineSuspendPending();
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -234,8 +247,10 @@ public:
 	                                 const ShaderPixelInputInfo*            ps_input_info,
 	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                                 const GraphicsPrograms& programs, bool may_defer);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                             const ShaderProgram&          compute_program);
+	// nullptr only within BeginPipelineSuspend(true), while a new pipeline compiles on a worker
+	// (KYTY_COMPUTE_ASYNC): the dispatch's packet runs again. Otherwise it waits for it.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
@@ -281,10 +296,26 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Replaced quick pipelines stay alive until GPU work has drained at cache teardown.
+	std::vector<vk::Pipeline>                               m_quick_retired;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// The wait budget background compiles share (KYTY_PIPELINE_WAIT_WINDOW_MS): the window's start
+	// and how much of KYTY_PIPELINE_WAIT_MS its draws have waited so far.
+	std::chrono::steady_clock::time_point                   m_wait_window_start {};
+	std::chrono::steady_clock::duration                     m_wait_window_used {};
+	// The periodic driver cache save (KYTY_PIPELINE_CACHE_SAVE_S).
+	std::thread                                             m_cache_saver;
+	std::mutex                                              m_cache_saver_mutex;
+	std::condition_variable                                 m_cache_saver_cv;
+	bool                                                    m_cache_saver_stop = false;
+	std::mutex                                              m_cache_write_mutex;
 
 	void InitializeDriverCache();
+	void StartDriverCacheSaver();
+	void StopDriverCacheSaver();
+	// Writes the driver cache file; `reason` is appended to the log line.
+	bool WriteDriverCache(const char* reason);
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 };
@@ -308,9 +339,21 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 // False for an embedded-fetch attribute whose components the shader only replaces by constants:
 // it gets no native vertex attribute, and its buffer is not bound for it.
 [[nodiscard]] bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute);
+// How CreateGraphicsPipeline compiles. CacheOnly (pipelineCreationCacheControl) returns
+// vk::Result::ePipelineCompileRequired instead of compiling a pipeline the driver has not cached;
+// Unoptimized adds VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT; CacheWarm compiles as the build
+// says only to fill the driver cache, so it never enters the slow-pipeline list.
+enum class PipelineCompile { Normal, CacheOnly, Unoptimized, CacheWarm };
 // Any thread.
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
-                                  vk::Pipeline* pipeline);
+                                  vk::Pipeline* pipeline, PipelineCompile mode = PipelineCompile::Normal);
+// The optimized compute pipeline an unoptimized one stood in for (CreatePipelineInternal with
+// warm): compiled later on a worker only to fill the driver cache, for the next run's probe.
+struct ComputePipelineWarm {
+	vk::Device                                            device;
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size {};
+	vk::ComputePipelineCreateInfo                         info {};
+};
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
@@ -319,9 +362,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache);
+// With warm, a pipeline the driver cache lacks is built without optimization and *warm gets the
+// optimized one to compile later. With deferred, one that has to be compiled is not: *deferred
+// gets its create info, for a worker.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            std::unique_ptr<ComputePipelineWarm>* warm     = nullptr,
+                            std::unique_ptr<ComputePipelineWarm>* deferred = nullptr);
 
 } // namespace Libs::Graphics
 

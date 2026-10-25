@@ -11,6 +11,7 @@
 #include <immintrin.h>
 #endif
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -39,10 +40,23 @@ inline void TrackingSpinPause() noexcept {
 #endif
 }
 
+// Diagnostics: a thread has waited ~0.5 s or more for a TrackingSpinLock; names the owner (the
+// first 16 times in the process), so a deadlock can be matched to the [freeze] stacks.
+inline void ReportLongTrackingSpin(const void* lock, uint32_t owner, uint32_t waiter,
+                                   uint64_t spins) noexcept {
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr, "[lock-wait] thread %u waits for lock %p held by thread %u (%llu spins)\n",
+		             waiter, lock, owner, static_cast<unsigned long long>(spins));
+		std::fflush(stderr);
+	}
+}
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
+		uint64_t   spins  = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			// Wait with plain loads and a pause until the lock looks free, then retry the
@@ -52,6 +66,10 @@ public:
 			do {
 				TrackingSpinPause();
 				std::atomic_signal_fence(std::memory_order_seq_cst);
+				if ((++spins & ((uint64_t {1} << 24u) - 1u)) == 0) {
+					ReportLongTrackingSpin(this, m_owner.load(std::memory_order_relaxed), thread,
+					                       spins);
+				}
 			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);

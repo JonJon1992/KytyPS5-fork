@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "common/environment.h"
 
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -288,7 +289,7 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
-	static const bool to_stderr = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool to_stderr = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (to_stderr) {
 		std::fprintf(stderr,
 		             "[draw-prep] 10 s: scanned %llu prepared %llu skip behind %llu unknown %llu "

@@ -1,4 +1,5 @@
 #include "common/sampler.h"
+#include "common/environment.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -435,7 +436,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	EXIT_IF(tick > CurrentTick());
 	// KYTY_WAIT_STACKS=1: a host stack for every 23rd wait that has to block (up to 60), to name
 	// the paths that make the command thread wait for the GPU.
-	if (static const bool stacks = std::getenv("KYTY_WAIT_STACKS") != nullptr;
+	if (static const bool stacks = Common::Environment::IsSet("KYTY_WAIT_STACKS");
 	    stacks && !m_master.IsFree(tick)) {
 		static std::atomic<uint32_t> waits {0};
 		const auto                   n = waits.fetch_add(1);
@@ -458,7 +459,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
 			// KYTY_DRAIN_STACKS=1: a host stack for every 37th forced drain (up to 48), to name
 			// the paths that make the command thread wait for the whole GPU.
-			if (static const bool stacks = std::getenv("KYTY_DRAIN_STACKS") != nullptr; stacks) {
+			if (static const bool stacks = Common::Environment::IsSet("KYTY_DRAIN_STACKS"); stacks) {
 				static std::atomic<uint32_t> drains {0};
 				const auto                   n = drains.fetch_add(1);
 				if (n % 37 == 0 && n / 37 < 48) {
@@ -659,7 +660,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
 	// KYTY_SUBMIT_STACKS=1: a host stack for every 97th submission (up to 40), to name what splits
 	// the frame into so many submissions. KYTY_FPS_LOG: submissions per second every 5 s.
-	if (static const bool stacks = std::getenv("KYTY_SUBMIT_STACKS") != nullptr; stacks) {
+	if (static const bool stacks = Common::Environment::IsSet("KYTY_SUBMIT_STACKS"); stacks) {
 		static std::atomic<uint32_t> submits {0};
 		const auto                   n = submits.fetch_add(1);
 		if (n % 97 == 0 && n / 97 < 40) {
@@ -667,7 +668,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 			std::fflush(stderr);
 		}
 	}
-	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
+	if (static const bool fps_log = Common::Environment::IsSet("KYTY_FPS_LOG"); fps_log) {
 		static std::atomic<uint64_t> count {0};
 		static std::atomic<int64_t>  window_start {0};
 		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -901,7 +902,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	Profiler::Add(Profiler::Counter::RecordingDrains);
 	// KYTY_RECORD_DRAIN_STACKS=1: which raw Handle() sites make the GPU thread wait (a host stack
 	// for every 4,999th drain, up to 64).
-	static const bool stacks = std::getenv("KYTY_RECORD_DRAIN_STACKS") != nullptr;
+	static const bool stacks = Common::Environment::IsSet("KYTY_RECORD_DRAIN_STACKS");
 	if (stacks && m_drains % 4999 == 0 && m_drains / 4999 <= 64) {
 		LOGF("Recording thread drain %" PRIu64 ":\n%s", m_drains,
 		     Common::HostBacktrace().c_str());

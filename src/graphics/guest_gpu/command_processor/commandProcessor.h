@@ -55,6 +55,10 @@ private:
 	const uint32_t*           m_deferred_packet = nullptr;
 	uint32_t                  m_defer_count     = 0;
 	uint64_t                  m_deferred_tick   = 0;
+	// KYTY_PIPELINE_WAIT_SUSPEND: the multi-draw packet suspended at one of its draws, and which.
+	const uint32_t*           m_multi_draw_packet = nullptr;
+	uint32_t                  m_multi_draw_next   = 0;
+	uint32_t                  m_pipeline_suspends = 0; // for the unknown-packet report
 };
 
 class CommandProcessor {
@@ -182,6 +186,9 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// A draw waits for its pipeline (KYTY_PIPELINE_WAIT_SUSPEND): the packet runs again once the
+	// GPU thread served its commands.
+	void SuspendForPipeline();
 	// KYTY_SRT_DEFER: around a dispatch's RenderExecutor call. EndDispatchDefer suspends the
 	// packet when its SRT refresh was deferred (PipelineCache::SrtDeferRead).
 	// BeginDispatchDefer returns true when the packet is still waiting: it is suspended again and
@@ -208,6 +215,8 @@ private:
 	// The DrawIndirectArgs whose instance count NUM_INSTANCES holds after a GPU-read indirect draw;
 	// read on the CPU only if a later draw takes its instance count from there.
 	uint64_t m_num_instances_args = 0;
+	// False when the packet cannot be run again from the draw (SuspendForPipeline).
+	bool     m_draw_may_suspend   = true;
 	uint32_t m_start_instance_register = 0;
 	void     WriteIndirectStartInstance(uint32_t start_instance);
 	[[nodiscard]] uint32_t NumInstances();

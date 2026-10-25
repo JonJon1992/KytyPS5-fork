@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/environment.h"
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -2086,7 +2087,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 
 				// KYTY_TRACE_APR_READS=1: log every file read (path, offset, size), to map the
 				// assets a scene loads back to the game's table of contents.
-				static const bool trace_reads = std::getenv("KYTY_TRACE_APR_READS") != nullptr;
+				static const bool trace_reads = Common::Environment::IsSet("KYTY_TRACE_APR_READS");
 				if (trace_reads) {
 					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
 					     host_path.c_str(), command.file_offset, command.size);
@@ -2416,7 +2417,17 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	// lands as zeros (seen as PAGE_READONLY + ERROR_NOACCESS). Reading into a host chunk and
 	// copying takes the tracked-page fault like any CPU write, so the tracker unprotects the
 	// page and marks it dirty, and the bytes land.
+	// KYTY_APR_STATS=1 (log only): every 10 s, where asset reads spend their time. The memory
+	// mapper's batches wait on these reads (76 ms on average, up to 267 ms, in a Wolverine route,
+	// 2026-10-22); this tells disk, cache invalidation (GPU-thread caches) and copy (page faults)
+	// apart.
+	static const bool apr_stats = Common::Environment::IsSet("KYTY_APR_STATS");
+	using StatClock             = std::chrono::steady_clock;
+	const auto t0               = apr_stats ? StatClock::now() : StatClock::time_point {};
+	double     disk_ms          = 0.0;
+	double     copy_ms          = 0.0;
 	LibKernel::Memory::InvalidateMemory(destination, readable);
+	const auto t1 = apr_stats ? StatClock::now() : StatClock::time_point {};
 	thread_local std::vector<uint8_t> chunk;
 	if (chunk.size() < APR_HOST_READ_CHUNK_SIZE) {
 		chunk.resize(APR_HOST_READ_CHUNK_SIZE);
@@ -2425,13 +2436,46 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	while (*bytes_read < readable) {
 		const auto request = static_cast<uint32_t>(
 		    std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable - *bytes_read));
-		uint32_t read = 0;
+		uint32_t   read      = 0;
+		const auto read_at   = apr_stats ? StatClock::now() : StatClock::time_point {};
 		file.Read(chunk.data(), request, &read);
+		const auto copy_at   = apr_stats ? StatClock::now() : StatClock::time_point {};
 		if (read == 0) {
 			break;
 		}
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), chunk.data(), read);
+		LibKernel::Memory::NoteEmulatorWrite('F', destination + *bytes_read, read);
 		*bytes_read += read;
+		if (apr_stats) {
+			disk_ms += std::chrono::duration<double, std::milli>(copy_at - read_at).count();
+			copy_ms += std::chrono::duration<double, std::milli>(StatClock::now() - copy_at).count();
+		}
+	}
+	if (apr_stats) {
+		static std::mutex      stats_mutex;
+		static uint64_t        reads = 0, bytes = 0;
+		static double          invalidate_sum = 0.0, disk_sum = 0.0, copy_sum = 0.0, max_ms = 0.0;
+		static StatClock::time_point last = StatClock::now();
+		const auto             now        = StatClock::now();
+		const double           invalidate = std::chrono::duration<double, std::milli>(t1 - t0).count();
+		std::scoped_lock       lock(stats_mutex);
+		reads++;
+		bytes += *bytes_read;
+		invalidate_sum += invalidate;
+		disk_sum += disk_ms;
+		copy_sum += copy_ms;
+		max_ms = std::max(max_ms, std::chrono::duration<double, std::milli>(now - t0).count());
+		if (now - last >= std::chrono::seconds(10)) {
+			std::fprintf(stderr,
+			             "[apr-stats] reads=%llu %.1f MB: invalidate %.1f ms, disk %.1f ms, copy %.1f "
+			             "ms, slowest read %.1f ms (%.1f s)\n",
+			             static_cast<unsigned long long>(reads), static_cast<double>(bytes) / 1048576.0,
+			             invalidate_sum, disk_sum, copy_sum, max_ms,
+			             std::chrono::duration<double>(now - last).count());
+			reads = bytes = 0;
+			invalidate_sum = disk_sum = copy_sum = max_ms = 0.0;
+			last                                          = now;
+		}
 	}
 	if (*bytes_read < readable) {
 		// The hardware engine would have written every byte; a short read here means the host

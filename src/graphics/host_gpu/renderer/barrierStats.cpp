@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/barrierStats.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/sampler.h"
@@ -317,7 +318,7 @@ void SetBarrierSite(const std::source_location* site) noexcept {
 }
 
 void InstallBarrierStats() {
-	if (std::getenv("KYTY_BARRIER_STATS") == nullptr) {
+	if (!Common::Environment::IsSet("KYTY_BARRIER_STATS")) {
 		return;
 	}
 	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;

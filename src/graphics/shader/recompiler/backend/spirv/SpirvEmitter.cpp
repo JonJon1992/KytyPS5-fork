@@ -457,7 +457,8 @@ namespace {
 // - otherwise none (a barrier that other waves of the scope may not reach could hang).
 // Compute shaders that write LDS only. KYTY_WAVE_LDS_ORDER=0 turns it off.
 uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
-                      uint32_t lane_count) {
+                      uint32_t lane_count, bool* fence_only) {
+	*fence_only = false;
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_WAVE_LDS_ORDER");
 		return value == nullptr || value[0] != '0';
@@ -481,10 +482,27 @@ uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo
 	if (threads <= program.wave_size) {
 		return spv::ScopeWorkgroup;
 	}
+	// KYTY_WAVE_LDS_HOST_SUBGROUP=1: a 64-wide host subgroup holding one wave64 counts too. On AMD
+	// (subgroup 64) multi-wave LDS-writing compute shaders otherwise got no ordering at all, which
+	// NVIDIA (subgroup 32, always ordered) never shows; suspect for the yellow screen tiles on the
+	// corridor glass (2026-10-22). pipelineCache.cpp passes the exact host width for wave32 then.
+	static const bool any_width = [] {
+		const char* value = std::getenv("KYTY_WAVE_LDS_HOST_SUBGROUP");
+		return value != nullptr && value[0] == '1';
+	}();
 	if (lane_count == 2u || (program.wave_size == workgroup->host_subgroup_size &&
-	                         workgroup->host_subgroup_size <= 32u)) {
+	                         (workgroup->host_subgroup_size <= 32u || any_width))) {
 		return spv::ScopeSubgroup;
 	}
+	// KYTY_WAVE_LDS_FENCE (default on; =0 none, as before): a memory barrier needs no other
+	// invocation to reach it, so it cannot hang, and it keeps the wave's own LDS accesses in order
+	// where the guest relied on lockstep. Jetsku d47cc5f9 does the same at S_WAITCNT lgkmcnt(0)
+	// (AMD: subgroup scope; a workgroup-scope one left a mesh shader waiting at S_BARRIER).
+	static const bool fence = [] {
+		const char* value = std::getenv("KYTY_WAVE_LDS_FENCE");
+		return value == nullptr || value[0] != '0';
+	}();
+	*fence_only = fence;
 	return 0;
 }
 
@@ -562,7 +580,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	if (program.stage == ShaderType::Mesh) {
 		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
 	}
-	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
+	state.wave_lds_scope =
+	    WaveLdsScope(program, workgroup, state.lane_count, &state.wave_lds_fence);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

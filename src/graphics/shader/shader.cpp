@@ -1,4 +1,5 @@
 #include "graphics/shader/shader.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -890,13 +891,13 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 				                                 static_cast<size_t>(words)},
 				                      static_cast<uint32_t>(gs_users.size()), 8u))
 				         .first;
-				if (std::getenv("KYTY_LOG_INSTANCE_BASE") != nullptr) {
+				if (Common::Environment::IsSet("KYTY_LOG_INSTANCE_BASE")) {
 					std::fprintf(stderr, "[instance-base] scan es %016llx merged=%d words=%zu users=%zu -> %d/%d\n",
 					             static_cast<unsigned long long>(hash), merged ? 1 : 0,
 					             static_cast<size_t>(words), gs_users.size(), it->second.base_slot,
 					             it->second.vsharp_slot);
 				}
-				if (it->second.base_slot >= 0 && std::getenv("KYTY_FPS_LOG") != nullptr) {
+				if (it->second.base_slot >= 0 && Common::Environment::IsSet("KYTY_FPS_LOG")) {
 					std::fprintf(stderr, "[instance-base] es %016llx: base slot %d, table V# slot %d\n",
 					             static_cast<unsigned long long>(hash), it->second.base_slot,
 					             it->second.vsharp_slot);
@@ -915,7 +916,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 				}
 				gs_users_fixed[static_cast<size_t>(ib.base_slot)] = 0;
 				static std::atomic<uint32_t> logged {0};
-				if (std::getenv("KYTY_FPS_LOG") != nullptr && logged.fetch_add(1) < 64) {
+				if (Common::Environment::IsSet("KYTY_FPS_LOG") && logged.fetch_add(1) < 64) {
 					std::fprintf(stderr,
 					             "[instance-base] es %016llx: base %08x >= records %u, zeroed\n",
 					             static_cast<unsigned long long>(hash), base, num_records);

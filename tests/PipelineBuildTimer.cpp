@@ -4,10 +4,11 @@
 //
 // Each module is compiled on its own with VK_EXT_shader_object (vkCreateShadersEXT), so a pixel
 // shader needs no matching vertex shader and no render state. Descriptor set layouts and the
-// push-constant range come from the module's own declarations. Before every compile the module
-// gets a fresh OpModuleProcessed "kyty-timer-<n>", so neither the driver's disk cache nor its
-// memory answers: every number is a cold compile, as on a first visit in a game. The result is
-// the median of --repeat compiles (default 3), one line per module in the CSV.
+// push-constant range come from the module's own declarations. Each request gets a fresh
+// OpModuleProcessed "kyty-timer-<n>", but a driver may ignore debug records when caching: these
+// timings do not prove a cold compile. Shader-object creation also differs from a complete
+// graphics pipeline. The result is the median of --repeat requests (default 3), one line per
+// module in the CSV.
 //
 // A tool, not a test: it needs a GPU and its driver, and its numbers depend on both.
 

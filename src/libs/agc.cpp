@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/sampler.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -64,6 +65,8 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// A freeze while the game boots (before its first flip) is reported as well.
+	Common::Sampler::StartFreezeWatch();
 	ShaderInit();
 }
 

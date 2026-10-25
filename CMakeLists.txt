@@ -551,6 +551,12 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_executable(spirv_builder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SpirvBuilderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp"
+)
+target_link_libraries(spirv_builder_tests fmt::fmt)
+target_include_directories(spirv_builder_tests PRIVATE ${inc_headers})
 # Offline batch translation of shaders extracted from game files; a tool, not a test.
 add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
 if(KYTY_CLANG_CL)
@@ -612,6 +618,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
+add_executable(coverage_spans_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CoverageSpansTests.cpp"
+)
+target_include_directories(coverage_spans_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
@@ -809,6 +820,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME spirv_builder COMMAND $<TARGET_FILE:spirv_builder_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -820,6 +832,7 @@ if(BUILD_TESTING)
 	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME coverage_spans COMMAND $<TARGET_FILE:coverage_spans_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME srt_native COMMAND $<TARGET_FILE:srt_native_tests>)
@@ -889,6 +902,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		spirv_builder_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
@@ -897,6 +911,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
+		coverage_spans_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		srt_native_tests

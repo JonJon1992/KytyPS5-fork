@@ -790,6 +790,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
+		graphics.LogMemoryBudget();
 		EXIT("Out of memory: an image fits neither in video memory nor in system memory (the VMA "
 		     "heap lines above give usage and budget). Close other programs; on a card with little "
 		     "video memory lower the resolution; if Windows' commit limit is reached, enlarge the "

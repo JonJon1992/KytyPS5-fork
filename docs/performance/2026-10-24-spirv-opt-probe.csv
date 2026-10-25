@@ -1,0 +1,5 @@
+variant,words,optimizer_ms,input_valid,output_valid,driver_shader_object_median_ms,driver_min_ms,driver_max_ms
+original,72867,0,1,1,940.44,901.74,1153.46
+performance_passes,62201,410.665,1,1,881.25,876.27,910.00
+simplify_instructions,70595,55.981,1,1,,,
+local_redundancy_and_dce,67730,64.622,1,1,,,

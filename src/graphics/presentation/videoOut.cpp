@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "common/environment.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -505,7 +506,7 @@ constexpr const char* kVoApiNames[VoApiCount] = {"GetVblankStatus", "WaitVblank"
                                                  "LatencyControlWaitBeforeInput"};
 std::array<std::atomic<uint32_t>, VoApiCount> g_vo_api_calls {};
 bool VoApiLogEnabled() {
-	static const bool enabled = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_FPS_LOG");
 	return enabled;
 }
 void NoteVoApi(VoApi api) {

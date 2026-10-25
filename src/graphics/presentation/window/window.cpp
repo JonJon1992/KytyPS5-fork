@@ -1,4 +1,5 @@
 #include "graphics/presentation/window.h"
+#include "common/environment.h"
 
 #include <SDL3/SDL.h>
 
@@ -41,6 +42,10 @@
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
+
+// Diagnostic readback toggles (bufferCache.cpp), F9 / F10.
+void ToggleReadbackVerifyKey();
+void ToggleCopyReadbacksKey();
 
 struct EventKeyboard {
 	bool     down;
@@ -208,6 +213,16 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
+				}
+				break;
+			case SDLK_F9:
+				if (!key.repeat) {
+					ToggleReadbackVerifyKey();
+				}
+				break;
+			case SDLK_F10:
+				if (!key.repeat) {
+					ToggleCopyReadbacksKey();
 				}
 				break;
 			case SDLK_RETURN:
@@ -763,7 +778,7 @@ static void WindowCreate(WindowContext& context) {
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
 	// override, and fall back to SDL's normal loader search when no bundle is present.
-	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
+	if (!Common::Environment::IsSet("SDL_VULKAN_LIBRARY")) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
 			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
@@ -780,7 +795,7 @@ static void WindowCreate(WindowContext& context) {
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
 	// borderless window skips that machinery entirely.
-	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
+	if (Common::Environment::IsSet("KYTY_BORDERLESS")) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif

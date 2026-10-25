@@ -383,6 +383,17 @@ void NoteGuestFrame() {
 	}
 }
 
+void StartFreezeWatch() {
+	int64_t never = 0;
+	g_last_frame_ms.compare_exchange_strong(never, NowMs(), std::memory_order_relaxed);
+	if (!g_freeze_watch_started.exchange(true)) {
+		const char* value = std::getenv("KYTY_FREEZE_DUMP");
+		if (value == nullptr || value[0] != '0') {
+			std::thread(FreezeWatch).detach();
+		}
+	}
+}
+
 void RegisterCurrentThread(const char* name) {
 	if (!GetConfig().enabled) {
 		return;
@@ -406,6 +417,7 @@ void RegisterCurrentThread(const char* name) {
 
 void RegisterCurrentThread(const char* /*name*/) {}
 void NoteGuestFrame() {}
+void StartFreezeWatch() {}
 
 #endif
 

@@ -1,4 +1,5 @@
 #include "common/archive.h"
+#include "common/environment.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
@@ -530,7 +531,8 @@ static void ApplyFrankEnvironmentDefaults() {
 		return;
 	}
 	static constexpr std::pair<const char*, const char*> Defaults[] = {
-	    {"KYTY_BINDLESS_EVICT", "0"},
+	    // Bindless eviction stays on (its own default): off, unsampled bindless textures were never
+	    // freed and a 16 GB card ran out of video memory in ~4 minutes (RX 9070 XT, 2026-10-22).
 	    {"KYTY_BINDLESS_SLOT_REUSE", "0"},
 	    {"KYTY_SHARED_BUFFERS", "1"},
 	    {"KYTY_WRITE_BITMAP", "1"},
@@ -550,9 +552,12 @@ static void ApplyFrankEnvironmentDefaults() {
 	    {"KYTY_HOST_ZONES", "1"},
 	    // Repeated syncs of a range with no page changed skip the tracker walk (37-52 % skipped).
 	    {"KYTY_SYNC_SKIP", "1"},
+	    // A game-thread readback lifts the page's protection without a second GPU-thread round
+	    // trip (13.7 -> 14.3 fps, seconds under 5 fps 9 -> 5, RX 9070 XT, 2026-10-22).
+	    {"KYTY_READBACK_ASYNC_LIFT", "1"},
 	};
 	for (const auto& [name, value]: Defaults) {
-		if (std::getenv(name) == nullptr) {
+		if (!Common::Environment::IsSet(name)) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			_putenv_s(name, value);
 #else

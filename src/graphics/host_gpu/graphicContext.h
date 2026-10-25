@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -38,6 +39,10 @@ RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 // After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
 // _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.
 void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+// KYTY_ADDRESS_BINDING_REPORT=1: the last device address bind/unbind events are kept in memory, and
+// a device fault names the events that covered its address (what was there, freed how long ago).
+void NoteAddressBinding(bool bind, uint64_t base, uint64_t size, uint32_t object_type,
+                        uint64_t handle, bool internal);
 void DumpGpuHangCheckpoints(GraphicContext& graphics, uint64_t tick, double seconds);
 
 struct GraphicContext {
@@ -64,6 +69,8 @@ struct GraphicContext {
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// pipelineCreationCacheControl: a pipeline can be asked of the driver cache without compiling.
+	bool                               pipeline_cache_control_enabled        = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
@@ -91,6 +98,19 @@ struct GraphicContext {
 	// the GPU thread submits to it.
 	uint32_t                           queue_count    = 1;
 	vk::Queue                          readback_queue = nullptr;
+	// KYTY_READBACK_QUEUE: the family of readback_queue when it is not queue_family (-1: it is).
+	uint32_t                           readback_queue_family = static_cast<uint32_t>(-1);
+	[[nodiscard]] uint32_t ReadbackQueueFamily() const noexcept {
+		return readback_queue_family != static_cast<uint32_t>(-1) ? readback_queue_family
+		                                                          : queue_family;
+	}
+	// With a readback queue of another family, cache buffers are VK_SHARING_MODE_CONCURRENT over
+	// both families: the readback queue copies from them with no ownership transfer, and nothing
+	// that the driver compiles into pipelines changes (its pipeline cache stays valid).
+	[[nodiscard]] bool ConcurrentBuffers() const noexcept {
+		return readback_queue_family != static_cast<uint32_t>(-1);
+	}
+	std::array<uint32_t, 2> buffer_queue_families {};
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 
@@ -223,6 +243,11 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// KYTY_IMAGE_POOL_MB: created plain (no pNext, optimal tiling, undefined initial layout) in
+	// device memory, so DeleteImage may keep it for an identical CreateImage; and the owner knows
+	// the GPU is done with it (TextureCache::ReleaseImage), so it may be handed out again at once.
+	bool                          poolable        = false;
+	bool                          release_to_pool = false;
 };
 
 

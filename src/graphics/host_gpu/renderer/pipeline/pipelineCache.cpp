@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -41,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -451,7 +453,7 @@ namespace {
 // KYTY_LOG_GPU_OWNED_SRT=1: the SRT reads that make the GPU thread download GPU-written bytes
 // (wait for the GPU), first three per shader and read size.
 void LogGpuOwnedSrtRead(const char* tag, uint64_t address, size_t dwords) {
-	static const bool enabled = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_LOG_GPU_OWNED_SRT");
 	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, dwords * 4u)) {
 		return;
 	}
@@ -478,7 +480,7 @@ void LogGpuOwnedSrtRead(const char* tag, uint64_t address, size_t dwords) {
 // KYTY_SRT_WAIT_STATS=1: time the SRT reads that download GPU-written bytes (the GPU thread waits
 // for the GPU), per shader, and print the top shaders by wait time every 10 s of wall time.
 bool TimedReadBufferBacking(uint64_t address, uint32_t* data, size_t bytes) {
-	static const bool enabled = std::getenv("KYTY_SRT_WAIT_STATS") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_SRT_WAIT_STATS");
 	if (!enabled || !Libs::LibKernel::Memory::IsGpuBufferWritten(address, bytes)) {
 		return Libs::LibKernel::Memory::TryReadBufferBacking(address, data, bytes);
 	}
@@ -639,7 +641,7 @@ bool ReadShaderGuestMemoryRawImpl(void* userdata, uint64_t address, std::span<ui
 	}
 	if (t_srt_shader_hash != 0 && Libs::Graphics::GuestGpu::IsGpuThread()) {
 		CountGpuOwnedSrtRead(address, static_cast<uint32_t>(values.size_bytes()));
-		if (static const bool log_owned = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+		if (static const bool log_owned = Common::Environment::IsSet("KYTY_LOG_GPU_OWNED_SRT");
 		    log_owned) {
 			static std::unordered_map<uint64_t, uint32_t> seen;
 			auto& n = seen[t_srt_shader_hash ^ (static_cast<uint64_t>(values.size()) << 56u)];
@@ -697,7 +699,7 @@ bool ReadShaderGuestMemoryImpl(void* userdata, uint64_t address, std::span<uint3
 	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
 	// the one the shader would see. Before, this only ever succeeded because the aggressive
 	// garbage collector happened to have downloaded the range first.
-	if (static const bool log_owned = std::getenv("KYTY_LOG_GPU_OWNED_SRT") != nullptr;
+	if (static const bool log_owned = Common::Environment::IsSet("KYTY_LOG_GPU_OWNED_SRT");
 	    log_owned && Libs::Graphics::GuestGpu::IsGpuThread()) {
 		static std::unordered_map<uint64_t, uint32_t> seen;
 		auto& n = seen[t_srt_shader_hash ^ (static_cast<uint64_t>(values.size()) << 56u)];
@@ -727,6 +729,113 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	const bool           ok = ReadShaderGuestMemoryImpl(userdata, address, values);
 	qualify.Finish(ok, values);
 	return ok;
+}
+
+// Where in guest memory `needle` sits behind the user data: in the 4 KiB at a pointer the user data
+// holds, or at a pointer found there. Returns the address and, through `table`, the pointer slot
+// that led to it (0 for the first level). 0 when not found.
+static uint64_t FindBehindUserData(std::span<const uint32_t> user_data, std::span<const uint32_t> needle,
+                                   uint64_t& table) {
+	std::array<uint32_t, 1024> words {};
+	const auto read = [&](uint64_t base) -> size_t {
+		if (Libs::LibKernel::Memory::TryReadBacking(base, words.data(), sizeof(words))) {
+			return words.size();
+		}
+		const auto bytes = 4096u - (base & 4095u);
+		return Libs::LibKernel::Memory::TryReadBacking(base, words.data(), bytes) ? bytes / 4u : 0;
+	};
+	const auto search = [&](uint64_t base, size_t count) -> uint64_t {
+		for (size_t i = 0; i + needle.size() <= count; i++) {
+			if (std::equal(needle.begin(), needle.end(), words.begin() + static_cast<std::ptrdiff_t>(i))) {
+				return base + i * 4u;
+			}
+		}
+		return 0;
+	};
+	std::vector<uint64_t> roots;
+	for (size_t i = 0; i + 1 < user_data.size(); i++) {
+		roots.push_back(user_data[i] | (uint64_t {user_data[i + 1]} << 32u));
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> second; // pointer, the slot it was read from
+	for (const auto root: roots) {
+		const auto count = root != 0 && (root & 3u) == 0 ? read(root) : 0;
+		if (const auto found = search(root, count); found != 0) {
+			table = 0;
+			return found;
+		}
+		for (size_t i = 0; i + 1 < count && second.size() < 512; i += 2) {
+			const auto pointer = words[i] | (uint64_t {words[i + 1]} << 32u);
+			if (pointer >= 0x0100000000ull && pointer < 0x10000000000ull && (pointer & 3u) == 0) {
+				second.emplace_back(pointer, root + i * 4u);
+			}
+		}
+	}
+	for (const auto& [pointer, slot]: second) {
+		if (const auto found = search(pointer, read(pointer)); found != 0) {
+			table = slot;
+			return found;
+		}
+	}
+	return 0;
+}
+
+// A compute source that keeps compiling permutations specializes on descriptors that change every
+// dispatch, i.e. bytes that are not descriptors: before each device loss of 24/10 (01:55, 02:19,
+// 12:33) one source compiled hundreds, a random stride 0..16383 each. Prints the changed
+// descriptors, where they were read from, and the emulator writes that last touched those bytes.
+static void ReportPermutationStorm(uint64_t hash, size_t permutations, std::span<const uint32_t> user_data,
+                                   const ShaderRecompiler::IR::ResourceSnapshot&       resources,
+                                   const ShaderRecompiler::IR::ResourceSpecialization& now,
+                                   const ShaderRecompiler::IR::ResourceSpecialization& last) {
+	// The first 12 of each source, for up to 8 sources: a legitimate source with many
+	// permutations must not use up the lines.
+	static std::mutex                             reported_mutex;
+	static std::unordered_map<uint64_t, uint32_t> reported;
+	{
+		std::lock_guard lock(reported_mutex);
+		const auto      found = reported.find(hash);
+		if (found == reported.end() ? reported.size() >= 8 : found->second >= 12) {
+			return;
+		}
+		reported[hash]++;
+	}
+	std::string text = fmt::format("[permutation-storm] cs 0x{:016x}: permutation {}, user_data", hash,
+	                               permutations + 1);
+	for (const auto value: user_data) {
+		text += fmt::format(" {:08x}", value);
+	}
+	std::printf("%s\n", text.c_str());
+	const auto describe = [&](const char* kind, size_t index,
+	                          const ShaderRecompiler::IR::DescriptorValue& value) {
+		text = fmt::format("  {} {}:", kind, index);
+		for (uint32_t i = 0; i < value.dword_count && i < value.dwords.size(); i++) {
+			text += fmt::format(" {:08x}", value.dwords[i]);
+		}
+		uint64_t   table = 0;
+		const auto at    = value.dword_count >= 4
+		                       ? FindBehindUserData(user_data, std::span(value.dwords).first(4), table)
+		                       : 0;
+		if (at == 0) {
+			std::printf("%s; not found behind the user data (two pointer levels)\n", text.c_str());
+			return;
+		}
+		std::printf("%s; at 0x%016" PRIx64 " (pointer slot 0x%016" PRIx64 ")\n", text.c_str(), at, table);
+		Libs::LibKernel::Memory::DescribeGuestBytes(at, value.dword_count * 4u);
+		if (table != 0) {
+			Libs::LibKernel::Memory::DescribeGuestBytes(table, 8);
+		}
+	};
+	for (size_t i = 0; i < now.buffers.size() && i < resources.buffers.size(); i++) {
+		if (i >= last.buffers.size() || !(now.buffers[i] == last.buffers[i])) {
+			describe("buffer", i, resources.buffers[i]);
+		}
+	}
+	for (size_t i = 0; i < now.images.size() && i < resources.images.size(); i++) {
+		if (i >= last.images.size() || !(now.images[i] == last.images[i])) {
+			describe("image", i, resources.images[i]);
+		}
+	}
+	std::fflush(stdout);
 }
 
 // The reader of a stage walked in the parallel window (StagePrepWorker): bytes no GPU work has
@@ -933,17 +1042,143 @@ static const std::chrono::milliseconds g_pipeline_wait = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_WAIT_MS");
 	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20u);
 }();
+// Background compiles share that wait: KYTY_PIPELINE_WAIT_MS in total per window of
+// KYTY_PIPELINE_WAIT_WINDOW_MS (default 33, a frame at 30 FPS; 0 = the whole wait per pipeline, as
+// before). Entering an area brings a hundred new pipelines within a few frames; waiting 20 ms for
+// each stopped the emulated GPU for seconds. Past the window's share their draws are skipped at
+// once and appear when the workers finish, a frame or two later.
+static const std::chrono::milliseconds g_pipeline_wait_window = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_WAIT_WINDOW_MS");
+	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 33u);
+}();
+// KYTY_URGENT_FAST_COMPILE (default on; =0 as before): a draw that waits for its pipeline (UI,
+// small, memory-writing) gets one built without driver optimization when the driver cache lacks
+// it. The AMD compiler took seconds on the optimized ones while the GPU thread waited (42 % of it
+// in the 60 s profile of 2026-10-24, the game frozen 3-7 s at a time). The optimized pipeline is
+// then compiled on an idle worker only to fill the driver cache, so the next run's probe takes it.
+static const bool g_urgent_fast_compile = [] {
+	const char* value = std::getenv("KYTY_URGENT_FAST_COMPILE");
+	return value == nullptr || value[0] != '0';
+}();
+// KYTY_COMPUTE_FAST_COMPILE (default on; =0 as before): the same for compute pipelines, which
+// are always built on the GPU thread.
+static const bool g_compute_fast_compile = [] {
+	const char* value = std::getenv("KYTY_COMPUTE_FAST_COMPILE");
+	return value == nullptr || value[0] != '0';
+}();
+// KYTY_COMPUTE_ASYNC=1 (opt-in, Play.bat; needs KYTY_PIPELINE_WAIT_SUSPEND=1): a new compute
+// pipeline the driver cache lacks compiles on a worker, and its dispatch's packet is suspended a
+// slice at a time until it is ready (never skipped: a skipped dispatch leaves data unwritten).
+// On the GPU thread no queued command was served meanwhile; the game threads' readbacks waited.
+static const bool g_compute_async = [] {
+	const char* value = std::getenv("KYTY_COMPUTE_ASYNC");
+	return value != nullptr && value[0] == '1';
+}();
+// A suspended draw or dispatch waits this long for its pipeline before its packet runs again.
+constexpr std::chrono::milliseconds PipelineWaitSlice {4};
+// BeginPipelineSuspend / EndPipelineSuspend: may the draw or dispatch at hand suspend its packet,
+// and did it.
+thread_local bool t_pipeline_suspend_allowed = false;
+thread_local bool t_pipeline_suspended       = false;
+// KYTY_PIPELINE_URGENT_FIRST (default on; =0 as before): a pipeline the GPU thread waits for goes
+// to the front of the compile queue, not behind the background compiles of a new area.
+static const bool g_pipeline_urgent_first = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_URGENT_FIRST");
+	return value == nullptr || value[0] != '0';
+}();
+
+// KYTY_PIPELINE_BACKGROUND_THREADS (default 2): only this many workers handle pipelines no draw
+// has requested recently or optimized replacements; the others stay available for the scene.
+static uint32_t PipelineBackgroundWorkerCount(uint32_t threads) {
+	const char* value = std::getenv("KYTY_PIPELINE_BACKGROUND_THREADS");
+	const auto  requested = value != nullptr
+	                            ? static_cast<uint32_t>(std::min<unsigned long>(
+	                                  std::strtoul(value, nullptr, 10), threads))
+	                            : std::min(2u, threads);
+	return std::max(1u, requested);
+}
+
+// KYTY_PIPELINE_QUICK=1: draw first with a temporary unoptimized graphics pipeline, then replace
+// it with the optimized pipeline when the background build completes. Off by default.
+static bool PipelineQuickEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_QUICK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static uint64_t ShaderWorkClockMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+static uint64_t ShaderWorkAgeMs(uint64_t now, uint64_t requested_at_ms) {
+	return now >= requested_at_ms ? now - requested_at_ms : 0;
+}
+
+// KYTY_PIPELINE_CACHE_PROBE (default on where the device has pipelineCreationCacheControl, which
+// Vulkan 1.3 requires): a new graphics pipeline is first asked of the driver cache without
+// compiling (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT). =0 compiles every one.
+static bool PipelineCacheProbeEnabled(const GraphicContext& graphics) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_PROBE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && graphics.pipeline_cache_control_enabled;
+}
+
+// How many probes the driver cache answered, logged every 256 probes.
+static void CountPipelineCacheProbe(bool hit) {
+	static std::atomic<uint64_t> hits {0};
+	static std::atomic<uint64_t> compiles {0};
+	const auto hit_count     = hit ? hits.fetch_add(1) + 1 : hits.load();
+	const auto compile_count = hit ? compiles.load() : compiles.fetch_add(1) + 1;
+	if ((hit_count + compile_count) % 256 == 1) {
+		PipelineCacheLog("Vulkan pipelines: driver cache probes: {} hits, {} compiles", hit_count,
+		                 compile_count);
+	}
+}
 
 struct PendingGraphicsPipeline {
-	std::unique_ptr<GraphicsPipelineBuild> build;
+	// Shared with the driver cache warm-up of an unoptimized build.
+	std::shared_ptr<GraphicsPipelineBuild> build;
+	// A compute pipeline instead (KYTY_COMPUTE_ASYNC); build is then unset.
+	std::shared_ptr<ComputePipelineWarm>   compute;
+	bool                                   unoptimized = false;
+	bool                                   background = false;
+	std::atomic<bool>                      urgent {false};
+	std::atomic<uint64_t>                  requested_at_ms {0};
+	// Quick graphics pipeline published before the optimized build completes.
+	vk::Pipeline                           quick = nullptr;
+	std::atomic<bool>                      quick_ready {false};
 	// For the profiler: the guest shaders (pixel 0 without one).
 	uint64_t                               vs_hash      = 0;
 	uint64_t                               ps_hash      = 0;
 	vk::PipelineCache                      driver_cache = nullptr;
+	// Its draws wait for it until then; past it (and for background compiles) they are skipped.
+	std::chrono::steady_clock::time_point  deadline {};
+	// For LogPipelineWait: why its draws wait, its size, when it was queued, when a worker took it
+	// (read once done) and when the GPU thread first waited for it.
+	const char*                            wait_reason = "";
+	uint64_t                               spirv_words = 0;
+	std::chrono::steady_clock::time_point  submitted {};
+	std::chrono::steady_clock::time_point  started {};
+	std::chrono::steady_clock::time_point  waited_since {};
 	vk::Pipeline                           pipeline     = nullptr;
 	vk::Result                             result       = vk::Result::eSuccess;
 	std::atomic<bool>                      done {false};
 };
+
+// Background translators and pipeline compilers each: a quarter of the hardware threads, 2 to 6
+// (the translators run below normal priority, LowerWorkerThreadPriority, so they take idle cores).
+static uint32_t DefaultWorkerThreads() {
+	return std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 6u);
+}
+
+// Pipelines the driver compiled this session: what the periodic driver cache save looks at.
+static std::atomic<uint64_t> g_pipelines_built {0};
 
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
@@ -951,6 +1186,7 @@ static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uin
 	const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                                         std::chrono::steady_clock::now() - begin)
 	                                         .count());
+	g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
 	Profiler::Add(counter);
 	Profiler::Add(Profiler::Counter::PipelineBuildTime, us);
 	Profiler::Message(us >= 100000 ? Profiler::MessageWarning : Profiler::MessageInfo,
@@ -964,20 +1200,58 @@ static void ReportGraphicsPipelineBuilt(uint64_t vs_hash, uint64_t ps_hash,
 	                    begin);
 }
 
+// GPU thread, once a pipeline it waited for is in place: each wait over 100 ms on stderr (the
+// first 200), with why it waited and whether the queue or the compile took the time.
+// Seconds on the steady clock, the time base of the stderr diagnostics and of KYTY_FRAME_TIMES
+// (swapchain.cpp), so waits can be matched to the frames they stalled.
+static double SteadySeconds() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void LogPipelineWait(PendingGraphicsPipeline& job) {
+	using Ms = std::chrono::duration<double, std::milli>;
+	static uint32_t logged = 0;
+	// Taken: a quick pipeline (KYTY_PIPELINE_QUICK) leaves the job pending for later lookups.
+	const auto since = std::exchange(job.waited_since, std::chrono::steady_clock::time_point {});
+	if (since == std::chrono::steady_clock::time_point {} || logged >= 200u) {
+		return;
+	}
+	const auto now    = std::chrono::steady_clock::now();
+	const auto waited = Ms(now - since).count();
+	if (waited < 100.0) {
+		return;
+	}
+	logged++;
+	const bool started = job.started != std::chrono::steady_clock::time_point {};
+	std::fprintf(stderr,
+	             "[pipeline-wait] at=%.3f %s 0x%016" PRIx64 " PS 0x%016" PRIx64 " words=%" PRIu64
+	             " reason=%s%s waited=%.0f ms queued=%.0f ms compiling=%.0f ms\n",
+	             SteadySeconds(), job.compute != nullptr ? "CS" : "VS", job.vs_hash, job.ps_hash,
+	             job.spirv_words,
+	             job.wait_reason, job.unoptimized ? " unoptimized" : "", waited,
+	             Ms((started ? job.started : now) - job.submitted).count(),
+	             started ? Ms(now - job.started).count() : 0.0);
+}
+
 // Compiles graphics pipelines on worker threads. The driver compiled on the GPU thread, which
 // stopped the whole emulated GPU for seconds per new pipeline (103 slow pipelines, 170 s of a
 // 600 s first pass through the prologue).
 class PipelineCompiler {
 public:
-	explicit PipelineCompiler(uint32_t threads) {
+	explicit PipelineCompiler(uint32_t threads, uint32_t background_threads)
+	    : m_background_threads(std::min(threads, std::max(1u, background_threads))) {
 		for (uint32_t i = 0; i < threads; i++) {
-			m_threads.emplace_back([this] { Run(); });
+			m_threads.emplace_back([this, i] { Run(i); });
 		}
 	}
 	~PipelineCompiler() { Stop(); }
 	KYTY_CLASS_NO_COPY(PipelineCompiler);
 
-	void Submit(std::shared_ptr<PendingGraphicsPipeline> job) {
+	// Jobs the GPU thread is waiting for stay ahead of scene-prefetch work.
+	void Submit(std::shared_ptr<PendingGraphicsPipeline> job, bool urgent = false) {
+		job->submitted = std::chrono::steady_clock::now();
+		job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
+		job->urgent.store(urgent, std::memory_order_relaxed);
 		{
 			std::lock_guard lock(m_mutex);
 			m_queue.push_back(std::move(job));
@@ -985,12 +1259,40 @@ public:
 		m_work.notify_one();
 	}
 
+	void Requested(const std::shared_ptr<PendingGraphicsPipeline>& job, bool urgent) {
+		{
+			std::lock_guard lock(m_mutex);
+			job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
+			if (urgent) {
+				job->urgent.store(true, std::memory_order_relaxed);
+			}
+		}
+		m_work.notify_one();
+	}
+
+	// A driver cache warm-up: runs only while no job is queued, one at a time, so the other
+	// workers stay free for the pipelines draws wait for.
+	bool Warm(std::function<void()> task) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_stopped) {
+				return false;
+			}
+			m_warm.push_back(std::move(task));
+		}
+		// All: only the background workers take warm-ups, and one other woken would drop it.
+		m_work.notify_all();
+		return true;
+	}
+
 	// Waits up to the budget; true when the job is done.
 	bool Wait(const PendingGraphicsPipeline& job, std::chrono::milliseconds budget) {
 		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
 		std::unique_lock lock(m_mutex);
-		return m_done.wait_for(lock, budget,
-		                       [&job] { return job.done.load(std::memory_order_acquire); });
+		return m_done.wait_for(lock, budget, [&job] {
+			return job.done.load(std::memory_order_acquire) ||
+			       job.quick_ready.load(std::memory_order_acquire);
+		});
 	}
 
 	// Finishes the compiles in progress; queued ones are left to their owner.
@@ -1002,6 +1304,7 @@ public:
 			}
 			m_stopped = true;
 			m_queue.clear();
+			m_warm.clear();
 		}
 		m_work.notify_all();
 		for (auto& thread: m_threads) {
@@ -1016,34 +1319,132 @@ public:
 	}
 
 private:
-	void Run() {
+	void MarkDone(const std::shared_ptr<PendingGraphicsPipeline>& job) {
+		Profiler::Add(Profiler::Counter::PipelinesPending, -1);
+		{
+			std::lock_guard lock(m_mutex);
+			job->done.store(true, std::memory_order_release);
+		}
+		m_done.notify_all();
+	}
+
+	void Compile(const std::shared_ptr<PendingGraphicsPipeline>& job, PipelineCompile mode) {
+		Profiler::Phases zone;
+		zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
+		KYTY_PROFILER_PHASE(zone, "PipelineCompiler::Compile", profiler::colors::DeepOrangeA200);
+		const auto begin = std::chrono::steady_clock::now();
+		job->result = CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline, mode);
+		ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
+		MarkDone(job);
+	}
+
+	bool Pick(uint32_t index, std::shared_ptr<PendingGraphicsPipeline>& job) {
+		if (m_queue.empty()) {
+			return false;
+		}
+		const auto urgent = std::ranges::find_if(m_queue, [](const auto& candidate) {
+			return candidate->urgent.load(std::memory_order_relaxed);
+		});
+		auto pick = urgent;
+		if (pick == m_queue.end()) {
+			const auto compare = [](const auto& a, const auto& b) {
+				return a->requested_at_ms.load(std::memory_order_relaxed) <
+				       b->requested_at_ms.load(std::memory_order_relaxed);
+			};
+			pick = index == 0 ? std::ranges::min_element(m_queue, compare)
+			                  : std::ranges::max_element(m_queue, compare);
+			const auto age = ShaderWorkAgeMs(
+			    ShaderWorkClockMs(), (*pick)->requested_at_ms.load(std::memory_order_relaxed));
+			if (index >= m_background_threads && age >= 2000u) {
+				return false;
+			}
+		}
+		job = std::move(*pick);
+		m_queue.erase(pick);
+		return true;
+	}
+
+	void Run(uint32_t index) {
 		KYTY_PROFILER_THREAD("PipelineCompiler");
+		// Normal priority, unlike the translators: the GPU thread waits up to seconds for UI and
+		// memory-writing pipelines, and a starved compile skips those draws for good.
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
+			std::function<void()>                    warm;
 			{
 				std::unique_lock lock(m_mutex);
-				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
-				if (m_queue.empty()) {
+				while (!m_stopped) {
+					if (!m_queue.empty()) {
+						if (Pick(index, job)) {
+							break;
+						}
+						m_work.wait_for(lock, std::chrono::milliseconds(200));
+						continue;
+					}
+					if (index < m_background_threads && !m_warm.empty() && !m_warming) {
+						warm = std::move(m_warm.front());
+						m_warm.pop_front();
+						m_warming = true;
+						break;
+					}
+					m_work.wait(lock, [this, index] {
+						return m_stopped || !m_queue.empty() ||
+						       (index < m_background_threads && !m_warm.empty() && !m_warming);
+					});
+				}
+				if (m_stopped) {
 					return;
 				}
-				job = std::move(m_queue.front());
-				m_queue.pop_front();
 			}
-			{
-				Profiler::Phases zone;
-				zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
-				KYTY_PROFILER_PHASE(zone, "PipelineCompiler::Compile", profiler::colors::DeepOrangeA200);
+			if (warm) {
+				{
+					KYTY_PROFILER_BLOCK("PipelineCompiler::Warm");
+					warm();
+				}
+				{
+					std::lock_guard lock(m_mutex);
+					m_warming = false;
+				}
+				m_work.notify_all();
+				continue;
+			}
+			job->started = std::chrono::steady_clock::now();
+			if (job->compute != nullptr) {
 				const auto begin = std::chrono::steady_clock::now();
-				job->result =
-				    CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
-				ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
-				Profiler::Add(Profiler::Counter::PipelinesPending, -1);
+				job->result      = job->compute->device.createComputePipelines(
+				    job->driver_cache, 1, &job->compute->info, nullptr, &job->pipeline);
+				ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job->vs_hash, 0,
+				                    begin);
+				MarkDone(job);
+				continue;
 			}
-			{
-				std::lock_guard lock(m_mutex);
-				job->done.store(true, std::memory_order_release);
+			const bool quick_candidate =
+			    PipelineQuickEnabled() && !job->unoptimized &&
+			    !(job->build->pipeline_info.flags & vk::PipelineCreateFlagBits::eDisableOptimization);
+			if (quick_candidate) {
+				const auto quick_begin = std::chrono::steady_clock::now();
+				job->result = CreateGraphicsPipeline(*job->build, nullptr, &job->quick,
+				                                     PipelineCompile::Unoptimized);
+				if (job->result != vk::Result::eSuccess && job->quick != nullptr) {
+					job->build->device.destroyPipeline(job->quick, nullptr);
+					job->quick = nullptr;
+				}
+				if (job->result == vk::Result::eSuccess && job->quick != nullptr) {
+					const auto quick_ms = std::chrono::duration<double, std::milli>(
+					                          std::chrono::steady_clock::now() - quick_begin)
+					                          .count();
+					LOGF("PipelineTrace: quick graphics pipeline ready VS=0x%016" PRIx64
+					     " PS=0x%016" PRIx64 " ms=%.1f\n",
+					     job->vs_hash, job->ps_hash, quick_ms);
+					job->quick_ready.store(true, std::memory_order_release);
+					m_done.notify_all();
+					// Rejected at shutdown: FinishPending compiles it on the GPU thread, which may
+					// already have taken job->quick.
+					(void)Warm([this, job] { Compile(job, PipelineCompile::Normal); });
+					continue;
+				}
 			}
-			m_done.notify_all();
+			Compile(job, job->unoptimized ? PipelineCompile::Unoptimized : PipelineCompile::Normal);
 		}
 	}
 
@@ -1051,8 +1452,11 @@ private:
 	std::condition_variable                              m_work;
 	std::condition_variable                              m_done;
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_queue;
+	std::deque<std::function<void()>>                    m_warm;
 	std::vector<std::thread>                             m_threads;
+	uint32_t                                             m_background_threads = 1;
 	bool                                                 m_stopped = false;
+	bool                                                 m_warming = false;
 };
 
 // Graphics shader translation on worker threads (plan.md P1; KYTY_ASYNC_TRANSLATION=0 translates
@@ -1069,6 +1473,19 @@ static const bool g_async_translation = [] {
 	const char* value = std::getenv("KYTY_ASYNC_TRANSLATION");
 	return value == nullptr || value[0] != '0';
 }();
+// KYTY_SHADER_WORKERS=1 (opt-in, Play.bat): the rest of a new shader's compile runs on these
+// workers too. The GPU thread still picks the specialization (it reads guest memory); the resource
+// plan, the SPIR-V emission and the module move here (300-440 ms for a 200-300k-word pixel shader,
+// 16 s on the GPU thread in the 2026-10-24 16:15 run). Draws that translate deferred are skipped
+// meanwhile, as during their translation; other draws and dispatches, compute included, leave it
+// to the workers too when their packet can be suspended (KYTY_PIPELINE_WAIT_SUSPEND): they wait a
+// slice at a time. Anything else still compiles on the GPU thread. A module from the disk cache
+// stays here: the driver keeps its own cache across runs (~2 ms for a 314k-word module it has seen,
+// 102 ms new; B1, docs/benchmarks/pipe_bench.cpp).
+static const bool g_shader_workers = [] {
+	const char* value = std::getenv("KYTY_SHADER_WORKERS");
+	return value != nullptr && value[0] == '1';
+}();
 
 struct TranslationJob {
 	std::vector<uint32_t>                code;
@@ -1076,17 +1493,55 @@ struct TranslationJob {
 	std::vector<uint32_t>                user_data;
 	ShaderVertexInputInfo                vertex {};
 	ShaderPixelInputInfo                 pixel {};
+	ShaderComputeInputInfo               compute {};
 	ShaderRecompiler::CompileOptions     options;
 	ShaderRecompiler::TranslateResult    result;
 	std::chrono::steady_clock::time_point queued;
+	std::atomic<uint64_t>                requested_at_ms {0};
 	std::atomic<bool>                    done {false};
+
+	// KYTY_SHADER_WORKERS: the translation also extracts the plan. Submitted again with `compile`
+	// set, the job emits the SPIR-V of `result` for `specialization` and creates its module.
+	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+	bool                                         compile = false;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	uint32_t                                     push_data_cursor = 0;
+	vk::Device                                   device;
+	bool                                         encode = false; // the disk cache record too
+	std::vector<uint8_t>                         permutation_key;
+	std::vector<uint8_t>                         permutation_payload;
+	std::vector<uint32_t>                        spirv;
+	ShaderRecompiler::IR::CompiledShaderInfo     program;
+	vk::ShaderModule                             module;
+	double                                       worker_ms = 0.0;
+
+	// The job's own copies of the stage inputs and code the options point at.
+	template <typename InputInfo>
+	void SetInputs(const ShaderRecompiler::CompileOptions& from, const InputInfo& input_info,
+	               std::span<const uint32_t> user_data_values, std::span<const uint32_t> back) {
+		user_data.assign(user_data_values.begin(), user_data_values.end());
+		back_code.assign(back.begin(), back.end());
+		options           = from;
+		options.user_data = user_data;
+		options.back_code = back_code;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			vertex                    = input_info;
+			options.input_info.vertex = &vertex;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			pixel                    = input_info;
+			options.input_info.pixel = &pixel;
+		} else {
+			compute                    = input_info;
+			options.input_info.compute = &compute;
+		}
+	}
 };
 
 class TranslationWorkers {
 public:
 	explicit TranslationWorkers(uint32_t threads) {
 		for (uint32_t i = 0; i < threads; i++) {
-			m_threads.emplace_back([this] { Run(); });
+			m_threads.emplace_back([this, i] { Run(i); });
 		}
 	}
 	~TranslationWorkers() {
@@ -1103,6 +1558,7 @@ public:
 	KYTY_CLASS_NO_COPY(TranslationWorkers);
 
 	void Submit(std::shared_ptr<TranslationJob> job) {
+		job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
 		{
 			std::lock_guard lock(m_mutex);
 			m_queue.push_back(std::move(job));
@@ -1110,11 +1566,131 @@ public:
 		m_work.notify_one();
 	}
 
+	void Requested(const std::shared_ptr<TranslationJob>& job) {
+		std::lock_guard lock(m_mutex);
+		job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
+	}
+
+	// True once the job is done; waits for it at most `timeout`.
+	bool Wait(const TranslationJob& job, std::chrono::milliseconds timeout) {
+		std::unique_lock lock(m_mutex);
+		return m_finished.wait_for(lock, timeout,
+		                           [&] { return job.done.load(std::memory_order_acquire); });
+	}
+
 private:
-	void Run() {
+	void Run(uint32_t index) {
 		KYTY_PROFILER_THREAD("ShaderTranslator");
+		Common::LowerWorkerThreadPriority();
 		for (;;) {
 			std::shared_ptr<TranslationJob> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
+				if (m_queue.empty()) {
+					return;
+				}
+				const auto compare = [](const auto& a, const auto& b) {
+					return a->requested_at_ms.load(std::memory_order_relaxed) <
+					       b->requested_at_ms.load(std::memory_order_relaxed);
+				};
+				auto pick = index == 0 ? std::ranges::min_element(m_queue, compare)
+				                      : std::ranges::max_element(m_queue, compare);
+				job = std::move(*pick);
+				m_queue.erase(pick);
+			}
+			const auto begin = std::chrono::steady_clock::now();
+			if (!job->compile) {
+				job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+				if (g_shader_workers && !job->result.unsupported) {
+					job->plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(job->result.program));
+				}
+			} else {
+				auto compiled = ShaderRecompiler::CompileProgram(std::move(job->result), job->options,
+				                                                 job->specialization, job->push_data_cursor);
+				job->spirv   = std::move(compiled.spirv);
+				job->program = std::move(compiled.program).TakeCompiledInfo();
+				if (job->encode) {
+					ShaderDiskCache::EncodePermutationRecord(job->spirv, job->program,
+					                                         job->permutation_payload);
+				}
+				job->module = CompileSPV(job->spirv, job->device);
+			}
+			job->worker_ms = std::chrono::duration<double, std::milli>(
+			                     std::chrono::steady_clock::now() - begin)
+			                     .count();
+			{
+				std::lock_guard lock(m_mutex);
+				job->done.store(true, std::memory_order_release);
+			}
+			m_finished.notify_all();
+		}
+	}
+
+	std::mutex                                  m_mutex;
+	std::condition_variable                     m_finished;
+	std::condition_variable                     m_work;
+	std::deque<std::shared_ptr<TranslationJob>> m_queue;
+	std::vector<std::thread>                    m_threads;
+	bool                                        m_stopped = false;
+};
+
+struct DiskReadJob {
+	std::vector<uint8_t>                 key;
+	std::vector<uint8_t>                 payload;
+	std::chrono::steady_clock::time_point queued;
+	std::atomic<uint64_t>                requested_at_ms {0};
+	bool                                 found = false;
+	std::atomic<bool>                    done {false};
+};
+
+// Its threads call Store::Load concurrently, which shaderDiskCache.h's Store comment does not say:
+// that header is hashed into the shader cache version, and editing it drops every cached shader.
+class DiskReaders {
+public:
+	DiskReaders(ShaderDiskCache::Store& store, uint32_t threads): m_store(store) {
+		m_threads.reserve(threads);
+		for (uint32_t i = 0; i < threads; i++) {
+			m_threads.emplace_back([this] { Run(); });
+		}
+	}
+	~DiskReaders() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stopped = true;
+			m_queue.clear();
+		}
+		m_work.notify_all();
+		for (auto& thread: m_threads) {
+			thread.join();
+		}
+	}
+	KYTY_CLASS_NO_COPY(DiskReaders);
+
+	bool Submit(std::shared_ptr<DiskReadJob> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_stopped) {
+				return false;
+			}
+			m_queue.push_back(std::move(job));
+		}
+		m_work.notify_one();
+		return true;
+	}
+
+	[[nodiscard]] size_t ReadyBytes() const { return m_ready_bytes.load(std::memory_order_relaxed); }
+
+	void Forget(const DiskReadJob& job) {
+		m_ready_bytes.fetch_sub(job.payload.size(), std::memory_order_relaxed);
+	}
+
+private:
+	void Run() {
+		KYTY_PROFILER_THREAD("ShaderDiskRead");
+		Common::LowerWorkerThreadPriority();
+		for (;;) {
+			std::shared_ptr<DiskReadJob> job;
 			{
 				std::unique_lock lock(m_mutex);
 				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
@@ -1124,16 +1700,22 @@ private:
 				job = std::move(m_queue.front());
 				m_queue.pop_front();
 			}
-			job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+			{
+				KYTY_PROFILER_BLOCK("ShaderDiskRead::Load");
+				job->found = m_store.Load(job->key, job->payload);
+			}
+			m_ready_bytes.fetch_add(job->payload.size(), std::memory_order_relaxed);
 			job->done.store(true, std::memory_order_release);
 		}
 	}
 
-	std::mutex                                  m_mutex;
-	std::condition_variable                     m_work;
-	std::deque<std::shared_ptr<TranslationJob>> m_queue;
-	std::vector<std::thread>                    m_threads;
-	bool                                        m_stopped = false;
+	ShaderDiskCache::Store&                m_store;
+	std::mutex                             m_mutex;
+	std::condition_variable                m_work;
+	std::deque<std::shared_ptr<DiskReadJob>> m_queue;
+	std::vector<std::thread>                m_threads;
+	std::atomic<size_t>                     m_ready_bytes {0};
+	bool                                    m_stopped = false;
 };
 
 // Vertex and pixel SRT refresh in parallel (plan.md P10, after Jetsku's draw-prep S3, c7c4da45).
@@ -1356,13 +1938,105 @@ struct PipelineCache::ProgramCache {
 		        .program = std::move(result.program).TakeCompiledInfo()};
 	}
 
-	// A compiled (or cached) permutation of the source: its module, bound for this stage.
+	// [shader-compile] (stderr, 10 ms or more, first 1000): what the GPU thread spent on a new
+	// permutation since `begin`: translating (`translated` "here"; "worker" if a worker did),
+	// emitting SPIR-V and creating the module, or, with `worker_ms` set, only taking what a worker
+	// compiled in that time (KYTY_SHADER_WORKERS).
+	void LogShaderCompile(const char* stage_name, uint64_t hash, std::chrono::steady_clock::time_point begin,
+	                      const char* translated, double worker_ms = 0.0) const {
+		const auto us = static_cast<int64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin)
+		        .count());
+		Profiler::Add(Profiler::Counter::ShadersCompiled);
+		Profiler::Add(Profiler::Counter::ShaderCompileTime, us);
+		Profiler::Message(Profiler::MessageInfo, "Shader compiled: %s 0x%016" PRIx64 " in %.1f ms, %zu SPIR-V words",
+		                  stage_name, hash, static_cast<double>(us) / 1000.0, last_spirv_words);
+		static std::atomic<uint32_t> slow_logged {0};
+		if (us >= 10000 && slow_logged.fetch_add(1, std::memory_order_relaxed) < 1000u) {
+			char worker[48] = "";
+			if (worker_ms > 0.0) {
+				std::snprintf(worker, sizeof(worker), " compiled=worker(%.0f ms)", worker_ms);
+			}
+			std::fprintf(stderr, "[shader-compile] at=%.3f %s 0x%016" PRIx64 " %.0f ms words=%zu translated=%s%s\n",
+			             SteadySeconds(), stage_name, hash, static_cast<double>(us) / 1000.0, last_spirv_words,
+			             translated, worker);
+		}
+	}
+
+	// May this lookup leave its shader's work to the translation workers? Draws that translate
+	// deferred are skipped meanwhile; with KYTY_SHADER_WORKERS, other draws and dispatches whose
+	// packet may be suspended wait a slice at a time.
+	[[nodiscard]] bool SkipsWhileWorking(ShaderType stage) const {
+		return defer_translation && stage != ShaderType::Compute;
+	}
+	[[nodiscard]] bool WorkersMayTake(ShaderType stage) const {
+		return translators != nullptr &&
+		       (SkipsWhileWorking(stage) || (g_shader_workers && t_pipeline_suspend_allowed));
+	}
+	// The draw skipped, or its packet suspended (it runs again), while a worker has its shader.
+	ShaderProgram NotReady(ShaderType stage, uint64_t hash, const char* doing) {
+		if (g_shader_workers && t_pipeline_suspend_allowed && !SkipsWhileWorking(stage)) {
+			t_pipeline_suspended = true;
+		}
+		translation_skips++;
+		Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": %s", StageLabel(stage), hash, doing);
+		return ShaderProgram {};
+	}
+	// Hands `job`, translated, to the workers to compile (KYTY_SHADER_WORKERS).
+	template <typename InputInfo>
+	ShaderProgram SubmitCompile(const ProgramKey& key, std::shared_ptr<TranslationJob> job, ShaderType stage,
+	                            const ShaderRecompiler::CompileOptions& options, const InputInfo& input_info,
+	                            const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                            uint32_t push_data_cursor, std::span<const uint8_t> permutation_key) {
+		job->SetInputs(options, input_info, options.user_data, options.back_code);
+		job->compile          = true;
+		job->specialization   = specialization;
+		job->push_data_cursor = push_data_cursor;
+		job->device           = device;
+		job->encode           = disk != nullptr;
+		job->permutation_key.assign(permutation_key.begin(), permutation_key.end());
+		job->queued = std::chrono::steady_clock::now();
+		job->done.store(false, std::memory_order_relaxed);
+		translating.insert_or_assign(key, job);
+		translators->Submit(std::move(job));
+		return NotReady(stage, options.shader_hash, "compiling");
+	}
+	// A permutation a worker compiled (KYTY_SHADER_WORKERS) joins the source; its handle when this
+	// lookup needs it (the same specialization and push data start), else an empty one.
+	template <typename InputInfo>
+	ShaderProgram TakeWorkerCompile(SourceEntry& source, TranslationJob& job, const char* stage_name,
+	                                const ShaderRecompiler::CompileOptions& options, InputInfo& input_info,
+	                                uint32_t& push_data_cursor) {
+		last_spirv_words  = job.spirv.size();
+		const auto& layout = job.program.bindings;
+		const bool  fits   = job.specialization == source.specialization &&
+		                  layout.push_data_start_dword ==
+		                      ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+		                                                               layout.ShaderDataDwords());
+		InputInfo     other_input  = input_info;
+		uint32_t      other_cursor = job.push_data_cursor;
+		ShaderProgram handle       = AddPermutation(source, stage_name, options, job.spirv, std::move(job.program),
+		                                            fits ? input_info : other_input,
+		                                            fits ? push_data_cursor : other_cursor,
+		                                            &job.specialization, job.module);
+		job.module = nullptr;
+		if (disk != nullptr && !job.permutation_payload.empty()) {
+			// After AddPermutation: SPIR-V that fails validation is never stored.
+			StoreEntry(false, options.shader_hash, job.permutation_key, {}, job.permutation_payload);
+		}
+		return fits ? handle : ShaderProgram {};
+	}
+
+	// A compiled (or cached) permutation of the source: its module, bound for this stage. It is for
+	// `specialization` (default: the source's current one); `module`, when set, was made on a worker.
 	template <typename InputInfo>
 	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
 	                             const ShaderRecompiler::CompileOptions&  options,
 	                             const std::vector<uint32_t>&             spirv,
 	                             ShaderRecompiler::IR::CompiledShaderInfo program,
-	                             InputInfo& input_info, uint32_t& push_data_cursor) {
+	                             InputInfo& input_info, uint32_t& push_data_cursor,
+	                             const ShaderRecompiler::IR::ResourceSpecialization* specialization = nullptr,
+	                             vk::ShaderModule worker_module = nullptr) {
 		Profiler::Phases phases;
 		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
 		KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V validate", profiler::colors::Blue300);
@@ -1374,20 +2048,33 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
-		const auto module = CompileSPV(spirv, device);
+		const auto module_begin = std::chrono::steady_clock::now();
+		const auto module       = worker_module != nullptr ? worker_module : CompileSPV(spirv, device);
 		EXIT_IF(module == nullptr);
 		phases.End();
+		// [shader-module] (stderr, 10 ms or more, first 200): a module made on the GPU thread.
+		if (const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+		                                                              module_begin)
+		                        .count();
+		    worker_module == nullptr && ms >= 10.0) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 200u) {
+				std::fprintf(stderr, "[shader-module] at=%.3f %s 0x%016" PRIx64 " %.0f ms words=%zu\n",
+				             SteadySeconds(), stage_name, options.shader_hash, ms, spirv.size());
+			}
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
 		source.permutations.push_back({
-		    .specialization = source.specialization,
+		    .specialization = specialization != nullptr ? *specialization : source.specialization,
 		    .program        = std::move(program),
 		    .handle         = {.id          = ++next_shader_id,
 		                       .module      = module,
 		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
-		                       .hash        = options.shader_hash},
+		                       .hash        = options.shader_hash,
+		                       .spirv_hash  = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t))},
 		});
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
@@ -1548,6 +2235,103 @@ struct PipelineCache::ProgramCache {
 		if (++disk_lookups % 4096u == 0) {
 			disk->LogTotals("so far");
 		}
+	}
+
+	enum class DiskReadState : uint8_t { Ready, Pending };
+	static constexpr size_t MaxPendingDiskReads = 8192;
+
+	void PruneDiskReads(const std::string& keep_name) {
+		constexpr size_t MaxReadyBytes = size_t {64} << 20u;
+		constexpr size_t LowReadyBytes = size_t {32} << 20u;
+		if (disk_reads.size() < MaxPendingDiskReads &&
+		    disk_readers->ReadyBytes() <= MaxReadyBytes) {
+			return;
+		}
+		const auto now = ShaderWorkClockMs();
+		using Iterator = decltype(disk_reads.begin());
+		std::vector<Iterator> evictable;
+		for (auto it = disk_reads.begin(); it != disk_reads.end();) {
+			const auto& job = it->second;
+			if (it->first == keep_name || !job->done.load(std::memory_order_acquire)) {
+				++it;
+				continue;
+			}
+			if (ShaderWorkAgeMs(now, job->requested_at_ms.load(std::memory_order_relaxed)) >=
+			    2000u) {
+				disk_readers->Forget(*job);
+				it = disk_reads.erase(it);
+				continue;
+			}
+			evictable.push_back(it++);
+		}
+		if (disk_reads.size() < MaxPendingDiskReads &&
+		    disk_readers->ReadyBytes() <= MaxReadyBytes) {
+			return;
+		}
+		std::ranges::sort(evictable, [](const Iterator& a, const Iterator& b) {
+			return a->second->requested_at_ms.load(std::memory_order_relaxed) <
+			       b->second->requested_at_ms.load(std::memory_order_relaxed);
+		});
+		for (const auto it: evictable) {
+			if (disk_reads.size() < MaxPendingDiskReads &&
+			    disk_readers->ReadyBytes() <= LowReadyBytes) {
+				break;
+			}
+			disk_readers->Forget(*it->second);
+			disk_reads.erase(it);
+		}
+	}
+
+	DiskReadState TakeDiskRead(std::span<const uint8_t> key, std::vector<uint8_t>& payload,
+	                           bool& found) {
+		std::string name(reinterpret_cast<const char*>(key.data()), key.size());
+		PruneDiskReads(name);
+		if (const auto it = disk_reads.find(name); it != disk_reads.end()) {
+			const auto& job = it->second;
+			if (!job->done.load(std::memory_order_acquire)) {
+				job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
+				return DiskReadState::Pending;
+			}
+			found   = job->found;
+			disk_readers->Forget(*job);
+			payload = std::move(job->payload);
+			const auto wait_us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(
+			        std::chrono::steady_clock::now() - job->queued)
+			        .count());
+			disk_read_wait_us += wait_us;
+			disk_read_longest_us = std::max(disk_read_longest_us, wait_us);
+			if (++disk_read_completions % 256u == 1u) {
+				LOGF("Shader disk cache: %" PRIu64
+				     " worker reads consumed; wait total %.1f ms, longest %.1f ms\n",
+				     disk_read_completions, static_cast<double>(disk_read_wait_us) / 1000.0,
+				     static_cast<double>(disk_read_longest_us) / 1000.0);
+			}
+			disk_reads.erase(it);
+			return DiskReadState::Ready;
+		}
+
+		if (disk_reads.size() >= MaxPendingDiskReads) {
+			// Keep memory bounded if the game streams unusually many one-off shader keys.
+			found = disk->Load(key, payload);
+			return DiskReadState::Ready;
+		}
+		auto job  = std::make_shared<DiskReadJob>();
+		job->key.assign(key.begin(), key.end());
+		job->queued = std::chrono::steady_clock::now();
+		job->requested_at_ms.store(ShaderWorkClockMs(), std::memory_order_relaxed);
+		auto [it, inserted] = disk_reads.emplace(std::move(name), job);
+		EXIT_IF(!inserted);
+		if (!disk_readers->Submit(job)) {
+			disk_reads.erase(it);
+			found = disk->Load(key, payload);
+			return DiskReadState::Ready;
+		}
+		if (++disk_read_skips % 256u == 1u) {
+			LOGF("Shader disk cache: draws skipped while a worker read a shader record: %" PRIu64 "\n",
+			     disk_read_skips);
+		}
+		return DiskReadState::Pending;
 	}
 
 	template <typename InputInfo>
@@ -1760,7 +2544,7 @@ struct PipelineCache::ProgramCache {
 				if (TakePrepared(&entry->second)) {
 					entry->second.prepared_serial = 0;
 					// Refreshed in this draw's parallel window (PrepareStagesInParallel).
-					static const bool verify = std::getenv("KYTY_STAGE_PREP_VERIFY") != nullptr;
+					static const bool verify = Common::Environment::IsSet("KYTY_STAGE_PREP_VERIFY");
 					materialized             = true;
 					if (verify) {
 						VerifyPrepared(entry->second, runtime, stage, params.hash);
@@ -1792,7 +2576,7 @@ struct PipelineCache::ProgramCache {
 					}
 					// KYTY_LOG_SLOW_SRT=1: refreshes over 1 ms (a guest read that waited for the GPU),
 					// by shader: the first 4 of each, for up to 64 shaders.
-					if (static const bool log_slow = std::getenv("KYTY_LOG_SLOW_SRT") != nullptr;
+					if (static const bool log_slow = Common::Environment::IsSet("KYTY_LOG_SLOW_SRT");
 					    log_slow) {
 						const auto ms = std::chrono::duration<double, std::milli>(
 						                    std::chrono::steady_clock::now() - walk_begin)
@@ -1890,6 +2674,11 @@ struct PipelineCache::ProgramCache {
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			if (stage == ShaderType::Compute && entry->second.permutations.size() >= 16) {
+				ReportPermutationStorm(params.hash, entry->second.permutations.size(), user_data,
+				                       entry->second.resources, entry->second.specialization,
+				                       entry->second.permutations.back().specialization);
+			}
 		}
 
 		if (fast_hit != nullptr) {
@@ -1900,13 +2689,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
+		// KYTY_SHADER_WORKERS: or a compile; a draw or dispatch that is not skipped waits a slice
+		// and suspends its packet, and a dispatch that cannot suspend waits for it.
 		if (!translating.empty()) {
 			if (const auto job = translating.find(lookup_key);
 			    job != translating.end() && !job->second->done.load(std::memory_order_acquire)) {
-				translation_skips++;
-				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
-				                                StageLabel(stage), params.hash);
-				return ShaderProgram {};
+				if (translators != nullptr) {
+					translators->Requested(job->second);
+				}
+				const bool wait = g_shader_workers && translators != nullptr && !SkipsWhileWorking(stage) &&
+				                  (t_pipeline_suspend_allowed || stage == ShaderType::Compute);
+				if (!wait || !translators->Wait(*job->second, t_pipeline_suspend_allowed
+				                                                  ? PipelineWaitSlice
+				                                                  : std::chrono::milliseconds(std::chrono::hours(1)))) {
+					return NotReady(stage, params.hash, job->second->compile ? "compiling" : "translating");
+				}
 			}
 		}
 
@@ -1956,6 +2753,21 @@ struct PipelineCache::ProgramCache {
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
+		// KYTY_SHADER_WORKERS: a compile the workers finished (the check above returned while it
+		// ran). A permutation for another specialization joins the source, and this one goes on.
+		if (const auto job = translating.empty() ? translating.end() : translating.find(lookup_key);
+		    job != translating.end() && job->second->compile) {
+			EXIT_IF(entry == nullptr);
+			const auto taken = std::move(job->second);
+			translating.erase(job);
+			const auto begin  = std::chrono::steady_clock::now();
+			auto       handle = TakeWorkerCompile(entry->second, *taken, stage_name, options, input_info,
+			                                      push_data_cursor);
+			LogShaderCompile(stage_name, params.hash, begin, "worker", taken->worker_ms);
+			if (handle) {
+				return handle;
+			}
+		}
 		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
 		// of a source new to this session, a permutation entry for the compile. In verify mode
 		// both are only compared with a fresh translation. A hit is not a compile: it is not
@@ -1965,15 +2777,30 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint8_t> permutation_key;
 		std::vector<uint8_t> cached_permutation;
 		if (disk != nullptr) {
+			const bool read_async =
+			    disk_readers != nullptr && defer_translation && stage != ShaderType::Compute;
+			const auto skip_for_read = [&] {
+				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": reading shader cache",
+				                                StageLabel(stage), params.hash);
+			};
 			Profiler::Phases disk_zone;
 			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
 			BuildSourceKey(source_key, compile_code, params, options, input_info);
 			if (entry == nullptr) {
-				CountDiskLookup();
 				std::vector<uint8_t>          payload;
 				ShaderDiskCache::SourceRecord record;
-				if (!disk->Load(source_key, payload)) {
+				bool                          found = false;
+				if (read_async) {
+					if (TakeDiskRead(source_key, payload, found) == DiskReadState::Pending) {
+						skip_for_read();
+						return ShaderProgram {};
+					}
+				} else {
+					found = disk->Load(source_key, payload);
+				}
+				CountDiskLookup();
+				if (!found) {
 					disk->counters.source_misses++;
 				} else if (disk_verify) {
 					disk->counters.source_hits++;
@@ -2016,7 +2843,16 @@ struct PipelineCache::ProgramCache {
 				                    push_data_cursor);
 				std::vector<uint8_t>               payload;
 				ShaderDiskCache::PermutationRecord record;
-				if (!disk->Load(permutation_key, payload)) {
+				bool                               found = false;
+				if (read_async) {
+					if (TakeDiskRead(permutation_key, payload, found) == DiskReadState::Pending) {
+						skip_for_read();
+						return ShaderProgram {};
+					}
+				} else {
+					found = disk->Load(permutation_key, payload);
+				}
+				if (!found) {
 					disk->counters.permutation_misses++;
 				} else if (disk_verify) {
 					disk->counters.permutation_hits++;
@@ -2041,6 +2877,7 @@ struct PipelineCache::ProgramCache {
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
 		ShaderRecompiler::TranslateResult translated;
+		std::shared_ptr<TranslationJob>   worker_job;
 		if (const auto job = translating.find(lookup_key); job != translating.end()) {
 			// Done (the check above returned while it was not): take the worker's translation.
 			const auto waited = std::chrono::duration<double, std::milli>(
@@ -2051,33 +2888,21 @@ struct PipelineCache::ProgramCache {
 				     " draws skipped so far while translating\n",
 				     stage_name, params.hash, waited, translation_skips);
 			}
-			translated = std::move(job->second->result);
+			worker_job = std::move(job->second);
+			translated = std::move(worker_job->result);
 			translating.erase(job);
-		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
+		} else if (WorkersMayTake(stage)) {
 			auto job = std::make_shared<TranslationJob>();
 			job->code.assign(compile_code.begin(), compile_code.end());
-			job->back_code.assign(params.back_code.begin(), params.back_code.end());
-			job->user_data.assign(user_data.begin(), user_data.end());
-			job->options           = options;
-			job->options.user_data = job->user_data;
-			job->options.back_code = job->back_code;
-			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-				job->vertex                   = input_info;
-				job->options.input_info.vertex = &job->vertex;
-			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-				job->pixel                   = input_info;
-				job->options.input_info.pixel = &job->pixel;
-			}
+			job->SetInputs(options, input_info, user_data, params.back_code);
 			job->queued = std::chrono::steady_clock::now();
 			translating.emplace(lookup_key, job);
 			translators->Submit(std::move(job));
-			translation_skips++;
-			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
-			                                StageLabel(stage), params.hash);
-			return ShaderProgram {};
+			return NotReady(stage, params.hash, "translating");
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		}
+		const bool worker_translated = worker_job != nullptr;
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
@@ -2093,7 +2918,11 @@ struct PipelineCache::ProgramCache {
 		const bool uses_clock = UsesShaderClock(translated.program);
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 		if (entry == nullptr) {
-			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+			if (worker_job != nullptr && worker_job->plan) {
+				plan = std::move(worker_job->plan); // KYTY_SHADER_WORKERS
+			} else {
+				plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+			}
 			if (disk != nullptr) {
 				std::vector<uint8_t> payload;
 				if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &*plan, payload)) {
@@ -2129,6 +2958,12 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
+		if (g_shader_workers && worker_translated && !disk_verify && WorkersMayTake(stage)) {
+			// KYTY_SHADER_WORKERS: the SPIR-V and the module of this specialization on a worker.
+			worker_job->result = std::move(translated);
+			return SubmitCompile(lookup_key, std::move(worker_job), stage, options, input_info,
+			                     entry->second.specialization, push_data_cursor, permutation_key);
+		}
 		auto compiled = CompileTranslated(options, std::move(translated),
 		                                  entry->second.specialization, push_data_cursor);
 		std::vector<uint8_t> permutation_payload;
@@ -2139,17 +2974,7 @@ struct PipelineCache::ProgramCache {
 		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
 		                                   std::move(compiled.program), input_info,
 		                                   push_data_cursor);
-		{
-			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                         std::chrono::steady_clock::now() - compile_begin)
-			                                         .count());
-			Profiler::Add(Profiler::Counter::ShadersCompiled);
-			Profiler::Add(Profiler::Counter::ShaderCompileTime, us);
-			Profiler::Message(Profiler::MessageInfo,
-			                  "Shader compiled: %s 0x%016" PRIx64 " in %.1f ms, %zu SPIR-V words",
-			                  stage_name, params.hash, static_cast<double>(us) / 1000.0,
-			                  last_spirv_words);
-		}
+		LogShaderCompile(stage_name, params.hash, compile_begin, worker_translated ? "worker" : "here");
 		compile_zone.End();
 		if (disk != nullptr) {
 			// After AddPermutation: SPIR-V that fails validation is never stored.
@@ -2171,13 +2996,28 @@ struct PipelineCache::ProgramCache {
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default 2).
+			// KYTY_TRANSLATION_THREADS=<n> (default a quarter of the hardware threads, 2 to 6).
 			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
 			const auto  threads = std::max<uint32_t>(
-			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+			                     : DefaultWorkerThreads(),
+			    1u);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
 			                 threads);
+		}
+		// KYTY_SHADER_READ_THREADS=<n> (opt-in, e.g. 4; default 0: cache reads on the GPU thread).
+		// A read in flight skips its 3D draw at each run's first use of a cached shader, a draw
+		// that writes memory included (see TryGetGraphicsPipeline).
+		const char* reads_value = std::getenv("KYTY_SHADER_READ_THREADS");
+		const auto  read_threads = reads_value != nullptr
+		                              ? static_cast<uint32_t>(std::min<unsigned long>(
+		                                    std::strtoul(reads_value, nullptr, 10), 16ul))
+		                              : 0u;
+		if (disk != nullptr && !disk_verify && read_threads != 0) {
+			disk_readers = std::make_unique<DiskReaders>(*disk, read_threads);
+			PipelineCacheLog("Shader disk cache: graphics records read on {} worker threads",
+			                 read_threads);
 		}
 		if (g_stage_prep_parallel) {
 			stage_prep = std::make_unique<StagePrepWorker>();
@@ -2190,6 +3030,10 @@ struct PipelineCache::ProgramCache {
 			disk->Flush();
 			disk->LogTotals("saved");
 		}
+	}
+	void StopDiskReaders() {
+		disk_readers.reset();
+		disk_reads.clear();
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -2377,6 +3221,14 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Pending asynchronous shader-cache reads are owned by the GPU thread; the workers only fill
+	// their payload and publish `done`. Declared after `disk` so they stop before the Store dies.
+	std::unordered_map<std::string, std::shared_ptr<DiskReadJob>> disk_reads;
+	std::unique_ptr<DiskReaders>                                 disk_readers;
+	uint64_t                                                     disk_read_skips      = 0;
+	uint64_t                                                     disk_read_completions = 0;
+	uint64_t                                                     disk_read_wait_us    = 0;
+	uint64_t                                                     disk_read_longest_us = 0;
 	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
 	std::unordered_map<ProgramKey, std::shared_ptr<TranslationJob>, ProgramKeyHash> translating;
 	uint64_t                                                    translation_skips = 0;
@@ -2548,7 +3400,7 @@ struct PipelineCache::ProgramCache {
 		// KYTY_FPS_LOG: why a scanned program has no entry (first miss of each shader): the
 		// fields of the keys the GPU thread inserted for the same shader that differ.
 		if (entry == programs.end()) {
-			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 			static std::mutex                   diag_mutex;
 			static std::unordered_set<uint64_t> diag_seen;
 			if (log) {
@@ -2577,7 +3429,7 @@ struct PipelineCache::ProgramCache {
 	// KYTY_FPS_LOG: the shaders the scanner could not prepare most often (no entry / walk failed),
 	// every 10 s.
 	static void NoteScanMiss(uint64_t hash, bool walk) {
-		static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+		static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 		if (!log) return;
 		static std::mutex                                                  mutex;
 		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> misses;
@@ -2617,7 +3469,7 @@ struct PipelineCache::ProgramCache {
 		    !SrtVerifyRead(address, values)) {
 			reader.failed = true;
 			// KYTY_FPS_LOG: the first refused reads of each shader, and why.
-			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 			if (log) {
 				static std::mutex                                 diag_mutex;
 				static std::unordered_map<uint64_t, uint32_t>     diag_seen;
@@ -2696,7 +3548,7 @@ struct PipelineCache::ProgramCache {
 			t_srt_verify = nullptr;
 		}
 		if (!ok || reader.failed) {
-			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && !reader.failed) {
+			if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log && !reader.failed) {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1) < 16) {
 					std::fprintf(stderr, "[draw-prep-walk] %016llx walk failed without a refused read\n",
@@ -2869,11 +3721,22 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
           ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	StartDriverCacheSaver();
 	if (g_async_pipelines) {
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
-		m_compiler         = std::make_unique<PipelineCompiler>(threads);
-		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
-		                 g_pipeline_wait.count());
+		// KYTY_PIPELINE_THREADS=<n> (default a quarter of the hardware threads, 2 to 6).
+		const char* value   = std::getenv("KYTY_PIPELINE_THREADS");
+		const auto  threads = std::max<uint32_t>(
+		    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
+		                     : DefaultWorkerThreads(),
+		    1u);
+		const auto background_threads = PipelineBackgroundWorkerCount(threads);
+		m_compiler = std::make_unique<PipelineCompiler>(threads, background_threads);
+		PipelineCacheLog(
+		    "Vulkan pipelines: compiled on {} worker threads ({} for background work; wait {} ms per "
+		    "{} ms; driver cache probe {}; quick {})",
+		    threads, background_threads, g_pipeline_wait.count(), g_pipeline_wait_window.count(),
+		    PipelineCacheProbeEnabled(m_graphics) ? "on" : "off",
+		    PipelineQuickEnabled() ? "on" : "off");
 	}
 }
 
@@ -2882,9 +3745,14 @@ PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
-			if (pipeline->pending && pipeline->pending->done.load(std::memory_order_acquire)) {
+		if (pipeline->pending && pipeline->pending->done.load(std::memory_order_acquire) &&
+		    pipeline->pending->pipeline != pipeline->pipeline) {
 				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
 			}
+		if (pipeline->pending && pipeline->pending->quick != nullptr &&
+		    pipeline->pending->quick != pipeline->pipeline) {
+			m_graphics.device.destroyPipeline(pipeline->pending->quick, nullptr);
+		}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
@@ -2892,6 +3760,9 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto pipeline: m_quick_retired) {
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -2975,7 +3846,9 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	m_program_cache->StopDiskReaders();
 	m_program_cache->FlushDisk();
+	StopDriverCacheSaver();
 	// No worker may use the driver cache once it is destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {
@@ -2984,7 +3857,55 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	WriteDriverCache("");
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
 
+// KYTY_PIPELINE_CACHE_SAVE_S (default 120; 0 = only at exit): the driver cache is also written
+// every so many seconds while new pipelines were built. It used to be written only at exit, and a
+// lost device (every 20-40 minutes in Wolverine) threw away every pipeline the session compiled.
+void PipelineCache::StartDriverCacheSaver() {
+	static const uint32_t interval_s = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_SAVE_S");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 120u;
+	}();
+	if (m_driver_cache == nullptr || interval_s == 0) {
+		return;
+	}
+	m_cache_saver = std::thread([this] {
+		uint64_t saved_builds = g_pipelines_built.load(std::memory_order_relaxed);
+		std::unique_lock lock(m_cache_saver_mutex);
+		while (!m_cache_saver_cv.wait_for(lock, std::chrono::seconds(interval_s),
+		                                  [this] { return m_cache_saver_stop; })) {
+			const auto builds = g_pipelines_built.load(std::memory_order_relaxed);
+			if (builds == saved_builds) {
+				continue;
+			}
+			lock.unlock();
+			if (WriteDriverCache(" (periodic)")) {
+				saved_builds = builds;
+			}
+			lock.lock();
+		}
+	});
+}
+
+void PipelineCache::StopDriverCacheSaver() {
+	{
+		std::lock_guard lock(m_cache_saver_mutex);
+		m_cache_saver_stop = true;
+	}
+	m_cache_saver_cv.notify_all();
+	if (m_cache_saver.joinable()) {
+		m_cache_saver.join();
+	}
+}
+
+// The driver cache as the file InitializeDriverCache reads (any thread; the cache itself is not
+// externally synchronized, so workers may keep compiling into it).
+bool PipelineCache::WriteDriverCache(const char* reason) {
+	std::lock_guard      write_lock(m_cache_write_mutex);
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -3005,7 +3926,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -3013,7 +3934,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -3030,12 +3951,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}{}", payload.size(),
+	                 Common::PathToString(m_driver_cache_path), reason);
+	return true;
 }
 
 // Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
@@ -3307,14 +4227,53 @@ bool PipelineCache::SrtDeferPending() {
 	return t_srt_defer_tick != 0;
 }
 
+bool PipelineCache::PipelineSuspendPending() {
+	return t_pipeline_suspended;
+}
+
+// KYTY_PIPELINE_WAIT_SUSPEND=1 (opt-in, Play.bat): a draw that waits for its pipeline (up to
+// KYTY_PIPELINE_SYNC_WAIT_MS / _WRITE_WAIT_MS) waits 4 ms at a time, and between those its packet
+// is suspended so the GPU thread serves the commands queued meanwhile. The game threads'
+// readbacks queued ~2 s behind such waits (19 over 500 ms in the 248 s run of 2026-10-24 00:53),
+// the game stopped meanwhile.
+static const bool g_pipeline_wait_suspend = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_WAIT_SUSPEND");
+	return value != nullptr && value[0] == '1';
+}();
+
+void PipelineCache::BeginPipelineSuspend(bool allowed) {
+	t_pipeline_suspend_allowed = allowed && g_pipeline_wait_suspend;
+	t_pipeline_suspended       = false;
+}
+
+bool PipelineCache::EndPipelineSuspend() {
+	t_pipeline_suspend_allowed = false;
+	return std::exchange(t_pipeline_suspended, false);
+}
+
 bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
+}
+
+// The host subgroup width the translator assumes for a compute shader. KYTY_WAVE_LDS_HOST_SUBGROUP=1:
+// the guest's wave size when the pipeline requires it (CreatePipelineInternal; AMD runs a wave32
+// shader on 32-wide subgroups, not 64), so WaveLdsScope sees one guest wave per host subgroup.
+static uint32_t ComputeHostSubgroupSize(const GraphicContext& graphics, uint32_t wave_size) {
+	static const bool exact = [] {
+		const char* value = std::getenv("KYTY_WAVE_LDS_HOST_SUBGROUP");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (exact && graphics.compute_subgroup_size_control_enabled &&
+	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+		return wave_size;
+	}
+	return graphics.SupportsComputeWave64() ? 64u : 32u;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.host_subgroup_size = ComputeHostSubgroupSize(m_graphics, regs.cs_regs.wave_size);
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
@@ -3339,7 +4298,7 @@ bool PipelineCache::DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW:
 		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
 		return false;
 	}
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	input_info.host_subgroup_size = ComputeHostSubgroupSize(m_graphics, regs.cs_regs.wave_size);
 	const auto params             = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage        = input_info.lds_size_dwords * 4u >
 	                         m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
@@ -3368,15 +4327,35 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	auto& job = *pipeline.pending;
 	if (!job.done.load(std::memory_order_acquire)) {
 		if (m_compiler != nullptr && !m_compiler->Stopped()) {
+			if (job.quick_ready.load(std::memory_order_acquire)) {
+				if (pipeline.pipeline == nullptr) {
+					pipeline.pipeline = job.quick;
+					job.quick       = nullptr;
+				}
+				return pipeline.pipeline != nullptr;
+			}
 			return false;
 		}
 		// The workers stopped before this job started: compile it here.
-		job.result = CreateGraphicsPipeline(*job.build, m_driver_cache, &job.pipeline);
+		job.result = CreateGraphicsPipeline(
+		    *job.build, m_driver_cache, &job.pipeline,
+		    job.unoptimized ? PipelineCompile::Unoptimized : PipelineCompile::Normal);
 		Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 		job.done.store(true, std::memory_order_release);
 	}
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
+	if (job.quick != nullptr) {
+		if (pipeline.pipeline == nullptr) {
+			// The optimized build won the race before any draw used the quick handle.
+			m_graphics.device.destroyPipeline(job.quick, nullptr);
+		}
+		job.quick = nullptr;
+	}
+	if (pipeline.pipeline != nullptr && pipeline.pipeline != job.pipeline) {
+		m_quick_retired.push_back(pipeline.pipeline);
+	}
 	pipeline.pipeline = job.pipeline;
+	job.pipeline     = nullptr;
 	pipeline.pending.reset();
 	return true;
 }
@@ -3580,10 +4559,60 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
+	// A compile its draws wait for, still running: true once it is done. A draw whose packet may
+	// run again waits one slice at a time (KYTY_PIPELINE_WAIT_SUSPEND).
+	const auto wait_pending = [&](PendingGraphicsPipeline& job) {
+		if (job.done.load(std::memory_order_acquire) ||
+		    job.quick_ready.load(std::memory_order_acquire)) {
+			return true;
+		}
+		const auto now  = std::chrono::steady_clock::now();
+		const auto left = std::chrono::ceil<std::chrono::milliseconds>(job.deadline - now);
+		if (left.count() <= 0) {
+			return job.done.load(std::memory_order_acquire) ||
+			       job.quick_ready.load(std::memory_order_acquire);
+		}
+		if (job.waited_since == std::chrono::steady_clock::time_point {}) {
+			job.waited_since = now;
+		}
+		return m_compiler->Wait(job, t_pipeline_suspend_allowed ? std::min(left, PipelineWaitSlice)
+		                                                        : left);
+	};
+	// Not ready: before its deadline the packet is suspended and runs again; past it, and for
+	// background compiles, the draw is skipped.
+	const auto not_ready = [&](const PendingGraphicsPipeline& job) -> Pipeline* {
+		if (t_pipeline_suspend_allowed && std::chrono::steady_clock::now() < job.deadline) {
+			t_pipeline_suspended = true;
+			return nullptr;
+		}
+		return defer();
+	};
+	static const std::chrono::milliseconds sync_wait = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SYNC_WAIT_MS");
+		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 3000u);
+	}();
+	static const std::chrono::milliseconds write_wait = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_WRITE_WAIT_MS");
+		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 10000u);
+	}();
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		auto& found = *iter->second;
-		if (found.pending && !FinishPending(found)) {
-			return defer();
+		if (found.pending && m_compiler != nullptr) {
+			const bool urgent = g_pipeline_urgent_first &&
+			                    (!may_defer || !found.pending->background);
+			// Once: a draw suspended for it (KYTY_PIPELINE_WAIT_SUSPEND) looks it up again every
+			// slice, and a deadline pushed back each time never ends the wait.
+			if (urgent && found.pending->deadline == std::chrono::steady_clock::time_point {}) {
+				const auto wait = may_defer ? sync_wait : write_wait;
+				found.pending->deadline = std::chrono::steady_clock::now() + wait;
+			}
+			m_compiler->Requested(found.pending, urgent);
+		}
+		if (const auto job = found.pending) { // FinishPending drops found's
+			if (!FinishPending(found) && (!wait_pending(*job) || !FinishPending(found))) {
+				return not_ready(*job);
+			}
+			LogPipelineWait(*job);
 		}
 		return &found;
 	}
@@ -3605,7 +4634,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		const char* value = std::getenv("KYTY_SLOW_GRAPHICS_TRY");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (!slow_try &&
+	if (!slow_try && !PipelineQuickEnabled() &&
 	    SlowGraphicsPipelineListed(vs_input_info.stage.program->shader_hash,
 	                               ps_active ? ps_input_info->stage.program->shader_hash : 0)) {
 		return defer();
@@ -3628,7 +4657,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// while its pipeline compiles left that data unwritten: the next draws read garbage counts and
 	// faulted (device lost as the title scene first appeared, ~1 run in 4). These compile at once.
 	// KYTY_DEFER_WRITING_DRAWS=1 restores deferring them.
-	static const bool defer_writing = std::getenv("KYTY_DEFER_WRITING_DRAWS") != nullptr;
+	static const bool defer_writing = Common::Environment::IsSet("KYTY_DEFER_WRITING_DRAWS");
 	const auto stage_writes = [](const auto* program) {
 		if (program == nullptr) {
 			return false;
@@ -3655,35 +4684,112 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// thread, as before): NVIDIA's compiler never finished one pipeline of the Wolverine save of
 	// 2026-10-20 (VS 0xd1ea70c7117d4d3a, PS 0x85892b3b3d0a61ba), which froze the game for good on
 	// the GPU thread. Past the wait the draw is skipped like a background compile's.
-	static const std::chrono::milliseconds sync_wait = [] {
-		const char* value = std::getenv("KYTY_PIPELINE_SYNC_WAIT_MS");
-		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 3000u);
-	}();
-	static const std::chrono::milliseconds write_wait = [] {
-		const char* value = std::getenv("KYTY_PIPELINE_WRITE_WAIT_MS");
-		return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 10000u);
-	}();
 	const bool background = may_defer && (defer_writing || !writes_memory) &&
 	                        spirv_words > g_pipeline_sync_words && !layer_draw;
-	const auto budget = background ? g_pipeline_wait : may_defer ? sync_wait : write_wait;
+	// A pipeline the driver has cached is taken at once, on this thread, whatever kind of draw
+	// needs it: no wait, no skipped draw. The others are compiled as below, and a background one
+	// does not wait at all: the wait only ever caught pipelines the driver had cached.
+	bool compile_required = false;
+	if (PipelineCacheProbeEnabled(m_graphics) && m_driver_cache != nullptr) {
+		const auto probe = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline,
+		                                          PipelineCompile::CacheOnly);
+		CountPipelineCacheProbe(probe == vk::Result::eSuccess && cached->pipeline != nullptr);
+		if (probe == vk::Result::eSuccess && cached->pipeline != nullptr) {
+			LogPipelineTrace("CreatePipelineInternal done (driver cache)", vs_id, ps_id);
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			return iter->second.get();
+		}
+		// Any other answer: compile as before.
+		cached->pipeline = nullptr;
+		compile_required = probe == vk::Result::ePipelineCompileRequired;
+		// KYTY_PIPELINE_MISS_LOG=1 (log only): the first 512 misses, each stage's guest and SPIR-V
+		// hash and the static state's. Since build 2026-10-22 20:01 warm runs miss ~90% (24 hits,
+		// 233 compiles); the same guest shader with another SPIR-V hash in the next run means the
+		// emitted code changes from run to run. The state hash covers raw bytes, padding included.
+		static const bool miss_log = [] {
+			const char* value = std::getenv("KYTY_PIPELINE_MISS_LOG");
+			return value != nullptr && value[0] == '1';
+		}();
+		static std::atomic<uint32_t> miss_logged {0};
+		if (miss_log && miss_logged.fetch_add(1) < 512u) {
+			uint64_t vs_spirv = 0;
+			for (const auto& program: programs.vertex) {
+				vs_spirv = vs_spirv * 31u + program.spirv_hash;
+			}
+			std::fprintf(stderr,
+			             "[pipeline-miss] VS %016" PRIx64 " spv %016" PRIx64 " PS %016" PRIx64
+			             " spv %016" PRIx64 " static %016" PRIx64 " rendering %016" PRIx64
+			             " result %d\n",
+			             vertex_program.hash, vs_spirv, ps_active ? pixel_program.hash : 0,
+			             ps_active ? pixel_program.spirv_hash : 0,
+			             XXH3_64bits(&key.static_params, sizeof(key.static_params)),
+			             XXH3_64bits(&key.rendering, sizeof(key.rendering)), static_cast<int>(probe));
+		}
+	}
+	auto budget = background ? g_pipeline_wait : may_defer ? sync_wait : write_wait;
+	const auto wait_begin = std::chrono::steady_clock::now();
+	if (background && compile_required) {
+		budget = std::chrono::milliseconds {0};
+	} else if (background && g_pipeline_wait_window.count() > 0) {
+		if (wait_begin - m_wait_window_start >= g_pipeline_wait_window) {
+			m_wait_window_start = wait_begin;
+			m_wait_window_used  = {};
+		}
+		budget = std::max(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                      g_pipeline_wait - m_wait_window_used),
+		                  std::chrono::milliseconds {0});
+	}
 	if ((background || budget.count() > 0) && m_compiler != nullptr && !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
 		// the background, and its draws are skipped until it is ready.
+		// The driver cache lacks it and the draw waits: unoptimized now, optimized for the cache.
+		const bool fast =
+		    !PipelineQuickEnabled() && g_urgent_fast_compile && !background && compile_required &&
+		    !(build->pipeline_info.flags & vk::PipelineCreateFlagBits::eDisableOptimization);
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
 		job->build        = std::move(build);
+		job->unoptimized  = fast;
+		job->background   = background;
 		job->driver_cache = m_driver_cache;
 		job->vs_hash      = vs_input_info.stage.program->shader_hash;
 		job->ps_hash      = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+		job->spirv_words  = spirv_words;
+		job->wait_reason  = background                                    ? "background"
+		                    : writes_memory && (!may_defer || !defer_writing) ? "writes-memory"
+		                    : !may_defer                                    ? "small-target"
+		                    : layer_draw                                    ? "layer"
+		                                                                    : "small";
+		if (!background) {
+			job->deadline = wait_begin + budget;
+		}
 		cached->pending   = job;
 		Profiler::Add(Profiler::Counter::PipelinesPending);
-		m_compiler->Submit(job);
-		(void)m_compiler->Wait(*job, budget);
+		m_compiler->Submit(job, g_pipeline_urgent_first && !background);
+		if (fast) {
+			m_compiler->Warm([build = job->build, driver_cache = m_driver_cache] {
+				vk::Pipeline warm = nullptr;
+				if (CreateGraphicsPipeline(*build, driver_cache, &warm, PipelineCompile::CacheWarm) ==
+				        vk::Result::eSuccess &&
+				    warm != nullptr) {
+					build->device.destroyPipeline(warm, nullptr);
+					g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
+				}
+			});
+		}
+		if (background) {
+			(void)m_compiler->Wait(*job, budget);
+			m_wait_window_used += std::chrono::steady_clock::now() - wait_begin;
+		} else {
+			(void)wait_pending(*job);
+		}
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 		EXIT_IF(!inserted);
 		auto& pipeline = *iter->second;
 		if (!FinishPending(pipeline)) {
-			return defer();
+			return not_ready(*job);
 		}
+		LogPipelineWait(*job);
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
 	}
@@ -3703,16 +4809,55 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	return iter->second.get();
 }
 
-PipelineCache::Pipeline&
-PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                  const ShaderProgram&          compute_program) {
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
 
+	// FinishPending for compute: true once the worker's pipeline is in place.
+	const auto finish = [this](Pipeline& pipeline) {
+		auto& job = *pipeline.pending;
+		if (!job.done.load(std::memory_order_acquire)) {
+			if (!m_compiler->Stopped()) {
+				return false;
+			}
+			// The workers stopped before this job started: compile it here.
+			job.result = m_graphics.device.createComputePipelines(m_driver_cache, 1,
+			                                                      &job.compute->info, nullptr,
+			                                                      &job.pipeline);
+			Profiler::Add(Profiler::Counter::PipelinesPending, -1);
+			job.done.store(true, std::memory_order_release);
+		}
+		EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
+		pipeline.pipeline = job.pipeline;
+		job.pipeline      = nullptr;
+		pipeline.pending.reset();
+		return true;
+	};
+	// Never skipped: it waits, a slice at a time when its packet may run again.
+	const auto ready = [&](Pipeline& pipeline) -> Pipeline* {
+		const auto job = pipeline.pending; // finish drops pipeline's
+		for (bool waited = false; !finish(pipeline); waited = true) {
+			if (waited && t_pipeline_suspend_allowed) {
+				t_pipeline_suspended = true;
+				return nullptr;
+			}
+			if (job->waited_since == std::chrono::steady_clock::time_point {}) {
+				job->waited_since = std::chrono::steady_clock::now();
+			}
+			(void)m_compiler->Wait(*job, t_pipeline_suspend_allowed ? PipelineWaitSlice
+			                                                        : std::chrono::milliseconds {100});
+		}
+		LogPipelineWait(*job);
+		return &pipeline;
+	};
+
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
+		auto& found = *iter->second;
+		return found.pending ? ready(found) : &found;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -3726,17 +4871,50 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		zone.SetText("CS 0x%016" PRIx64, hash);
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto begin = std::chrono::steady_clock::now();
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
-		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+		std::unique_ptr<ComputePipelineWarm> warm;
+		std::unique_ptr<ComputePipelineWarm> deferred;
+		const bool workers = m_compiler != nullptr && !m_compiler->Stopped();
+		const bool fast    = g_compute_fast_compile && workers;
+		const bool async   = g_compute_async && t_pipeline_suspend_allowed && workers;
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
+		                       fast ? &warm : nullptr, async ? &deferred : nullptr);
+		if (deferred != nullptr) {
+			auto job          = std::make_shared<PendingGraphicsPipeline>();
+			job->compute      = std::move(deferred);
+			job->unoptimized  = static_cast<bool>(job->compute->info.flags &
+			                                      vk::PipelineCreateFlagBits::eDisableOptimization);
+			job->driver_cache = m_driver_cache;
+			job->vs_hash      = hash;
+			job->spirv_words  = compute_program.spirv_words;
+			job->wait_reason  = "dispatch";
+			cached->pending   = job;
+			Profiler::Add(Profiler::Counter::PipelinesPending);
+			m_compiler->Submit(std::move(job), true);
+		} else {
+			ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+		}
+		if (warm != nullptr) {
+			m_compiler->Warm([owned = std::shared_ptr<ComputePipelineWarm>(std::move(warm)),
+			                  driver_cache = m_driver_cache] {
+				vk::Pipeline pipeline = nullptr;
+				if (owned->device.createComputePipelines(driver_cache, 1, &owned->info, nullptr,
+				                                         &pipeline) == vk::Result::eSuccess &&
+				    pipeline != nullptr) {
+					owned->device.destroyPipeline(pipeline, nullptr);
+					g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
+				}
+			});
+		}
 	}
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr && !cached->pending);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	auto& pipeline = *iter->second;
+	return pipeline.pending ? ready(pipeline) : &pipeline;
 }
 void SrtVerifyReportMiss(uint64_t shader_hash) {
 	bool inserted = false;

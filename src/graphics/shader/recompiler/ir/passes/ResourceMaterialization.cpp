@@ -36,13 +36,32 @@ bool SpecializationFail(std::string_view message) {
 	return false;
 }
 
+// KYTY_ARRAYED_IMAGES=1 (off by default): a sampled image read by an array instruction stays an
+// array when the texture bound has one layer (or is null), bound as a one-layer array view.
+// Otherwise the same shader became another SPIR-V, and another pipeline compile, whenever the game
+// bound a 2D texture where it had bound an array (Wolverine, 2026-10-24: 123 of 208 shaders with
+// several permutations; docs/AUDITORIA-SHADERS-PIPELINES.md, finding 1). Storage images keep the
+// descriptor's type: the host binds a storage array only to an array texture.
+bool ArrayedImagesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ARRAYED_IMAGES");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
-                                            Decoder::ImageDimension requested) {
+                                            Decoder::ImageDimension requested, bool keep_array) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DArray ||
 	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
+	// The single-layer types below keep the array the instruction asked for.
+	const auto keep = [&](Decoder::ImageDimension single, Decoder::ImageDimension array) {
+		return keep_array && requested == array ? array : single;
+	};
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
-		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
+		case Prospero::ImageType::kColor1D:
+			return keep(Decoder::ImageDimension::Dim1D, Decoder::ImageDimension::Dim1DArray);
 		case Prospero::ImageType::kColor1DArray:
 			if (is_array) {
 				return Decoder::ImageDimension::Dim1DArray;
@@ -60,8 +79,10 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 				return Decoder::ImageDimension::Dim2DMsaaArray;
 			}
 			return Decoder::ImageDimension::Dim2DMsaa;
-		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2D:
+			return keep(Decoder::ImageDimension::Dim2D, Decoder::ImageDimension::Dim2DArray);
+		case Prospero::ImageType::kColor2DMsaa:
+			return keep(Decoder::ImageDimension::Dim2DMsaa, Decoder::ImageDimension::Dim2DMsaaArray);
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }
@@ -662,10 +683,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(
 			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
+		const bool keep_array =
+		    ArrayedImagesEnabled() && base.resource_class == ImageResourceClass::Sampled;
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
+			image.dimension     = keep_array && (base.dimension == Decoder::ImageDimension::Dim1DArray ||
+			                                     base.dimension == Decoder::ImageDimension::Dim2DArray)
+			                          ? base.dimension
+			                          : Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
 			if (image.bindless) {
 				// No one descriptor describes a bindless image: keep the dimension the
@@ -677,7 +703,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			continue;
 		}
-		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
+		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension, keep_array);
 		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
 			return SpecializationFail(fmt::format(
 			    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"

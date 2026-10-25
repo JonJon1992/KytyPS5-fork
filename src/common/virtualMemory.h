@@ -41,6 +41,9 @@ bool     FlushInstructionCache(uint64_t address, uint64_t size);
 // Linux the strict-overcommit CommitLimit. False where no such limit applies (Linux with heuristic
 // overcommit, macOS) or it cannot be read.
 bool     QueryCommit(uint64_t& limit, uint64_t& available);
+// This process's resident set (Windows: working set) and private committed bytes. False where it
+// cannot be read (not on Linux or macOS yet).
+bool     QueryProcessMemory(uint64_t& resident, uint64_t& private_bytes);
 
 } // namespace VirtualMemory
 

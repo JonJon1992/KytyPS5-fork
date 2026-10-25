@@ -516,7 +516,8 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto src_wide = src.wstring();
 	auto dst_wide = dst.wstring();
-	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
+	// One step: deleting the destination first left only the source behind if the process died in between.
+	return MoveFileExW(src_wide.c_str(), dst_wide.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {

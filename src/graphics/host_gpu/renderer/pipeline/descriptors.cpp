@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -617,7 +618,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	const auto base_lod = view.base_level * 256u;
 	// KYTY_IGNORE_MIN_LOD=1: diagnostic, sample every mip regardless of the T#'s MIN_LOD clamp.
-	static const bool ignore_min_lod = std::getenv("KYTY_IGNORE_MIN_LOD") != nullptr;
+	static const bool ignore_min_lod = Common::Environment::IsSet("KYTY_IGNORE_MIN_LOD");
 	if (!ignore_min_lod && descriptor.MinLod() > base_lod) {
 		view.min_lod = descriptor.MinLod() - base_lod;
 	}
@@ -1254,7 +1255,7 @@ static std::atomic<uint64_t> g_bindless_levels_stats[16] {};
 static std::atomic<uint64_t> g_bindless_minlod_stats[16] {};
 static std::atomic<uint64_t> g_bindless_type_stats[64] {};
 static bool BindlessStatsEnabled() {
-	static const bool enabled = std::getenv("KYTY_BINDLESS_STATS") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_BINDLESS_STATS");
 	return enabled;
 }
 static void BindlessStat(BindlessStat stat, uint64_t n = 1) {
@@ -1853,7 +1854,7 @@ static uint64_t MipChainBytes(const ShaderTextureResource& descriptor, uint32_t 
 // - mip_stats: entries enabling the PS5's mip statistics;
 // then the write watch's totals since the last line.
 static void LogBindlessHeapStats(BindlessTable& table, uint64_t frame) {
-	static const bool enabled = std::getenv("KYTY_BINDLESS_HEAP_STATS") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_BINDLESS_HEAP_STATS");
 	static uint64_t   next    = 0;
 	if (!enabled || frame < next) {
 		return;
@@ -2013,7 +2014,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 	}
 	// Diagnostics: KYTY_KEY_CAPTURE=<hash>: the image and sampler keys that shader sampled since the
 	// last print, every 60th snapshot, up to 12 prints.
-	if (static const bool capture = std::getenv("KYTY_KEY_CAPTURE") != nullptr; capture) {
+	if (static const bool capture = Common::Environment::IsSet("KYTY_KEY_CAPTURE"); capture) {
 		static uint32_t rounds  = 0;
 		static uint32_t printed = 0;
 		if (++rounds % 60u == 0u && printed < 12u) {
@@ -2977,7 +2978,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			             static_cast<unsigned long long>(used != nullptr ? used->address : 0));
 			SrtVerifyReportMiss(missed);
 		}
-		static const bool keep_used = std::getenv("KYTY_FPS_LOG") != nullptr;
+		static const bool keep_used = Common::Environment::IsSet("KYTY_FPS_LOG");
 		if (keep_used && !snapshot.srt_verify.empty()) {
 			auto& kept = last_used[program.shader_hash];
 			kept.assign(snapshot.srt_verify.begin(), snapshot.srt_verify.end());
@@ -3129,14 +3130,19 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma = false;
+	bool uses_dma       = false;
+	bool address_writes = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		address_writes |= stage->runtime->program->has_address_writes;
 	}
 	if (uses_dma) {
 		KYTY_PROFILER_BLOCK("Draw::PrepareBda");
 		m_context.PrepareBda();
+	}
+	if (address_writes) {
+		m_context.GetBufferCache().NoteAddressWrites();
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
@@ -3329,7 +3335,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// thousands of resolved images; one whose images' states did not change since it was
 		// last checked (g_bindless_state_generation) needs a look only at the images resolved
 		// since. KYTY_BINDLESS_VERIFY=1 checks every image and stops if a skipped one needed it.
-		static const bool verify = std::getenv("KYTY_BINDLESS_VERIFY") != nullptr;
+		static const bool verify = Common::Environment::IsSet("KYTY_BINDLESS_VERIFY");
 		if (BindlessEngineEnabled() && !verify && !descriptors.bindless_heaps.empty()) {
 			// Engine method, E5: only images settled since the last bindless draw, and pinned
 			// images whose state changed (NoteBindlessStateChange), are made readable again; a
@@ -3498,7 +3504,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						} else if (binding.kind == BindingKind::SharedMemory) {
 							view = &descriptors.shared_memory;
 						}
-						EXIT_IF(view->buffer == nullptr);
+						if (view->buffer == nullptr) {
+							// Bindings prepared for another variant of the shader than the one
+							// committed: name the binding and the shader.
+							EXIT("descriptor buffer of kind %u is null: shader 0x%016" PRIx64
+							     " stage %u, %zu descriptor bindings\n",
+							     static_cast<uint32_t>(binding.kind), program.shader_hash,
+							     static_cast<uint32_t>(program.stage),
+							     program.bindings.descriptors.size());
+						}
 						m_descriptor_buffers.push_back(*view);
 						break;
 					}

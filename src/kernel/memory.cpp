@@ -1,5 +1,7 @@
 #include "kernel/memory.h"
 
+#include "kernel/coverageSpans.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -450,6 +452,22 @@ static uint64_t RangeHistoryMicros() {
 static std::array<RangeHistoryEntry, 16384> g_extended_history {};
 static std::atomic<uint64_t>                 g_extended_history_next {0};
 
+struct EmulatorWrite {
+	uint64_t start  = 0;
+	uint64_t size   = 0;
+	uint64_t micros = 0;
+	uint32_t thread = 0;
+	char     kind   = 0;
+};
+static std::array<EmulatorWrite, 65536> g_emulator_writes {};
+static std::atomic<uint64_t>            g_emulator_writes_next {0};
+
+void NoteEmulatorWrite(char kind, uint64_t vaddr, uint64_t size) {
+	const auto index = g_emulator_writes_next.fetch_add(1, std::memory_order_relaxed);
+	g_emulator_writes[index % g_emulator_writes.size()] = {vaddr, size, RangeHistoryMicros(),
+	                                                       RangeHistoryThread(), kind};
+}
+
 static void RecordRangeChange(char op, uint64_t start, uint64_t size, int type, int protection) {
 	const RangeHistoryEntry value {start, size, RangeHistoryMicros(), RangeHistoryThread(), op, type,
 	                               protection};
@@ -485,7 +503,7 @@ public:
 		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('A', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteCoverageChangeUnlocked(start, size);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -511,7 +529,7 @@ public:
 		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('R', start, size, 0, 0);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteCoverageChangeUnlocked(start, size);
 
 		if (const auto it = m_ranges.find(start); it != m_ranges.end() && it->second.size == size) {
 			m_ranges.erase(it);
@@ -541,7 +559,7 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		DiagLockGuard lock(m_mutex, __func__);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteCoverageChangeUnlocked(start, size);
 
 		if (const auto it = m_ranges.find(start); it != m_ranges.end() &&
 		                                          it->second.size == size &&
@@ -557,7 +575,7 @@ public:
 		DiagLockGuard lock(m_mutex, __func__);
 		RecordRangeChange('S', start, size, static_cast<int>(type), protection);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteCoverageChangeUnlocked(start, size);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -709,19 +727,8 @@ public:
 			return value == nullptr || value[0] != '0';
 		}();
 		if (spans) {
-			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
-			if (m_spans_generation != generation) {
-				RebuildSpansUnlocked();
-				m_spans_generation = generation;
-			}
-			auto span = std::upper_bound(
-			    m_spans.begin(), m_spans.end(), virtual_addr,
-			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-			if (span == m_spans.begin()) {
-				return 0;
-			}
-			--span;
-			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+			const auto span = SpanForUnlocked(virtual_addr);
+			return virtual_addr < span.end ? std::min(size, span.end - virtual_addr) : 0;
 		}
 
 		auto vma = m_ranges.upper_bound(virtual_addr);
@@ -758,26 +765,41 @@ public:
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
-		thread_local std::vector<Span> local;
-		thread_local uint64_t          local_generation = 0;
+		// With KYTY_CLAMP_SPANS_LOCAL the copy is of the spans and of the changes since they were
+		// built; it is taken again only when the spans were rebuilt (m_spans_version).
+		thread_local std::vector<Span>  local;
+		thread_local CoverageChanges    local_changes;
+		thread_local uint64_t           local_generation = 0;
+		thread_local uint64_t           local_version    = UINT64_MAX;
+		const auto refresh = [&] {
+			if (local_version != m_spans_version) {
+				local         = m_spans;
+				local_version = m_spans_version;
+			}
+			local_changes    = m_changes;
+			local_generation = m_coverage_generation.load(std::memory_order_relaxed);
+		};
 		if (local_generation != m_coverage_generation.load(std::memory_order_acquire)) {
 			DiagLockGuard lock(m_mutex, __func__);
-			const auto        generation = m_coverage_generation.load(std::memory_order_relaxed);
-			if (m_spans_generation != generation) {
-				RebuildSpansUnlocked();
-				m_spans_generation = generation;
+			if (!LocalSpans() &&
+			    m_spans_generation != m_coverage_generation.load(std::memory_order_relaxed)) {
+				RebuildSpansNowUnlocked();
 			}
-			local            = m_spans;
-			local_generation = generation;
+			refresh();
 		}
-		auto span = std::upper_bound(
-		    local.begin(), local.end(), virtual_addr,
-		    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-		if (span == local.begin()) {
-			return 0;
+		auto span = FindCoverageSpan(local, virtual_addr);
+		if (local_changes.Touches(span.start, span.end)) {
+			DiagLockGuard lock(m_mutex, __func__);
+			span = SpanForUnlocked(virtual_addr);
+			refresh();
+		} else if (VerifyLocalSpans()) {
+			DiagLockGuard lock(m_mutex, __func__);
+			// Only against the coverage the copy describes (a later change is seen on the next call).
+			if (local_generation == m_coverage_generation.load(std::memory_order_relaxed)) {
+				CheckSpanUnlocked(virtual_addr, span);
+			}
 		}
-		--span;
-		return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+		return virtual_addr < span.end ? std::min(size, span.end - virtual_addr) : 0;
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -813,23 +835,84 @@ private:
 	}
 
 	// Maximal runs of adjacent committed ranges, as ClampRangeSize's walk joins them.
-	struct Span {
-		uint64_t start = 0;
-		uint64_t end   = 0;
-	};
-	void RebuildSpansUnlocked() {
-		m_spans.clear();
+	using Span = CoverageSpan;
+	void BuildSpansUnlocked(std::vector<Span>& spans) const {
+		spans.clear();
 		for (const auto& [key, r]: m_ranges) {
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
 			const auto end = End(r.start, r.size);
-			if (!m_spans.empty() && m_spans.back().end == r.start) {
-				m_spans.back().end = end;
+			if (!spans.empty() && spans.back().end == r.start) {
+				spans.back().end = end;
 			} else {
-				m_spans.push_back({r.start, end});
+				spans.push_back({r.start, end});
 			}
 		}
+	}
+	void RebuildSpansUnlocked() { BuildSpansUnlocked(m_spans); }
+
+	// KYTY_CLAMP_SPANS_LOCAL (default on; =0 rebuilds after every change, as before): the spans are
+	// rebuilt only when a lookup lands on one a change since the last build touches. Each rebuild
+	// walks every range (tens of thousands), and the game changes coverage hundreds of times a
+	// second: 14 % of the GPU thread in the Wolverine route (2026-10-22). Changes in streaming
+	// memory leave the spans of the heaps the draws bind alone.
+	static bool LocalSpans() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_CLAMP_SPANS_LOCAL");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+	// KYTY_CLAMP_SPANS_VERIFY=1 (diagnostics): every answer the old spans give is checked against
+	// spans built anew; a difference ends the emulator with both.
+	static bool VerifyLocalSpans() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_CLAMP_SPANS_VERIFY");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled;
+	}
+
+	void NoteCoverageChangeUnlocked(uint64_t start, uint64_t size) {
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_changes.Note(start, End(start, size));
+	}
+
+	void RebuildSpansNowUnlocked() {
+		RebuildSpansUnlocked();
+		m_spans_generation = m_coverage_generation.load(std::memory_order_relaxed);
+		m_changes.Clear();
+		m_spans_version++;
+	}
+
+	void CheckSpanUnlocked(uint64_t vaddr, const Span& span) const {
+		thread_local std::vector<Span> exact;
+		BuildSpansUnlocked(exact);
+		const auto expected = FindCoverageSpan(exact, vaddr);
+		if (!(expected == span)) {
+			EXIT("Memory: KYTY_CLAMP_SPANS_LOCAL answered 0x%016" PRIx64 "-0x%016" PRIx64
+			     " for 0x%016" PRIx64 ", the ranges say 0x%016" PRIx64 "-0x%016" PRIx64 "\n",
+			     span.start, span.end, vaddr, expected.start, expected.end);
+		}
+	}
+
+	// The span holding vaddr ({vaddr, vaddr} when none), from spans rebuilt only when needed.
+	Span SpanForUnlocked(uint64_t vaddr) {
+		if (m_spans_generation != m_coverage_generation.load(std::memory_order_relaxed)) {
+			if (!LocalSpans()) {
+				RebuildSpansNowUnlocked();
+			} else if (const auto span = FindCoverageSpan(m_spans, vaddr);
+			           !m_changes.Touches(span.start, span.end)) {
+				if (VerifyLocalSpans()) {
+					CheckSpanUnlocked(vaddr, span);
+				}
+				return span;
+			} else {
+				RebuildSpansNowUnlocked();
+			}
+		}
+		return FindCoverageSpan(m_spans, vaddr);
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -962,6 +1045,9 @@ private:
 	std::atomic<uint64_t> m_coverage_generation {1};
 	std::vector<Span>     m_spans;
 	uint64_t              m_spans_generation = 0;
+	// The coverage changes since m_spans was built, and its builds (ClampRangeSizeSnapshot copies).
+	CoverageChanges       m_changes;
+	uint64_t              m_spans_version = 0;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1257,7 +1343,8 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
-bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, char writer) {
+	NoteEmulatorWrite(writer, vaddr, size);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
@@ -1409,8 +1496,8 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
-void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	if (!TryWriteBacking(vaddr, data, size)) {
+void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, char writer) noexcept {
+	if (!TryWriteBacking(vaddr, data, size, writer)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
@@ -1520,6 +1607,88 @@ void DescribeUnhandledFault(uint64_t vaddr) {
 	std::fflush(stdout);
 	if (auto* hook = g_unhandled_fault_hook.load(); hook != nullptr) {
 		hook(vaddr);
+	}
+}
+
+void DescribeGuestBytes(uint64_t vaddr, uint64_t size) {
+	static uint64_t last_range = UINT64_MAX;
+	if (VirtualRanges::Range range {};
+	    g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range) &&
+	    range.start != last_range) {
+		last_range = range.start;
+		std::printf("      in guest range 0x%016" PRIx64 "..0x%016" PRIx64 " type=%s prot=0x%x "
+		            "memory_type=%d name=%s\n",
+		            range.start, range.start + range.size,
+		            std::string(magic_enum::enum_name(range.type)).c_str(), range.protection,
+		            range.memory_type, range.name);
+	}
+	const auto now   = RangeHistoryMicros();
+	const auto next  = g_emulator_writes_next.load(std::memory_order_relaxed);
+	const auto count = std::min<uint64_t>(next, g_emulator_writes.size());
+	uint32_t   shown = 0;
+	for (uint64_t i = next; i > next - count && shown < 4; i--) {
+		const auto& write = g_emulator_writes[(i - 1) % g_emulator_writes.size()];
+		if (write.start < vaddr + size && vaddr < write.start + write.size) {
+			shown++;
+			std::printf("      emulator wrote it: %c 0x%016" PRIx64 "+0x%" PRIx64 " thread=%u %" PRIu64
+			            " us ago\n",
+			            write.kind, write.start, write.size, write.thread, now - write.micros);
+		}
+	}
+}
+
+uint64_t EmulatorWriteSequence() {
+	return g_emulator_writes_next.load(std::memory_order_relaxed);
+}
+
+char EmulatorWroteSince(uint64_t sequence, uint64_t vaddr, uint64_t size) {
+	const auto next = g_emulator_writes_next.load(std::memory_order_relaxed);
+	if (next - sequence > g_emulator_writes.size()) {
+		return '?';
+	}
+	for (uint64_t i = next; i > sequence; i--) {
+		const auto& write = g_emulator_writes[(i - 1) % g_emulator_writes.size()];
+		if (write.start < vaddr + size && vaddr < write.start + write.size) {
+			return write.kind;
+		}
+	}
+	return 0;
+}
+
+void FindGuestQword(uint64_t value, std::span<const uint64_t> others) {
+	if (g_virtual_ranges == nullptr) {
+		return;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	for (const auto address: others) {
+		VirtualRanges::Range range {};
+		if (g_virtual_ranges->Query(address, 0, &range) && range.size <= 256ull * 1024 * 1024 &&
+		    std::none_of(ranges.begin(), ranges.end(),
+		                 [&](const auto& r) { return r.start == range.start; })) {
+			ranges.push_back(range);
+		}
+	}
+	std::vector<uint64_t> chunk(128 * 1024);
+	uint32_t              found = 0;
+	for (const auto& range: ranges) {
+		for (uint64_t at = range.start; at < range.start + range.size && found < 4;
+		     at += chunk.size() * 8u) {
+			const auto bytes = std::min<uint64_t>(chunk.size() * 8u, range.start + range.size - at);
+			if (!TryReadBacking(at, chunk.data(), bytes)) {
+				continue;
+			}
+			for (uint64_t i = 0; i < bytes / 8u && found < 4; i++) {
+				if (chunk[i] == value) {
+					found++;
+					std::printf("  0x%016" PRIx64 " is stored at 0x%016" PRIx64 " (%s)\n", value,
+					            at + i * 8u, range.name);
+					DescribeGuestBytes(at + i * 8u, 8);
+				}
+			}
+		}
+	}
+	if (found == 0) {
+		std::printf("  0x%016" PRIx64 " is not stored in the ranges the registers point into\n", value);
 	}
 }
 
@@ -4259,6 +4428,36 @@ bool TestGuestBackingOutsideAddressSpace() {
 uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Each mode's view gets exactly that protection (KYTY_SKIP_VIEW_PROTECT; from KytyPS5 c30ac7c9).
+bool TestWindowsBackingViewModes() {
+	constexpr uint64_t size = 0x10000;
+	GuestBackingStore  backing(size);
+	void* placeholder = VirtualAlloc2(GetCurrentProcess(), nullptr, size,
+	                                  MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+	if (placeholder == nullptr) {
+		return false;
+	}
+	const auto address = reinterpret_cast<uint64_t>(placeholder);
+	bool       valid   = true;
+	for (auto [mode, protection]: std::array {
+	         std::pair {VirtualMemory::Mode::NoAccess, DWORD {PAGE_NOACCESS}},
+	         std::pair {VirtualMemory::Mode::Read, DWORD {PAGE_READONLY}},
+	         std::pair {VirtualMemory::Mode::ReadWrite, DWORD {PAGE_READWRITE}},
+	         std::pair {VirtualMemory::Mode::ExecuteReadWrite, DWORD {PAGE_EXECUTE_READWRITE}}}) {
+		if (!backing.MapFixed(address, size, 0, mode)) {
+			valid = false;
+			break;
+		}
+		MEMORY_BASIC_INFORMATION info {};
+		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED &&
+		        info.Protect == protection && valid;
+		EXIT_IF(!backing.Unmap(address, size));
+	}
+	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
+}
+#endif
 
 bool TestGuestFreeRangeBounds() {
 	return GuestFreeRangeContains(0x10000, 0x20000, 0x18000, 0x4000) &&

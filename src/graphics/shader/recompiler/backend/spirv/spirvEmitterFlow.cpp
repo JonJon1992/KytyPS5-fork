@@ -858,6 +858,13 @@ void EmitWaveLdsBarrier(EmitterState& state) {
 	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
 	                        ? spv::MemorySemanticsUniformMemoryMask
 	                        : spv::MemorySemanticsWorkgroupMemoryMask;
+	if (state.wave_lds_scope == 0) { // wave_lds_fence: order only, no invocation waits
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform); // subgroup memory scope
+		state.builder.AddFunction(
+		    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeSubgroup),
+		    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+		return;
+	}
 	state.builder.AddFunction(
 	    spv::OpControlBarrier, ConstantU32(state, state.wave_lds_scope),
 	    ConstantU32(state, spv::ScopeWorkgroup),

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -567,7 +568,7 @@ static bool ConvertMeshArgsRun(RenderContext& context, MeshIndirectArgs& convert
 	EXIT_IF(entry == nullptr);
 	command_buffer = entry->buffer;
 	command_offset = entry->offset;
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log) {
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now  = std::chrono::steady_clock::now();
 		if (now - last >= std::chrono::seconds(5)) {
@@ -1110,7 +1111,7 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 		const bool ps_match =
 		    !es_match && sh.GetPs().ps_regs.data_addr != 0 && ShaderDeclaredHash(sh.GetPs().ps_regs.data_addr) == watch;
 		static std::atomic<uint32_t> logged {0};
-		if ((es_match || ps_match) && std::getenv("KYTY_TRACE_GS_SLOT_SEQ") != nullptr) {
+		if ((es_match || ps_match) && Common::Environment::IsSet("KYTY_TRACE_GS_SLOT_SEQ")) {
 			// The command-buffer dwords these draws' slot came from, read again a few frames later:
 			// does the game write them after the submission was parsed?
 			struct Pending {
@@ -1253,7 +1254,7 @@ static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t 
 		}
 	}
 	// KYTY_LOG_DRAW_PAIRS=1: each new (es, gs, ps) combination once, with its first draw's shape.
-	if (static const bool log_pairs = std::getenv("KYTY_LOG_DRAW_PAIRS") != nullptr; log_pairs) {
+	if (static const bool log_pairs = Common::Environment::IsSet("KYTY_LOG_DRAW_PAIRS"); log_pairs) {
 		static std::mutex                   pairs_mutex;
 		static std::unordered_set<uint64_t> pairs;
 		const auto& sh = buffer.GetShaders();
@@ -1876,7 +1877,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// KYTY_RT_SIZES=1: draws per first color target size, every 10 s ([rt-sizes]): the game's
 	// internal render resolution.
-	if (static const bool log = std::getenv("KYTY_RT_SIZES") != nullptr; log) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_RT_SIZES"); log) {
 		static std::mutex                             mutex;
 		static std::unordered_map<uint64_t, uint32_t> sizes;
 		static auto                                   last = std::chrono::steady_clock::now();
@@ -2154,7 +2155,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 	// KYTY_LOG_GPU_ARGS_DRAWS=1: each new (es, gs, ps) of a DrawIndexAuto with GPU-written
 	// arguments, once, with the arguments' address.
-	static const bool log_gpu_args = std::getenv("KYTY_LOG_GPU_ARGS_DRAWS") != nullptr;
+	static const bool log_gpu_args = Common::Environment::IsSet("KYTY_LOG_GPU_ARGS_DRAWS");
 	if (log_gpu_args && (args.gpu_args_address != 0 || args.gpu_instance_count_address != 0)) {
 		static std::mutex                   seen_mutex;
 		static std::unordered_set<uint64_t> seen;
@@ -2258,7 +2259,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		if (!gpu_ok) {
 			uint32_t words[4] {};
 			m_context.GetBufferCache().WaitSharedWrites(args.gpu_args_address, sizeof(words));
-			static const bool args_debug = std::getenv("KYTY_ARGS_DEBUG") != nullptr;
+			static const bool args_debug = Common::Environment::IsSet("KYTY_ARGS_DEBUG");
 			const auto        before =
 			    args_debug ? m_context.GetBufferCache().DescribeWriteState(args.gpu_args_address)
 			                      : std::string {};

@@ -25,6 +25,10 @@ void RegisterCurrentThread(const char* name);
 // lines on stderr), three times a second apart; again after 60 s, at most three reports.
 void NoteGuestFrame();
 
+// Arms the freeze recorder at start-up, before the first flip, so a freeze while the game boots
+// (no flip at all) is reported too, 15 s after this call.
+void StartFreezeWatch();
+
 } // namespace Common::Sampler
 
 #endif /* KYTY_COMMON_SAMPLER_H_ */

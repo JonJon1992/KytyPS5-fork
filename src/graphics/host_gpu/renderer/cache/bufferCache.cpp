@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -7,6 +8,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/gcAge.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -27,16 +29,19 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -380,6 +385,12 @@ void BufferCache::UnmapShared(uint64_t vaddr, uint64_t size) {
 			ids.push_back(id);
 		}
 	}
+	if (!ids.empty()) {
+		// The caller drained the main queue, not the copy-queue readbacks, which may still be
+		// reading the import: a copy on the SDMA queue (KYTY_READBACK_QUEUE=transfer) outlived it
+		// and the device was lost (2026-10-22).
+		WaitCopyReadbacks();
+	}
 	for (const auto id: ids) {
 		DeleteBuffer(id);
 		// The caller drained the GPU; the import must not outlive the memory it points into.
@@ -405,6 +416,61 @@ void BufferCache::ReleaseBuffer(BufferId id) {
 	m_slot_buffers.erase(id);
 }
 
+// KYTY_DOWNLOAD_GUARD (default on, =0 off), detection only: a download's guest bytes are hashed
+// when it is recorded and again before it is published. Its GPU-written pages stay protected in
+// between, so a difference is a write the protection missed, which the publication then
+// overwrites: the suspect for the RenderAlloc records holding floats in the closes of 24/10.
+static bool DownloadGuardEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DOWNLOAD_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// 0 when the bytes cannot be read.
+static uint64_t HashGuestBytes(uint64_t vaddr, uint64_t size) {
+	thread_local std::vector<uint64_t> chunk(32 * 1024);
+	uint64_t                           hash = 0;
+	for (uint64_t at = 0; at < size;) {
+		const auto bytes = std::min<uint64_t>(chunk.size() * 8u, size - at);
+		if (!Libs::LibKernel::Memory::TryReadBacking(vaddr + at, chunk.data(), bytes)) {
+			return 0;
+		}
+		hash = XXH3_64bits_withSeed(chunk.data(), bytes, hash);
+		at += bytes;
+	}
+	return hash | 1u;
+}
+
+static void CheckDownloadGuard(char kind, uint64_t vaddr, uint64_t size, uint64_t recorded,
+                               uint64_t sequence) {
+	if (recorded == 0) {
+		return;
+	}
+	if (const auto now = HashGuestBytes(vaddr, size); now == 0 || now == recorded) {
+		return;
+	}
+	const char writer = Libs::LibKernel::Memory::EmulatorWroteSince(sequence, vaddr, size);
+	// Main-queue downloads publish in record order (one priority thread), so a B landing over an
+	// older B holds the newer bytes; counting it used up the cap that a Q over a B needs (24/10).
+	if (kind == 'B' && writer == 'B') {
+		return;
+	}
+	// Another emulator write in between (an overlapping download) is expected; the game's is not.
+	static std::atomic<uint32_t> by_game {0};
+	static std::atomic<uint32_t> by_emulator {0};
+	if ((writer == 0 ? by_game : by_emulator).fetch_add(1) >= (writer == 0 ? 32u : 8u)) {
+		return;
+	}
+	std::printf("[download-guard] %c 0x%016" PRIx64 "+0x%" PRIx64
+	            ": guest bytes changed after the download was recorded (%s%c), published over them\n",
+	            kind, vaddr, size, writer == 0 ? "no emulator write: the game" : "emulator write ",
+	            writer == 0 ? ' ' : writer);
+	Libs::LibKernel::Memory::DescribeGuestBytes(vaddr, size);
+	std::fflush(stdout);
+}
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
@@ -419,6 +485,16 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 template <bool async>
 bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// A copy-queue readback of these bytes still in flight holds older bytes: it lands first, or
+	// it lands later over this download's newer ones ([download-guard], 24/10: one 1.3 s late in
+	// RenderAlloc, over records the game had written since).
+	for (uint32_t i = 0; i < CopyReadbackSlots; i++) {
+		const auto marker = FindCopyReadback(vaddr, size);
+		if (marker == 0) {
+			break;
+		}
+		CompleteCopyReadback(marker);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -485,6 +561,13 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
+	std::vector<uint64_t> guard;
+	const auto            guard_sequence = Libs::LibKernel::Memory::EmulatorWriteSequence();
+	if (DownloadGuardEnabled()) {
+		for (const auto& copy: copies) {
+			guard.push_back(HashGuestBytes(buffer_address + copy.srcOffset, copy.size));
+		}
+	}
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -515,10 +598,15 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
+	auto publish = [this, mapped, offset, total_size, buffer_address, guard = std::move(guard),
+	                guard_sequence, copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
+		for (size_t i = 0; i < copies.size(); i++) {
+			const auto& copy = copies[i];
+			if (i < guard.size()) {
+				CheckDownloadGuard('B', buffer_address + copy.srcOffset, copy.size, guard[i],
+				                   guard_sequence);
+			}
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
@@ -643,7 +731,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
 		KYTY_PROFILER_BLOCK("ReadMemory: CPU write over GPU-written bytes");
 		// KYTY_FPS_LOG: on the GPU thread, which pages its own writes flush most (every 10 s).
-		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && GuestGpu::IsGpuThread()) {
+		if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log && GuestGpu::IsGpuThread()) {
 			static std::unordered_map<uint64_t, uint64_t> pages;
 			static auto                                  last = std::chrono::steady_clock::now();
 			pages[vaddr & ~uint64_t {0xfff}]++;
@@ -678,7 +766,7 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
-	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size, 'W')) {
 		return false;
 	}
 	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
@@ -764,7 +852,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 		}
 	};
-	static const bool readback_stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	static const bool readback_stats = Common::Environment::IsSet("KYTY_READBACK_STATS");
 	ReadbackTimer timer {readback_stats, from_gpu_thread ? 2 : (is_write ? 1 : 0), vaddr,
 	                     readback_stats ? std::chrono::steady_clock::now()
 	                                    : std::chrono::steady_clock::time_point {}};
@@ -836,6 +924,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			CompleteCopyReadback(wait_tick);
 			slow.Add("copywait", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count(),
 			         rm_reason, 0, 0);
+			if (LiftAsynchronously(vaddr, size, is_write, from_gpu_thread)) {
+				return;
+			}
 			continue;
 		}
 		// WaitPriorityOperations only waits for publications queued at or before the tick; a
@@ -852,7 +943,38 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		m_scheduler.WaitPriorityOperations(wait_tick);
 		slow.Add("wait", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count(),
 		         rm_reason, wait_tick, m_scheduler.CurrentTick());
+		if (LiftAsynchronously(vaddr, size, is_write, from_gpu_thread)) {
+			return;
+		}
 	}
+}
+
+// KYTY_READBACK_ASYNC_LIFT=1 (opt-in). A game-thread read waits for its readback to be published,
+// then went through the GPU thread a second time only to lift the window's protection: a second
+// round trip, which waits for the packet the GPU thread is on (about half of the game threads'
+// readback time once the copies got short, 2026-10-22). When the bytes the read wants are current
+// in guest memory, the lift is queued without waiting and the read returns: retried before the
+// lift has run, it faults again and the clean-read emulation completes it from the backing store
+// (KytyExceptionHandler); after the lift it runs natively. Writes keep the waiting path.
+static bool ReadbackAsyncLiftEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_ASYNC_LIFT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::LiftAsynchronously(uint64_t vaddr, uint64_t size, bool is_write,
+                                     bool from_gpu_thread) {
+	if (!ReadbackAsyncLiftEnabled() || is_write || from_gpu_thread ||
+	    !IsCleanForConcurrentRead(vaddr, size)) {
+		return false;
+	}
+	return m_scheduler.Context().GetGpu().TrySendCommand([this, vaddr, size] {
+		// The window's pages without GPU-written bytes lose their protection; bytes the GPU wrote
+		// since start their download and stay protected for the next fault.
+		(void)ReadMemoryStep(vaddr, size, false, false, true);
+	});
 }
 
 uint32_t BufferCache::PeekDword(uint64_t vaddr) {
@@ -1056,7 +1178,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// Shared guest memory groundwork (KYTY_SHARED_MEMORY_PROBE=1): whether the driver can import
 	// this guest memory as a GPU buffer (VK_EXT_external_memory_host), and which cache buffers
 	// the game threads read back most, i.e. the candidates for sharing.
-	if (static const bool probe = std::getenv("KYTY_SHARED_MEMORY_PROBE") != nullptr; probe) {
+	if (static const bool probe = Common::Environment::IsSet("KYTY_SHARED_MEMORY_PROBE"); probe) {
 		auto& graphics = m_scheduler.Context().GetGraphics();
 		static bool probed = false;
 		if (!probed) {
@@ -1136,7 +1258,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		(dirty ? exact : shared)++;
 		static uint32_t logged = 0;
 		static uint32_t shared_seen = 0;
-		static const bool shared_stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		static const bool shared_stats = Common::Environment::IsSet("KYTY_READBACK_STATS");
 		if (!dirty && shared_stats && !from_gpu_thread && (shared_seen++ % 256) == 0 &&
 		    shared_seen < 256u * 120u) {
 			std::string dirty_ranges;
@@ -1180,7 +1302,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		if ((exact + shared) % 1024 == 0) {
 			LOGF("ReadMemory faults: gpu_written=%" PRIu64 " false_sharing=%" PRIu64 "\n", exact,
 			     shared);
-			if (static const bool stats = std::getenv("KYTY_READBACK_STATS") != nullptr; stats) {
+			if (static const bool stats = Common::Environment::IsSet("KYTY_READBACK_STATS"); stats) {
 				std::fprintf(stderr, "[readback] faults: bytes GPU-written %llu, page shared %llu\n",
 				             static_cast<unsigned long long>(exact),
 				             static_cast<unsigned long long>(shared));
@@ -1188,7 +1310,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 		// KYTY_READBACK_STATS: the bytes of the page that count as GPU-written, for game reads of
 		// GPU-written bytes, the first 48.
-		if (static const bool stats = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		if (static const bool stats = Common::Environment::IsSet("KYTY_READBACK_STATS");
 		    stats && dirty && !from_gpu_thread) {
 			static std::atomic<uint32_t> seen_reads {0};
 			static std::atomic<uint32_t> shown {0};
@@ -1390,6 +1512,16 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		// The writers of the window have finished: copy it on the second queue, behind nothing,
 		// and let the caller wait for that copy alone.
 		if (const auto marker = TryCopyQueueReadback(buffer, window_begin, window_end);
+		    marker != 0) {
+			{ t_rm_reason = 4; return marker; }
+		}
+		// Game threads only. An SRT refresh on the GPU thread (StartSrtReadback) has read the bytes
+		// before asking: a readback it completes on the spot leaves it with the older bytes, so it
+		// must get a tick to defer on (the startup crashed with a refresh that went on with them,
+		// a dispatch's bindings prepared for another shader variant).
+		if (const auto marker = from_gpu_thread ? 0
+		                                        : TryNarrowCopyReadback(buffer, vaddr, size,
+		                                                                window_begin, window_end);
 		    marker != 0) {
 			{ t_rm_reason = 4; return marker; }
 		}
@@ -1644,7 +1776,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			memo_hits++;
 			return false;
 		}
-		if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+		if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 		    log && (memo_calls & ((1u << 20u) - 1u)) == 0) {
 			std::fprintf(stderr, "[sync-skip] %llu of %llu syncs skipped\n",
 			             static_cast<unsigned long long>(memo_hits),
@@ -1668,7 +1800,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	} memo_store {slot, &buffer, vaddr, size, is_written};
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
-	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
+	static const bool timed = Common::Environment::IsSet("KYTY_SYNC_STATS");
 	Common::Timer               walk_timer;
 	if (timed) {
 		walk_timer.Start();
@@ -1935,6 +2067,54 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+static bool ReadbackVerifyEnabled();
+
+namespace {
+// KYTY_READBACK_VERIFY: the last bounded writes (KYTY_BOUNDED_BUFFER_WRITES), so a stale readback
+// can name the shader whose binding covers the stale bytes but whose store extent left them out.
+struct BoundedWriteNote {
+	uint64_t binding_begin = 0;
+	uint64_t binding_end   = 0;
+	uint64_t written_begin = 0;
+	uint64_t written_end   = 0;
+	uint64_t shader        = 0;
+	uint64_t tick          = 0;
+};
+constexpr size_t                          BoundedWriteNotes = 16384;
+std::mutex                                g_bounded_notes_mutex;
+std::array<BoundedWriteNote, BoundedWriteNotes> g_bounded_notes {};
+uint64_t                                  g_bounded_notes_next = 0;
+
+void NoteBoundedWrite(const BoundedWriteNote& note) {
+	std::lock_guard lock(g_bounded_notes_mutex);
+	g_bounded_notes[g_bounded_notes_next++ % BoundedWriteNotes] = note;
+}
+
+// Bounded writes whose binding covers [address, address + size) while their extent does not
+// cover all of it, newest first, at most four.
+std::string BoundedWritesMissing(uint64_t address, uint64_t size) {
+	std::string                 text;
+	std::lock_guard             lock(g_bounded_notes_mutex);
+	uint32_t                    found = 0;
+	const auto                  count = std::min<uint64_t>(g_bounded_notes_next, BoundedWriteNotes);
+	for (uint64_t i = 0; i < count && found < 4; i++) {
+		const auto& note = g_bounded_notes[(g_bounded_notes_next - 1 - i) % BoundedWriteNotes];
+		if (note.binding_begin > address || address + size > note.binding_end) {
+			continue;
+		}
+		if (note.written_begin <= address && address + size <= note.written_end) {
+			continue;
+		}
+		found++;
+		text += fmt::format(" [shader {:016x} tick {} binding {:x}+{:x} written {:x}+{:x}]",
+		                    note.shader, note.tick, note.binding_begin,
+		                    note.binding_end - note.binding_begin, note.written_begin,
+		                    note.written_end - note.written_begin);
+	}
+	return text.empty() ? std::string(" [no bounded binding covers it]") : text;
+}
+} // namespace
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
                                                               uint64_t written_vaddr,
                                                               uint64_t written_size, BufferId id) {
@@ -1955,6 +2135,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	if (written_size != 0) {
 		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
 		MarkGpuWritten(written_vaddr, written_size);
+	}
+	// The store extent bounds what becomes GPU-written (and is downloaded), but it can miss
+	// stores: shader 5e04a15a8ee16915 binds a 2.7 GB heap with an extent of a few KB and wrote
+	// 32-byte records 80 MB away from it ([readback-verify], 2026-10-22). A copy-queue readback
+	// must not copy any of the binding before this work has run, so its writer tick covers the
+	// whole binding; nothing more is marked. Also on the graphics family's second queue: it runs
+	// beside the first (4 stale copies of 4096 in that mode, 2026-10-22 18:50).
+	NoteGpuWriteTick(vaddr, size);
+	if (ReadbackVerifyEnabled()) {
+		NoteBoundedWrite({.binding_begin = vaddr,
+		                  .binding_end   = vaddr + size,
+		                  .written_begin = written_vaddr,
+		                  .written_end   = written_vaddr + written_size,
+		                  .shader        = s_diag_shader_hash,
+		                  .tick          = m_scheduler.CurrentTick()});
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -2379,7 +2574,7 @@ void BufferCache::ProcessBitmapCopy(BitmapCopy& copy) {
 	s_released += released;
 	s_compute_ms += std::chrono::duration<double, std::milli>(computed - start).count();
 	s_protect_ms += std::chrono::duration<double, std::milli>(done_at - computed).count();
-	if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	if (static const bool log = Common::Environment::IsSet("KYTY_READBACK_STATS");
 	    log && copy.era % 64 == 63) {
 		std::fprintf(stderr,
 		             "[write-bitmap] eras %llu-%llu: %llu pages written (%llu missed by the "
@@ -2524,7 +2719,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 				m_narrow_window = true;
 				window_tick     = 0;
 				s_page_narrowed++;
-			} else if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr; log) {
+			} else if (static const bool log = Common::Environment::IsSet("KYTY_READBACK_STATS"); log) {
 				static std::atomic<uint32_t> logged {0};
 				if (logged++ < 32) {
 					std::fprintf(stderr,
@@ -2537,7 +2732,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 			}
 		}
 		(window_tick == 0 ? s_range_narrowed : s_range_kept)++;
-		if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr; log) {
+		if (static const bool log = Common::Environment::IsSet("KYTY_READBACK_STATS"); log) {
 			static std::atomic<uint32_t> logged {0};
 			if ((s_range_narrowed + s_range_kept) % 64 == 1 && logged++ < 64) {
 				std::fprintf(stderr,
@@ -2557,7 +2752,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	}
 	static std::atomic<uint64_t> s_refines {0}, s_refine_waits {0}, s_refine_gpu {0},
 	    s_refine_written {0}, s_refine_dropped {0};
-	if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	if (static const bool log = Common::Environment::IsSet("KYTY_READBACK_STATS");
 	    log && ++s_refines % 1024 == 0) {
 		std::fprintf(stderr,
 		             "[write-bitmap] refine: 1024 calls: %llu wait for a pending write, %llu on "
@@ -2665,7 +2860,7 @@ void BufferCache::SettleWriteBitmap(uint64_t completed_tick) {
 	KYTY_PROFILER_BLOCK("BufferCache::SettleWriteBitmap");
 	static uint64_t s_settle_pieces = 0, s_settle_tracked = 0;
 	// Which tracked pages the GPU really writes, and how often a page is written for the first time
-	static const bool                   s_log_written = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	static const bool                   s_log_written = Common::Environment::IsSet("KYTY_READBACK_STATS");
 	static uint64_t                     s_written = 0, s_new_written = 0;
 	static std::unordered_set<uint64_t> s_ever_written;
 	static std::vector<uint64_t>        s_new_samples;
@@ -2794,7 +2989,7 @@ void BufferCache::SettleWriteBitmap(uint64_t completed_tick) {
 	const auto      done = std::chrono::steady_clock::now();
 	compute_ms += std::chrono::duration<double, std::milli>(computed - settle_start).count();
 	unmark_ms += std::chrono::duration<double, std::milli>(done - computed).count();
-	if (static const bool log = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	if (static const bool log = Common::Environment::IsSet("KYTY_READBACK_STATS");
 	    log && ++settles % 64 == 1) {
 		std::fprintf(stderr,
 		             "[write-bitmap] settle #%llu: %llu pages released (%zu runs), total %llu; "
@@ -2945,7 +3140,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	NoteGpuWriteTick(vaddr, size);
 	NoteEagerWrite(vaddr, size);
 	// KYTY_LOG_HUGE_WRITES=1: the shaders whose bindings mark 64 MB or more GPU-written at once.
-	if (static const bool huge_log = std::getenv("KYTY_LOG_HUGE_WRITES") != nullptr;
+	if (static const bool huge_log = Common::Environment::IsSet("KYTY_LOG_HUGE_WRITES");
 	    huge_log && size >= (64ull << 20u)) {
 		static std::mutex                             huge_mutex;
 		static std::unordered_map<uint64_t, uint64_t> huge;
@@ -3033,6 +3228,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		Libs::LibKernel::Memory::NoteEmulatorWrite('D', dst_vaddr, size);
 		return;
 	}
 
@@ -3380,10 +3576,86 @@ uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
+// KYTY_GC_ASYNC_DIRTY (default on; =0 waits as before): a GPU-written buffer the collector drops is
+// downloaded and freed on a later run, once the GPU has finished that tick, instead of the
+// collector submitting and waiting for the whole GPU on the spot (a stall of a GPU frame each
+// time). It stays registered until then; one the game binds again before that is kept.
+static bool GcAsyncDirtyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GC_ASYNC_DIRTY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_GC_TIME_BUDGET_US (default 1000; 0 = none): one collection stops past this much time and the
+// next run goes on, so a large backlog is freed a little per run instead of in one long pass.
+static uint64_t GcTimeBudgetUs() {
+	static const uint64_t budget = [] {
+		const char* value = std::getenv("KYTY_GC_TIME_BUDGET_US");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1000};
+	}();
+	return budget;
+}
+
+namespace {
+// GPU-written buffers being retired (KYTY_GC_ASYNC_DIRTY): downloaded in `tick`. GPU thread.
+struct RetiringBuffer {
+	BufferId id;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t tick    = 0;
+};
+std::vector<RetiringBuffer> g_retiring_buffers;
+} // namespace
+
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
 	const auto clock = LruClock();
+	static LruClockRate clock_rate;
+	clock_rate.Sample(clock);
+	// Retiring GPU-written buffers whose download tick is done: their bytes are in guest memory
+	// once the priority runner has published them. A buffer bound again after the download was
+	// recorded, or whose pages took newer GPU writes meanwhile, stays.
+	if (!g_retiring_buffers.empty()) {
+		bool readbacks_done = false;
+		std::erase_if(g_retiring_buffers, [&](const RetiringBuffer& retiring) {
+			if (!m_scheduler.IsFree(retiring.tick)) {
+				return false;
+			}
+			auto* buffer = m_slot_buffers.try_get(retiring.id);
+			if (buffer != nullptr) {
+				buffer->retiring = false; // the entry goes on every path below
+			}
+			if (buffer == nullptr || buffer->is_deleted || buffer->CpuAddress() != retiring.address ||
+			    buffer->Size() != retiring.size || buffer->last_use_tick >= retiring.tick) {
+				return true;
+			}
+			m_scheduler.WaitPriorityOperations(retiring.tick);
+			if (!readbacks_done) {
+				WaitCopyReadbacks();
+				readbacks_done = true;
+			}
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				if (m_gpu_modified_ranges.Intersects(retiring.address, retiring.size)) {
+					return true;
+				}
+			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(retiring.address, retiring.size);
+			if (m_memory_tracker.IsRegionGpuModified(retiring.address, retiring.size)) {
+				return true;
+			}
+			m_memory_tracker.UntrackMemory(retiring.address, retiring.size);
+			// Not destroyed here: work recorded after the download tick may still read it through
+			// the BDA page table (which does not move last_use_tick); DeleteBuffer unregisters it and
+			// releases it once the current tick is done, as for a clean buffer. Destroying it at once
+			// lost the device a minute into a Wolverine session (2026-10-22).
+			DeleteBuffer(retiring.id);
+			return true;
+		});
+	}
 	// Memory pressure, as in TextureCache::RunGarbageCollector.
 	if (m_trigger_gc_memory != m_applied_trigger_gc_memory ||
 	    m_critical_gc_memory != m_applied_critical_gc_memory) {
@@ -3405,13 +3677,13 @@ void BufferCache::RunGarbageCollector() {
 	// spilled to host memory, which on a 6 GB card keeps it above the critical mark forever
 	// and has the collector destroy and recreate every buffer twice a second (a third of
 	// the GPU thread's time in the world). KYTY_GC_DEVICE_BYTES=1 restores that policy.
-	static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+	static const bool device_bytes = Common::Environment::IsSet("KYTY_GC_DEVICE_BYTES");
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	// KYTY_FPS_LOG: [buffer-gc] per 5 s, the collections, what they deleted and waited for, the
 	// cache's bytes against its thresholds and the buffers created.
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now - m_gc_stats.last > std::chrono::seconds(5)) {
 			std::fprintf(stderr,
@@ -3437,9 +3709,16 @@ void BufferCache::RunGarbageCollector() {
 	m_gc_stats.runs++;
 	m_gc_stats.aggressive += aggressive ? 1 : 0;
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
-	// never a candidate, whatever the submission count.
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
+	// never a candidate, whatever the submission count. With KYTY_GC_MIN_AGE also a minimum time
+	// (0.5 s aggressive, 1.5 s otherwise), whatever the frame rate.
+	uint64_t age_units = aggressive ? 2 : 4;
+	if (GcMinAgeEnabled()) {
+		age_units = std::max(age_units, clock_rate.UnitsIn(aggressive ? 500 : 1500));
+	}
+	const uint64_t age        = std::min<uint64_t>(age_units, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
+	const bool     async_dirty    = GcAsyncDirtyEnabled();
+	const uint64_t time_budget_us = GcTimeBudgetUs();
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
@@ -3449,12 +3728,18 @@ void BufferCache::RunGarbageCollector() {
 	gc_timer.Start();
 	gc_runs++;
 	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
+		if (time_budget_us != 0 && gc_timer.GetTimeS() * 1e6 >= static_cast<double>(time_budget_us)) {
+			return true; // the next run goes on
+		}
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		gc_visited++;
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
+		}
+		if (buffer.retiring) {
+			return false; // already downloaded, freed once its tick is done
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
@@ -3518,6 +3803,16 @@ void BufferCache::RunGarbageCollector() {
 	if (dirty_buffers.empty()) {
 		return;
 	}
+	if (async_dirty) {
+		// Their downloads are in the open recording: freed by a later run once it is done.
+		const auto tick = m_scheduler.CurrentTick();
+		for (const auto id: dirty_buffers) {
+			auto& buffer    = m_slot_buffers[id];
+			buffer.retiring = true;
+			g_retiring_buffers.push_back({id, buffer.CpuAddress(), buffer.Size(), tick});
+		}
+		return;
+	}
 
 	// Publish all queued downloads before releasing their tracked pages and owners. Must be
 	// CurrentTick(): DownloadBufferMemory above queued copy-out commands into the currently open
@@ -3575,7 +3870,7 @@ void BufferCache::SynchronizeTouchedMappedBuffers(const RangeSet& mapped) {
 	if (mapped.Empty()) {
 		return;
 	}
-	static const bool log   = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log   = Common::Environment::IsSet("KYTY_FPS_LOG");
 	static uint64_t   walks = 0, regions = 0, synced = 0;
 	static auto       last  = std::chrono::steady_clock::now();
 	walks++;
@@ -3648,7 +3943,11 @@ void BufferCache::NoteGpuWriteTick(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	constexpr uint64_t BlockBits = 20;
-	const auto         tick      = m_scheduler.CurrentTick();
+	// The next tick too: a submission between preparing a binding and recording its draw (an SRT
+	// readback, a ring that wraps) moves the draw into that tick, and a copy that waited only for
+	// this one read the bytes before it ran ([readback-verify]: noted 241955, written in 241956,
+	// 2026-10-22).
+	const auto         tick      = m_scheduler.CurrentTick() + 1;
 	const auto         first     = vaddr >> BlockBits;
 	const auto         last      = (vaddr + size - 1) >> BlockBits;
 	if (last - first < 64) {
@@ -3668,6 +3967,29 @@ void BufferCache::NoteGpuWriteTick(uint64_t vaddr, uint64_t size) {
 		              [this](const auto& write) { return m_scheduler.IsFree(write[2]); });
 	}
 	m_large_writes.push_back({vaddr, vaddr + size, tick});
+}
+
+// Stores through guest addresses (FLAT/GLOBAL) can reach any mapped byte and nothing notes which
+// at recording time: the write bitmap (or nothing) marks the pages only after the work has run. A
+// copy-queue readback then copied a window whose noted writers had finished while such a store
+// was still writing it ([readback-verify]: no bounded binding covered 63 of 64 stale ranges,
+// 2026-10-22). So the whole guest range counts as written until the tick after the one being
+// recorded has run: a submission between this note and the command's recording moves the command
+// into that next tick. The graphics family's second queue too: it does not run behind the first
+// (stale copies in that mode, 2026-10-22 18:50; the game closed after ~1 min, 2026-10-24).
+void BufferCache::NoteAddressWrites() {
+	if (!CopyQueueReadbackEnabled()) {
+		return;
+	}
+	constexpr uint64_t AddressWritesEnd = uint64_t {1} << 48u;
+	const auto         tick             = m_scheduler.CurrentTick() + 1;
+	for (auto& write: m_large_writes) {
+		if (write[0] == 0 && write[1] == AddressWritesEnd) {
+			write[2] = std::max(write[2], tick);
+			return;
+		}
+	}
+	m_large_writes.push_back({0, AddressWritesEnd, tick});
 }
 
 uint64_t BufferCache::LatestGpuWriteTick(uint64_t begin, uint64_t end) const {
@@ -3715,11 +4037,60 @@ uint64_t BufferCache::FindCopyReadback(uint64_t vaddr, uint64_t size) const {
 	return 0;
 }
 
+// A copy-queue readback that finds the device lost reports the fault as the main queue does
+// (VK_EXT_device_fault and, with KYTY_ADDRESS_BINDING_REPORT, what was bound at the fault
+// address), then exits; RequireVulkanSuccess alone exits without it.
+static void ReadbackVulkanSuccess(GraphicContext& graphics, vk::Result result,
+                                  const char* operation) {
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics);
+	}
+	RequireVulkanSuccess(result, operation);
+}
+
+// KYTY_READBACK_VERIFY=1 (diagnostics): each copy-queue readback is copied twice, the second time
+// behind all the work recorded when the first was submitted (what a main-queue download waits
+// for); the two copies are compared, differences are logged ([readback-verify]) with what the
+// cache knew about the writers, and the second copy is published, so the game never sees bytes a
+// writer had not finished. Copies on the SDMA queue (KYTY_READBACK_QUEUE=transfer) gave the game
+// such bytes (a garbage pointer on its main thread, 2026-10-22): this names them.
+// F9 / F10 in the game window (window.cpp), diagnostics for one run: turn the verification, or the
+// copy-queue readbacks themselves (declined ones download on the main queue), off and on again live,
+// to see which one draws the yellow blocks on the corridor glass with KYTY_READBACK_QUEUE=transfer
+// (2026-10-22). Write ticks keep being noted, so turning copies on again stays safe.
+static std::atomic<bool> g_key_verify_off {false};
+static std::atomic<bool> g_key_copies_off {false};
+
+static void ToggleKey(std::atomic<bool>& off, const char* what) {
+	const bool now_off = !off.load(std::memory_order_relaxed);
+	off.store(now_off, std::memory_order_relaxed);
+	const auto time = std::time(nullptr);
+	char       clock[16] {};
+	std::strftime(clock, sizeof(clock), "%H:%M:%S", std::localtime(&time));
+	std::fprintf(stderr, "[diag-key] %s %s at %s\n", what, now_off ? "OFF" : "ON", clock);
+}
+
+void ToggleReadbackVerifyKey() {
+	ToggleKey(g_key_verify_off, "F9 readback verify");
+}
+
+void ToggleCopyReadbacksKey() {
+	ToggleKey(g_key_copies_off, "F10 copy-queue readbacks");
+}
+
+static bool ReadbackVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && !g_key_verify_off.load(std::memory_order_relaxed);
+}
+
 uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
                                            uint64_t window_end) {
 	constexpr uint64_t StagingSize = 8ull * 1024 * 1024;
-	if (!CopyQueueReadbackEnabled() || m_graphics.readback_queue == nullptr ||
-	    window_begin >= window_end) {
+	if (!CopyQueueReadbackEnabled() || g_key_copies_off.load(std::memory_order_relaxed) ||
+	    m_graphics.readback_queue == nullptr || window_begin >= window_end) {
 		return 0;
 	}
 	const auto latest_write = LatestGpuWriteTick(window_begin, window_end);
@@ -3753,6 +4124,10 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	if (copies.empty() || total_size > StagingSize) {
 		return 0;
 	}
+	const bool verify = ReadbackVerifyEnabled();
+	if (verify && total_size * 2 > StagingSize) {
+		return 0;
+	}
 	uint32_t index = CopyReadbackSlots;
 	for (uint32_t i = 0; i < CopyReadbackSlots; i++) {
 		if (m_copy_slots[i].busy.load(std::memory_order_acquire) == 0) {
@@ -3770,7 +4145,7 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	if (slot.pool == nullptr) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		pool_info.queueFamilyIndex = m_graphics.ReadbackQueueFamily(); // KYTY_READBACK_QUEUE
 		RequireVulkanSuccess(device.createCommandPool(&pool_info, nullptr, &slot.pool),
 		                     "create readback command pool");
 		vk::CommandBufferAllocateInfo allocate {};
@@ -3804,6 +4179,30 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	                             vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &to_host, 0,
 	                             nullptr);
 	RequireVulkanSuccess(slot.command.end(), "end readback command buffer");
+	if (verify) {
+		if (slot.verify_command == nullptr) {
+			vk::CommandBufferAllocateInfo allocate {};
+			allocate.commandPool        = slot.pool;
+			allocate.level              = vk::CommandBufferLevel::ePrimary;
+			allocate.commandBufferCount = 1;
+			RequireVulkanSuccess(device.allocateCommandBuffers(&allocate, &slot.verify_command),
+			                     "allocate readback verify command buffer");
+		}
+		auto verify_copies = copies;
+		for (auto& copy: verify_copies) {
+			copy.dstOffset += total_size;
+		}
+		RequireVulkanSuccess(slot.verify_command.begin(&begin), "begin readback verify");
+		slot.verify_command.copyBuffer(buffer.Handle(), slot.staging->Handle(),
+		                               static_cast<uint32_t>(verify_copies.size()),
+		                               verify_copies.data());
+		auto verify_to_host   = to_host;
+		verify_to_host.offset = total_size;
+		slot.verify_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+		                                    &verify_to_host, 0, nullptr);
+		RequireVulkanSuccess(slot.verify_command.end(), "end readback verify");
+	}
 
 	// The memory dependency on the writers: a wait for the timeline value of the last one (one
 	// the GPU has reached when they have finished). A writer in the tick being recorded is
@@ -3825,8 +4224,36 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &slot.command;
-	RequireVulkanSuccess(m_graphics.readback_queue.submit(1, &submit, slot.fence),
-	                     "submit readback");
+	// KYTY_READBACK_VERIFY: the second batch waits for everything recorded so far (submitted now,
+	// so the wait cannot depend on the GPU thread's next submission).
+	uint64_t verify_tick = 0;
+	if (verify) {
+		(KYTY_SUBMIT_REASON(), m_scheduler.Flush());
+		verify_tick = m_scheduler.CurrentTick() - 1;
+	}
+	vk::TimelineSemaphoreSubmitInfo verify_timeline {};
+	verify_timeline.waitSemaphoreValueCount = 1;
+	verify_timeline.pWaitSemaphoreValues    = &verify_tick;
+	vk::SubmitInfo submits[2]               = {submit, submit};
+	submits[1].pNext                        = &verify_timeline;
+	submits[1].pCommandBuffers              = &slot.verify_command;
+	ReadbackVulkanSuccess(m_graphics,
+	                      m_graphics.readback_queue.submit(verify ? 2u : 1u, submits, slot.fence),
+	                      "submit readback");
+	uint64_t block_tick = 0;
+	uint64_t large_tick = 0;
+	if (verify) {
+		for (auto block = window_begin >> 20u; block <= (window_end - 1) >> 20u; block++) {
+			if (const auto found = m_write_ticks.find(block); found != m_write_ticks.end()) {
+				block_tick = std::max(block_tick, found->second);
+			}
+		}
+		for (const auto& write: m_large_writes) {
+			if (write[0] < window_end && window_begin < write[1]) {
+				large_tick = std::max(large_tick, write[2]);
+			}
+		}
+	}
 
 	// The bytes are on their way back: they stop counting as GPU-written and count as
 	// downloading until the caller publishes them, as with a main-queue download.
@@ -3843,8 +4270,21 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 	slot.window_begin   = window_begin;
 	slot.window_end     = window_end;
 	slot.total_size     = total_size;
+	slot.guard_sequence = Libs::LibKernel::Memory::EmulatorWriteSequence();
+	slot.guard.clear();
+	if (DownloadGuardEnabled()) {
+		for (const auto& copy: copies) {
+			slot.guard.push_back(HashGuestBytes(buffer_address + copy.srcOffset, copy.size));
+		}
+	}
 	slot.copies         = std::move(copies);
 	slot.snapshot       = false;
+	slot.verify         = verify;
+	slot.narrow         = m_narrow_copy_in_progress;
+	slot.block_tick     = block_tick;
+	slot.large_tick     = large_tick;
+	slot.reached_tick   = reached;
+	slot.verify_tick    = verify_tick;
 	slot.generation     = (slot.generation + 1u) & 0xffffffu;
 	m_copy_in_flight.fetch_add(1, std::memory_order_acq_rel);
 	slot.busy.store(1, std::memory_order_release);
@@ -3857,6 +4297,50 @@ uint64_t BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin
 		             m_copy_taken, m_copy_running, m_copy_busy);
 	}
 	return CopyReadbackMarker | (uint64_t {slot.generation} << 8u) | index;
+}
+
+// KYTY_READBACK_NARROW_COPY (default on; =0 as before). A game-thread read copies the readback
+// window on the second queue only when every writer of the window has finished; otherwise the
+// window downloads on the main queue, behind everything recorded so far. Writers are known per
+// 1 MiB block, so one block of the 4 MB window that the frame being drawn writes made every read
+// of the window wait for that frame, also reads of a block the GPU had finished long before (a
+// game reading the previous frame's results). Then the 1 MiB block around the read is copied on
+// the second queue alone, behind finished work; the rest of the window keeps its protection and
+// GPU-written bytes for a later read, as KYTY_SRT_NARROW_READBACK does for SRT refreshes.
+static bool ReadbackNarrowCopyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_NARROW_COPY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+uint64_t BufferCache::TryNarrowCopyReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                            uint64_t window_begin, uint64_t window_end) {
+	constexpr uint64_t Block = 1ull << 20u; // the granularity of the writer ticks (NoteGpuWriteTick)
+	if (!ReadbackNarrowCopyEnabled() || !CopyQueueReadbackEnabled() ||
+	    m_graphics.readback_queue == nullptr) {
+		return 0;
+	}
+	const auto begin = std::max(Common::AlignDown(vaddr, Block), window_begin);
+	const auto end   = std::min(std::max(begin + Block, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE)),
+	                            window_end);
+	if (begin >= end || (begin == window_begin && end == window_end)) {
+		return 0; // the window itself, which has just been declined
+	}
+	const auto latest = LatestGpuWriteTick(begin, end);
+	if (latest != 0 && !m_scheduler.IsFree(latest)) {
+		m_narrow_running++;
+		return 0;
+	}
+	m_narrow_copy_in_progress = true;
+	const auto marker         = TryCopyQueueReadback(buffer, begin, end);
+	m_narrow_copy_in_progress = false;
+	if (marker != 0 && ++m_narrow_taken % 1024 == 1) {
+		std::fprintf(stderr, "[copy-readback] narrow taken=%" PRIu64 " block_running=%" PRIu64 "\n",
+		             m_narrow_taken, m_narrow_running);
+	}
+	return marker;
 }
 
 uint64_t BufferCache::TrySnapshotReadback(Buffer& buffer, uint64_t window_begin,
@@ -3906,7 +4390,7 @@ uint64_t BufferCache::TrySnapshotReadback(Buffer& buffer, uint64_t window_begin,
 	if (slot.pool == nullptr) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		pool_info.queueFamilyIndex = m_graphics.ReadbackQueueFamily(); // KYTY_READBACK_QUEUE
 		RequireVulkanSuccess(device.createCommandPool(&pool_info, nullptr, &slot.pool),
 		                     "create readback command pool");
 		vk::CommandBufferAllocateInfo allocate {};
@@ -3954,14 +4438,15 @@ uint64_t BufferCache::TrySnapshotReadback(Buffer& buffer, uint64_t window_begin,
 	submit.pWaitDstStageMask  = &wait_stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &slot.command;
-	RequireVulkanSuccess(m_graphics.readback_queue.submit(1, &submit, slot.fence),
-	                     "submit snapshot readback");
+	ReadbackVulkanSuccess(m_graphics, m_graphics.readback_queue.submit(1, &submit, slot.fence),
+	                      "submit snapshot readback");
 	slot.buffer_address = buffer_address;
 	slot.window_begin   = window_begin;
 	slot.window_end     = window_end;
 	slot.total_size     = total_size;
 	slot.copies         = std::move(copies);
 	slot.snapshot       = true;
+	slot.verify         = false;
 	slot.generation     = (slot.generation + 1u) & 0xffffffu;
 	m_copy_in_flight.fetch_add(1, std::memory_order_acq_rel);
 	slot.busy.store(1, std::memory_order_release);
@@ -3984,10 +4469,64 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 	}
 	KYTY_PROFILER_BLOCK("BufferCache::CompleteCopyReadback");
 	auto device = m_graphics.device;
-	RequireVulkanSuccess(device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
-	                     "wait for readback");
-	slot.staging->Invalidate(0, slot.total_size);
+	ReadbackVulkanSuccess(m_graphics, device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
+	                      "wait for readback");
+	slot.staging->Invalidate(0, slot.total_size * (slot.verify ? 2u : 1u));
 	const auto* mapped = slot.staging->Mapped().data();
+	if (slot.verify) {
+		static std::atomic<uint64_t> verified {0};
+		static std::atomic<uint64_t> stale_copies {0};
+		static std::atomic<uint64_t> stale_bytes {0};
+		static std::atomic<uint32_t> logged {0};
+		bool                         stale = false;
+		for (const auto& copy: slot.copies) {
+			const auto* fast = mapped + copy.dstOffset;
+			const auto* safe = mapped + slot.total_size + copy.dstOffset;
+			if (std::memcmp(fast, safe, static_cast<size_t>(copy.size)) == 0) {
+				continue;
+			}
+			uint64_t differ = 0;
+			uint64_t first  = UINT64_MAX;
+			for (uint64_t i = 0; i < copy.size; i++) {
+				if (fast[i] != safe[i]) {
+					differ++;
+					first = std::min(first, i);
+				}
+			}
+			stale = true;
+			stale_bytes.fetch_add(differ, std::memory_order_relaxed);
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+				std::fprintf(stderr,
+				             "[readback-verify] stale 0x%llx+0x%llx: %llu bytes differ (first +0x%llx); "
+				             "window 0x%llx-0x%llx narrow=%d; writer ticks noted: block %llu large %llu; "
+				             "first copy waited %llu, checked copy %llu;%s\n",
+				             static_cast<unsigned long long>(slot.buffer_address + copy.srcOffset),
+				             static_cast<unsigned long long>(copy.size),
+				             static_cast<unsigned long long>(differ),
+				             static_cast<unsigned long long>(first),
+				             static_cast<unsigned long long>(slot.window_begin),
+				             static_cast<unsigned long long>(slot.window_end), slot.narrow ? 1 : 0,
+				             static_cast<unsigned long long>(slot.block_tick),
+				             static_cast<unsigned long long>(slot.large_tick),
+				             static_cast<unsigned long long>(slot.reached_tick),
+				             static_cast<unsigned long long>(slot.verify_tick),
+				             BoundedWritesMissing(slot.buffer_address + copy.srcOffset + first, 1)
+				                 .c_str());
+			}
+		}
+		const auto count = verified.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (stale) {
+			stale_copies.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (count % 1024 == 0) {
+			std::fprintf(stderr,
+			             "[readback-verify] %llu copies checked, %llu with stale bytes (%llu bytes)\n",
+			             static_cast<unsigned long long>(count),
+			             static_cast<unsigned long long>(stale_copies.load()),
+			             static_cast<unsigned long long>(stale_bytes.load()));
+		}
+		mapped += slot.total_size; // publish the checked copy
+	}
 	if (slot.snapshot) {
 		// Only bytes still GPU-written: a download recorded since may have published newer
 		// bytes of the rest, which the older snapshot must not overwrite.
@@ -3999,13 +4538,31 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 					return;
 				}
 				Libs::LibKernel::Memory::WriteBacking(from, mapped + copy.dstOffset + (from - begin),
-				                                      to - from);
+				                                      to - from, 'Q');
 			});
 		}
 	} else {
-		for (const auto& copy: slot.copies) {
-			Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
-			                                      mapped + copy.dstOffset, copy.size);
+		for (size_t i = 0; i < slot.copies.size(); i++) {
+			const auto& copy = slot.copies[i];
+			if (i < slot.guard.size()) {
+				CheckDownloadGuard('Q', slot.buffer_address + copy.srcOffset, copy.size, slot.guard[i],
+				                   slot.guard_sequence);
+			}
+			// Unlike a main-queue download, published by a priority operation an unmap waits for,
+			// a copy-queue readback can complete after the game has unmapped its range (an AMM
+			// batch, a streaming release): those bytes are gone with the mapping, so they are
+			// skipped. WriteBacking exited instead ("required direct-backing write failed", with
+			// the slower SDMA copies, 2026-10-22).
+			if (!Libs::LibKernel::Memory::TryWriteBacking(slot.buffer_address + copy.srcOffset,
+			                                              mapped + copy.dstOffset, copy.size, 'Q')) {
+				static std::atomic<uint32_t> skipped {0};
+				if (skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+					std::fprintf(stderr,
+					             "[copy-readback] publish skipped: 0x%llx+0x%llx is no longer mapped\n",
+					             static_cast<unsigned long long>(slot.buffer_address + copy.srcOffset),
+					             static_cast<unsigned long long>(copy.size));
+				}
+			}
 		}
 	}
 	if (slot.snapshot) {
@@ -4020,6 +4577,11 @@ void BufferCache::CompleteCopyReadback(uint64_t marker) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: slot.copies) {
 			m_downloading_ranges.Subtract(slot.buffer_address + copy.srcOffset, copy.size);
+		}
+		// Ranges a main-queue download still has in flight stay marked, as its own publication
+		// keeps them: unmarked, the game wrote there and that download landed over it (24/10).
+		for (const auto& [start, bytes]: m_downloading_list) {
+			m_downloading_ranges.Add(start, bytes);
 		}
 		NoteDownloading();
 	}
@@ -4138,8 +4700,8 @@ void BufferCache::WaitCopyReadbacks() {
 		}
 		std::lock_guard guard(slot.mutex);
 		if (slot.busy.load(std::memory_order_acquire) != 0) {
-			RequireVulkanSuccess(
-			    m_graphics.device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
+			ReadbackVulkanSuccess(
+			    m_graphics, m_graphics.device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
 			    "wait for readback");
 		}
 	}

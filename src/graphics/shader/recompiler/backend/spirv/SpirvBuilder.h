@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <algorithm>
+#include <array>
 #include <initializer_list>
 #include <iterator>
 #include <map>
@@ -38,7 +40,15 @@ public:
 	uint32_t Import(const char* name);
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, const Args&... operands) {
-		return DeclareType(opcode, MakeTypeKey(opcode, operands...));
+		if constexpr (((std::is_integral_v<Args> || std::is_enum_v<Args>) && ...)) {
+			static_assert(((sizeof(Args) <= sizeof(uint32_t)) && ...));
+			static_assert(((!std::is_enum_v<Args> || sizeof(Args) == sizeof(uint32_t)) && ...));
+			const std::array<uint32_t, 2u + sizeof...(Args)> key {
+			    static_cast<uint32_t>(opcode), sizeof...(Args), static_cast<uint32_t>(operands)...};
+			return DeclareType(opcode, key);
+		} else {
+			return DeclareType(opcode, MakeTypeKey(opcode, operands...));
+		}
 	}
 
 	template <typename... Args>
@@ -49,10 +59,18 @@ public:
 
 	template <typename... Args>
 	uint32_t Constant(spv::Op opcode, uint32_t type, const Args&... operands) {
-		std::vector<uint32_t> key;
-		key.reserve(2u + (0u + ... + OperandWordCount(operands)));
-		AppendOperands(key, opcode, type, operands...);
-		return DeclareConstant(opcode, std::move(key));
+		if constexpr (((std::is_integral_v<Args> || std::is_enum_v<Args>) && ...)) {
+			static_assert(((sizeof(Args) <= sizeof(uint32_t)) && ...));
+			static_assert(((!std::is_enum_v<Args> || sizeof(Args) == sizeof(uint32_t)) && ...));
+			const std::array<uint32_t, 2u + sizeof...(Args)> key {
+			    static_cast<uint32_t>(opcode), type, static_cast<uint32_t>(operands)...};
+			return DeclareConstant(opcode, key);
+		} else {
+			std::vector<uint32_t> key;
+			key.reserve(2u + (0u + ... + OperandWordCount(operands)));
+			AppendOperands(key, opcode, type, operands...);
+			return DeclareConstant(opcode, std::move(key));
+		}
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
@@ -135,9 +153,19 @@ private:
 		section[offset] |= word_count << spv::WordCountShift;
 	}
 
+	// Heterogeneous lookup lets fixed-size keys stay on the stack; only new declarations own
+	// a vector in the map. Comparison is the same word ordering used by vector's operator<.
+	struct DeclarationKeyLess {
+		using is_transparent = void;
+		bool operator()(std::span<const uint32_t> lhs, std::span<const uint32_t> rhs) const {
+			return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
+		}
+	};
+	uint32_t    DeclareType(spv::Op opcode, std::span<const uint32_t> key);
 	uint32_t    DeclareType(spv::Op opcode, std::vector<uint32_t> key);
 	uint32_t    DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
 	                                 std::initializer_list<TypeAnnotation> annotations);
+	uint32_t    DeclareConstant(spv::Op opcode, std::span<const uint32_t> key);
 	uint32_t    DeclareConstant(spv::Op opcode, std::vector<uint32_t> key);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
@@ -156,7 +184,7 @@ private:
 	std::set<spv::Capability>                 m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	std::map<std::vector<uint32_t>, uint32_t, DeclarationKeyLess> m_declaration_ids;
 	size_t                                    m_unpatched_phi_incomings = 0;
 };
 

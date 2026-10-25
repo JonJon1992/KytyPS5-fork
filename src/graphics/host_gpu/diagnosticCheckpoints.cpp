@@ -6,9 +6,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -57,6 +59,72 @@ const DiagnosticCheckpoint* RecordDiagnosticCheckpoint(const DiagnosticCheckpoin
 	return &slot;
 }
 
+namespace {
+
+// KYTY_ADDRESS_BINDING_REPORT=1: the last device address bind/unbind events (VulkanAddressBinding
+// Callback), newest last. A device fault reports a GPU virtual address; these say which object
+// covered it and whether it had been freed, and how long before the fault.
+struct AddressBindingEvent {
+	uint64_t base        = 0;
+	uint64_t size        = 0;
+	uint64_t handle      = 0;
+	uint64_t time_us     = 0;
+	uint32_t object_type = 0;
+	bool     bind        = false;
+	bool     internal    = false;
+};
+constexpr size_t                                 ADDRESS_BINDING_RING_SIZE = 1u << 16u;
+std::mutex                                       g_address_binding_mutex;
+std::array<AddressBindingEvent, ADDRESS_BINDING_RING_SIZE> g_address_bindings {};
+uint64_t                                         g_address_binding_count = 0;
+
+uint64_t NowUs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// The newest events whose range covers the address (within the fault's precision).
+void PrintAddressBindingsAt(uint64_t address, uint64_t precision) {
+	std::lock_guard lock(g_address_binding_mutex);
+	if (g_address_binding_count == 0) {
+		return;
+	}
+	const uint64_t now   = NowUs();
+	const uint64_t slack = std::max<uint64_t>(precision, 1);
+	const uint64_t kept  = std::min<uint64_t>(g_address_binding_count, ADDRESS_BINDING_RING_SIZE);
+	uint32_t       shown = 0;
+	for (uint64_t i = 0; i < kept && shown < 8; i++) {
+		const auto& event = g_address_bindings[(g_address_binding_count - 1 - i) % ADDRESS_BINDING_RING_SIZE];
+		if (address + slack <= event.base || address >= event.base + event.size + slack) {
+			continue;
+		}
+		shown++;
+		std::fprintf(stderr,
+		             "[device-fault]   %s %s handle=0x%016" PRIx64 " 0x%016" PRIx64 "+0x%" PRIx64
+		             "%s, %.1f ms before the report\n",
+		             event.bind ? "bind" : "unbind",
+		             vk::to_string(static_cast<vk::ObjectType>(event.object_type)).c_str(), event.handle,
+		             event.base, event.size, event.internal ? " internal" : "",
+		             static_cast<double>(now - event.time_us) / 1000.0);
+	}
+	if (shown == 0) {
+		std::fprintf(stderr, "[device-fault]   no bind/unbind event of the last %" PRIu64
+		                     " covers this address\n",
+		             kept);
+	}
+}
+
+} // namespace
+
+void NoteAddressBinding(bool bind, uint64_t base, uint64_t size, uint32_t object_type,
+                        uint64_t handle, bool internal) {
+	std::lock_guard lock(g_address_binding_mutex);
+	g_address_bindings[g_address_binding_count % ADDRESS_BINDING_RING_SIZE] = {
+	    base, size, handle, NowUs(), object_type, bind, internal};
+	g_address_binding_count++;
+}
+
 static void DumpDeviceFault(GraphicContext& graphics) {
 	if (!graphics.device_fault_enabled) {
 		return;
@@ -91,6 +159,8 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		             vk::to_string(address.addressType).c_str(),
 		             static_cast<uint64_t>(address.reportedAddress),
 		             static_cast<uint64_t>(address.addressPrecision));
+		PrintAddressBindingsAt(static_cast<uint64_t>(address.reportedAddress),
+		                       static_cast<uint64_t>(address.addressPrecision));
 		LOGF("  address[%u]: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n", i,
 		     vk::to_string(address.addressType).c_str(),
 		     static_cast<uint64_t>(address.reportedAddress),

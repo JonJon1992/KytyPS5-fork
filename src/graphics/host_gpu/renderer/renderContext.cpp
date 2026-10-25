@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/environment.h"
 
 #include "common/profiler.h"
 
@@ -217,29 +218,13 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			return;
 		}
 	}
-	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
-		m_buffer_cache.UnmapShared(vaddr, size);
-		m_buffer_cache.InvalidateMemory(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
-		m_bindless_table.UnwatchRange(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
-	};
-	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
-	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps every 5 s.
+	static const bool stats = Common::Environment::IsSet("KYTY_FPS_LOG");
+	const auto        begin = std::chrono::steady_clock::now();
+	UnmapMappedRanges({{vaddr, size}});
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
-		unmap();
 		return;
 	}
-	// KYTY_FPS_LOG: time the GPU-thread round trips of unmaps (each drains the GPU) every 5 s.
-	static const bool stats = std::getenv("KYTY_FPS_LOG") != nullptr;
-	const auto        begin = std::chrono::steady_clock::now();
-	m_gpu->SendCommandSync(unmap);
 	if (stats) {
 		static std::mutex mutex;
 		static double     total_ms = 0.0, max_ms = 0.0;
@@ -278,12 +263,38 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 	if (mapped.empty()) {
 		return;
 	}
-	const auto unmap = [this, &mapped] {
+	UnmapMappedRanges(mapped);
+}
+
+// KYTY_ASYNC_UNMAP (default on; =0 drains on the GPU thread as before). An unmap used to submit
+// and wait for the GPU on the GPU thread (CommandScheduler::Finish): the emulated GPU stopped for
+// a whole GPU frame, ~20 ms, at every unmap of the game's streaming (51 in two minutes of
+// Wolverine traversal, 2026-10-22). Now the GPU thread only submits; the thread that unmaps (an
+// AMPR engine, a guest thread) waits for that tick and for the priority operations up to it (the
+// guest writes the drain waited for), and the caches let go of the ranges afterwards, in the same
+// order as before. Buffers and images over the ranges are released only once the GPU is done with
+// them (DeferRelease). Imported guest memory (shared buffers, host zones) still drains: an import
+// must not outlive the memory it points into (VK_EXT_external_memory_host), and UnmapShared frees
+// it at once.
+static bool AsyncUnmapEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_UNMAP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void RenderContext::UnmapMappedRanges(const std::vector<std::pair<uint64_t, uint64_t>>& mapped) {
+	// GPU thread: submits and waits for the GPU and the guest writes queued up to now.
+	const auto drain = [this] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			(KYTY_SUBMIT_REASON(), m_command_scheduler.Finish());
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
+	};
+	// GPU thread, once nothing in flight uses the ranges: the caches let go of them.
+	const auto release = [this, &mapped] {
 		for (const auto& [vaddr, size]: mapped) {
 			m_buffer_cache.UnmapShared(vaddr, size);
 			m_buffer_cache.InvalidateMemory(vaddr, size);
@@ -295,11 +306,45 @@ void RenderContext::UnmapMemoryRanges(std::span<const std::pair<uint64_t, uint64
 			m_mapped_ranges.Subtract(vaddr, size);
 		}
 	};
+	const auto imported = [this, &mapped] {
+		return std::ranges::any_of(mapped, [this](const auto& range) {
+			return m_buffer_cache.IntersectsShared(range.first, range.second);
+		});
+	};
+	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
+	// longer accepts external work. Use the guest GPU's state for the teardown route.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
-		unmap();
+		drain();
+		release();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	bool     wait          = false;
+	uint64_t gpu_tick      = 0;
+	uint64_t priority_tick = 0;
+	m_gpu->SendCommandSync([&] {
+		if (!AsyncUnmapEnabled() || !m_command_scheduler.Active() || imported()) {
+			drain();
+			release();
+			return;
+		}
+		priority_tick = m_command_scheduler.CurrentTick();
+		(KYTY_SUBMIT_REASON(), m_command_scheduler.Flush());
+		// As Finish: the tick just submitted, or the last one if nothing was recorded.
+		gpu_tick = m_command_scheduler.CurrentTick() - 1;
+		wait     = true;
+	});
+	if (!wait) {
+		return;
+	}
+	m_command_scheduler.GetMasterSemaphore().Wait(gpu_tick);
+	m_command_scheduler.WaitPriorityOperations(priority_tick);
+	m_gpu->SendCommandSync([&] {
+		// A shared buffer or host zone created over the ranges meanwhile is still drained for.
+		if (imported()) {
+			drain();
+		}
+		release();
+	});
 }
 
 void RenderContext::PrepareBda() {

@@ -593,6 +593,12 @@ bool QueryCommit(uint64_t& limit, uint64_t& available) {
 #endif
 }
 
+bool QueryProcessMemory(uint64_t& resident, uint64_t& private_bytes) {
+	(void)resident;
+	(void)private_bytes;
+	return false;
+}
+
 } // namespace Common::VirtualMemory
 
 #endif

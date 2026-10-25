@@ -82,6 +82,9 @@ private:
 		int                                 event_id = 0;
 	};
 
+	// The common part of UnmapMemory and UnmapMemoryRanges, for the ranges that need it.
+	void UnmapMappedRanges(const std::vector<std::pair<uint64_t, uint64_t>>& mapped);
+
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;

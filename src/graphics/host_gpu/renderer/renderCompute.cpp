@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/environment.h"
 #include <fmt/format.h>
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -937,8 +938,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
-	if (!compute_program && PipelineCache::SrtDeferPending()) {
-		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
+	if (!compute_program && (PipelineCache::SrtDeferPending() || PipelineCache::PipelineSuspendPending())) {
+		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER) or its shader is compiled
+		// (KYTY_SHADER_WORKERS); not skipped.
 		ResetBindings();
 		return;
 	}
@@ -961,7 +963,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
 	const auto& resources = *input_info.stage.resources;
 	// KYTY_LOG_CS_IMAGES=1: each compute shader's written images (extent, format), once per shape.
-	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
+	if (static const bool log_images = Common::Environment::IsSet("KYTY_LOG_CS_IMAGES"); log_images) {
 		static std::unordered_set<uint64_t> seen;
 		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
 			if (!program.info.images[i].written) continue;
@@ -986,6 +988,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			return;
 		}
 	}
+	// Before anything is recorded: nullptr suspends the packet, which runs again (KYTY_COMPUTE_ASYNC).
+	auto* const pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		ResetBindings();
+		return;
+	}
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -1007,8 +1016,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -1019,6 +1027,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.PrepareBda();
+	}
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteAddressWrites();
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
@@ -1179,8 +1190,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
-	if (!compute_program && PipelineCache::SrtDeferPending()) {
-		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER); not skipped.
+	if (!compute_program && (PipelineCache::SrtDeferPending() || PipelineCache::PipelineSuspendPending())) {
+		// Suspended until the SRT bytes it reads land (KYTY_SRT_DEFER) or its shader is compiled
+		// (KYTY_SHADER_WORKERS); not skipped.
 		ResetBindings();
 		return;
 	}
@@ -1196,6 +1208,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			             static_cast<uint64_t>(cs_regs.cs_regs.data_addr),
 			             input_info.stage.program->shader_hash);
 		}
+	}
+	// Before anything is recorded: nullptr suspends the packet, which runs again (KYTY_COMPUTE_ASYNC).
+	auto* const pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		ResetBindings();
+		return;
 	}
 	// KYTY_INDIRECT_CLAMP_GROUPS (default 1): group-count arguments go through the same GPU
 	// conversion, which empties dispatches no real workload needs (garbage counts launched
@@ -1266,14 +1285,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 		}
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	NoteRunShader(cs_regs.cs_regs.data_addr, program.shader_hash);
 	NoteTickWork(m_context.GetCommandScheduler().CurrentTick(), 'C', program.shader_hash, cs_regs.cs_regs.data_addr);
-	if (static const bool log_images = std::getenv("KYTY_LOG_CS_IMAGES") != nullptr; log_images) {
+	if (static const bool log_images = Common::Environment::IsSet("KYTY_LOG_CS_IMAGES"); log_images) {
 		static std::unordered_set<uint64_t> seen;
 		const auto& resources = *input_info.stage.resources;
 		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
@@ -1291,6 +1310,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteAddressWrites();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);

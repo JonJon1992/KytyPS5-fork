@@ -8,6 +8,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <psapi.h>   // PROCESS_MEMORY_COUNTERS_EX (the function itself is kernel32's K32 one)
 
 #include "common/assert.h"
 #include "common/virtualMemory.h"
@@ -343,6 +344,19 @@ bool QueryCommit(uint64_t& limit, uint64_t& available) {
 	}
 	limit     = status.ullTotalPageFile;
 	available = status.ullAvailPageFile;
+	return true;
+}
+
+bool QueryProcessMemory(uint64_t& resident, uint64_t& private_bytes) {
+	// K32GetProcessMemoryInfo lives in kernel32 (Windows 7 and later): no psapi.lib needed.
+	PROCESS_MEMORY_COUNTERS_EX counters {};
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+	                            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+	                            sizeof(counters)) == 0) {
+		return false;
+	}
+	resident      = counters.WorkingSetSize;
+	private_bytes = counters.PrivateUsage;
 	return true;
 }
 

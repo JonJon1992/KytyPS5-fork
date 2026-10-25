@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/cpuAffinity.h"
@@ -771,6 +772,9 @@ void GuestGpu::WaitForIdle() {
 // KYTY_SRT_DEFER: the tick the dispatch just suspended waits for; GuestGpu::ThreadRun moves it
 // to the submission (GPU thread only).
 static uint64_t g_srt_wait_tick = 0;
+// KYTY_PIPELINE_WAIT_SUSPEND: a draw suspended its packet waiting for its pipeline; the submission
+// runs again as soon as the commands queued meanwhile are served, not when new work arrives.
+static bool g_pipeline_wait_suspended = false;
 
 struct SrtDeferStats {
 	uint64_t deferred   = 0; // dispatches suspended
@@ -799,7 +803,7 @@ struct SuspendSite {
 };
 static std::unordered_map<const uint32_t*, SuspendSite> g_suspend_sites;
 static void NoteSuspendSite(const uint32_t* packet, uint32_t remaining_dw) {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (!log) return;
 	auto& site = g_suspend_sites[packet];
 	if (site.count++ == 0) {
@@ -814,7 +818,7 @@ static void ReportSrtDeferStats() {
 	if (now - st.last < std::chrono::seconds(5)) {
 		return;
 	}
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (log) {
 		const double s = std::chrono::duration<double>(now - st.last).count();
 		std::fprintf(stderr,
@@ -872,6 +876,8 @@ void GuestGpu::ThreadRun(void* data) {
 	Common::Sampler::RegisterCurrentThread("gpu");
 
 	auto loop_mark = std::chrono::steady_clock::now();
+	// The queue whose submission is suspended while it waits for a pipeline, or -1.
+	int pipeline_queue = -1;
 	for (;;) {
 		{
 			const auto now = std::chrono::steady_clock::now();
@@ -917,7 +923,17 @@ void GuestGpu::ThreadRun(void* data) {
 				bool     tick_pending   = false;
 				uint64_t pending_tick   = UINT64_MAX;
 				auto& scheduler     = gpu->m_renderer.GetCommandScheduler();
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
+				// A submission waiting for a pipeline runs again before any other queue: in between
+				// only the GPU thread's commands are served, as when the wait sat inside the packet.
+				// On the console a queue never stalls for seconds while the others run ahead.
+				const bool resume =
+				    pipeline_queue >= 0 &&
+				    !gpu->m_queues[static_cast<uint32_t>(pipeline_queue)].empty() &&
+				    gpu->m_queues[static_cast<uint32_t>(pipeline_queue)].front().srt_wait_tick == 0;
+				if (resume) {
+					selected_queue = pipeline_queue;
+				}
+				for (uint32_t offset = 0; !resume && offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
 					if (gpu->m_queues[id].empty()) {
 						continue;
@@ -1051,7 +1067,8 @@ void GuestGpu::ThreadRun(void* data) {
 				g_srt_defer_stats.noprog_calls++;
 			}
 		}
-		const auto srt_tick = std::exchange(g_srt_wait_tick, 0);
+		const auto srt_tick      = std::exchange(g_srt_wait_tick, 0);
+		const bool pipeline_wait = std::exchange(g_pipeline_wait_suspended, false);
 		ReportSrtDeferStats();
 
 		const auto lock2_begin = std::chrono::steady_clock::now();
@@ -1060,8 +1077,9 @@ void GuestGpu::ThreadRun(void* data) {
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
 		        std::chrono::steady_clock::now() - lock2_begin)
 		        .count());
+		pipeline_queue = !complete && pipeline_wait ? static_cast<int>(submission.queue_id) : -1;
 		if (!complete) {
-			submission.blocked       = true;
+			submission.blocked       = !pipeline_wait;
 			submission.srt_wait_tick = srt_tick;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
@@ -1122,7 +1140,7 @@ static void HotPagesSlice(bool first_slice) {
 		last_epoch = now;
 		g_hot_epoch.fetch_add(1, std::memory_order_relaxed);
 	}
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log) {
 		std::fprintf(stderr,
 		             "[hot-pages] faults %.0f/s, promoted %.0f/s, uploads %.0f/s, repeats skipped "
 		             "%.0f/s, demoted by GPU writes %.0f/s, generations %.0f/s\n",
@@ -1301,6 +1319,12 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+void CommandProcessor::SuspendForPipeline() {
+	g_pipeline_wait_suspended = true;
+	SuspendPm4();
+	g_current_execution->m_pipeline_suspends++;
+}
+
 bool CommandProcessor::BeginDispatchDefer() {
 	if (!PipelineCache::SrtDeferEnabled() || g_current_execution == nullptr ||
 	    g_current_execution->m_buffer_stack.empty()) {
@@ -1475,6 +1499,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
+			// stderr: the shader log above is usually silent.
+			std::fprintf(stderr,
+			             "[pm4-unknown] queue=%u buffer=%p dw=%u offset=0x%05x depth=%zu "
+			             "pipeline_suspends=%u srt_defers=%u\n",
+			             g_stat_queue, static_cast<const void*>(base), total_dw, offset,
+			             execution.m_buffer_stack.size(), execution.m_pipeline_suspends,
+			             execution.m_defer_count);
+			for (uint32_t i = dump_begin; i < dump_end; i++) {
+				std::fprintf(stderr, "[pm4-unknown] %05x%s %08x\n", i, i == offset ? ":" : " ",
+				             base[i]);
+			}
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
 			     total_dw - remaining_dw, packet_header);
 		}
@@ -1598,7 +1633,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	PipelineCache::BeginPipelineSuspend(m_draw_may_suspend && g_current_execution != nullptr);
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	if (PipelineCache::EndPipelineSuspend()) {
+		SuspendForPipeline();
+		return;
+	}
 	CompleteDraw();
 }
 
@@ -1627,7 +1667,7 @@ void CommandProcessor::WriteIndirectStartInstance(uint32_t start_instance) {
 		return value == nullptr || value[0] != '0';
 	}();
 	const auto reg = m_start_instance_register;
-	if (static const bool log = std::getenv("KYTY_LOG_START_INST") != nullptr; log) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_LOG_START_INST"); log) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1) < 40) {
 			std::fprintf(stderr, "[start-inst] cpu reg=0x%x value=%u func=%d\n", reg, start_instance,
@@ -1654,7 +1694,7 @@ static void PrepareMeshArgsRun(const CommandProcessor& cp, const uint32_t* packe
 	                collected = 0, multi = 0;
 	static uint32_t last_header = 0, last_prev = 0, last_stop = 0;
 	static auto     last_log    = std::chrono::steady_clock::now();
-	if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log && MeshArgsRunsEnabled()) {
+	if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log && MeshArgsRunsEnabled()) {
 		calls++;
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last_log >= std::chrono::seconds(5)) {
@@ -1803,7 +1843,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		    m_start_instance_register <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
 			start_instance_sgpr = m_start_instance_register - Pm4::SPI_SHADER_USER_DATA_GS_0 + 1u;
 		}
-		if (static const bool log = std::getenv("KYTY_LOG_START_INST") != nullptr; log) {
+		if (static const bool log = Common::Environment::IsSet("KYTY_LOG_START_INST"); log) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1) < 40) {
 				std::fprintf(stderr, "[start-inst] gpu reg=0x%x sgpr=%u args=%u %u %u %u\n",
@@ -1929,7 +1969,25 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
-	for (uint32_t i = 0; i < draw_count; i++) {
+	// A draw suspended for its pipeline (KYTY_PIPELINE_WAIT_SUSPEND) runs the packet again from that
+	// draw: the ones before it are made already.
+	auto* const     execution = g_current_execution;
+	const uint32_t* packet    = nullptr;
+	uint32_t        first     = 0;
+	if (execution != nullptr && !execution->m_buffer_stack.empty()) {
+		const auto& cursor = execution->m_buffer_stack.back();
+		packet             = cursor.commands.data() + cursor.offset_dw;
+		if (execution->m_multi_draw_packet == packet) {
+			first = execution->m_multi_draw_next;
+		}
+		execution->m_multi_draw_packet = nullptr;
+	}
+	m_draw_may_suspend = packet != nullptr;
+	uint32_t i         = first;
+	for (; i < draw_count; i++) {
+		if (execution != nullptr && execution->m_suspended) {
+			break;
+		}
 		// DRAW_INDIRECT_MULTI writes DrawIndex before each draw, including draws
 		// with zero vertices/instances. It starts at zero for each packet.
 		if (draw_index_register != Pm4::SH_NOP) {
@@ -1981,6 +2039,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		           .first_instance = args->start_instance_location,
 		           .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
+	if (execution != nullptr && execution->m_suspended) {
+		EXIT_IF(i == first); // only a draw of this packet suspends it
+		execution->m_multi_draw_packet = packet;
+		execution->m_multi_draw_next   = i - 1;
+	}
+	m_draw_may_suspend = true;
 }
 
 // Profiling (KYTY_FPS_LOG): which queue each compute shader is dispatched from, with its first
@@ -1990,7 +2054,7 @@ static uint64_t g_dispatch_cpu_us[2] {};
 // compute submissions arrive, every 5 s: a packet that runs hundreds of times a frame is a loop
 // in the command stream (a chained indirect buffer that re-runs until a label changes).
 static void NotePacket(const uint32_t* packet, bool async, uint64_t shader) {
-	static const bool enabled = std::getenv("KYTY_PACKET_STATS") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_PACKET_STATS");
 	if (!enabled || packet == nullptr) {
 		return;
 	}
@@ -2028,7 +2092,7 @@ static void NotePacket(const uint32_t* packet, bool async, uint64_t shader) {
 }
 
 static void NoteDispatchQueue(uint64_t addr, bool async, uint32_t x, uint32_t y, uint32_t z) {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (!log) {
 		return;
 	}
@@ -2140,7 +2204,7 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 	}
 	// KYTY_FPS_LOG: run lengths by the shader of each dispatch (addr -> {dispatches, runs started}).
 	// (getenv once: on Windows each call locks and scans the environment, ~1 us a dispatch.)
-	static const bool run_log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool run_log = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (run_log) {
 		static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_shader;
 		static uint64_t                                                   run_len = 0;
@@ -2202,7 +2266,7 @@ static void PrepareDispatchRun(CommandProcessor& cp, bool indirect, const uint32
 }
 
 static void ReportDispatchRuns() {
-	static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+	static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 	if (!log || !DispatchRunsEnabled()) return;
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
@@ -2266,8 +2330,12 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			PrepareDispatchRun(*this, false, run_packet, run_end);
 		}
 		ReportDispatchRuns();
+		PipelineCache::BeginPipelineSuspend(g_current_execution != nullptr);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		if (PipelineCache::EndPipelineSuspend()) {
+			SuspendForPipeline();
+		}
 		EndDispatchDefer();
 		NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
 		                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2281,7 +2349,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	// Thread counts are converted on the GPU. Reading them here drained the GPU for every
 	// dispatch, since the previous dispatch writes them; KYTY_INDIRECT_THREADS_ON_CPU=1 restores
 	// that path for A/B runs.
-	static const bool threads_on_cpu = std::getenv("KYTY_INDIRECT_THREADS_ON_CPU") != nullptr;
+	static const bool threads_on_cpu = Common::Environment::IsSet("KYTY_INDIRECT_THREADS_ON_CPU");
 	if (threads_on_cpu && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);
@@ -2291,7 +2359,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	NoteDispatchQueue(m_sh_ctx.GetCs().cs_regs.data_addr, IsAsyncComputeQueue(), 0, 0, 0);
 	// KYTY_INDIRECT_STATS=1: the group counts indirect dispatches had, per shader, from copies of
 	// their arguments that never make the GPU thread wait (a frame or more old), every 5 s.
-	if (static const bool stats = std::getenv("KYTY_INDIRECT_STATS") != nullptr; stats) {
+	if (static const bool stats = Common::Environment::IsSet("KYTY_INDIRECT_STATS"); stats) {
 		struct Stat {
 			uint64_t n = 0, zero = 0, groups = 0, seen = 0, max = 0;
 		};
@@ -2347,7 +2415,11 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		                   run_packet, run_end);
 	}
 	ReportDispatchRuns();
+	PipelineCache::BeginPipelineSuspend(g_current_execution != nullptr);
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	if (PipelineCache::EndPipelineSuspend()) {
+		SuspendForPipeline();
+	}
 	EndDispatchDefer();
 	NoteDispatchQueue(0, IsAsyncComputeQueue(), UINT32_MAX, 0,
 	                  static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2377,7 +2449,12 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			args.instance_count = NumInstances();
 		}
 	}
+	PipelineCache::BeginPipelineSuspend(m_draw_may_suspend && g_current_execution != nullptr);
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	if (PipelineCache::EndPipelineSuspend()) {
+		SuspendForPipeline();
+		return;
+	}
 	CompleteDraw();
 }
 
@@ -2727,7 +2804,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			if (!occlusion_zero) {
 				m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			}
-			if (static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr; log) {
+			if (static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG"); log) {
 				static auto     start = std::chrono::steady_clock::now();
 				static uint64_t dumps = 0;
 				dumps++;

@@ -195,11 +195,10 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	// evicting: the collector writes the image back before freeing it; the write is dropped if
-	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
+	// The write is dropped if the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
 	// `landed`, when given, is set once the write-back has reached guest memory (or was dropped
 	// because the guest wrote the bytes first): an evicted image is freed only then.
-	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false,
+	[[nodiscard]] bool DownloadImageMemory(ImageId id,
 	                                       std::shared_ptr<std::atomic<bool>>* landed = nullptr);
 
 	GraphicContext&                                   m_graphics;
@@ -258,6 +257,11 @@ private:
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// KYTY_GC_IDLE_MEMO: the LRU clock and the level (0 normal, 1 pressure, 2 critical) of the
+	// last collector pass that freed nothing, and the frame the guest-dropped list was last scanned.
+	uint64_t         m_gc_idle_clock               = UINT64_MAX;
+	uint32_t         m_gc_idle_level               = 0;
+	uint64_t         m_guest_dropped_scan_frame    = UINT64_MAX;
 	// Two-phase eviction of GPU-written images: the write-back is deferred until the GPU is done,
 	// and the image stays registered until it has landed. Freeing it at once let a draw in between
 	// recreate it from the old guest bytes, without what the GPU had drawn into it (the glyph

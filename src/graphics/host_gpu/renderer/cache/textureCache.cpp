@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -9,6 +10,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/gcAge.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -64,7 +66,10 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 // guest that reused the memory in between (a retired render target becoming a CPU-written vertex
 // table, as in Jetsku's 919e712a) had it overwritten with stale pixels. The guest bytes are hashed
 // when the copy is recorded and again before it is published; if they changed, the write-back
-// is dropped. KYTY_EVICT_WRITEBACK_GUARD=0 publishes unconditionally again.
+// is dropped. The linear-image readback of every submission too (--readback-linear-images): the
+// game's per-frame allocator (RenderAlloc) reuses memory for CPU lists while older GPU bytes of it
+// are on their way back (an 8 KB emulator write over one, 40 ms before a crash, 2026-10-24).
+// KYTY_EVICT_WRITEBACK_GUARD=0 publishes unconditionally again.
 [[nodiscard]] bool EvictWriteBackGuard() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_EVICT_WRITEBACK_GUARD");
@@ -435,6 +440,11 @@ void TextureCache::ReleaseImage(ImageId id) {
 		}
 		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 		return;
+	}
+	if (auto* owned = m_slot_images.try_get(id); owned != nullptr) {
+		// The GPU is done with it (the tick of its last use has finished): its device image may be
+		// handed to the next identical CreateImage (KYTY_IMAGE_POOL_MB).
+		owned->backing.release_to_pool = true;
 	}
 	m_slot_images.erase(id);
 	Profiler::Add(Profiler::Counter::ImagesDestroyed);
@@ -924,7 +934,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	// KYTY_LOG_IMAGE_OVERLAPS=1: each overlap of differently laid-out images, once per pair.
-	if (static const bool log_overlaps = std::getenv("KYTY_LOG_IMAGE_OVERLAPS") != nullptr;
+	if (static const bool log_overlaps = Common::Environment::IsSet("KYTY_LOG_IMAGE_OVERLAPS");
 	    log_overlaps && (requested.tile_mode != cached.info.tile_mode ||
 	                     requested.pixel_format != cached.info.pixel_format ||
 	                     requested.extent != cached.info.extent ||
@@ -1391,7 +1401,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size(), 'M');
 		}
 	}
 }
@@ -2169,8 +2179,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
-                                       std::shared_ptr<std::atomic<bool>>* landed) {
+bool TextureCache::DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic<bool>>* landed) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -2207,7 +2216,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	const bool guard      = evicting && EvictWriteBackGuard();
+	const bool guard      = EvictWriteBackGuard();
 	uint64_t   guest_hash = 0;
 	if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
 		return false;
@@ -2245,17 +2254,27 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		uint64_t current = 0;
 		if (guard && (!HashGuestBacking(range.address, range.size, current) ||
 		              current != guest_hash)) {
-			// The guest wrote (or unmapped) these bytes after the image was evicted: they are
+			// The guest wrote (or unmapped) these bytes after the copy was recorded: they are
 			// newer than its pixels.
 			static std::atomic<uint32_t> reported = 0;
 			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("TextureCache: evicted image write-back dropped, guest=0x%016" PRIx64
-				     " size=0x%" PRIx64 ": the guest bytes changed before it landed\n",
-				     range.address, range.size);
+				std::fprintf(stderr,
+				             "[image-writeback] dropped 0x%016" PRIx64 "+0x%" PRIx64
+				             ": the guest bytes changed before it landed\n",
+				             range.address, range.size);
 			}
 			return;
 		}
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		// KYTY_ASYNC_UNMAP: a write-back queued between the unmap's flush and its release is not
+		// waited for, and may land after the game unmapped the range (even after the hash above).
+		if (!LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size, 'T')) {
+			static std::atomic<uint32_t> skipped = 0;
+			if (skipped.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: image write-back dropped, guest=0x%016" PRIx64 " size=0x%" PRIx64
+				     ": no longer mapped\n",
+				     range.address, range.size);
+			}
+		}
 	});
 	return true;
 }
@@ -2386,7 +2405,25 @@ struct GcSkipStats {
 	uint64_t small_target = 0; // render targets of at most 1024x1024 kept (glyphs, cached layers)
 	uint64_t pending      = 0; // evicted, write-back not landed yet
 	uint64_t revived      = 0; // used again before the write-back landed: stays
+	uint64_t idle         = 0; // passes skipped: one earlier in this clock freed nothing
 };
+
+// KYTY_GC_IDLE_MEMO (default on; =0 as before). The collector runs once per guest submission,
+// hundreds of times a frame, and under pressure a pass walks up to 4096 LRU entries. When none of
+// them can go (GPU-written targets past the frame's write-back budget, depth associations, small
+// render targets) the pass frees nothing, spends none of the frame's budget, and the next
+// submission walks the same entries again: 12 % of the GPU thread in Wolverine (2026-10-22), each
+// entry a cache miss in the LRU list and another in the image slots. Within one clock value no
+// entry becomes old enough that was not already, so a pass that freed nothing is not repeated
+// until the clock moves (or the pressure level rises); entries that this collector never frees
+// move to the young end of the LRU instead of being visited first on every pass.
+bool GcIdleMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GC_IDLE_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 GcSkipStats g_gc_skip;
 } // namespace
 
@@ -2402,6 +2439,8 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
+	static LruClockRate clock_rate;
+	clock_rate.Sample(clock);
 	// Evictions whose write-back has landed: free the image now, unless it was used since (then
 	// its pixels are newer than the guest bytes and it stays, as if never a candidate).
 	std::erase_if(m_pending_evictions, [&](const PendingEviction& pending) {
@@ -2448,13 +2487,15 @@ void TextureCache::RunGarbageCollector() {
 	m_applied_trigger_gc_memory  = m_trigger_gc_memory;
 	m_applied_pressure_gc_memory = m_pressure_gc_memory;
 	m_applied_critical_gc_memory = m_critical_gc_memory;
-	if (!m_guest_dropped.empty()) {
+	const bool idle_memo = GcIdleMemoEnabled();
+	if (const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	    !m_guest_dropped.empty() && (!idle_memo || m_guest_dropped_scan_frame != frame)) {
 		// Engine method: the guest's own streaming dropped these textures from its heaps, as an
 		// engine unloads a texture; free them once no draw has used them for a few frames, not
 		// when the cache reaches its memory threshold. Images the GPU wrote keep their data for
 		// the regular collector (it writes them back); one a heap entry or a render target uses
-		// again stays.
-		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		// again stays. The grace is counted in frames, so one scan a frame is enough.
+		m_guest_dropped_scan_frame = frame;
 		std::erase_if(m_guest_dropped, [&](ImageId id) {
 			auto* image = m_slot_images.try_get(id);
 			if (image == nullptr || !image->registered || image->bindless_pinned ||
@@ -2486,7 +2527,7 @@ void TextureCache::RunGarbageCollector() {
 		// one holding too much. Spider-Man's world then grew to 7.6 GB of images on a 6 GB
 		// card, all of it spilled, and every shader access crossed PCIe (3 fps).
 		// KYTY_GC_DEVICE_BYTES=1 restores the old policy, as in the buffer cache.
-		static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+		static const bool device_bytes = Common::Environment::IsSet("KYTY_GC_DEVICE_BYTES");
 		if (device_bytes) {
 			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		}
@@ -2517,15 +2558,48 @@ void TextureCache::RunGarbageCollector() {
 		m_gc_freed_images_frame = 0;
 		m_gc_written_back_bytes_frame = 0;
 	}
+	// KYTY_GC_HYSTERESIS (default on; =0 as before): once over the pressure threshold the cache keeps
+	// collecting until it is a twelfth (~8 %) below it, then stops until the threshold is crossed
+	// again. Collecting to just under it had the next image cross it again: the same images freed
+	// and created over and over.
+	static const bool hysteresis = [] {
+		const char* value = std::getenv("KYTY_GC_HYSTERESIS");
+		return value == nullptr || value[0] != '0';
+	}();
+	static bool pressure_latched = false; // one texture cache, under m_lock
+	const uint64_t pressure_low = m_pressure_gc_memory - m_pressure_gc_memory / 12;
 	const auto collect = [&](bool allow_aggressive) {
-		bool pressured  = CollectableMemory() >= m_pressure_gc_memory;
-		bool aggressive = allow_aggressive && CollectableMemory() >= m_critical_gc_memory;
+		const auto collectable = CollectableMemory();
+		if (hysteresis) {
+			if (collectable >= m_pressure_gc_memory) {
+				pressure_latched = true;
+			} else if (collectable < pressure_low) {
+				pressure_latched = false;
+			}
+		}
+		bool pressured  = hysteresis ? pressure_latched : collectable >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && collectable >= m_critical_gc_memory;
+		// A higher level reaches younger entries with looser rules, so its candidates include a
+		// lower level's: a pass that found nothing covers every level up to its own.
+		const uint32_t level = aggressive ? 2u : pressured ? 1u : 0u;
+		if (idle_memo && m_gc_idle_clock == clock && level <= m_gc_idle_level) {
+			g_gc_skip.idle++;
+			return;
+		}
+		bool progressed = false;
 		// Ages in frames. This collector runs once per guest submission, and a title can
 		// submit a hundred times a frame: an age counted in its ticks evicted textures inside
 		// the frame that used them, to recreate them the next (11 000 images a second at the
 		// title menu). An image used in the frame being recorded is never a candidate, at any
 		// pressure; over budget the collector reaches back only as far as the previous frame.
-		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		// With KYTY_GC_MIN_AGE also a minimum time (0.5 s critical, 1 s under pressure, 2 s
+		// otherwise): at 3 fps an age of one frame freed textures the game was still sampling.
+		uint64_t age_units = aggressive ? 1 : pressured ? 4 : 16;
+		if (GcMinAgeEnabled()) {
+			age_units = std::max(age_units,
+			                     clock_rate.UnitsIn(aggressive ? 500 : pressured ? 1000 : 2000));
+		}
+		const uint64_t age = std::min<uint64_t>(age_units, clock);
 		// Under pressure the work is budgeted per frame, in bytes actually freed, and in
 		// proportion to the excess, so the cache converges on its threshold instead of either
 		// churning (a per-run budget: 7 600 submissions a frame) or growing without bound (a
@@ -2537,8 +2611,11 @@ void TextureCache::RunGarbageCollector() {
 		uint64_t           byte_budget     = 0;
 		size_t             deletions       = 10;
 		if (pressured || aggressive) {
-			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
-			const auto excess    = CollectableMemory() - threshold;
+			const auto threshold = aggressive   ? m_critical_gc_memory
+			                       : hysteresis ? pressure_low
+			                                    : m_pressure_gc_memory;
+			const auto held      = CollectableMemory();
+			const auto excess    = held > threshold ? held - threshold : 0;
 			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
 			                         : std::max<uint64_t>(16 * MiB, excess / 8);
 			if (m_gc_freed_bytes_frame >= byte_budget ||
@@ -2575,7 +2652,11 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->depth_id) {
+				// Freed with its depth image, never here.
 				g_gc_skip.depth++;
+				if (idle_memo) {
+					m_lru_cache.Touch(owner->lru_id, clock);
+				}
 				continue;
 			}
 			if (m_evicting.contains(id)) {
@@ -2589,6 +2670,9 @@ void TextureCache::RunGarbageCollector() {
 			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
 			    owner->info.extent.height <= 1024) {
 				g_gc_skip.small_target++;
+				if (idle_memo) {
+					m_lru_cache.Touch(owner->lru_id, clock);
+				}
 				continue;
 			}
 			if (owner->bindless_pinned) {
@@ -2610,7 +2694,7 @@ void TextureCache::RunGarbageCollector() {
 				// present. Under pressure such an image is now written back, detiled, like any
 				// other, within a per-frame write-back budget; candidates are never ones used in
 				// the frame being recorded. KYTY_GC_KEEP_TILED=1 restores the old rule.
-				static const bool keep_tiled = std::getenv("KYTY_GC_KEEP_TILED") != nullptr;
+				static const bool keep_tiled = Common::Environment::IsSet("KYTY_GC_KEEP_TILED");
 				constexpr uint64_t WriteBackPerFrame = 256 * MiB;
 				if (safe && owner->info.IsTiled() &&
 				    (keep_tiled || !(pressured || aggressive) ||
@@ -2632,7 +2716,7 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 				std::shared_ptr<std::atomic<bool>> landed;
-				if (safe && !DownloadImageMemory(id, true, &landed)) {
+				if (safe && !DownloadImageMemory(id, &landed)) {
 					g_gc_skip.gpu_download++;
 					continue;
 				}
@@ -2645,6 +2729,7 @@ void TextureCache::RunGarbageCollector() {
 				m_pending_evictions.push_back(
 				    {id, owner->info.data.address, owner->frame_accessed_last, std::move(landed)});
 				m_evicting.insert(id);
+				progressed = true;
 				if (pressured || aggressive) {
 					--deletions;
 					m_gc_freed_images_frame++;
@@ -2659,6 +2744,7 @@ void TextureCache::RunGarbageCollector() {
 			g_gc_skip.freed++;
 			g_gc_skip.freed_mb += freed >> 20u;
 			FreeImage(id);
+			progressed = true;
 			if (pressured || aggressive) {
 				--deletions;
 				m_gc_freed_images_frame++;
@@ -2671,10 +2757,15 @@ void TextureCache::RunGarbageCollector() {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (CollectableMemory() < m_pressure_gc_memory && pressured) {
+			if (CollectableMemory() < (hysteresis ? pressure_low : m_pressure_gc_memory) && pressured) {
 				deletions >>= 1;
-				pressured = false;
+				pressured        = false;
+				pressure_latched = false;
 			}
+		}
+		if (!progressed) {
+			m_gc_idle_level = m_gc_idle_clock == clock ? std::max(m_gc_idle_level, level) : level;
+			m_gc_idle_clock = clock;
 		}
 	};
 	collect(false);
@@ -2698,11 +2789,11 @@ void TextureCache::RunGarbageCollector() {
 		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
 		     " gone=%" PRIu64 " depth=%" PRIu64 " gpu_tiled=%" PRIu64 " gpu_unpressured=%" PRIu64
 		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 " bindless=%" PRIu64
-		     " small_target=%" PRIu64 " pending=%" PRIu64 " revived=%" PRIu64 "\n",
+		     " small_target=%" PRIu64 " pending=%" PRIu64 " revived=%" PRIu64 " idle=%" PRIu64 "\n",
 		     g_gc_skip.visited, g_gc_skip.freed, g_gc_skip.freed_mb, g_gc_skip.written_back,
 		     g_gc_skip.gone, g_gc_skip.depth, g_gc_skip.gpu_tiled, g_gc_skip.gpu_unpress,
 		     g_gc_skip.gpu_download, g_gc_skip.young, g_gc_skip.bindless, g_gc_skip.small_target,
-		     g_gc_skip.pending, g_gc_skip.revived);
+		     g_gc_skip.pending, g_gc_skip.revived, g_gc_skip.idle);
 		g_gc_skip = {};
 	}
 }

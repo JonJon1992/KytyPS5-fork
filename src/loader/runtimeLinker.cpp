@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "common/environment.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -772,7 +773,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// fault waits for the GPU thread, which downloads the page and drains the GPU.
 		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
 		static const bool emulate_clean_reads =
-		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
+		    !Common::Environment::IsSet("KYTY_NO_CLEAN_READ_EMULATION");
 		if (access == GpuAccess::Read && emulate_clean_reads &&
 		    Loader::X64InstructionEmulator::TryEmulateLoad(
 		        info->native_context, info->access_violation_vaddr,
@@ -788,6 +789,24 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// A fault inside another host DLL (USER32, CoreMessaging, overlay hooks) goes on to Windows
+	// SEH: those DLLs guard probes with __try. Guest code and JIT pages are not modules.
+	if (HMODULE host_module = nullptr;
+	    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(info->exception_address), &host_module) != 0 &&
+	    host_module != nullptr && host_module != GetModuleHandleW(nullptr)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 8u) {
+			char module_name[MAX_PATH] = "?";
+			GetModuleFileNameA(host_module, module_name, MAX_PATH);
+			std::fprintf(stderr, "Host fault at 0x%016" PRIx64 " in %s: passed to SEH\n",
+			             info->exception_address, module_name);
+		}
+		return false;
+	}
+#endif
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
@@ -821,6 +840,60 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+		}
+		// Where a bad pointer came from (Wolverine faulted on pointer slots holding float data,
+		// 2026-10-24): the 64 bytes behind each register, and behind each pointer found there.
+		const auto print_words = [](const char* prefix, uint64_t addr) {
+			if (addr < 0x10000 || !IsReadableRange(addr, 64)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				// Committed but not readable: a page the emulator protects (readback tracking).
+				MEMORY_BASIC_INFORMATION mbi {};
+				if (addr >= 0x10000 &&
+				    VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) != 0 &&
+				    mbi.State == MEM_COMMIT) {
+					std::printf("%s%016" PRIx64 ": committed, protect=0x%lx, not readable\n", prefix,
+					            addr, mbi.Protect);
+					Libs::LibKernel::Memory::DescribeGuestBytes(addr, 64);
+				}
+#endif
+				return static_cast<const uint64_t*>(nullptr);
+			}
+			const auto* words = reinterpret_cast<const uint64_t*>(addr);
+			std::printf("%s%016" PRIx64 ":", prefix, addr);
+			for (int i = 0; i < 8; i++) {
+				std::printf(" %016" PRIx64, words[i]);
+			}
+			std::printf("\n");
+			Libs::LibKernel::Memory::DescribeGuestBytes(addr, 64);
+			return words;
+		};
+		const std::pair<const char*, uint64_t> registers[] = {
+		    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+		    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},
+		    {"r9", info->r9},   {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12},
+		    {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+		std::printf("pointers (64 bytes behind each register, then behind each pointer there):\n");
+		for (const auto& [name, value]: registers) {
+			char prefix[16];
+			std::snprintf(prefix, sizeof(prefix), " %s ", name);
+			const auto* words = print_words(prefix, value);
+			for (int i = 0; words != nullptr && i < 8; i++) {
+				if (words[i] != value) {
+					std::snprintf(prefix, sizeof(prefix), "   +0x%02x ", i * 8);
+					(void)print_words(prefix, words[i]);
+				}
+			}
+		}
+		// A non-canonical register (float bits used as a pointer): the slot it was loaded from.
+		std::vector<uint64_t> others;
+		for (const auto& [name, value]: registers) {
+			others.push_back(value);
+		}
+		for (const auto& [name, value]: registers) {
+			if (const auto top = value >> 47u; top != 0 && top != 0x1ffffu) {
+				std::printf("where %s came from:\n", name);
+				Libs::LibKernel::Memory::FindGuestQword(value, others);
+			}
 		}
 		std::fflush(stdout);
 	}

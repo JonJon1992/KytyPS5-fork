@@ -196,6 +196,15 @@ public:
 	// GPU thread, before guest memory is unmapped: drops the shared buffers over it (their
 	// imports point into that memory).
 	void UnmapShared(uint64_t vaddr, uint64_t size);
+	// GPU thread: imported guest memory (a shared buffer, a host zone) overlaps the range, so an
+	// unmap of it must drain the GPU before UnmapShared frees the import.
+	[[nodiscard]] bool IntersectsShared(uint64_t vaddr, uint64_t size) const {
+		return IsShared(vaddr, size);
+	}
+	// GPU thread, before a draw or dispatch whose shader stores through guest addresses
+	// (has_address_writes): every copy-queue readback window counts as written until that work
+	// has run.
+	void NoteAddressWrites();
 
 private:
 	// Shared buffers (KYTY_SHARED_BUFFERS=1): a small buffer the game threads keep reading back is
@@ -339,6 +348,14 @@ private:
 	// returns the readback's marker (0: not taken, the caller downloads as before).
 	[[nodiscard]] uint64_t TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
 	                                            uint64_t window_end);
+	// KYTY_READBACK_ASYNC_LIFT: after a game-thread read's readback is published, queues the
+	// protection lift on the GPU thread without waiting. False: the caller asks again, waiting.
+	[[nodiscard]] bool LiftAsynchronously(uint64_t vaddr, uint64_t size, bool is_write,
+	                                      bool from_gpu_thread);
+	// KYTY_READBACK_NARROW_COPY: the window declined (a writer still runs in it), the 1 MiB block
+	// around the read alone when its writers have finished. Marker as TryCopyQueueReadback.
+	[[nodiscard]] uint64_t TryNarrowCopyReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                             uint64_t window_begin, uint64_t window_end);
 	// GPU thread: the marker of an unfinished copy-queue readback overlapping the range, or 0.
 	[[nodiscard]] uint64_t FindCopyReadback(uint64_t vaddr, uint64_t size) const;
 	// Any thread: waits until no copy-queue readback is reading a cache buffer (before one is
@@ -361,7 +378,19 @@ private:
 		uint64_t                    total_size     = 0;
 		std::vector<vk::BufferCopy> copies;
 		bool                        snapshot       = false; // KYTY_READ_SNAPSHOT
+		// KYTY_READBACK_VERIFY: a second copy of the same bytes after all the work recorded when
+		// the first was submitted; the two are compared and the second is published.
+		vk::CommandBuffer           verify_command = nullptr;
+		bool                        verify         = false;
+		bool                        narrow         = false;
+		uint64_t                    block_tick     = 0; // writer ticks noted for the window
+		uint64_t                    large_tick     = 0;
+		uint64_t                    reached_tick   = 0; // what the first copy waited for
+		uint64_t                    verify_tick    = 0; // what the second copy waited for
+		std::vector<uint64_t>       guard;              // KYTY_DOWNLOAD_GUARD: per copy
+		uint64_t                    guard_sequence = 0;
 	};
+	bool                                              m_narrow_copy_in_progress = false;
 	// KYTY_READ_SNAPSHOT: the GPU's current bytes of a window whose writers are still running,
 	// copied without waiting for them; and the windows whose snapshot is in guest memory, waiting
 	// for the GPU thread to let reads through.
@@ -383,6 +412,8 @@ private:
 	uint64_t                                          m_copy_taken   = 0;
 	uint64_t                                          m_copy_busy    = 0;
 	uint64_t                                          m_copy_running = 0;
+	uint64_t                                          m_narrow_taken   = 0;
+	uint64_t                                          m_narrow_running = 0;
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;

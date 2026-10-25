@@ -16,6 +16,13 @@ void PreferPerformanceCores(const char* name);
 // idxtri/wolverine-perf 861aa3d1: ~40 guest threads compete with them at normal priority.
 void RaiseGpuThreadPriority();
 
+// KYTY_WORKER_THREAD_PRIORITY (default -1): scheduling priority of the calling background worker
+// (shader translation; not pipeline compiles, which the GPU thread waits for): -1 below normal,
+// 0 normal (Windows only). Translation
+// bursts on entering an area then take the idle cores without slowing the GPU thread and the
+// guest threads, which decide the frame time.
+void LowerWorkerThreadPriority();
+
 } // namespace Common
 
 #endif // EMULATOR_SRC_COMMON_CPUAFFINITY_H_

@@ -365,7 +365,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		} else {
 			emitted_non_phi = true;
 		}
-		if (ctx.state.wave_lds_scope != 0) {
+		if (ctx.state.wave_lds_scope != 0 || ctx.state.wave_lds_fence) {
 			const auto access = IR::SharedAccessOf(inst.GetOpcode());
 			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
 				lds_written = false;
@@ -865,6 +865,31 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	// An empty ballot (EXEC zero) gives lane 0, which V_READFIRSTLANE reads on hardware; FindILsb
+	// returns -1 for zero, where BallotFindLSB's result is undefined and the split form gave lane
+	// 31 (KytyPS5 919fac13). KYTY_FIRSTLANE_EXEC_ZERO=0: the forms below, as before.
+	static const bool exec_zero = [] {
+		const char* value = std::getenv("KYTY_FIRSTLANE_EXEC_ZERO");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (exec_zero) {
+		const auto first = [&](uint32_t word) {
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, word);
+			return std::pair {bits, EmitGlsl<GLSLstd450FindILsb, IR::Type::U32>(state, bits)};
+		};
+		const auto [low, low_first] = first(0);
+		if (state.program.wave_size == 32u) {
+			return EmitGlsl<GLSLstd450SMax, IR::Type::U32>(state, low_first, ConstantU32(state, 0));
+		}
+		const auto high_first = first(1).second;
+		const auto high_lane  = EmitGlsl<GLSLstd450SMax, IR::Type::U32>(
+		    state, EmitBinaryU32(state, spv::OpBitwiseOr, high_first, ConstantU32(state, 32)),
+		    ConstantU32(state, 0));
+		return Select(state, TypeU32(state),
+		              Binary(state, spv::OpINotEqual, TypeBool(state), low, ConstantU32(state, 0)),
+		              low_first, high_lane);
+	}
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,

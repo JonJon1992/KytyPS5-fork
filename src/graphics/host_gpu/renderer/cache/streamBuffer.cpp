@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -75,10 +76,32 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	if (graphics.ConcurrentBuffers()) { // KYTY_READBACK_QUEUE: shared with the readback family
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = graphics.buffer_queue_families.data();
+	}
 
+	// Buffers with device addresses (every guest buffer) took dedicated memory, a driver (kernel)
+	// allocation each: the cache creates and frees them all the time, and under memory pressure
+	// each one waited in the driver (a quarter of the GPU thread at 2 fps late in a Wolverine
+	// route, 2026-10-22). Those up to 64 MiB now share VMA's memory blocks, freed space reused
+	// in place (KYTY_BDA_SHARED_BLOCKS=0: dedicated again). Nothing needs the allocation's offset
+	// to be 0: the BDA page table stores BufferDeviceAddress() + page offset, which already
+	// includes the placement; mapped pointers come from pMappedData and flushes/invalidates go
+	// through vmaFlush/InvalidateAllocation, both allocation-relative; the allocator was created
+	// with VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT, so its blocks carry the address flag.
+	// From KytyPS5-fork (streamBuffer.cpp, BufferAllocationPolicy::BdaSharedBlockMax).
+	static const bool shared_blocks = [] {
+		const char* value = std::getenv("KYTY_BDA_SHARED_BLOCKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	constexpr uint64_t BdaSharedBlockMax = uint64_t {64} << 20u;
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !(shared_blocks && size <= BdaSharedBlockMax)
+	        ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+	        : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -94,7 +117,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
             graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &create_info,
             &native_buffer, &m_allocation, &allocation_result));
 	};
-	auto result = create(allocation_info);
+	auto result        = create(allocation_info);
+	auto first_result  = result;
+	auto system_result = result;
 	if (result != vk::Result::eSuccess) {
 		// The heap it prefers is out of budget: video memory, on a 4-8 GB card, for the game's
 		// large buffers. As images do (GraphicContext::CreateImage), take system memory and pay in
@@ -103,8 +128,20 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		auto spill           = allocation_info;
 		spill.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 		spill.preferredFlags = 0;
+		// System memory only, and not held to the heap's budget (the commit limit is what bounds
+		// it): with resizable BAR all video memory is host-visible too, so "prefer host" could pick
+		// the full device heap again, and a 5 MB buffer failed with 14.8 GB of the system heap free
+		// (RX 9070 XT, 2026-10-22).
+		spill.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		const auto& memory = graphics.physical_device_memory_properties;
+		for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+			if (!(memory.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+				spill.memoryTypeBits |= 1u << type;
+			}
+		}
 		const auto first     = result;
 		result               = create(spill);
+		system_result        = result;
 		const char* where    = "system memory";
 		if (result != vk::Result::eSuccess) {
 			auto over  = allocation_info;
@@ -124,8 +161,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		EXIT("Out of memory: a %" PRIu64 " MB GPU buffer fits neither in video memory nor in system "
 		     "memory (%s). The VMA heap lines above give usage and budget. Close other programs; on "
 		     "a card with little video memory lower the resolution; if Windows' commit limit is "
-		     "reached, enlarge the page file.\n",
-		     size >> 20u, vk::to_string(result).c_str());
+		     "reached, enlarge the page file. (usage %d, device %s, system %s)\n",
+		     size >> 20u, vk::to_string(result).c_str(), static_cast<int>(usage),
+		     vk::to_string(first_result).c_str(), vk::to_string(system_result).c_str());
 	}
 
 	m_buffer = native_buffer;
@@ -171,6 +209,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	info.size        = size;
 	info.usage       = static_cast<VkBufferUsageFlags>(flags);
 	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	if (graphics.ConcurrentBuffers()) { // KYTY_READBACK_QUEUE: shared with the readback family
+		info.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+		info.queueFamilyIndexCount = 2;
+		info.pQueueFamilyIndices   = graphics.buffer_queue_families.data();
+	}
 	VkBuffer buffer  = VK_NULL_HANDLE;
 	if (d.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) {
 		return;
@@ -473,7 +516,7 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		{
 			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
 			// KYTY_FPS_LOG: [ring-wait] per 5 s, the waits and their time by ring size.
-			static const bool log = std::getenv("KYTY_FPS_LOG") != nullptr;
+			static const bool log = Common::Environment::IsSet("KYTY_FPS_LOG");
 			const auto        wait_start = std::chrono::steady_clock::now();
 			Scheduler().Wait(watch.tick);
 			if (log) {

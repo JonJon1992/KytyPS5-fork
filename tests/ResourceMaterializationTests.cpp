@@ -581,6 +581,50 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// KYTY_ARRAYED_IMAGES=1 (set first thing in main): an array instruction keeps the array type on a
+// 2D or null texture, so both share the array's permutation; a storage image keeps the T#'s type.
+void TestArrayInstructionKeepsArrayOnSingleLayerTexture() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  const auto dimension = [](ImageType type, uint32_t base, ImageResourceClass resource_class) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(base);
+    source.dwords[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    source.dwords[3] = Value(static_cast<uint32_t>(type) << 28u);
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back(
+        {.source = 0,
+         .resource_class = resource_class,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = ImageDimension::Dim2DArray});
+    auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization),
+          "arrayed image materialization failed");
+    return specialization.images[0].dimension;
+  };
+  Check(dimension(ImageType::kColor2D, 1u, ImageResourceClass::Sampled) ==
+                ImageDimension::Dim2DArray &&
+            dimension(ImageType::kColor2DArray, 1u, ImageResourceClass::Sampled) ==
+                ImageDimension::Dim2DArray,
+        "a 2D texture under an array instruction became a second permutation");
+  Check(dimension(ImageType::kColor2D, 0u, ImageResourceClass::Sampled) ==
+            ImageDimension::Dim2DArray,
+        "a null texture under an array instruction became a second permutation");
+  Check(dimension(ImageType::kColor2D, 1u, ImageResourceClass::Storage) == ImageDimension::Dim2D,
+        "a 2D storage texture was declared as an array");
+}
+
 } // namespace
 
 namespace Common {
@@ -598,6 +642,13 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  // Read once, on the first materialization; the other cases use non-array instructions.
+#ifdef _WIN32
+  _putenv("KYTY_ARRAYED_IMAGES=1");
+#else
+  setenv("KYTY_ARRAYED_IMAGES", "1", 1);
+#endif
+  TestArrayInstructionKeepsArrayOnSingleLayerTexture();
   TestMappedSrtUsesDirectReaderByDefault();
   TestRawScalarAddressPreservesHighBits();
   TestIntegerRuntimeValueFollowsSrtReads();

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
+#include "common/environment.h"
 
 #include <cstdio>
 #include <cinttypes>
@@ -286,7 +287,7 @@ void BindlessTable::WriteDefaultSampler(vk::Sampler sampler) {
 // KYTY_LOG_BINDLESS_SAMPLERS=1: sampler heap mirroring on stderr ([bl-samp]): each heap update,
 // the array-full case, and every distinct sampler record decoded once.
 static bool LogBindlessSamplers() {
-	static const bool enabled = std::getenv("KYTY_LOG_BINDLESS_SAMPLERS") != nullptr;
+	static const bool enabled = Common::Environment::IsSet("KYTY_LOG_BINDLESS_SAMPLERS");
 	return enabled;
 }
 
@@ -513,7 +514,7 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	                        Placeholders, to_transfer.data());
 	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
 	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
-	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
+	const bool debug_colors = Common::Environment::IsSet("KYTY_BINDLESS_DEBUG_COLORS");
 	const auto color        = [debug_colors](float r, float g, float b) {
         return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
 		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
@@ -784,7 +785,7 @@ void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot
 void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	// Regions are allocated contiguously after word 0, so one copy covers every heap.
 	static const bool capture =
-	    std::getenv("KYTY_KEY_CAPTURE") != nullptr || std::getenv("KYTY_PROBE_RECT") != nullptr;
+	    Common::Environment::IsSet("KYTY_KEY_CAPTURE") || Common::Environment::IsSet("KYTY_PROBE_RECT");
 	const vk::DeviceSize size = vk::DeviceSize {capture ? TranslationEntries : m_next_region} *
 	                            sizeof(uint32_t);
 	scheduler.EndRendering();

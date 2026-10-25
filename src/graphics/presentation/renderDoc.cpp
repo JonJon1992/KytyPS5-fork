@@ -1,4 +1,5 @@
 #include "graphics/presentation/renderDoc.h"
+#include "common/environment.h"
 
 #include "common/sampler.h"
 
@@ -166,7 +167,7 @@ uint64_t AllocCountTotal(); // allocStats.cpp
 void RenderDocOnGuestFlip(RenderContext& renderer) {
 	Common::Sampler::NoteGuestFrame(); // freeze recorder
 	// KYTY_FPS_LOG=1: guest flips per second, every 5 s, to stderr (for scripted runs).
-	if (static const bool fps_log = std::getenv("KYTY_FPS_LOG") != nullptr; fps_log) {
+	if (static const bool fps_log = Common::Environment::IsSet("KYTY_FPS_LOG"); fps_log) {
 		static auto     window_start = std::chrono::steady_clock::now();
 		static uint32_t flips        = 0;
 		flips++;

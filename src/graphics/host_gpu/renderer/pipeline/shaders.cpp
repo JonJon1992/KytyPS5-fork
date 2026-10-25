@@ -25,9 +25,11 @@
 #include <cstdlib>
 #include <limits>
 #include <cstdio>
+#include <filesystem>
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -63,15 +65,27 @@ const std::vector<SlowKey>& ListedSlowPipelines() {
 		if (!SlowPipelinesEnabled()) {
 			return result;
 		}
+		// This compute shader takes about 59 s to compile optimized on the RX 9070 XT. Seed it
+		// before first use so a cold gameplay run starts with the fast path; the driver-cache probe
+		// in CreatePipelineInternal still uses an optimized pipeline when one is already available.
+		constexpr SlowKey known_slow_compute {'C', 0xdec083415ec94cc6ull, 0};
+		result.push_back(known_slow_compute);
 		if (auto* file = std::fopen(SlowPipelineFile, "r"); file != nullptr) {
 			char               kind = 0;
 			unsigned long long a = 0, b = 0;
 			while (std::fscanf(file, " %c %llx %llx", &kind, &a, &b) == 3) {
-				result.push_back({kind, a, b});
-				std::fprintf(stderr, "[slow-pipeline] %c %016llx %016llx: listed (graphics: draws skipped; compute: no optimization)\n", kind, a, b);
+				const SlowKey key {kind, a, b};
+				if (std::ranges::find(result, key) == result.end()) {
+					result.push_back(key);
+					std::fprintf(stderr, "[slow-pipeline] %c %016llx %016llx: listed (graphics: draws skipped; compute: no optimization)\n", kind, a, b);
+				}
 			}
 			std::fclose(file);
 		}
+		std::fprintf(stderr,
+		             "[slow-pipeline] C %016llx %016llx: built-in (compute: no optimization on cache miss)\n",
+		             static_cast<unsigned long long>(known_slow_compute.a),
+		             static_cast<unsigned long long>(known_slow_compute.b));
 		return result;
 	}();
 	return listed;
@@ -102,6 +116,14 @@ void SlowWatch() {
 			             entry->key.kind, static_cast<unsigned long long>(entry->key.a),
 			             static_cast<unsigned long long>(entry->key.b), SlowPipelineFile);
 			std::fflush(stderr);
+			// The folder only existed with shader dumps on, so compute entries were never kept: the
+			// AMD driver took 30+ s on CS 0xdec083415ec94cc6 at every cold start (2026-10-22). Graphics
+			// entries still need the folder: a slow graphics compile runs on a worker and does not
+			// freeze, while a listed one loses its draws in every later run.
+			if (entry->key.kind == 'C') {
+				std::error_code error;
+				std::filesystem::create_directories(std::filesystem::path(SlowPipelineFile).parent_path(), error);
+			}
 			if (auto* file = std::fopen(SlowPipelineFile, "a"); file != nullptr) {
 				std::fprintf(file, "%c %016llx %016llx\n", entry->key.kind,
 				             static_cast<unsigned long long>(entry->key.a),
@@ -780,11 +802,21 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 }
 
 vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
-                                  vk::Pipeline* pipeline) {
+                                  vk::Pipeline* pipeline, PipelineCompile mode) {
 	const auto create_begin = std::chrono::steady_clock::now();
-	const CompileWatch watch('G', build.vs_hash, build.ps_hash);
-	const auto result =
-	    build.device.createGraphicsPipelines(driver_cache, 1, &build.pipeline_info, nullptr, pipeline);
+	// A warm-up freezes nothing; listed, its draws would be skipped in every later run.
+	std::optional<CompileWatch> watch;
+	if (mode != PipelineCompile::CacheWarm) {
+		watch.emplace('G', build.vs_hash, build.ps_hash);
+	}
+	auto info = build.pipeline_info;
+	if (mode == PipelineCompile::CacheOnly) {
+		// VK_PIPELINE_COMPILE_REQUIRED and a null pipeline instead of a compile.
+		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+	} else if (mode == PipelineCompile::Unoptimized) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
+	const auto result = build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -820,7 +852,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            std::unique_ptr<ComputePipelineWarm>* warm,
+                            std::unique_ptr<ComputePipelineWarm>* deferred) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -869,14 +903,56 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
-	if (DisableOptimizationFor(input_info.stage.program->shader_hash) ||
-	    SlowPipelineListed('C', input_info.stage.program->shader_hash, 0)) {
+	const auto hash        = input_info.stage.program->shader_hash;
+	const bool listed_slow = SlowPipelineListed('C', hash, 0);
+	const bool forced      = DisableOptimizationFor(hash);
+	bool       unoptimized = forced || listed_slow;
+	// A listed pipeline, and with warm any other, is first asked of the driver cache optimized:
+	// an earlier run may have finished it.
+	if ((listed_slow || (warm != nullptr && !forced)) && graphics.pipeline_cache_control_enabled &&
+	    driver_cache != nullptr) {
+		auto probe  = info;
+		probe.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		result      = graphics.device.createComputePipelines(driver_cache, 1, &probe, nullptr,
+		                                                     &pipeline.pipeline);
+		if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+			LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " taken optimized from the driver cache\n",
+			     hash);
+			return;
+		}
+		pipeline.pipeline = nullptr;
+		unoptimized       = true;
+		// Not cached: this run gets it without optimization (the GPU thread waits for it), and the
+		// optimized one is compiled on a worker for the next run. Not a listed one: its optimized
+		// compile took minutes, and a running one holds the exit (PipelineCompiler::Stop).
+		if (warm != nullptr && !listed_slow) {
+			*warm               = std::make_unique<ComputePipelineWarm>();
+			(*warm)->device     = graphics.device;
+			(*warm)->info       = info;
+			if (info.stage.pNext != nullptr) {
+				(*warm)->subgroup_size     = comp_subgroup_size;
+				(*warm)->info.stage.pNext = &(*warm)->subgroup_size;
+			}
+		}
+	}
+	if (unoptimized) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " built without optimization\n",
 		     input_info.stage.program->shader_hash);
 	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
+
+	if (deferred != nullptr) {
+		*deferred           = std::make_unique<ComputePipelineWarm>();
+		(*deferred)->device = graphics.device;
+		(*deferred)->info   = info;
+		if (info.stage.pNext != nullptr) {
+			(*deferred)->subgroup_size     = comp_subgroup_size;
+			(*deferred)->info.stage.pNext = &(*deferred)->subgroup_size;
+		}
+		return;
+	}
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));

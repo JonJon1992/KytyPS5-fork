@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/environment.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
@@ -206,7 +207,7 @@ struct PageManager::Impl {
 	};
 	static ProtectStats* Stats() {
 		static ProtectStats* stats =
-		    std::getenv("KYTY_FPS_LOG") != nullptr ? new ProtectStats : nullptr;
+		    Common::Environment::IsSet("KYTY_FPS_LOG") ? new ProtectStats : nullptr;
 		return stats;
 	}
 	static void Note(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode, double us) {

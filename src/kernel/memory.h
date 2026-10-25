@@ -116,7 +116,8 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// writer: the NoteEmulatorWrite kind the crash report names.
+bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size, char writer = 'B');
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 // Diagnostics: the virtual mappings of the direct memory behind a range (aliases included).
 std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t vaddr, uint64_t size);
@@ -149,6 +150,20 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 // Crash diagnostics: prints the guest mapping, the host state and the recent guest mapping changes
 // at an address whose fault nothing handled.
 void DescribeUnhandledFault(uint64_t vaddr);
+// Crash diagnostics: guest bytes the emulator writes itself ('B' buffer download on the main queue,
+// 'Q' copy-queue readback, 'W' GPU-thread clean write, 'T' image write-back, 'M' image metadata,
+// 'F' AMPR asset read, 'D' DMA copy on the CPU), kept in a ring of the last 65536.
+void NoteEmulatorWrite(char kind, uint64_t vaddr, uint64_t size);
+// Crash diagnostics: the guest range holding vaddr (when it differs from the last one printed) and
+// the newest emulator writes touching [vaddr, vaddr + size).
+void DescribeGuestBytes(uint64_t vaddr, uint64_t size);
+// Download guard (bufferCache.cpp): the position in that ring now, and the kind of the newest
+// emulator write since `sequence` touching [vaddr, vaddr + size) (0 none, '?' the ring wrapped).
+uint64_t EmulatorWriteSequence();
+char     EmulatorWroteSince(uint64_t sequence, uint64_t vaddr, uint64_t size);
+// Crash diagnostics: where `value` (a bad pointer) is stored in the guest ranges holding `others`
+// (the other registers), with the emulator writes there.
+void FindGuestQword(uint64_t value, std::span<const uint64_t> others);
 // The GPU side of unmapping these ranges, all at once, ahead of the remaps that follow (an AMM
 // batch). The remaps' own unmaps then find the ranges no longer GPU-mapped and skip the GPU.
 void PrepareGpuUnmap(std::span<const std::pair<uint64_t, uint64_t>> ranges);
@@ -188,7 +203,7 @@ void SetUnhandledFaultHook(void (*hook)(uint64_t vaddr));
 // mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
 // so is every range before the kernel's memory is set up (unit tests).
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size, char writer = 'B') noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
